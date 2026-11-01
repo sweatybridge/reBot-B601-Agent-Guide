@@ -62,13 +62,15 @@ Gateway 启动后保持运行，不要关闭该终端。
 >
 > ```cmd
 > :: Windows cmd
-> taskkill /F /IM motorbridge-gateway.exe
+> taskkill /F /IM ws_gateway.exe
 > ```
 >
 > ```powershell
 > # PowerShell
-> Stop-Process -Name "motorbridge-gateway" -ErrorAction SilentlyContinue
+> Stop-Process -Name "ws_gateway" -Force -ErrorAction SilentlyContinue
 > ```
+>
+> **Windows 说明**：`motorbridge-gateway.exe` 只是一个启动器，真正占用总线和端口的是它的子进程 `ws_gateway.exe`。只结束启动器会留下 `ws_gateway.exe` 继续运行，端口仍被占用，下次启动会报 `Os { code: 10048, kind: AddrInUse }`。请结束 `ws_gateway.exe`，启动器会随之退出。
 >
 > 扫描完成后再重新启动 Gateway。建议在启动 Gateway 前完成所有 CLI 扫描和电机 ID 设置工作。
 

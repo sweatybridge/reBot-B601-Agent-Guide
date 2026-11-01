@@ -37,7 +37,7 @@
 motorbridge-cli --help
 ```
 
-> **Windows 用户**：使用 Miniforge 创建 conda 环境，不要使用系统 Python 直接 `pip install motorbridge`。不需要配置 can0。详见 [环境初始化参考](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md)。
+> **Windows 用户**：使用 Miniforge 创建 conda 环境，不要使用系统 Python 直接 `pip install motorbridge`。如果已安装 `uv`，使用独立 uv venv 也是认可的替代方案（见参考文档中的 uv 小节）——无论哪种方式，都不要装进系统 Python。不需要配置 can0。详见 [环境初始化参考](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md)。
 
 ---
 

@@ -37,7 +37,7 @@ After completion, verify motorbridge-cli is available:
 motorbridge-cli --help
 ```
 
-> **Windows users**: Use Miniforge to create a conda environment — do not use system Python directly. No can0 configuration needed. See [Environment Setup Reference](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) for details.
+> **Windows users**: Use Miniforge to create a conda environment — do not use system Python directly. If you already use `uv`, an isolated uv venv is an accepted alternative (see the uv section of the reference) — either way, never install into a system Python. No can0 configuration needed. See [Environment Setup Reference](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) for details.
 
 ---
 

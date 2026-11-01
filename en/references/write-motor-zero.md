@@ -60,13 +60,15 @@ Keep the Gateway running — do not close this terminal.
 >
 > ```cmd
 > :: Windows cmd
-> taskkill /F /IM motorbridge-gateway.exe
+> taskkill /F /IM ws_gateway.exe
 > ```
 >
 > ```powershell
 > # PowerShell
-> Stop-Process -Name "motorbridge-gateway" -ErrorAction SilentlyContinue
+> Stop-Process -Name "ws_gateway" -Force -ErrorAction SilentlyContinue
 > ```
+>
+> **Windows note**: `motorbridge-gateway.exe` is only a launcher — the process that owns the bus and the port is its child `ws_gateway.exe`. Killing the launcher alone leaves `ws_gateway.exe` running, so the port stays bound and the next start fails with `Os { code: 10048, kind: AddrInUse }`. Kill `ws_gateway.exe`; the launcher exits with it.
 >
 > Restart the Gateway after scanning is complete. It's recommended to complete all CLI scan and motor ID setup work before starting the Gateway.
 

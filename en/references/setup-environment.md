@@ -136,6 +136,30 @@ conda activate rebot
 
    Close and reopen PowerShell, then `conda` will be available. Alternatively, use the **Anaconda Prompt** that comes with Miniforge — no extra configuration needed.
 
+#### Alternative: uv
+
+> Use this only if the user already has `uv` and prefers it to Miniforge. The requirement this section exists to satisfy is **isolation**, not conda itself: a uv venv has its own interpreter and its own `Scripts\` directory, and never touches a system Python.
+
+```powershell
+uv venv .rebot-venv --python 3.12
+uv pip install --python .rebot-venv\Scripts\python.exe motorbridge
+.\.rebot-venv\Scripts\motorbridge-cli.exe --help
+```
+
+- Keep Python 3.12 to match the rest of this guide. `motorbridge` publishes Windows wheels for cp310–cp314, so other versions generally work too.
+- Replace every `conda activate rebot` in the other references with `.\.rebot-venv\Scripts\Activate.ps1` — or skip activation entirely and call `.\.rebot-venv\Scripts\motorbridge-cli.exe` and `.\.rebot-venv\Scripts\motorbridge-gateway.exe` by full path. If `Activate.ps1` is blocked by execution policy, use the full-path form.
+- `uv tool install motorbridge` is an alternative that puts `motorbridge-cli` and `motorbridge-gateway` on PATH (`%USERPROFILE%\.local\bin`), so commands in the other references run unchanged.
+- If `uv` cannot write its default cache (restricted or sandboxed host), redirect it: set `$env:UV_CACHE_DIR` and `$env:UV_PYTHON_INSTALL_DIR` to writable directories.
+- `uv` ignores `pip.ini`, so the `global.target` check in Step 2 does not apply.
+
+> **Write to memory**: record the uv venv path instead of the conda fields:
+>
+> ```markdown
+> ## Python Environment (uv)
+> - venv path: `D:\work\reBot-B601-Agent-Guide\.rebot-venv`
+> - Activate: `.rebot-venv\Scripts\Activate.ps1`
+> ```
+
 ---
 
 ## Step 2: Install motorbridge
