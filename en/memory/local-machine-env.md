@@ -7,6 +7,25 @@
 
 ---
 
+## Control Host
+
+<!-- Automatically written by Agent after the control host is identified -->
+
+- Host type (local / remote SSH):
+- SSH target (`user@host`):
+- OS / release:
+- Architecture (`uname -m`):
+- motorbridge wheel supported (yes / no):
+
+## CAN Interface
+
+<!-- Automatically written by Agent after the CAN path is configured -->
+
+- Adapter (PCAN-USB / CANable / CAN HAT MCP2515 / damiao serial):
+- Interface name and bitrate (`can0` @ 1000000):
+- Configured persistently across reboots (yes / no, and how):
+- CAN HAT overlay line / config file:
+
 ## conda
 
 <!-- Automatically written by Agent after Miniforge installation -->
