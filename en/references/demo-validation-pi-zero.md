@@ -2,7 +2,7 @@
 
 > **Note: This reference document is a beta version and for reference only. If you have any questions or encounter issues, please contact Seeed for support.**
 
-This documents how the pure-Python motion demo ([`en/examples/edge/gradual_motion_demo.py`](../examples/edge/gradual_motion_demo.py)) was built and validated on a 32-bit Raspberry Pi, and — more usefully — the checks that caught real defects before they reached the arm. Follow the same order for any new motion script on this class of hardware.
+This documents how the pure-Python motion demo ([`examples/edge/gradual_motion_demo.py`](../../examples/edge/gradual_motion_demo.py)) was built and validated on a 32-bit Raspberry Pi, and — more usefully — the checks that caught real defects before they reached the arm. Follow the same order for any new motion script on this class of hardware.
 
 **Verified baseline**
 
