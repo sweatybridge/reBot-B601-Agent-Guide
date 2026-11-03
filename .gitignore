@@ -1,0 +1,8 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local tooling / venvs (not part of the guide)
+.rebot-venv/
+.uv-cache/
+.uv-python/
