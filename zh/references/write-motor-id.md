@@ -47,8 +47,11 @@ motorbridge-cli --help 2>/dev/null || echo "motorbridge-cli not found"
 
 | 类型 | 连接方式 | 说明 |
 |------|----------|------|
-| robstride（灵足） | USB-CAN（PCAN-USB） | Linux 通过 socketcan `can0` 通信；Windows 驱动自动识别 |
+| robstride（灵足） | USB-CAN（PCAN-USB / CANable） | Linux 通过 socketcan `can0` 通信；Windows 驱动自动识别 |
+| robstride（灵足） | CAN HAT（SPI 接口 MCP2515） | 树莓派：先用 [CAN HAT 配置](setup-can-hat.md) 配置一次，之后 `can0` 以 1 Mbit/s 工作 |
 | damiao（达妙） | USB 串口 | Linux 通过 `/dev/ttyACM0` 通信；Windows 通过 `COMx` |
+
+> **远程主机**：如果这些电机接在你通过 SSH 访问的板子上，请给每条命令加上 `ssh <用户名>@<主机> "…"` 前缀。板子上有 conda 环境时，把激活也串进同一条命令（`"source ~/miniforge3/etc/profile.d/conda.sh && conda activate rebot && motorbridge-cli ..."`）。
 
 ## CLI 命令路径约定
 
@@ -89,7 +92,7 @@ motorbridge-cli --help 2>/dev/null || echo "motorbridge-cli not found"
 ### Linux — robstride（USB-CAN）
 
 ```bash
-# 加载 PCAN-USB 驱动
+# 加载 PCAN-USB 驱动（CANable/candleLight 用 gs_usb，跳过这步）
 sudo modprobe peak_usb
 ip -br link
 
@@ -100,6 +103,15 @@ sudo ip link set can0 up
 
 # 确认状态
 ip -br link show can0
+```
+
+### Linux — robstride（CAN HAT，SPI 接口 MCP2515）
+
+HAT 不使用 `peak_usb`；只有启用 SPI overlay 并重启之后 `can0` 才会出现。先按 [CAN HAT 配置](setup-can-hat.md) 做一次，然后在扫描前确认接口状态：
+
+```bash
+ip -details link show can0 | grep -E "can state|bitrate"
+# can state ERROR-ACTIVE / bitrate 1000000
 ```
 
 ### Windows — robstride（USB-CAN）

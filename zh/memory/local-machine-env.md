@@ -7,6 +7,25 @@
 
 ---
 
+## 控制主机
+
+<!-- 确认控制主机后由 Agent 自动写入 -->
+
+- 主机类型（本地 / 远程 SSH）：
+- SSH 目标（`用户名@主机`）：
+- 操作系统 / 版本：
+- CPU 架构（`uname -m`）：
+- motorbridge wheel 是否受支持（是 / 否）：
+
+## CAN 接口
+
+<!-- CAN 通路配置完成后由 Agent 自动写入 -->
+
+- 转接方式（PCAN-USB / CANable / CAN HAT MCP2515 / damiao 串口）：
+- 接口名称与速率（`can0` @ 1000000）：
+- 是否重启后自动生效（是 / 否，以及实现方式）：
+- CAN HAT overlay 配置行 / 配置文件：
+
 ## conda
 
 <!-- 安装 Miniforge 后由 Agent 自动写入 -->

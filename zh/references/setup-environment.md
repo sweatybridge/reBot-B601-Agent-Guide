@@ -6,6 +6,29 @@
 
 开始前，先检查 `../memory/local-machine-env.md` 是否已有当前机器的环境配置。如果已有 conda 路径和 motorbridge 信息，可直接使用；如果没有或信息不完整，按以下步骤重新初始化。
 
+## 远程控制主机（SSH）
+
+如果 motorbridge 要运行在另一块板子上（树莓派、Jetson 等），先读这一节：
+
+- 本文档及其他参考文档中的所有命令都在**那块板子上**执行，通过 `ssh <用户名>@<主机> "<命令>"` 下发
+- motorbridge **没有网络传输方式**——它是在本地打开 CAN 接口的。板子必须就是连接机械臂的那台机器
+- 把 SSH 目标记录到 `../memory/local-machine-env.md`，后续步骤就不用反复询问
+- conda 环境必须在需要它的同一条 SSH 命令里激活，例如
+  `ssh <用户名>@<主机> "source ~/miniforge3/etc/profile.d/conda.sh && conda activate rebot && motorbridge-cli --help"`
+- Gateway（零点校准步骤）需要 `ssh -L 9002:127.0.0.1:9002` 端口转发，而不是把绑定地址改成 `0.0.0.0`
+
+## 安装前的架构检查
+
+`motorbridge` 的 wheel 里带有预编译的 `libmotor_abi.so` 与 `ws_gateway` 二进制。受支持的目标：**Linux x86_64**、**Linux aarch64**、macOS arm64、Windows x86_64。
+
+```bash
+uname -m                                   # x86_64 | aarch64 -> 可以 ; armv6l | armv7l -> 停止
+python3 -m venv ~/mb-probe
+~/mb-probe/bin/pip download motorbridge --no-deps --only-binary=:all: -d /tmp/mb-probe
+```
+
+如果下载时报 `No matching distribution found for motorbridge`，说明该平台不受支持——源码安装只能得到 Python 封装层，无法加载 ABI。请先解决主机选择问题（见 `AGENTS.md` 第零步）；在 32 位树莓派系统上，Miniforge 同样没有对应架构的构建。
+
 ## 第零步：检查是否已安装
 
 在开始之前，先检查 motorbridge 是否已安装：
@@ -28,6 +51,8 @@ motorbridge-cli --help *>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { python -m mot
 ### Linux / Jetson / 树莓派
 
 > 以下命令在 **bash/zsh** 中执行。
+>
+> **架构说明**：在 64 位树莓派系统上 `$(uname -m)` 展开为 `aarch64`（可用），但在 32 位树莓派系统上是 `armv6l` / `armv7l`——**Miniforge 没有这两种架构的构建**，下面的下载链接会 404。再加上 motorbridge 也没有对应 wheel，32 位树莓派无法运行这套底层栈；参见[安装前的架构检查](#安装前的架构检查)。
 
 安装 Miniforge：
 
@@ -200,10 +225,14 @@ motorbridge-cli --help
 
 根据操作系统和设备类型，完成以下配置：
 
-### Linux — robstride（USB-CAN）
+### Linux — robstride（CAN HAT，SPI 接口 MCP2515）
+
+如果 CAN 控制器是插在 40 pin SPI 排针上的 HAT（树莓派常见配置）而不是 USB 转接板，`peak_usb` 不适用，而且在启用 overlay 之前 `can0` 根本不存在。请参考 [CAN HAT 配置](setup-can-hat.md)——其中包含 overlay、重启、以 1 Mbit/s 启动 `can0`、重启后自动生效，以及回环自测。
+
+### Linux — robstride（USB-CAN：PCAN-USB / CANable）
 
 ```bash
-# 加载 PCAN-USB 驱动
+# 加载 PCAN-USB 驱动（CANable/candleLight 用 gs_usb，跳过这步）
 sudo modprobe peak_usb
 ip -br link
 

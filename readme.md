@@ -28,5 +28,7 @@ Please follow the workflow in AGENTS.md (https://github.com/Welt-liu/reBot-B601-
 
 - [AGENTS 工作流](zh/AGENTS.md) — 机械臂初始化完整流程
 - [环境初始化](zh/references/setup-environment.md) — Python、motorbridge、平台配置
+- [CAN HAT 配置](zh/references/setup-can-hat.md) — 树莓派 + SPI 接口 MCP2515 CAN HAT
+- [演示开发与验证](zh/references/demo-validation-pi-zero.md) — 在 Pi Zero W 上构建并验证运动演示
 - [写入电机 ID](zh/references/write-motor-id.md) — 写入电机 ID 1–7
 - [零点校准](zh/references/write-motor-zero.md) — 校准电机零点

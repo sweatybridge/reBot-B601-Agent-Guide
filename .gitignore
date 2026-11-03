@@ -2,7 +2,18 @@
 __pycache__/
 *.py[cod]
 
-# Local tooling / venvs (not part of the guide)
+# Local tooling / venvs (machine-specific, not part of the guide)
 .rebot-venv/
+.venv/
 .uv-cache/
 .uv-python/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS clutter
+.DS_Store
+Thumbs.db
+desktop.ini
