@@ -5,7 +5,8 @@
 ## Prerequisites
 
 - Motor IDs have been correctly set via the write motor ID process
-- `can0` is configured and UP (Linux needs configuration in environment setup; Windows/macOS do not)
+- `can0` is configured and UP (Linux needs configuration in environment setup; a Raspberry Pi CAN HAT needs the SPI overlay and reboot first — see [CAN HAT Setup](setup-can-hat.md); Windows/macOS do not)
+- On a CAN HAT, `can0` must be up **and** persistent: after a reboot the gateway otherwise fails with `SocketCAN write failed: Network is down`
 
 ## Steps
 
@@ -71,6 +72,40 @@ Keep the Gateway running — do not close this terminal.
 > **Windows note**: `motorbridge-gateway.exe` is only a launcher — the process that owns the bus and the port is its child `ws_gateway.exe`. Killing the launcher alone leaves `ws_gateway.exe` running, so the port stays bound and the next start fails with `Os { code: 10048, kind: AddrInUse }`. Kill `ws_gateway.exe`; the launcher exits with it.
 >
 > Restart the Gateway after scanning is complete. It's recommended to complete all CLI scan and motor ID setup work before starting the Gateway.
+
+### 1b. Remote Host over SSH
+
+When the arm is wired to a board (Raspberry Pi / Jetson) and the user's browser is on another machine, the gateway stays bound to the board's loopback and the port is forwarded to the user's machine. Do **not** bind `0.0.0.0` — that requires `MOTORBRIDGE_WS_TOKEN` and exposes motor control to the network.
+
+1. Start the gateway on the board, detached so it survives the SSH session:
+
+```bash
+ssh <user>@<host> "source ~/miniforge3/etc/profile.d/conda.sh && conda activate rebot && \
+  setsid nohup motorbridge-gateway -- --bind 127.0.0.1:9002 --transport socketcan --channel can0 \
+  >/tmp/motorbridge-gateway.log 2>&1 &"
+```
+
+2. Confirm it is listening (and check the log if not):
+
+```bash
+ssh <user>@<host> "ss -ltnp | grep 9002; tail -5 /tmp/motorbridge-gateway.log"
+```
+
+3. Keep a forwarding session open on the user's machine:
+
+```bash
+ssh -L 9002:127.0.0.1:9002 <user>@<host>
+```
+
+4. The user then opens Motorbridge Studio and points it at `127.0.0.1:9002` — that address is now the board's gateway through the tunnel.
+
+5. When calibration is finished, stop the gateway on the board:
+
+```bash
+ssh <user>@<host> "pkill -f ws_gateway"
+```
+
+> The tunnel must stay open for the whole calibration. If the browser reports a connection failure, check the SSH session first, then `ss -ltnp` on the board — not the address in the web UI.
 
 ### 2. Open Motorbridge Studio
 

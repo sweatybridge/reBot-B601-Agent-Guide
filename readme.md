@@ -14,6 +14,8 @@ Please follow the workflow in AGENTS.md (https://github.com/Welt-liu/reBot-B601-
 
 - [AGENTS Workflow](en/AGENTS.md) — Complete robotic arm initialization workflow
 - [Environment Setup](en/references/setup-environment.md) — Python, motorbridge, platform config
+- [CAN HAT Setup](en/references/setup-can-hat.md) — Raspberry Pi + MCP2515 CAN HAT (SPI)
+- [Demo Development & Validation](en/references/demo-validation-pi-zero.md) — Building and validating a motion demo on a Pi Zero W
 - [Write Motor ID](en/references/write-motor-id.md) — Set motor IDs 1–7
 - [Zero Calibration](en/references/write-motor-zero.md) — Calibrate motor zero positions
 

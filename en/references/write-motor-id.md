@@ -25,8 +25,11 @@ Before proceeding, identify which protocol the motors use:
 
 | Type | Connection | Description |
 |------|------------|-------------|
-| robstride | USB-CAN (PCAN-USB) | Linux uses socketcan `can0`; Windows driver auto-detects |
+| robstride | USB-CAN (PCAN-USB / CANable) | Linux uses socketcan `can0`; Windows driver auto-detects |
+| robstride | CAN HAT (MCP2515 over SPI) | Raspberry Pi: configure once with [CAN HAT Setup](setup-can-hat.md), then `can0` at 1 Mbit/s |
 | damiao | USB serial | Linux uses `/dev/ttyACM0`; Windows uses `COMx` |
+
+> **Remote host**: if these motors are wired to a board you reach over SSH, prefix every command with `ssh <user>@<host> "…"`. When the board has a conda environment, chain the activation into the same command (`"source ~/miniforge3/etc/profile.d/conda.sh && conda activate rebot && motorbridge-cli ..."`).
 
 ## CLI Command Path Convention
 
@@ -66,7 +69,7 @@ Complete initialization based on your OS and device type.
 ### Linux — robstride (USB-CAN)
 
 ```bash
-# Load PCAN-USB driver
+# Load PCAN-USB driver (skip for CANable/candleLight — they use gs_usb)
 sudo modprobe peak_usb
 ip -br link
 
@@ -77,6 +80,15 @@ sudo ip link set can0 up
 
 # Verify status
 ip -br link show can0
+```
+
+### Linux — robstride (CAN HAT, MCP2515 over SPI)
+
+The HAT does not use `peak_usb`; `can0` only appears after the SPI overlay is enabled and the board has rebooted. Follow [CAN HAT Setup](setup-can-hat.md) once, then confirm the interface before scanning:
+
+```bash
+ip -details link show can0 | grep -E "can state|bitrate"
+# can state ERROR-ACTIVE / bitrate 1000000
 ```
 
 ### Windows — robstride (USB-CAN)

@@ -6,6 +6,29 @@
 
 Before starting, check `../memory/local-machine-env.md` to see if the current machine's environment configuration already exists. If conda path and motorbridge info are already recorded, you can use them directly; if not, or if the information is incomplete, follow the steps below to re-initialize.
 
+## Remote Control Host (SSH)
+
+If motorbridge will run on a board that is not this machine (Raspberry Pi, Jetson, …), read this first:
+
+- Every command in this document and in the other references runs **on that board**, over `ssh <user>@<host> "<command>"`
+- motorbridge has **no network transport** — it opens the CAN interface locally. The board must be the machine wired to the arm
+- Record the SSH target in `../memory/local-machine-env.md` so later steps do not re-ask
+- The conda environment must be activated inside the same SSH command that needs it, e.g.
+  `ssh <user>@<host> "source ~/miniforge3/etc/profile.d/conda.sh && conda activate rebot && motorbridge-cli --help"`
+- The gateway (Zero Calibration step) needs an `ssh -L 9002:127.0.0.1:9002` tunnel, not `0.0.0.0` binding
+
+## Architecture Check Before Installing
+
+`motorbridge` publishes wheels with prebuilt `libmotor_abi.so` + `ws_gateway` binaries. Supported targets: **Linux x86_64**, **Linux aarch64**, macOS arm64, Windows x86_64.
+
+```bash
+uname -m                                   # x86_64 | aarch64 -> OK ; armv6l | armv7l -> stop
+python3 -m venv ~/mb-probe
+~/mb-probe/bin/pip download motorbridge --no-deps --only-binary=:all: -d /tmp/mb-probe
+```
+
+If the download reports `No matching distribution found for motorbridge`, the platform is unsupported — a source install only provides the Python wrapper and cannot load the ABI. Resolve the host choice (see `AGENTS.md` Step 0) before continuing; on 32-bit Raspberry Pi OS, Miniforge has no build for that architecture either.
+
 ## Step 0: Check for Existing Installation
 
 Before starting, check whether motorbridge is already installed:
@@ -28,6 +51,8 @@ motorbridge-cli --help *>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { python -m mot
 ### Linux / Jetson / Raspberry Pi
 
 > Run these commands in **bash/zsh**.
+>
+> **Architecture note**: `$(uname -m)` expands to `aarch64` on a 64-bit Raspberry Pi OS (works), but to `armv6l` / `armv7l` on 32-bit Raspberry Pi OS — **Miniforge ships no build for those**, and the download below returns 404. Combined with the missing motorbridge wheels, a 32-bit Raspberry Pi cannot run the low-level stack; see [Architecture Check](#architecture-check-before-installing).
 
 Install Miniforge:
 
@@ -200,10 +225,14 @@ If the command is not found, check whether the Python Scripts directory is in PA
 
 Complete the following setup based on your operating system and device type:
 
-### Linux — robstride (USB-CAN)
+### Linux — robstride (CAN HAT, MCP2515 over SPI)
+
+If the CAN controller is a HAT on the 40-pin SPI header (typical Raspberry Pi setup) instead of a USB adapter, `peak_usb` does not apply and `can0` will not exist until the overlay is enabled. Follow [CAN HAT Setup](setup-can-hat.md) — it covers the overlay, the reboot, `can0` at 1 Mbit/s, persistence across reboots, and a loopback self-test.
+
+### Linux — robstride (USB-CAN: PCAN-USB / CANable)
 
 ```bash
-# Load PCAN-USB driver
+# Load PCAN-USB driver (skip for CANable/candleLight — they use gs_usb)
 sudo modprobe peak_usb
 ip -br link
 
