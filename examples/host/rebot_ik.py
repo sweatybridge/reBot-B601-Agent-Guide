@@ -25,15 +25,17 @@ solve, which numpy does instantly.
 
 Gravity helpers (`gravity_torques`, `potential_energy`, `com_positions`)
 -----------------------------------------------------------------------
-These are **diagnostics only — nothing in the control path calls them.** They
-are validated against the potential-energy gradient to 3.5e-9 Nm, but do not
-feed them to the motors without reading this: on the reference arm the measured
-droop at the top of a 10 cm lift implies ~1.97 Nm on joint 4 (model: 1.67 Nm,
-good agreement) yet only ~0.10 Nm and ~0.74 Nm on joints 2 and 3 (model: 1.75
-and 5.81 Nm). The upper arm is partly supported at that pose, so injecting the
-full model torque there would drive the arm up against whatever holds it.
-`torque_ff` in `write_operation_frame` is the place it would go if you calibrate
-it per joint, per pose, first.
+`gravity_torques` is the model the gravity demo feeds to the motors; the other
+two are diagnostics. It agrees with the potential-energy gradient to 4e-9 Nm.
+On the reference arm a hold run at the top of a 10 cm lift measured 0.86 / 7.46
+/ 1.85 Nm on joints 2-4 against 1.40 / 6.22 / 1.65 from this model - close
+enough to be useful, not close enough to skip a per-pose scale.
+
+One thing to get right before comparing: the MIT frame scales kp and torque by
+the *motor model* (RS-06 on joints 1-3, RS-00 on 4-6), and sending rs-00
+everywhere makes a kp * droop estimate ten times too small. The edge scripts
+take `--model-spec` for this and default to that split. `torque_ff` in
+`write_operation_frame` is where the model torque goes.
 """
 
 import numpy as np

@@ -36,11 +36,19 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gradual_motion_demo import Demo, can_is_up, clamp, drain_rx  # noqa: E402
+from gradual_motion_demo import (  # noqa: E402
+    DEFAULT_MODEL_SPEC,
+    Demo,
+    can_is_up,
+    clamp,
+    drain_rx,
+)
 
 TRAJECTORY_FORMAT = "rebot-joint-trajectory"
 MAX_JOINT_STEP = 0.5          # rad between consecutive waypoints, sanity only
 LIMIT_TOL = 0.002             # encoders read a few mrad past a stop at rest
+MAX_KP = 150.0                # safety ceiling for --kp, Nm/rad (the vendor's j2/j3 value)
+MAX_KD = 10.0                 # safety ceiling for --kd (vendor uses 10 on j2/j3)
 
 
 def load_trajectory(path):
@@ -87,8 +95,18 @@ def parse_args(argv):
         description="Play a planned joint-space trajectory (dry run by default).")
     parser.add_argument("trajectory", help="trajectory JSON from plan_cartesian.py")
     parser.add_argument("--channel", default="can0")
-    parser.add_argument("--kp", default="20", help="'20' or per joint '4:45,5:35'")
-    parser.add_argument("--kd", default="0.6", help="'0.6' or per joint '4:1.0'")
+    parser.add_argument("--model", default="rs-00",
+                        help="Fallback motor model for MIT scaling (default: rs-00)")
+    parser.add_argument("--model-spec", default=DEFAULT_MODEL_SPEC,
+                        help="Per-joint models, ID:MODEL,... The B601-RS uses RS-06 on "
+                             "joints 1-3 and RS-00 on 4-7, and the MIT frame scales kp, "
+                             "kd and torque by the model, so a wrong table silently "
+                             "changes the gains tenfold. Pass '' for a uniform arm "
+                             "(default: %s)" % DEFAULT_MODEL_SPEC)
+    parser.add_argument("--kp", default="50,2:150,3:150",
+                        help="vendor rebotarm_rs.yaml: 50, stiffer 150 on j2/j3")
+    parser.add_argument("--kd", default="3,2:10,3:10,4:5,5:4,6:4,7:4",
+                        help="vendor rebotarm_rs.yaml: 3, 10 on j2/j3, 4-5 on the wrist")
     parser.add_argument("--ramp", type=float, default=2.0,
                         help="seconds to ease onto the trajectory start pose (default 2.0)")
     parser.add_argument("--speed", type=float, default=1.0,
@@ -97,6 +115,13 @@ def parse_args(argv):
     parser.add_argument("--max-follow-error", type=float, default=0.0,
                         help="abort if measured position lags the command by more than this "
                              "(rad, checked twice a second; 0 disables)")
+    parser.add_argument("--allow-kp-mismatch", action="store_true",
+                        help="play a sag-compensated trajectory at a kp other than the "
+                             "one it was compensated for; the arm will miss by the "
+                             "difference")
+    parser.add_argument("--log", default="",
+                        help="write every waypoint's commanded and measured angles here; "
+                             "host/trim_trajectory.py turns that into a corrected trajectory")
     parser.add_argument("--fast-frames", action="store_true",
                         help="build MIT frames without numpy (6x cheaper, needed above ~20 Hz)")
     parser.add_argument("--delay", type=float, default=0.0,
@@ -118,18 +143,41 @@ def main(argv=None):
 
     from gradual_motion_demo import load_sdk
     RobstrideBus, Motor, ParameterType, CommunicationType = load_sdk(args.sdk_path)
-    from gradual_motion_demo import parse_gain_spec, format_gains
+    from gradual_motion_demo import format_gains, parse_gain_spec, parse_model_spec
 
     ids = data["ids"]
     names = ["m%d" % i for i in ids]
+    model_by_id = parse_model_spec(args.model_spec, args.model, ids)
     start_q = [float(v) for v in data["waypoints"][0]["q"]]
     hz = int(clamp(float(data.get("control_hz", 20)), 5, 50))
     speed = clamp(args.speed, 0.1, 5.0)
 
-    kp_base, kp_over = parse_gain_spec(args.kp, 20.0, 60.0, "kp")
-    kd_base, kd_over = parse_gain_spec(args.kd, 0.6, 3.0, "kd")
+    kp_base, kp_over = parse_gain_spec(args.kp, 50.0, MAX_KP, "kp")
+    kd_base, kd_over = parse_gain_spec(args.kd, 3.0, MAX_KD, "kd")
     kp_by_id = {i: kp_over.get(i, kp_base) for i in ids}
     kd_by_id = {i: kd_over.get(i, kd_base) for i in ids}
+
+    # A sag-compensated or trimmed file has q_cmd = q_plan + correction baked in, so
+    # the correction is only right at the kp it was computed for. Playing it
+    # stiffer undershoots; softer overshoots, and the arm climbs above the plan.
+    bound = data.get("sag_compensation") or data.get("trim") or {}
+    bound_kp = {int(key): float(value) for key, value in (bound.get("kp") or {}).items()}
+    mismatched = [i for i in ids
+                  if i in bound_kp and abs(kp_by_id[i] - bound_kp[i]) > 0.02 * bound_kp[i]]
+
+    # Optional modelled feedforward: `tau` per waypoint, in `ids` order. Unlike the
+    # position trims this is an absolute torque, so it is not tied to kp.
+    has_tau = any("tau" in waypoint for waypoint in data["waypoints"])
+    if has_tau:
+        for index, waypoint in enumerate(data["waypoints"]):
+            values = waypoint.get("tau") or []
+            if len(values) != len(ids):
+                raise SystemExit("waypoint %d has %d tau values for %d motors"
+                                 % (index, len(values), len(ids)))
+        peak_tau = max(abs(float(v)) for waypoint in data["waypoints"]
+                       for v in waypoint["tau"])
+    else:
+        peak_tau = 0.0
 
     print("Planned trajectory")
     print("  file      : %s" % args.trajectory)
@@ -143,19 +191,40 @@ def main(argv=None):
     print("  peak speed: %.3f rad/s, worst IK residual %.3f mm"
           % (data.get("peak_joint_speed", 0), 1000 * data.get("worst_ik_residual_m", 0)))
     print("  kp        : %s" % format_gains(kp_by_id))
+    if has_tau:
+        print("  tau       : modelled gravity feedforward, peak %.2f Nm" % peak_tau)
+    print("  models    : %s" % ", ".join("%d:%s" % (i, model_by_id[i]) for i in ids))
+    if bound:
+        print("  corrected : %s%s"
+              % (", ".join("%d:%.1f" % (i, v) for i, v in sorted(bound_kp.items())),
+                 "" if not mismatched else "   <- MISMATCH with --kp"))
     print("  mode      : %s" % ("EXECUTE - the arm will move" if args.execute else "dry run (read-only)"))
+
+    if mismatched:
+        detail = ", ".join("joint %d: file %.1f, playing %.1f"
+                           % (i, bound_kp[i], kp_by_id[i]) for i in mismatched)
+        if not args.allow_kp_mismatch:
+            raise SystemExit(
+                "this trajectory was corrected for a different kp (%s).\n"
+                "The offset is tau/kp, so replaying it at another gain either "
+                "under- or overshoots; at a softer kp the arm climbs above the "
+                "plan. Play it with the same --kp, or pass --allow-kp-mismatch if "
+                "you want the difference." % detail)
+        print("  warning   : playing a sag-compensated file at a different kp (%s)"
+              % detail)
 
     if not can_is_up(args.channel):
         raise SystemExit("%s is not UP. Bring it up first:\n"
                          "  sudo systemctl start can0-setup.service" % args.channel)
 
-    motors = {name: Motor(motor_id, "rs-00") for name, motor_id in zip(names, ids)}
+    motors = {name: Motor(motor_id, model_by_id[motor_id])
+              for name, motor_id in zip(names, ids)}
     bus = RobstrideBus(args.channel, motors)
     bus.connect()
     demo = Demo(bus, names, kp_by_id, kd_by_id, hz)
     if args.fast_frames:
         from mit_frames import MitSender
-        demo.sender = MitSender(bus, "rs-00")
+        demo.sender = MitSender(bus, args.model, models=model_by_id)
         print("  frames    : hand-built (numpy-free)")
     exit_code = 0
 
@@ -215,6 +284,9 @@ def main(argv=None):
         next_follow_check = 0.5
         abort_reason = None
         stamps = []
+        logging = bool(args.log)
+        logged = []
+        held = {name: demo.start.get(name, 0.0) for name in names}
         for index, wp in enumerate(data["waypoints"]):
             targets = {n: float(v) for n, v in zip(names, wp["q"])}
             sample = args.track and index in sample_at
@@ -226,7 +298,19 @@ def main(argv=None):
             # trajectory to 34 s. Read only when a check is due, keep the reads
             # short, and skip draining so the reply frames are already queued.
             check_due = args.max_follow_error > 0 and elapsed >= next_follow_check
-            demo.command(targets, drain=not (sample or check_due))
+            torques = ({name: float(value) for name, value in zip(names, wp["tau"])}
+                       if "tau" in wp else None)
+            demo.command(targets, drain=not (sample or check_due or logging),
+                         torques=torques)
+
+            if logging:
+                # One poll after the frames: the status replies belong to the
+                # command just sent, so cmd/meas line up in the log. ~6 ms.
+                for name, state in demo.poll_states(names, 0.012).items():
+                    held[name] = state[0]
+                logged.append({"t": round(elapsed, 4),
+                               "cmd": [targets[name] for name in names],
+                               "meas": [held[name] for name in names]})
 
             if check_due:
                 next_follow_check = elapsed + 1.0
@@ -279,6 +363,22 @@ def main(argv=None):
         exit_code = 130
     finally:
         try:
+            if logging and logged:
+                payload = {
+                    "format": "rebot-trajectory-log",
+                    "version": 1,
+                    "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "trajectory": args.trajectory,
+                    "ids": list(ids),
+                    "kp": {str(i): kp_by_id[i] for i in ids},
+                    "kd": {str(i): kd_by_id[i] for i in ids},
+                    "control_hz": hz,
+                    "speed": speed,
+                    "samples": logged,
+                }
+                with open(args.log, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, separators=(",", ":"))
+                print("  log       : %s (%d waypoints)" % (args.log, len(logged)))
             home = {n: demo.start[n] for n in names if n in demo.start}
             demo.shut_down(home, args.stay_enabled, CommunicationType, track=args.track)
         except Exception as exc:

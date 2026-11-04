@@ -2,6 +2,8 @@
 
 > **注意：本参考文档为 beta 版本，仅供参考。如有疑问或遇到问题，请联系 Seeed 获取支持。**
 
+> **文件布局说明。** 下文引用的示例后来合并为一条流水线，见 [`examples/README.md`](../../examples/README.md)：`examples/host/plan_with_pinocchio.py` 在 Docker 容器中规划（Seeed 的 IK 加 Pinocchio 逐路点重力前馈），`examples/edge/play_trajectory.py` 在板子上回放 JSON。`host/plan_cartesian.py`、`host/fit_gravity.py`、`host/plan_gripper.py`、`edge/gravity_comp_demo.py`、`edge/test_mit_frames.py`、`host/trim_trajectory.py` 等路径属于早期布局，已不存在；下文的测量结果与经验仍然成立。
+
 本文记录纯 Python 运动演示（[`examples/edge/gradual_motion_demo.py`](../../examples/edge/gradual_motion_demo.py)）是如何在 32 位树莓派上构建并验证的，以及更有价值的部分——那些在动作到达机械臂之前就把真实缺陷抓出来的检查。在这类硬件上开发任何新的运动脚本，都建议按同样顺序进行。
 
 **验证基线**
@@ -13,6 +15,7 @@
 | 系统 / 内核 | Raspbian GNU/Linux 12 (bookworm) / `6.6.20+rpt-rpi-v6` |
 | Python | 3.11.2（系统自带） |
 | CAN | RS485 CAN HAT，SPI0 CE0 上的 MCP2515，12 MHz 晶振，`INT` = GPIO25 |
+| 电机 | 7 颗 RobStride RS 系列：**1–3 号 RS-06，4–7 号 RS-00** |
 | 库 | Seeed `RobStride_Control` → `robstride_dynamics`（纯 Python） |
 | 软件包 | `python3-can` 4.1.0、`python3-numpy` 1.24.2、`python3-tqdm` 4.64.1（均由 apt 安装） |
 
@@ -97,6 +100,8 @@ bus.read(name, ParameterType.MECHANICAL_POSITION)   # -> 关节角度（rad）
 
 ## 测量结果
 
+读这些数字时要注意一点：这些运行把所有电机都按 rs-00 的参数表发送。1–3 号是 RS-06，kp 范围是 rs-00 的十倍，所以它们的实际刚度是命令行 `--kp` 的十倍（kp 15 → 150 Nm/rad）；rs-00 的腕部关节与命令一致。现在的脚本默认使用正确的每关节型号，要复现这些具体数字需要加 `--model-spec ""`——本页末尾的命令行里已经加上。
+
 单关节，δ = 0.0524 rad（3°），kp 15 / kd 0.6，30 Hz——实测位置：
 
 | 段 | 24 % | 50 % | 76 % | 100 % |
@@ -118,7 +123,7 @@ bus.read(name, ParameterType.MECHANICAL_POSITION)   # -> 关节角度（rad）
 | 6 | −0.007 | −0.003 |
 | 7 | −0.001 | +0.002 |
 
-3、4 号关节始终偏短——4 号即使给到 45 Nm/rad、3 号仍是 20 的基准值——而机械臂静止时两者都能跟到约 2 mrad，这说明是负载而非调参问题。正确的解法是重力补偿，它在 `reBotArm_control_py` 里，而那个库依赖 motorbridge。时序：20 Hz 下 3 秒的段实际跑了 3.35–3.40 秒，也就是**7 关节下约 18 Hz 有效速率**——差不多就是 Zero W 加这块 HAT 的上限。
+3、4 号关节始终偏短——4 号即使给到 45 Nm/rad、3 号仍是 20 的基准值——而机械臂静止时两者都能跟到约 2 mrad，这说明是负载而非调参问题。正确的解法是重力补偿：`reBotArm_control_py` 里有，但依赖 motorbridge；现在这条纯 Python 通路上也有了[重力补偿示例](../../examples/edge/gravity_comp_demo.py)，只是要按实测下垂标定。时序：20 Hz 下 3 秒的段实际跑了 3.35–3.40 秒，也就是**7 关节下约 18 Hz 有效速率**——差不多就是 Zero W 加这块 HAT 的上限。
 
 ## 下一次 Pi Zero W 会话的检查清单
 
@@ -140,12 +145,19 @@ tar xzf /tmp/rs.tar.gz && mv RobStride_Control-master ~/RobStride_Control
 sudo apt-get install -y python3-can python3-numpy python3-tqdm
 
 # 单关节，3 度，带实测
+# （--model-spec "" = 上表实测时所用的 rs-00 参数表）
 python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
-    --execute --joints 1 --delta 0.0524 --duration 3 --kp 15 --hz 30 --track
+    --model-spec "" --execute --joints 1 --delta 0.0524 --duration 3 --kp 15 \
+    --hz 30 --track
 
 # 全部关节，6 度，腕部更硬
 python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
-    --execute --joints all --delta 0.1048 --kp 4:45,5:35 --hz 20 --track
+    --model-spec "" --execute --joints all --delta 0.1048 --kp 4:45,5:35 \
+    --hz 20 --track
+
+# 用每关节型号（现在的默认）时 --kp 就是真实刚度，下面这条在 1–3 号上比上面软十倍
+python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
+    --execute --joints all --delta 0.1048 --kp 20 --hz 20 --track
 ```
 
 ## 离线笛卡尔规划
@@ -207,15 +219,37 @@ python3 edge/play_trajectory.py trajectories/raise10cm.json --execute
 
 也就是说，10–25 cm 的动作上，差值稳定在 18–25 mm 区间，并且随着机械臂伸展只缓慢变大，说明它由腕部柔度主导，而不是比例误差。因此幅度越大，百分比精度越好：10 cm 时短 21 %、20 cm 时短 9 %、25 cm 时短 10 %（伸展增加抵消了一部分收益）。
 
-重力前馈做过建模（`host/rebot_ik.gravity_torques`，与 `dU/dq` 的数值梯度比对误差 3.5e-9 Nm），但**刻意没有启用**。把模型与机械臂在抬升顶点实际表现出的下垂对比：
+重力前馈做过建模（`host/rebot_ik.gravity_torques`，与 `dU/dq` 的数值梯度比对误差 3.5e-9 Nm）。把模型与机械臂在抬升顶点实际表现出的下垂对比，kp 取**实际生效值**：
 
-| 关节 | kp·下垂（推算负载） | URDF 模型 | 比值 |
-|---|---|---|---|
-| 2 号 | 0.10 Nm | 1.75 Nm | 0.06 |
-| 3 号 | 0.74 Nm | 5.81 Nm | 0.13 |
-| 4 号 | 1.97 Nm | 1.67 Nm | 1.18 |
+| 关节 | 实际 kp | 下垂 | 推算负载 | URDF 模型 | 比值 |
+|---|---|---|---|---|---|
+| 2 号 | 200 Nm/rad | 0.005 | 1.0 Nm | 1.75 Nm | 0.57 |
+| 3 号 | 200 Nm/rad | 0.037 | 7.4 Nm | 5.81 Nm | 1.27 |
+| 4 号 | 45 Nm/rad | 0.045 | 2.0 Nm | 1.67 Nm | 1.20 |
 
-4 号吻合——腕部确实在承担夹爪重量。2、3 号只承担了模型预测的十分之一，说明这个位姿下大臂有一部分是被支撑着的。若把模型算出的 5.8 Nm 灌进 3 号关节，会把机械臂顶向那个支撑物。因此 78 mm 就是这套配置下诚实的结果；要用前馈，必须先按关节、按位姿用实测负载标定。
+这些 kp 不是命令行上的值。1–3 号是 RS-06，MIT 的 kp 范围是 5000 Nm/rad，而 rs-00 是 500；用 rs-00 表（这些运行正是如此）时，kp 20 在基座三个关节上其实是 200 Nm/rad；腕部是 rs-00，kp 45 就是 45。模型误差在 30–40 % 以内，说明 78 mm 的差值来自负载下的关节柔度，把模型力矩灌进去就是正确的修法——下面这个示例正是这么做的。
+
+### 真正用上它：带标定的示例
+
+[`examples/edge/gravity_comp_demo.py`](../../examples/edge/gravity_comp_demo.py) 把最后这一步做完了，而不只是写一句建议，并且已经在这台机械臂上跑过。`--mode hold` 先用位置控制保持一个位姿，把下垂量读成 `kp × 下垂`，据此对模型求每关节的比例系数，再用由实测位姿逐周期重算的前馈保持一次。
+
+在上面那次 10 cm 抬升的顶点、用上机械臂需要的每关节型号（`--model-spec "1:rs-06,2:rs-06,3:rs-06"`）、kp 30、10 Hz 下实测：
+
+| 关节 | 模型 Nm | 实测负载 Nm | 系数 | 补偿前下垂 | 补偿后下垂 |
+|---|---|---|---|---|---|
+| 2 号 | 1.40 | 0.86 | 0.613 | 0.0287 | 0.0095 |
+| 3 号 | 6.22 | 7.46 | 1.199 | 0.2485 | 0.0909 |
+| 4 号 | 1.65 | 1.85 | 1.120 | 0.0616 | 0.0183 |
+
+平均 |下垂| 从 0.057 rad 降到 0.020 rad（消除 65 %），各受力关节 63–70 %；系数落在 0.6–1.2，说明 URDF 模型大体是对的、标定只是在修小差。
+
+这次运行把三件事坐实了：
+
+- **前馈只能抵消它超过的那部分负载。** 3 号施加 7.46 Nm，收回它 0.25 rad 下垂中的 63 %；余下的是摩擦与静摩擦，它决定小力矩关节能跟到多准。
+- **顶在限位上的位姿测到的是支撑力，不是重力。** 同样的实验在静止位姿（2、3 号正好压在 0 rad 限位上）得到 0.08 和 0.63 的系数、只消除 4 %：那时机械臂靠在支撑物上。标定前先把机械臂抬离支撑。
+- **这个模型在这块板子上每次调用约 80 ms**，所以示例默认 10 Hz、周期正好 100 ms。按 20 Hz 跑会出现 90 ms 的周期、一半超时——瓶颈是 numpy，不是总线。
+
+`examples/host/fit_gravity.py` 会用多个位姿拟合每个关节的系数，并报告它是否可迁移。安装与用法见[示例说明](../../examples/README.md#gravity-compensation)。
 
 ### 夹爪（7 号电机）
 
@@ -240,5 +274,5 @@ rad 到厘米的换算是小齿轮几何，URDF 并没有建模（它把手指�
 ## 已知限制
 
 - **笛卡尔运动是离线规划的。** `host/rebot_ik.py` + `host/plan_cartesian.py` 在工作站上运行；树莓派只回放关节路点。末端的精度受关节柔度限制（kp 30–45 时 100 mm 的抬升差 21 mm），而不是受规划器限制。
-- **手臂上没有重力补偿。** 模型存在且已数值验证（`host/rebot_ik.gravity_torques`），但没有接入控制通路：实测关节负载在 2、3 号关节上与模型不符（大臂被部分支撑），盲目启用会把机械臂顶起来。使用前必须按关节用实测下垂标定。
+- **厂商／motorbridge 通路上没有重力补偿。** 模型存在且已数值验证（`host/rebot_ik.gravity_torques`），[`examples/edge/gravity_comp_demo.py`](../../examples/edge/gravity_comp_demo.py) 在纯 Python 通路上用上了它——前提是用对每关节的电机型号（1–3 号 RS-06、4–6 号 RS-00），并按实测下垂拟合该位姿的系数。在位姿顶点它能消除约 65 % 的静态下垂，余下的是关节摩擦。厂商的 `reBotArm_control_py` 通路不受这个示例影响，仍然需要 motorbridge。
 - **随库附带的 `write_id()` 是坏的**：它调用了不存在的 `CommunicationType.SET_CAN_ID`（正确常量是 `SET_DEVICE_ID = 7`）。ID 设好之后无关紧要，但不要相信那个方法。

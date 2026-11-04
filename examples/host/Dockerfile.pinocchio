@@ -1,0 +1,30 @@
+# Pinocchio planning container for the B601-RS.
+#
+# The host here is Windows, and Pinocchio publishes no win_amd64 wheels (only
+# manylinux/musllinux/macOS), so the planning half of the pipeline runs in this
+# container. It is build-once and offline afterwards: the ARM/URDF/dynamics come
+# from Seeed's reBotArm_control_py, the output is a plain joint trajectory JSON
+# that the Pi replays with no Python dependencies beyond numpy.
+#
+#   docker build -t rebot-pino -f examples/host/Dockerfile.pinocchio .
+#   docker run --rm -v "$PWD:/work" rebot-pino \
+#       python /work/examples/host/plan_with_pinocchio.py \
+#       --joints /work/current.json --out /work/seq_pino.json
+FROM python:3.11-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# pin = Pinocchio's PyPI distribution; motorbridge is only needed because the
+# package's __init__ imports the actuator layer, not because planning uses CAN.
+RUN pip install --no-cache-dir "pin>=3.9" numpy pyyaml "motorbridge>=0.4.9" \
+    && python -c "import pinocchio; print('pinocchio', pinocchio.__version__)"
+
+# Pinned to the commit this repo's numbers were validated against.
+ARG REBOT_COMMIT=d4f3591bc0183de03f3ae8651298db0269aadfdd
+RUN git clone https://github.com/Seeed-Projects/reBotArm_control_py /opt/reBotArm_control_py \
+    && cd /opt/reBotArm_control_py && git checkout "$REBOT_COMMIT"
+
+ENV PYTHONPATH=/opt/reBotArm_control_py
+WORKDIR /work

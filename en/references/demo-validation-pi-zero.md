@@ -2,6 +2,8 @@
 
 > **Note: This reference document is a beta version and for reference only. If you have any questions or encounter issues, please contact Seeed for support.**
 
+> **File layout note.** The examples referenced below were later consolidated into one pipeline, documented in [`examples/README.md`](../../examples/README.md): `examples/host/plan_with_pinocchio.py` plans in a Docker container (Seeed's IK plus Pinocchio gravity feedforward on every waypoint) and `examples/edge/play_trajectory.py` replays the JSON on the board. Paths such as `host/plan_cartesian.py`, `host/fit_gravity.py`, `host/plan_gripper.py`, `edge/gravity_comp_demo.py`, `edge/test_mit_frames.py` and `host/trim_trajectory.py` describe the earlier layout and no longer exist; the measurements and lessons below still stand.
+
 This documents how the pure-Python motion demo ([`examples/edge/gradual_motion_demo.py`](../../examples/edge/gradual_motion_demo.py)) was built and validated on a 32-bit Raspberry Pi, and — more usefully — the checks that caught real defects before they reached the arm. Follow the same order for any new motion script on this class of hardware.
 
 **Verified baseline**
@@ -13,6 +15,7 @@ This documents how the pure-Python motion demo ([`examples/edge/gradual_motion_d
 | OS / kernel | Raspbian GNU/Linux 12 (bookworm) / `6.6.20+rpt-rpi-v6` |
 | Python | 3.11.2 (system) |
 | CAN | RS485 CAN HAT, MCP2515 over SPI0 CE0, 12 MHz crystal, `INT` = GPIO25 |
+| Motors | 7x RobStride RS series: **RS-06 on joints 1-3, RS-00 on joints 4-7** |
 | Library | Seeed `RobStride_Control` → `robstride_dynamics` (pure Python) |
 | Packages | `python3-can` 4.1.0, `python3-numpy` 1.24.2, `python3-tqdm` 4.64.1 (all from apt) |
 
@@ -97,6 +100,13 @@ Defect 2 matters beyond logging: the same call seeded the start pose at bring-up
 
 ## Measurements
 
+One thing to keep in mind while reading these: the runs used the rs-00 MIT table
+for every motor. Joints 1-3 are RS-06, whose kp range is ten times rs-00's, so
+their stiffness in effect was ten times the `--kp` on the command line (kp 15 →
+150 Nm/rad); the rs-00 wrist joints match the command. The scripts default to the
+correct per-joint models now, so reproducing these exact numbers needs
+`--model-spec ""` — the command lines at the end of this page have it.
+
 Single joint, δ = 0.0524 rad (3°), kp 15 / kd 0.6, 30 Hz — measured positions:
 
 | leg | 24 % | 50 % | 76 % | 100 % |
@@ -118,7 +128,7 @@ All 7 joints, δ = 0.1048 rad (6°), `--track`, tracking error at the far point 
 | 6 | −0.007 | −0.003 |
 | 7 | −0.001 | +0.002 |
 
-Joints 3 and 4 remain short — joint 4 even at 45 Nm/rad, joint 3 still at the 20 base — and both track to ~2 mrad when the arm is at rest, which points at load rather than mistuning. Gravity compensation is the correct fix, and it lives in `reBotArm_control_py`, which needs motorbridge. Timing: 3.35–3.40 s per 3 s leg at 20 Hz, i.e. **~18 Hz effective for 7 joints** — about the Zero W's ceiling over this HAT.
+Joints 3 and 4 remain short — joint 4 even at 45 Nm/rad, joint 3 still at the 20 base — and both track to ~2 mrad when the arm is at rest, which points at load rather than mistuning. Gravity compensation is the correct fix: `reBotArm_control_py` has it but needs motorbridge, and [the gravity example](../../examples/edge/gravity_comp_demo.py) now does it on this pure-Python path, calibrated against the measured droop. Timing: 3.35–3.40 s per 3 s leg at 20 Hz, i.e. **~18 Hz effective for 7 joints** — about the Zero W's ceiling over this HAT.
 
 ## Checklist for the next Pi Zero W session
 
@@ -140,12 +150,20 @@ tar xzf /tmp/rs.tar.gz && mv RobStride_Control-master ~/RobStride_Control
 sudo apt-get install -y python3-can python3-numpy python3-tqdm
 
 # single joint, 3 degrees, measured
+# (--model-spec "" = the rs-00 table these tables were measured with)
 python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
-    --execute --joints 1 --delta 0.0524 --duration 3 --kp 15 --hz 30 --track
+    --model-spec "" --execute --joints 1 --delta 0.0524 --duration 3 --kp 15 \
+    --hz 30 --track
 
 # all joints, 6 degrees, stiffer wrist
 python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
-    --execute --joints all --delta 0.1048 --kp 4:45,5:35 --hz 20 --track
+    --model-spec "" --execute --joints all --delta 0.1048 --kp 4:45,5:35 \
+    --hz 20 --track
+
+# with the per-joint models (the default now) --kp is the real stiffness, so
+# this is ten times softer on joints 1-3 than the run above was
+python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
+    --execute --joints all --delta 0.1048 --kp 20 --hz 20 --track
 ```
 
 ## Offline cartesian planning
@@ -234,21 +252,59 @@ error. Accuracy therefore improves in percentage terms with amplitude: 21 % shor
 at 10 cm, 9 % at 20 cm, 10 % at 25 cm (with the extra reach offsetting the gain).
 
 Gravity feedforward was modelled (`host/rebot_ik.gravity_torques`, validated against
-`dU/dq` to 3.5e-9 Nm) and then deliberately **not** applied. Comparing the model
-against the droop the arm actually shows at the top of the lift:
+`dU/dq` to 3.5e-9 Nm). Comparing the model against the droop the arm shows at the
+top of the lift, with the kp that was actually in effect:
 
-| joint | kp·droop (implied load) | URDF model | ratio |
-|---|---|---|---|
-| j2 | 0.10 Nm | 1.75 Nm | 0.06 |
-| j3 | 0.74 Nm | 5.81 Nm | 0.13 |
-| j4 | 1.97 Nm | 1.67 Nm | 1.18 |
+| joint | kp in effect | droop | implied load | URDF model | ratio |
+|---|---|---|---|---|---|
+| j2 | 200 Nm/rad | 0.005 | 1.0 Nm | 1.75 Nm | 0.57 |
+| j3 | 200 Nm/rad | 0.037 | 7.4 Nm | 5.81 Nm | 1.27 |
+| j4 | 45 Nm/rad | 0.045 | 2.0 Nm | 1.67 Nm | 1.20 |
 
-Joint 4 agrees — the wrist really does carry the gripper. Joints 2 and 3 carry a
-tenth of what the model predicts, i.e. the upper arm is partly supported at this
-pose. Feeding the modelled 5.8 Nm into joint 3 would drive the arm up against
-whatever is holding it. So the 78 mm stands as the honest result for this setup,
-and feedforward would have to be calibrated per joint against measured load
-first.
+Those kp values are not the commanded ones. Joints 1-3 are RS-06, whose MIT kp
+range is 5000 Nm/rad against rs-00's 500, so with the rs-00 table (which these
+runs used) a command of kp 20 is 200 Nm/rad on the base joints; the wrist is
+rs-00, so its kp 45 is 45. The model agrees to within 30-40 %, so the 78 mm
+shortfall is joint compliance under load, and feeding the model torque in is the
+right fix — which is what the example below does.
+
+### Applying it: the calibrated example
+
+[`examples/edge/gravity_comp_demo.py`](../../examples/edge/gravity_comp_demo.py)
+takes that last step rather than leaving it as advice, and it has since been run
+on this arm. In `--mode hold` it holds one pose with position control, reads the
+droop as `kp × droop`, derives a per-joint scale against the model, then holds
+again with feedforward recomputed from the measured pose every tick.
+
+Run at the top of the 10 cm lift above, with the per-joint models the arm needs
+(`--model-spec "1:rs-06,2:rs-06,3:rs-06"`), kp 30, 10 Hz:
+
+| joint | model Nm | measured load Nm | scale | droop before | droop after |
+|---|---|---|---|---|---|
+| 2 | 1.40 | 0.86 | 0.613 | 0.0287 | 0.0095 |
+| 3 | 6.22 | 7.46 | 1.199 | 0.2485 | 0.0909 |
+| 4 | 1.65 | 1.85 | 1.120 | 0.0616 | 0.0183 |
+
+Mean |droop| fell from 0.057 to 0.020 rad (65 %), 63-70 % on each loaded joint;
+the scales are 0.6-1.2, i.e. the URDF model is roughly right and the calibration
+trims it.
+
+Three things the runs made concrete:
+
+- **Feedforward only cancels a load it exceeds.** Joint 3 applied 7.46 Nm and
+  recovered 63 % of its 0.25 rad droop; the rest is friction and stiction, which
+  sets how well a low-torque joint can track.
+- **A pose on the stops measures the support, not gravity.** The same
+  experiment at the resting pose (joints 2-3 exactly on their 0 rad limits) gave
+  scales of 0.08 and 0.63 and removed 4 %: the arm was resting on its support.
+  Lift it clear before calibrating.
+- **The model costs ~80 ms per call on this board**, so the demo defaults to
+  10 Hz and holds 100 ms ticks. A 20 Hz attempt ran 90 ms ticks with half of
+  them late; the bus is not the bottleneck, numpy is.
+
+`examples/host/fit_gravity.py` fits one scale per joint over several poses and
+reports whether it travels. Setup and usage:
+[Examples](../../examples/README.md#gravity-compensation).
 
 ### Gripper (motor 7)
 
@@ -295,5 +351,5 @@ result look like "about 100 mm".
 ## Known limits
 
 - **Cartesian motion is planned offline.** `host/rebot_ik.py` + `host/plan_cartesian.py` run on a workstation; the Pi only replays joint waypoints. Accuracy at the tool is limited by joint compliance (21 mm of a 100 mm lift at kp 30-45), not by the planner.
-- **No gravity compensation on the arm.** A model exists and is numerically validated (`host/rebot_ik.gravity_torques`), but it is not wired into the control path: measured joint loads disagree with it on joints 2-3 (arm partly supported), and applying it blindly would push the arm up. Calibrate per joint against measured droop before using it.
+- **No gravity compensation in the vendor/motorbridge path.** A model exists and is numerically validated (`host/rebot_ik.gravity_torques`), and [`examples/edge/gravity_comp_demo.py`](../../examples/edge/gravity_comp_demo.py) applies it on the pure-Python path — with the per-joint motor models it needs (RS-06 on joints 1-3, RS-00 on 4-6) and a scale fitted from measured droop at the pose in question. It removes ~65 % of the static droop there; the remainder is joint friction. The vendor `reBotArm_control_py` path is unaffected by the example and still needs motorbridge.
 - **`write_id()` in the vendored library is broken**: it calls `CommunicationType.SET_CAN_ID`, which does not exist (the constant is `SET_DEVICE_ID = 7`). Irrelevant once IDs are set, but do not trust that method.

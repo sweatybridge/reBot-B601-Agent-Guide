@@ -57,6 +57,11 @@ Requires a CAN interface that is UP at 1 Mbit/s. On a CAN HAT:
 
 Verified on the reference arm
 -----------------------------
+These runs used `--model-spec ""`, i.e. the rs-00 MIT table for every motor, so
+the kp below is the wrist's and joints 1-3 (RS-06) ran ten times stiffer than it.
+The current default scales each joint by its own model, so `--kp` is the real
+stiffness.
+
 Raspberry Pi Zero W + RS485 CAN HAT, 7x RS motors at IDs 1-7, joint 1,
 delta 0.0524 rad (3 deg), kp=15/kd=0.6, 30 Hz, `--track`:
     outbound  24/50/76/100 % measured +0.0284 +0.0456 +0.0629 +0.0736
@@ -101,6 +106,14 @@ MAX_KP = 60.0             # Nm/rad
 MAX_KD = 3.0              # Nm/(rad/s)
 MIN_HZ, MAX_HZ = 10, 100
 
+# The B601-RS mixes actuators: joints 1-3 are RS-06, joints 4-7 are RS-00. The
+# MIT frame scales position, kp, kd and torque by the *model's* ranges, and the
+# two differ tenfold on kp/kd (5000 vs 500 Nm/rad, 100 vs 5 Nm/rad/s) and 3.5x
+# on torque (60 vs 17 Nm). Sending an RS-06 joint the rs-00 table therefore
+# commands ten times the stiffness and a third of the torque asked for.
+MODEL_NAMES = ("rs-00", "rs-01", "rs-02", "rs-03", "rs-04", "rs-05", "rs-06")
+DEFAULT_MODEL_SPEC = "1:rs-06,2:rs-06,3:rs-06"
+
 
 # --------------------------------------------------------------------------- #
 # SDK resolution
@@ -126,6 +139,36 @@ def load_sdk(sdk_path):
             "~/RobStride_Control" % exc
         )
     return RobstrideBus, Motor, ParameterType, CommunicationType
+
+
+def parse_model_spec(spec, default, motor_ids):
+    """Parse '1:rs-06,2:rs-06,3:rs-06' into {motor_id: model}, defaulting the rest.
+
+    The MIT frame scales kp/kd/torque by the model's range, so this is not
+    cosmetic: the same --kp means 10x less torque per rad on an RS-06 joint than
+    on an RS-00 one. Pass an empty spec for an arm whose motors are all alike.
+    """
+    models = {motor_id: default for motor_id in motor_ids}
+    if not spec.strip():
+        return models
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        key, _, value = part.partition(":")
+        value = value.strip()
+        try:
+            motor_id = int(key)
+        except ValueError:
+            raise SystemExit("--model-spec: cannot parse '%s' (expected ID:MODEL)" % part)
+        if motor_id not in motor_ids:
+            raise SystemExit("--model-spec: motor IDs are %s (got %d)"
+                             % (", ".join(str(i) for i in motor_ids), motor_id))
+        if value not in MODEL_NAMES:
+            raise SystemExit("--model-spec: unknown model '%s' (known: %s)"
+                             % (value, ", ".join(MODEL_NAMES)))
+        models[motor_id] = value
+    return models
 
 
 # --------------------------------------------------------------------------- #
@@ -218,19 +261,73 @@ class Demo:
             drain_rx(self.bus)
         self.enabled = True
 
-    def command(self, targets, drain=True):
-        """Send one MIT frame per joint at the current tick."""
+    def command(self, targets, drain=True, torques=None):
+        """Send one MIT frame per joint at the current tick.
+
+        `torques` is optional feedforward, {name: Nm}; it lands in the frame's
+        torque field, which the motor adds to its own kp/kd output. The gravity
+        demo uses it, everything else leaves it at 0.
+        """
         for name, target in targets.items():
             motor_id = self.bus.motors[name].id
+            torque = 0.0 if torques is None else float(torques.get(name, 0.0))
             if self.sender is not None:
                 # ~6x cheaper than the library's numpy path; see mit_frames.py
-                self.sender.send(motor_id, target, self.kp[motor_id], self.kd[motor_id])
+                self.sender.send(motor_id, target, self.kp[motor_id], self.kd[motor_id],
+                                 0.0, torque)
             else:
                 self.bus.write_operation_frame(name, target, self.kp[motor_id],
-                                               self.kd[motor_id], 0.0, 0.0)
+                                               self.kd[motor_id], 0.0, torque)
             self.last[name] = target
         if drain:
             drain_rx(self.bus)
+
+    def poll_states(self, names, timeout=0.03):
+        """Latest status for several joints from one pass over the socket.
+
+        `read_status()` blocks per joint and skips frames that belong to another
+        motor, which is right for the occasional sample but wasteful in a loop:
+        six joints would drop most of the six replies waiting for them.
+        One pass here fills every joint asked for, and misses are simply absent
+        from the result so the caller can reuse its last value.
+        """
+        from robstride_dynamics.table import (
+            MODEL_MIT_POSITION_TABLE,
+            MODEL_MIT_TORQUE_TABLE,
+            MODEL_MIT_VELOCITY_TABLE,
+        )
+
+        wanted = {self.bus.motors[name].id: name for name in names}
+        found = {}
+        deadline = time.perf_counter() + timeout
+        while len(found) < len(wanted):
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            msg = self.bus.channel_handler.recv(timeout=min(0.005, remaining))
+            if msg is None or not msg.is_extended_id:
+                continue
+            comm_type = (msg.arbitration_id >> 24) & 0x1F
+            if comm_type == 21:
+                raise RuntimeError(
+                    "motor %d reported a fault frame: %s"
+                    % (msg.arbitration_id & 0xFF, msg.data.hex()))
+            if comm_type != 2:
+                continue
+            name = wanted.get((msg.arbitration_id >> 8) & 0xFF)
+            if name is None:
+                continue
+            model = self.bus.motors[name].model
+            # Status payload: position, velocity, torque (bipolar), temperature
+            # (signed, 0.1 C per count) - `>HHHh`.
+            pos_u16, vel_u16, torque_u16, temp_i16 = struct.unpack(">HHHh", msg.data)
+            found.setdefault(name, (
+                (float(pos_u16) / 0x7FFF - 1.0) * MODEL_MIT_POSITION_TABLE[model],
+                (float(vel_u16) / 0x7FFF - 1.0) * MODEL_MIT_VELOCITY_TABLE[model],
+                (float(torque_u16) / 0x7FFF - 1.0) * MODEL_MIT_TORQUE_TABLE[model],
+                float(temp_i16) * 0.1,
+            ))
+        return found
 
     def sample(self, name, timeout=0.05):
         """Measured position for exactly this joint, or None."""
@@ -269,12 +366,14 @@ class Demo:
                 continue
             if ((msg.arbitration_id >> 8) & 0xFF) != motor.id:
                 continue
-            pos_u16, vel_u16, torque_i16, temp_u16 = struct.unpack(">HHHh", msg.data)
+            # Status payload: position, velocity, torque (bipolar), temperature
+            # (signed, 0.1 C per count) - `>HHHh`.
+            pos_u16, vel_u16, torque_u16, temp_i16 = struct.unpack(">HHHh", msg.data)
             return (
                 (float(pos_u16) / 0x7FFF - 1.0) * MODEL_MIT_POSITION_TABLE[model],
                 (float(vel_u16) / 0x7FFF - 1.0) * MODEL_MIT_VELOCITY_TABLE[model],
-                (float(torque_i16) / 0x7FFF - 1.0) * MODEL_MIT_TORQUE_TABLE[model],
-                float(temp_u16) * 0.1,
+                (float(torque_u16) / 0x7FFF - 1.0) * MODEL_MIT_TORQUE_TABLE[model],
+                float(temp_i16) * 0.1,
             )
 
     def move_leg(self, targets, duration, label, track=False):
@@ -314,12 +413,13 @@ class Demo:
             self.command(targets)
             time.sleep(self.period)
 
-    def shut_down(self, targets, stay_enabled, CommunicationType, track=False):
+    def shut_down(self, targets, stay_enabled, CommunicationType, track=False,
+                  seconds=1.5):
         """Ramp home, hold, then drop torque unless asked to stay enabled."""
         if not self.enabled:
             return
         print("  returning to start pose...")
-        self.move_leg(targets, 1.5, "home", track=track)
+        self.move_leg(targets, seconds, "home", track=track)
         self.hold(targets, 0.5)
         if stay_enabled:
             print("  --stay-enabled: leaving torque ON (motors keep holding).")
@@ -338,7 +438,14 @@ def parse_args(argv):
     parser.add_argument("--joints", default="1",
                         help="Comma-separated motor IDs, or 'all' (default: 1)")
     parser.add_argument("--model", default="rs-00",
-                        help="Motor model for MIT scaling (all rs-* share 4*pi here)")
+                        help="Fallback motor model for MIT scaling (all rs-* share "
+                             "4*pi position, but not the gain ranges)")
+    parser.add_argument("--model-spec", default=DEFAULT_MODEL_SPEC,
+                        help="Per-joint models, ID:MODEL,... The B601-RS uses RS-06 on "
+                             "joints 1-3 and RS-00 on 4-7, and the MIT frame scales kp, "
+                             "kd and torque by the model, so a wrong table silently "
+                             "changes the gains tenfold. Pass '' for a uniform arm "
+                             "(default: %s)" % DEFAULT_MODEL_SPEC)
     parser.add_argument("--delta", type=float, default=0.10,
                         help="Amplitude in rad, each way (default 0.10, max %.2f)" % MAX_DELTA)
     parser.add_argument("--duration", type=float, default=3.0,
@@ -416,6 +523,7 @@ def main(argv=None):
     RobstrideBus, Motor, ParameterType, CommunicationType = load_sdk(args.sdk_path)
 
     ids = resolve_joint_ids(args.joints)
+    model_by_id = parse_model_spec(args.model_spec, args.model, ids)
     delta = clamp(abs(args.delta), 0.0, MAX_DELTA)
     kp_base, kp_over = parse_gain_spec(args.kp, 20.0, MAX_KP, "kp")
     kd_base, kd_over = parse_gain_spec(args.kd, 0.6, MAX_KD, "kd")
@@ -427,6 +535,7 @@ def main(argv=None):
     print("B601-RS gradual motion demo")
     print("  channel : %s" % args.channel)
     print("  joints  : %s" % ", ".join(str(i) for i in ids))
+    print("  models  : %s" % ", ".join("%d:%s" % (i, model_by_id[i]) for i in ids))
     print("  motion  : +/-%.3f rad (%.1f deg) over %.1f s per leg"
           % (delta, math.degrees(delta), duration))
     print("  kp      : %s" % format_gains(kp_by_id))
@@ -439,7 +548,7 @@ def main(argv=None):
                          "  sudo systemctl start can0-setup.service\n"
                          "  ip -details link show %s" % (args.channel, args.channel))
 
-    motors = {("m%d" % i): Motor(i, args.model) for i in ids}
+    motors = {("m%d" % i): Motor(i, model_by_id[i]) for i in ids}
     names = list(motors)
 
     bus = RobstrideBus(args.channel, motors)
