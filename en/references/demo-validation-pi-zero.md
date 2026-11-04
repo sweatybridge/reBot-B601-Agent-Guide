@@ -2,9 +2,9 @@
 
 > **Note: This reference document is a beta version and for reference only. If you have any questions or encounter issues, please contact Seeed for support.**
 
-> **File layout note.** The examples referenced below were later consolidated into one pipeline, documented in [`examples/README.md`](../../examples/README.md): `examples/host/plan_with_pinocchio.py` plans in a Docker container (Seeed's IK plus Pinocchio gravity feedforward on every waypoint) and `examples/edge/play_trajectory.py` replays the JSON on the board. Paths such as `host/plan_cartesian.py`, `host/fit_gravity.py`, `host/plan_gripper.py`, `edge/gravity_comp_demo.py`, `edge/test_mit_frames.py` and `host/trim_trajectory.py` describe the earlier layout and no longer exist; the measurements and lessons below still stand.
+> **File layout note.** The Python edge implementation described below has been removed. The player is now the Rust binary in [`examples/edge-rust/`](../../examples/edge-rust/README.md), which also provides the read-only `dump` subcommand. The Python paths and commands below are historical context; the measurements and lessons still stand.
 
-This documents how the pure-Python motion demo ([`examples/edge/gradual_motion_demo.py`](../../examples/edge/gradual_motion_demo.py)) was built and validated on a 32-bit Raspberry Pi, and — more usefully — the checks that caught real defects before they reached the arm. Follow the same order for any new motion script on this class of hardware.
+This documents how the pure-Python motion demo (`examples/edge/gradual_motion_demo.py`, since removed) was built and validated on a 32-bit Raspberry Pi, and — more usefully — the checks that caught real defects before they reached the arm. The same checks live in the [Rust player](../../examples/edge-rust/README.md) now; follow the same order for any new motion script on this class of hardware.
 
 **Verified baseline**
 
@@ -128,7 +128,7 @@ All 7 joints, δ = 0.1048 rad (6°), `--track`, tracking error at the far point 
 | 6 | −0.007 | −0.003 |
 | 7 | −0.001 | +0.002 |
 
-Joints 3 and 4 remain short — joint 4 even at 45 Nm/rad, joint 3 still at the 20 base — and both track to ~2 mrad when the arm is at rest, which points at load rather than mistuning. Gravity compensation is the correct fix: `reBotArm_control_py` has it but needs motorbridge, and [the gravity example](../../examples/edge/gravity_comp_demo.py) now does it on this pure-Python path, calibrated against the measured droop. Timing: 3.35–3.40 s per 3 s leg at 20 Hz, i.e. **~18 Hz effective for 7 joints** — about the Zero W's ceiling over this HAT.
+Joints 3 and 4 remain short — joint 4 even at 45 Nm/rad, joint 3 still at the 20 base — and both track to ~2 mrad when the arm is at rest, which points at load rather than mistuning. Gravity compensation is the correct fix: `reBotArm_control_py` has it but needs motorbridge, and the historical gravity example (`examples/edge/gravity_comp_demo.py`, removed) did it on the old pure-Python path, calibrated against the measured droop. Timing: 3.35–3.40 s per 3 s leg at 20 Hz, i.e. **~18 Hz effective for 7 joints** — about the Zero W's ceiling over this HAT.
 
 ## Checklist for the next Pi Zero W session
 
@@ -169,8 +169,10 @@ python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
 ## Offline cartesian planning
 
 The Pi cannot do IK in a control loop: one damped-least-squares solve costs
-~1.3 s on a Zero W, so 20 Hz is hopeless. The split that works — and the reason
-the examples are laid out as `edge/`, `host/` and `trajectories/`:
+~1.3 s on a Zero W, so 20 Hz is hopeless. This is why the historical examples
+were laid out as `edge/`, `host/` and `trajectories/`; the current layout and
+commands are in [`examples/README.md`](../../examples/README.md), with the Rust
+player replacing the Python edge files below.
 
 | Stage | Where | File | Job |
 |---|---|---|---|
@@ -270,7 +272,7 @@ right fix — which is what the example below does.
 
 ### Applying it: the calibrated example
 
-[`examples/edge/gravity_comp_demo.py`](../../examples/edge/gravity_comp_demo.py)
+`examples/edge/gravity_comp_demo.py` (since removed)
 takes that last step rather than leaving it as advice, and it has since been run
 on this arm. In `--mode hold` it holds one pose with position control, reads the
 droop as `kp × droop`, derives a per-joint scale against the model, then holds
@@ -351,5 +353,5 @@ result look like "about 100 mm".
 ## Known limits
 
 - **Cartesian motion is planned offline.** `host/rebot_ik.py` + `host/plan_cartesian.py` run on a workstation; the Pi only replays joint waypoints. Accuracy at the tool is limited by joint compliance (21 mm of a 100 mm lift at kp 30-45), not by the planner.
-- **No gravity compensation in the vendor/motorbridge path.** A model exists and is numerically validated (`host/rebot_ik.gravity_torques`), and [`examples/edge/gravity_comp_demo.py`](../../examples/edge/gravity_comp_demo.py) applies it on the pure-Python path — with the per-joint motor models it needs (RS-06 on joints 1-3, RS-00 on 4-6) and a scale fitted from measured droop at the pose in question. It removes ~65 % of the static droop there; the remainder is joint friction. The vendor `reBotArm_control_py` path is unaffected by the example and still needs motorbridge.
+- **No gravity compensation in the vendor/motorbridge path.** A model exists and is numerically validated (`host/rebot_ik.gravity_torques`), and `examples/edge/gravity_comp_demo.py` (since removed) applied it on the old pure-Python path — with the per-joint motor models it needs (RS-06 on joints 1-3, RS-00 on 4-6) and a scale fitted from measured droop at the pose in question. It removed ~65 % of the static droop there; the remainder is joint friction. The vendor `reBotArm_control_py` path is unaffected by the example and still needs motorbridge.
 - **`write_id()` in the vendored library is broken**: it calls `CommunicationType.SET_CAN_ID`, which does not exist (the constant is `SET_DEVICE_ID = 7`). Irrelevant once IDs are set, but do not trust that method.

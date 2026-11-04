@@ -54,7 +54,7 @@ python3 -m venv ~/mb-probe
 1. Use a 64-bit host board (Pi Zero 2 W / Pi 3 / Pi 4 / Pi 5 with a 64-bit OS, or any x86_64 Linux box) — same CAN HAT, `pip install motorbridge` just works
 2. Build `motor_abi` + `ws_gateway` from source for that architecture (hours on a Pi Zero W, and outside the scope of this guide)
 3. Move the CAN adapter to a supported host
-4. Keep the 32-bit board and drive the motors with the pure-Python `robstride_dynamics` driver — verified working on a Pi Zero W. Joint-space only on the board, but an offline planner (`examples/host/plan_with_pinocchio.py`, run in a Docker container) turns cartesian moves into joint trajectories the Pi replays, with Pinocchio gravity feedforward baked into each waypoint. Still no Studio calibration UI. See [Demo Validation on Pi Zero W](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/demo-validation-pi-zero.md)
+4. Keep the 32-bit board and use the Rust edge player (`examples/edge-rust/`, SocketCAN, no Python or numpy on the board) — verified on a Pi Zero W. Joint-space only on the board, but an offline planner (`examples/host/plan_with_pinocchio.py`, run in a Docker container) turns cartesian moves into joint trajectories the binary replays, with Pinocchio gravity feedforward baked into each waypoint. Still no Studio calibration UI. See [Demo Validation on Pi Zero W](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/demo-validation-pi-zero.md)
 
 > The CAN HAT itself is configured in Step 1 and can be set up on a 32-bit board regardless; it is only the Python/ABI side that needs a supported architecture.
 

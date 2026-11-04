@@ -3,7 +3,7 @@
 One trajectory, two machines, one hand-off.
 
 ```
-edge/          runs on the board wired to the CAN bus (Raspberry Pi Zero W + MCP2515 HAT)
+edge-rust/     the edge player: one static Rust binary (Raspberry Pi Zero W + MCP2515 HAT)
 host/          planning runs in a Docker container (Pinocchio has no Windows wheels)
 trajectories/  the hand-off: joint-space JSON with gravity feedforward
 ```
@@ -15,35 +15,48 @@ the edge only ever sends joint angles and torques it was handed.
 ## The loop
 
 ```
-  edge/dump_joints.py        host/plan_with_pinocchio.py (container)       edge/play_trajectory.py
-arm ────────────────► current.json ──────────────────────────────► seq.json ──────────────────────► arm
-     (read 0x7019,         (their IK + Pinocchio g(q),                 (30 Hz frames,
-      no torque)            one tau per waypoint)                       dry run by default)
+  edge-rust dump          host/plan_with_pinocchio.py (container)        edge-rust
+arm ───────────► current.json ──────────────────────────────► seq.json ───────────► arm
+     (read 0x7019,          (their IK + Pinocchio g(q),         (30 Hz frames,
+      no torque)             one tau per waypoint)               dry run by default)
 ```
 
 ```bash
 # 1. edge: snapshot where the arm is (read-only)
-python3 edge/dump_joints.py --ids 1,2,3,4,5,6,7 \
-    --sdk-path ~/RobStride_Control/python > current.json
+./rebot-edge dump --ids 1,2,3,4,5,6,7 > current.json
 
 # 2. host: plan with Seeed's stack, inside the container
-docker build -t rebot-pino -f host/Dockerfile.pinocchio .
-pwsh -File host/repeat_pino.ps1            # plan and save
+docker build -t rebot-pino -f examples/host/Dockerfile.pinocchio .
+pwsh -File examples/host/repeat_pino.ps1            # plan and save
 
 # 3. edge: replay it (dry run first)
-python3 edge/play_trajectory.py trajectories/seq_pino_peel.json
-python3 edge/play_trajectory.py trajectories/seq_pino_peel.json \
-    --sdk-path ~/RobStride_Control/python --execute --fast-frames --log run.json
+./rebot-edge trajectories/seq_pino_peel.json
+sudo ./rebot-edge trajectories/seq_pino_peel.json --execute --track
 ```
 
-`host/repeat_pino.ps1 -Replay` does all three steps in one command (it copies the
-JSON to the board and replays it). On a POSIX host, the container can be run with
-a bind mount instead of `docker cp`:
+On a POSIX host, the container can be run with a bind mount instead of
+`docker cp`:
 
 ```bash
 docker run --rm -v "$PWD:/work" rebot-pino python \
     /work/host/plan_with_pinocchio.py --joints /work/current.json --out /work/seq.json
 ```
+
+## Build the Rust player
+
+```bash
+# from the repository root; ARMv6 static binary for a Pi Zero W
+docker build --target bin --output examples/edge-rust/dist examples/edge-rust
+scp examples/edge-rust/dist/rebot-edge pi@raspberrypi.local:~
+```
+
+Other targets (armv7, aarch64, x86_64) and every option are in
+[`edge-rust/README.md`](edge-rust/README.md).
+
+`rebot-edge dump` is the read-only pose snapshot: it reads parameter `0x7019`
+from each motor and prints JSON. It enables nothing and sends no torque.
+`rebot-edge` with a trajectory JSON is the player; `--execute` is the gate and
+`--check` validates a file without touching CAN.
 
 ## The trajectory
 
@@ -59,7 +72,7 @@ docker run --rm -v "$PWD:/work" rebot-pino python \
 | jaws | 17 - 22 s | open, close, back on the stops |
 
 Every waypoint carries `tau`, the Pinocchio gravity torque of that pose, which
-`play_trajectory.py` sends in the MIT frame's torque field.
+the edge player sends in the MIT frame's torque field.
 
 ![trajectory](trajectories/seq_pino_peel.png)
 
@@ -74,6 +87,9 @@ Every waypoint carries `tau`, the Pinocchio gravity torque of that pose, which
 The residual is the model's own error: the URDF under-predicts j2/j3 by ~3 Nm at
 the folded pose, and `sag = residual / kp`. Stiffer joints therefore help
 directly, which is why the vendor gains (kp 150 on j2/j3) are the default.
+
+The Rust player has been measured from 30 Hz to 200 Hz on this arm; see
+[`edge-rust/README.md`](edge-rust/README.md#measured-on-the-reference-arm).
 
 ## The model
 
@@ -104,10 +120,9 @@ gap) and CAN `rate: 500` (this rig runs 1 Mbit/s).
 
 | file | job |
 |---|---|
-| `edge/dump_joints.py` | read parameter `0x7019` from each motor, print JSON. Enables nothing |
-| `edge/play_trajectory.py` | stream a trajectory at `control_hz`, send its `tau`; dry run by default |
-| `edge/gradual_motion_demo.py` | the control loop (MIT frames, ramps, shutdown) that the player uses |
-| `edge/mit_frames.py` | MIT frame builder without numpy, 6x faster (needed at 30 Hz) |
+| `edge-rust/src/main.rs` | the whole edge: CLI, dump, CAN, MIT frames, playback, logging |
+| `edge-rust/Dockerfile` | static musl cross-build for armv6/armv7/aarch64 + host tests |
+| `edge-rust/README.md` | build targets, trajectory schema, options, measured results |
 | `host/Dockerfile.pinocchio` | python 3.11 + Pinocchio + `reBotArm_control_py`, pinned |
 | `host/plan_with_pinocchio.py` | plans with their IK, adds `tau`, writes the JSON (runs in the container) |
 | `host/repeat_pino.ps1` | one-shot: dump pose, plan, save, optionally replay |
@@ -121,8 +136,8 @@ gap) and CAN `rate: 500` (this rig runs 1 Mbit/s).
   pinned and the dip grows to -18 mm; the elbow is the binding stop, and 8° over
   the jaw-opening leg removes the dip entirely.
 - **Dry run is the default.** Nothing moves without `--execute`.
-- **7 joints at 30 Hz needs `--fast-frames`**; without it the library's numpy path
-  costs ~50 ms per tick and the motion stretches ~9 %.
+- **30 Hz no longer needs a special frame path.** The Rust player builds MIT
+  frames directly and measured 33.3 ms mean tick spacing on the Zero W.
 - **`--payload kg`** on the planner folds a held mass into `tau` (1 kg at the tool
   adds -2.77 / +5.08 / +2.84 Nm on j2/j3/j4 at the parked pose).
 - **Limits are re-checked on the edge**; a waypoint outside the URDF range is

@@ -2,9 +2,9 @@
 
 > **注意：本参考文档为 beta 版本，仅供参考。如有疑问或遇到问题，请联系 Seeed 获取支持。**
 
-> **文件布局说明。** 下文引用的示例后来合并为一条流水线，见 [`examples/README.md`](../../examples/README.md)：`examples/host/plan_with_pinocchio.py` 在 Docker 容器中规划（Seeed 的 IK 加 Pinocchio 逐路点重力前馈），`examples/edge/play_trajectory.py` 在板子上回放 JSON。`host/plan_cartesian.py`、`host/fit_gravity.py`、`host/plan_gripper.py`、`edge/gravity_comp_demo.py`、`edge/test_mit_frames.py`、`host/trim_trajectory.py` 等路径属于早期布局，已不存在；下文的测量结果与经验仍然成立。
+> **文件布局说明。** 下文的 Python edge 实现已移除。当前回放器是 [`examples/edge-rust/`](../../examples/edge-rust/README.md) 的 Rust 单文件二进制，并提供只读 `dump` 子命令。下文的 Python 路径与命令仅作历史背景；测量结果与经验仍然成立。
 
-本文记录纯 Python 运动演示（[`examples/edge/gradual_motion_demo.py`](../../examples/edge/gradual_motion_demo.py)）是如何在 32 位树莓派上构建并验证的，以及更有价值的部分——那些在动作到达机械臂之前就把真实缺陷抓出来的检查。在这类硬件上开发任何新的运动脚本，都建议按同样顺序进行。
+本文记录纯 Python 运动演示（`examples/edge/gradual_motion_demo.py`，已移除）是如何在 32 位树莓派上构建并验证的，以及更有价值的部分——那些在动作到达机械臂之前就把真实缺陷抓出来的检查。相同的检查现在由 [Rust 回放器](../../examples/edge-rust/README.md) 承担；在这类硬件上开发任何新的运动脚本，都建议按同样顺序进行。
 
 **验证基线**
 
@@ -123,7 +123,7 @@ bus.read(name, ParameterType.MECHANICAL_POSITION)   # -> 关节角度（rad）
 | 6 | −0.007 | −0.003 |
 | 7 | −0.001 | +0.002 |
 
-3、4 号关节始终偏短——4 号即使给到 45 Nm/rad、3 号仍是 20 的基准值——而机械臂静止时两者都能跟到约 2 mrad，这说明是负载而非调参问题。正确的解法是重力补偿：`reBotArm_control_py` 里有，但依赖 motorbridge；现在这条纯 Python 通路上也有了[重力补偿示例](../../examples/edge/gravity_comp_demo.py)，只是要按实测下垂标定。时序：20 Hz 下 3 秒的段实际跑了 3.35–3.40 秒，也就是**7 关节下约 18 Hz 有效速率**——差不多就是 Zero W 加这块 HAT 的上限。
+3、4 号关节始终偏短——4 号即使给到 45 Nm/rad、3 号仍是 20 的基准值——而机械臂静止时两者都能跟到约 2 mrad，这说明是负载而非调参问题。正确的解法是重力补偿：`reBotArm_control_py` 里有，但依赖 motorbridge；旧纯 Python 通路上曾有重力补偿示例（`examples/edge/gravity_comp_demo.py`，已移除），只是要按实测下垂标定。时序：20 Hz 下 3 秒的段实际跑了 3.35–3.40 秒，也就是**7 关节下约 18 Hz 有效速率**——差不多就是 Zero W 加这块 HAT 的上限。
 
 ## 下一次 Pi Zero W 会话的检查清单
 
@@ -162,7 +162,7 @@ python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
 
 ## 离线笛卡尔规划
 
-树莓派无法在控制回路里做 IK：在 Zero W 上一次阻尼最小二乘求解要花约 1.3 秒，20 Hz 完全没有希望。可行的分工——这也是示例代码按 `edge/`、`host/`、`trajectories/` 组织的原因：
+树莓派无法在控制回路里做 IK：在 Zero W 上一次阻尼最小二乘求解要花约 1.3 秒，20 Hz 完全没有希望。这是历史示例按 `edge/`、`host/`、`trajectories/` 组织的原因；当前布局与命令见 [`examples/README.md`](../../examples/README.md)，Python edge 已由 Rust 回放器取代。
 
 | 阶段 | 在哪 | 文件 | 做什么 |
 |---|---|---|---|
@@ -231,7 +231,7 @@ python3 edge/play_trajectory.py trajectories/raise10cm.json --execute
 
 ### 真正用上它：带标定的示例
 
-[`examples/edge/gravity_comp_demo.py`](../../examples/edge/gravity_comp_demo.py) 把最后这一步做完了，而不只是写一句建议，并且已经在这台机械臂上跑过。`--mode hold` 先用位置控制保持一个位姿，把下垂量读成 `kp × 下垂`，据此对模型求每关节的比例系数，再用由实测位姿逐周期重算的前馈保持一次。
+`examples/edge/gravity_comp_demo.py`（已移除）把最后这一步做完了，而不只是写一句建议，并且已经在这台机械臂上跑过。`--mode hold` 先用位置控制保持一个位姿，把下垂量读成 `kp × 下垂`，据此对模型求每关节的比例系数，再用由实测位姿逐周期重算的前馈保持一次。
 
 在上面那次 10 cm 抬升的顶点、用上机械臂需要的每关节型号（`--model-spec "1:rs-06,2:rs-06,3:rs-06"`）、kp 30、10 Hz 下实测：
 
@@ -274,5 +274,5 @@ rad 到厘米的换算是小齿轮几何，URDF 并没有建模（它把手指�
 ## 已知限制
 
 - **笛卡尔运动是离线规划的。** `host/rebot_ik.py` + `host/plan_cartesian.py` 在工作站上运行；树莓派只回放关节路点。末端的精度受关节柔度限制（kp 30–45 时 100 mm 的抬升差 21 mm），而不是受规划器限制。
-- **厂商／motorbridge 通路上没有重力补偿。** 模型存在且已数值验证（`host/rebot_ik.gravity_torques`），[`examples/edge/gravity_comp_demo.py`](../../examples/edge/gravity_comp_demo.py) 在纯 Python 通路上用上了它——前提是用对每关节的电机型号（1–3 号 RS-06、4–6 号 RS-00），并按实测下垂拟合该位姿的系数。在位姿顶点它能消除约 65 % 的静态下垂，余下的是关节摩擦。厂商的 `reBotArm_control_py` 通路不受这个示例影响，仍然需要 motorbridge。
+- **厂商／motorbridge 通路上没有重力补偿。** 模型存在且已数值验证（`host/rebot_ik.gravity_torques`），`examples/edge/gravity_comp_demo.py`（已移除）在旧纯 Python 通路上用上了它——前提是用对每关节的电机型号（1–3 号 RS-06、4–6 号 RS-00），并按实测下垂拟合该位姿的系数。在位姿顶点它能消除约 65 % 的静态下垂，余下的是关节摩擦。厂商的 `reBotArm_control_py` 通路不受这个示例影响，仍然需要 motorbridge。
 - **随库附带的 `write_id()` 是坏的**：它调用了不存在的 `CommunicationType.SET_CAN_ID`（正确常量是 `SET_DEVICE_ID = 7`）。ID 设好之后无关紧要，但不要相信那个方法。

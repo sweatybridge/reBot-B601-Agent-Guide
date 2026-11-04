@@ -4,9 +4,9 @@
 #   pwsh -File examples/host/repeat_pino.ps1 -Replay    # plan, save, and play it on the arm
 #
 # Needs: Docker Desktop with the rebot-pino image (built from
-# examples/host/Dockerfile.pinocchio), ssh access to the Pi, and
-# examples/edge on the Pi. The planner runs in the container because Pinocchio
-# has no Windows wheels; the pose dump and the replay go over ssh.
+# examples/host/Dockerfile.pinocchio), ssh access to the Pi, and the Rust edge
+# binary at $PiDir/rebot-edge-rust. The planner runs in the container because
+# Pinocchio has no Windows wheels; the pose dump and the replay go over ssh.
 param(
     [string]$Pi = "qh812@raspberrypi",
     [string]$PiDir = "~/gravity-test",
@@ -25,7 +25,7 @@ Set-Location $repo
 
 # 1. where is the arm now (read-only)
 $dump = Join-Path $env:TEMP "rebot_pose.json"
-& $Ssh -o BatchMode=yes $Pi "cd $PiDir && python3 examples/edge/dump_joints.py --ids 1,2,3,4,5,6,7 --sdk-path ~/RobStride_Control/python" |
+& $Ssh -o BatchMode=yes $Pi "cd $PiDir && ./rebot-edge-rust dump --ids 1,2,3,4,5,6,7" |
     Set-Content -Encoding utf8 $dump
 Write-Host "pose: $(Get-Content $dump -Raw | ConvertFrom-Json | Select-Object -ExpandProperty q)"
 
@@ -50,5 +50,5 @@ Write-Host "wrote $Out"
 # 3. optionally play it on the arm, with logging
 if ($Replay) {
     & $Scp $Out "${Pi}:${PiDir}/$(Split-Path -Leaf $Out)"
-    & $Ssh -o BatchMode=yes $Pi "cd $PiDir && python3 examples/edge/play_trajectory.py $(Split-Path -Leaf $Out) --sdk-path ~/RobStride_Control/python --execute --fast-frames --kp $Kp --kd $Kd --log repeat.json"
+    & $Ssh -o BatchMode=yes $Pi "cd $PiDir && ./rebot-edge-rust $(Split-Path -Leaf $Out) --execute --kp $Kp --kd $Kd --log repeat.json"
 }

@@ -18,7 +18,7 @@ Please follow the workflow in AGENTS.md (https://github.com/Welt-liu/reBot-B601-
 - [Demo Development & Validation](en/references/demo-validation-pi-zero.md) — Building and validating a motion demo on a Pi Zero W
 - [Write Motor ID](en/references/write-motor-id.md) — Set motor IDs 1–7
 - [Zero Calibration](en/references/write-motor-zero.md) — Calibrate motor zero positions
-- [Examples](examples/README.md) — `edge/` (Pi), `host/` (workstation) and `trajectories/` code, including a calibrated [gravity-compensation demo](examples/README.md#gravity-compensation)
+- [Examples](examples/README.md) — `edge-rust/` (Pi), `host/` (workstation) and `trajectories/` code, including the measured trajectory pipeline
 
 ### 中文
 

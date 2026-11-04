@@ -1,0 +1,22 @@
+[package]
+name = "rebot-edge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Single-binary B601-RS edge player: stream a joint-space trajectory JSON over SocketCAN"
+license = "MIT"
+
+[[bin]]
+name = "rebot-edge"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

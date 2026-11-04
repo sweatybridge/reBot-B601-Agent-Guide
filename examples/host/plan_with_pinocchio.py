@@ -64,7 +64,7 @@ def load_dump(path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Plan a trajectory with Pinocchio.")
-    parser.add_argument("--joints", required=True, help="dump_joints.py output")
+    parser.add_argument("--joints", required=True, help="rebot-edge dump output")
     parser.add_argument("--out", required=True, help="trajectory JSON to write")
     parser.add_argument("--urdf", default="", help="override the URDF path")
     parser.add_argument("--hz", type=float, default=30.0)

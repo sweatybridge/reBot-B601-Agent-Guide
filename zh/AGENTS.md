@@ -54,7 +54,7 @@ python3 -m venv ~/mb-probe
 1. 换用 64 位主机（Pi Zero 2 W / Pi 3 / Pi 4 / Pi 5 配 64 位系统，或任意 x86_64 Linux 机器）——同一块 CAN HAT，`pip install motorbridge` 直接可用
 2. 为该架构从源码编译 `motor_abi` + `ws_gateway`（在 Pi Zero W 上需要数小时，超出本文档范围）
 3. 把 CAN 转接板换到受支持的主机上
-4. 继续使用这块 32 位板，改用纯 Python 的 `robstride_dynamics` 驱动——已在 Pi Zero W 上验证可用。板上只做关节空间，但配合离线规划器（`examples/host/plan_with_pinocchio.py`，在 Docker 容器中运行）可以把笛卡尔运动转成关节轨迹交给板子回放，每个路点都带 Pinocchio 重力前馈。仍然没有 Studio 校准界面。详见 [Pi Zero W 演示开发与验证](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/demo-validation-pi-zero.md)
+4. 继续使用这块 32 位板，改用 Rust edge 回放器（`examples/edge-rust/`，直接走 SocketCAN，板上不需要 Python 或 numpy）——已在 Pi Zero W 上验证可用。板上只做关节空间，但配合离线规划器（`examples/host/plan_with_pinocchio.py`，在 Docker 容器中运行）可以把笛卡尔运动转成关节轨迹交给二进制回放，每个路点都带 Pinocchio 重力前馈。仍然没有 Studio 校准界面。详见 [Pi Zero W 演示开发与验证](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/demo-validation-pi-zero.md)
 
 > CAN HAT 本身仍然在第一步配置，32 位板同样可以配置；只有 Python／ABI 这一侧需要受支持的架构。
 

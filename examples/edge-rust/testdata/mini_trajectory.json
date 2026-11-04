@@ -1,0 +1,24 @@
+{
+  "format": "rebot-joint-trajectory",
+  "version": 1,
+  "created": "2026-01-01T00:00:00",
+  "control_hz": 30,
+  "ids": [1, 2],
+  "limits": [[-2.8, 2.8], [-2.8, 2.8]],
+  "steps": "fixture: two joints, four waypoints",
+  "duration_s": 0.3,
+  "hold_start_s": 0.1,
+  "hold_end_s": 0.2,
+  "start_tcp": [0.2, 0.0, 0.1],
+  "end_tcp": [0.2, 0.0, 0.2],
+  "delta_xyz": [0.0, 0.0, 0.1],
+  "peak_joint_speed": 0.5,
+  "worst_ik_residual_m": 0.0001,
+  "sag_compensation": {"kp": {"1": 50.0, "2": 150.0}},
+  "waypoints": [
+    {"t": 0.0, "q": [0.0, 0.1], "tau": [0.0, 0.5]},
+    {"t": 0.1, "q": [0.05, 0.15], "tau": [0.1, 0.4]},
+    {"t": 0.2, "q": [0.1, 0.2], "tau": [0.2, 0.3]},
+    {"t": 0.3, "q": [0.15, 0.25], "tau": [0.3, 0.2]}
+  ]
+}

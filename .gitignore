@@ -2,6 +2,11 @@
 __pycache__/
 *.py[cod]
 
+# Rust build output (examples/edge-rust)
+examples/edge-rust/target/
+examples/edge-rust/dist/
+examples/edge-rust/.bench/
+
 # Local tooling / venvs (machine-specific, not part of the guide)
 .rebot-venv/
 .venv/
