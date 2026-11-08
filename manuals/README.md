@@ -19,7 +19,7 @@ within its operating limits.
 | Mount | Counter base, end of run | Counter base, dead corner | Ceiling / soffit, inverted |
 | Covers | Sink, drainboard, prep tail | Sink leg + near hob burners | Central prep disc only |
 | Cooktop | Opposite run, 1.45 m away | Adjacent leg, cold-clean only | Back wall, 2.2 m away |
-| Optional hood cam | Hob + aisle approach | Hob + corner + sink edge | Hob only |
+| Optional cameras | Hood: hob + aisle. Cabinet: arm/sink | Hood: hob + corner. Cabinet: arm/corner | Hood: hob. Soffit: arm disc |
 | Best for | Wet cleanup after cooking | Widest task mix, dead-space reuse | Zero worktop footprint, downward cleaning |
 | Main limit | Only the wet end | Heat interlock is mandatory | Payload derated when inverted |
 | Manual | [Layout A](layout-a-sink-station.md) | [Layout B](layout-b-corner-bay.md) | [Layout C](layout-c-overhead-island.md) |
@@ -74,26 +74,34 @@ reaches roughly **600 mm above the counter**.
 - It cannot open the oven, climb, clean the floor, clean inside the sink basin,
   handle knives, or sterilise a biohazard by itself.
 
-## Optional hood camera
+## Optional cameras
 
-Each layout can take a **12 MP, 120° camera module clamped to the front edge of the
-cooker hood**, lens at 1500 AFF (600 mm above the worktop). It looks straight down
-and gives a **1.66 × 1.25 m view** of the cooking zone at ≈2.4 px/mm. It is a
-context/safety view, not a metrology camera; the arm's wrist camera remains primary
-for contact tasks.
+Each layout can take one **12 MP, 120° camera module** in either of two places.
+Use one, or both only if the host has two camera ports.
+
+| Option | Mount | Lens height | View | Best for |
+|---|---|---|---|---|
+| **Hood edge** | front edge of the cooker hood | 1500 AFF | 1.66 × 1.25 m, straight down | Hob / cooking zone |
+| **Under-cabinet** | bottom edge of the upper cabinets (soffit in C) | 1350 AFF (1450 in C) | ≈1.2 × 0.9 m, oblique (straight down in C) | Arm motion |
 
 ![Hood-edge camera detail](assets/hood-camera-detail.png)
 
 | | A | B | C |
 |---|---|---|---|
-| Camera position | (1200, 1865) | (640, 1000) | (650, 640) |
-| Sees | Hob + aisle | Hob + corner + sink edge | Hob + cooking wall |
-| Misses | Sink / prep board | Far corners / upper cabinets | Island prep disc |
+| Hood camera | (1200, 1865) | (640, 1000) | (650, 640) |
+| Under-cabinet camera | (700, 350) | (1300, 350) | (2250, 2200) soffit |
+| Cabinet camera sees | Sink, base, prep tail | Corner, base, sink edge | Arm and island disc |
 
-The module is optional. It uses a 10–40 mm edge clamp and a 1/4"-20 ball head,
-routes USB-C along the hood, and processes locally with an active LED; no cloud by
-default. It is not a safety-rated stop — the heat interlock and the arm's limits
-remain the safety functions.
+The hood camera is the cooking-zone view. The under-cabinet camera is the arm-motion
+view: lower, oblique, and clear of heat and steam, but it picks up cabinet-door
+vibration. In Layout C there are no wall upper cabinets near the island, so the
+alternative uses the **bottom edge of the overhead cabinet/soffit** instead. Both
+are context/safety views, not metrology cameras or safety-rated stops; the wrist
+and ceiling cameras remain primary for contact tasks.
+
+The module uses a 10–40 mm edge clamp and a 1/4"-20 ball head, routes USB-C along
+the hood or through the cabinet, and processes locally with an active LED; no cloud
+by default.
 
 ## The tool set
 
@@ -135,11 +143,11 @@ These apply in every layout:
 Each layout sheet has a **plan** at a stated scale with a 1 m scale bar, a
 **schematic section**, and deployment notes. The plan shows the base, the 600 mm
 working radius, the 755 mm maximum, the 40° dead wedge, the tool dock, and the
-heat keep-out. It also shows the optional hood camera as a small module icon at
-the hood edge, with a dashed rectangle for its useful view. The mess cards are
-close-ups: the arm enters from the side that matches the layout, the tool is the
-one named in the footer, and the annotations give the size window and the
-limiting condition.
+heat keep-out. It also shows the optional cameras: a teal module at the hood edge
+and a purple module at the bottom edge of the upper cabinets (or the island soffit
+in C), each with a dashed view rectangle. The mess cards are close-ups: the arm
+enters from the side that matches the layout, the tool is the one named in the
+footer, and the annotations give the size window and the limiting condition.
 
 ## Files
 
@@ -165,4 +173,5 @@ limiting condition.
   [`en/references/demo-validation-pi-zero.md`](../en/references/demo-validation-pi-zero.md).
 - Working-envelope sampling: `manuals/_build/workspace_probe.py` and
   `manuals/_build/reach_bands.py` in this repository.
+
 

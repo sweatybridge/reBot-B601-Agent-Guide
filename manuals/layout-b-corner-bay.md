@@ -135,6 +135,24 @@ device; the heat interlock, not the camera, is the stop function.
 The camera is optional. Keep the lens out of the direct burner plume and wipe
 the grease film weekly; a greasy lens is the main failure mode above a hob.
 
+### 4.5 Alternative: under-cabinet camera
+
+The same module can sit on the **bottom edge of the leg-1 upper cabinet at
+(1300, 350)**, lens **1350 AFF**, pitched **30° down**, with a view rectangle of
+200–1000 × 200–700. That covers the corner, the base, and the sink edge: the arm
+motion, seen from the side rather than from above the hob. It is 870 mm from the
+base and outside the 600 mm disc. Trade-offs: lower and oblique, cabinet-door
+vibration, no view of the far burners. Choose it when arm supervision matters more
+than hob monitoring; otherwise keep the hood camera.
+
+| Item | Value |
+|---|---|
+| Mount | bottom edge of the upper cabinet; 10–40 mm clamp + 30° wedge |
+| Lens height | 1350 AFF (450 mm above worktop) |
+| View at worktop | ≈1.2 × 0.9 m, centred on the corner/base |
+| Cable | USB-C through the cabinet; drip loop; strain relief |
+| Trade-off | oblique/lower view, door vibration; no heat or steam |
+
 ## 5. Coverage map
 
 | Zone | Distance from base | Task | Tool |
@@ -307,8 +325,9 @@ surface that will be wiped afterwards.
 - **Biohazard.** Raw egg is a one-way task. Disposable pad, tool cover, bag,
   disinfectant, human verification. No reusable cloth.
 - **Knife.** The knife is never picked, even when it is within reach.
-- **Camera.** Local processing only; LED when active. The hood camera can confirm
-  burner state, but it is not a safety-rated interlock; the gas/heat interlock is.
+- **Camera.** Local processing only; LED when active. The hood and cabinet cameras
+  can confirm burner state or arm motion, but neither is a safety-rated interlock;
+  the gas/heat interlock is.
 
 ## 9. Out of scope here
 
@@ -333,7 +352,7 @@ surface that will be wiped afterwards.
 8. Mount the camera at 1.9 m, 30° down, looking into the corner; calibrate.
 9. Run a cold dry cycle; then a 3 N wipe on a scrap tile; log the force peak.
 10. Verify the upper runs start 870 mm from the base on both legs.
-11. *(Optional)* Fit the hood camera at (640, 1000); set the lens vertical; calibrate to the base.
+11. *(Optional)* Choose one camera: hood at (640, 1000), or under-cabinet at (1300, 350); set the lens, calibrate.
 
 ## 11. Bill of materials
 
@@ -351,6 +370,7 @@ surface that will be wiped afterwards.
 | RGB-D camera | 1 | Corner view, 1.9 m |
 | Optional hood camera (12 MP, 120°, USB 3.0, IP65) | 1 | Cooker-hood edge, 1500 AFF |
 | Hood-edge clamp + 1/4"-20 ball head | 1 | 10–40 mm flange; lens axis vertical |
+| Alternative under-cabinet bracket + 30° wedge | 1 | If the cabinet camera is chosen |
 | USB-C cable, 5 V 2 A supply, strain relief | 1 | Along hood; drip loop |
 | GFCI + drip loop + sealed entry | 1 | Low-point protection |
 | Disposable pads, tool covers, disinfectant | — | Biohazard kit |
@@ -361,7 +381,7 @@ surface that will be wiped afterwards.
 |---|---|
 | Each cycle | Empty the chute; dispose of one-way tools; wipe the sink deck |
 | Daily | Check the hob interlock with a warm cup; inspect the corner bolts |
-| Weekly | Clean the fixed and hood camera lenses; check the hood clamp; check the chute gasket; verify the exclusion tape |
+| Weekly | Clean the fixed, hood, and cabinet camera lenses; check both clamps; check the chute gasket; verify the exclusion tape |
 | Monthly | Re-check the 3 N force cap on glass; test the gas isolation |
 | After raw egg | Dispose of pad and cover; disinfect; log the human verification |
 | Every 6 months | Re-torque the base; inspect the corner plate for corrosion |

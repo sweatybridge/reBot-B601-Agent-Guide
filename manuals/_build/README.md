@@ -67,8 +67,10 @@ Run them if the chain or the joint limits change:
   side that matches the layout (right for A, left for B, above for C).
 - Text in the cards is intentionally sparse; the manual carries the full method,
   the size window, and the stop condition.
-- The optional hood camera is the small module icon at the hood edge; the dashed
-  rectangle is its useful view on the worktop, not the full optical footprint.
+- The optional hood camera is the teal module at the hood edge; the optional
+  under-cabinet camera is the purple module at the cabinet/soffit bottom edge.
+  The dashed rectangles are their useful views on the worktop, not full optical
+  footprints.
 
 ## Editing dimensions
 
@@ -79,4 +81,5 @@ If a base position or appliance size changes, update it in **both** places:
 
 The dimension annotations on the sheet are the source of truth for the plan; the
 manual repeats the same numbers for the reader.
+
 

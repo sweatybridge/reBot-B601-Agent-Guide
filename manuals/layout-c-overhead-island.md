@@ -128,6 +128,23 @@ ceiling camera above the arm remains the primary view for cleaning.
 Optional. If the ceiling camera already covers the island, this module adds
 cooking-zone context only; it does not improve the arm's reach or accuracy.
 
+### 4.5 Alternative: soffit-edge camera
+
+Layout C has no wall upper cabinets near the island, so the alternative is the
+**bottom edge of the overhead cabinet/soffit** at **(2250, 2200)**, lens **1450
+AFF**, looking straight down with a view rectangle of 1700–2500 × 1800–2600. This
+is the best **arm-motion** view in Layout C: it sees the links, the tool, and the
+island disc from above. It does not see the back-wall hob, and it must not reduce
+the 550 mm clearance or hang into the arm's disc.
+
+| Item | Value |
+|---|---|
+| Mount | bottom edge of the soffit/overhead cabinet; 10–40 mm clamp |
+| Lens height | 1450 AFF (550 mm above worktop) |
+| View at worktop | ≈1.5 × 1.1 m, centred on the arm disc |
+| Cable | USB-C through the soffit; drip loop; strain relief |
+| Trade-off | sees arm, not hob; tool can pass close to the lens |
+
 ## 5. Coverage map
 
 | Zone | Distance from mount | Task | Tool |
@@ -300,7 +317,8 @@ and honey never contaminates the dry brush.
 - **Mount structure.** The 300 × 300 plate is rated for 4× the arm mass. Inspect
   the lag bolts monthly; vibration loosens them.
 - **Camera.** Local processing only; LED when active. The hood camera looks at the
-  back-wall hob, not the island; the ceiling camera above the arm is primary.
+  back-wall hob; the soffit camera looks at the arm; the ceiling camera above the
+  arm remains primary. None is a safety-rated stop.
 
 ## 9. Out of scope here
 
@@ -323,7 +341,7 @@ and honey never contaminates the dry brush.
 8. Mount the camera above the arm, offset 300 mm; calibrate hand–eye.
 9. Load-test the mount with 4× the arm mass; check for deflection.
 10. Run a 1.0 kg payload test at full down reach; verify the torque margin.
-11. *(Optional)* Fit the hood camera at (650, 640); set the lens vertical; calibrate to the base.
+11. *(Optional)* Choose one camera: hood at (650, 640), or soffit-edge at (2250, 2200); set the lens, calibrate.
 
 ## 11. Bill of materials
 
@@ -339,6 +357,7 @@ and honey never contaminates the dry brush.
 | RGB-D camera | 1 | Above the arm, 300 mm offset |
 | Optional hood camera (12 MP, 120°, USB 3.0, IP65) | 1 | Back-wall hood edge, 1500 AFF |
 | Hood-edge clamp + 1/4"-20 ball head | 1 | 10–40 mm flange; lens axis vertical |
+| Alternative soffit-edge bracket + 30° wedge | 1 | If the soffit camera is chosen |
 | USB-C cable, 5 V 2 A supply, strain relief | 1 | Along hood; drip loop |
 | Drop detection / tool tether kit | 1 | Mandatory |
 | GFCI + drip loop | 1 | Island cabinet |
@@ -350,7 +369,7 @@ and honey never contaminates the dry brush.
 |---|---|
 | Each cycle | Wipe the wrist; check the tool tethers; empty the chute |
 | Daily | Inspect the mount bolts for movement; check the cable at the soffit |
-| Weekly | Clean the ceiling and hood camera lenses; check the hood clamp; check the vacuum hose; verify the park pose |
+| Weekly | Clean the ceiling, hood, and soffit camera lenses; check both clamps; check the vacuum hose; verify the park pose |
 | Monthly | Re-torque the mount; re-run the 1.0 kg payload test; check the brakes |
 | After wine or honey | Discard the cloth; clean the tool handle; log |
 | Every 6 months | Inspect the ceiling plate and joists; re-calibrate gravity feedforward |

@@ -351,6 +351,43 @@ class Plan:
                         size=11, color=self.acc["deep"], family="mono",
                         anchor=("la" if a[0] >= px else "ra"))
 
+    def cabinet_camera(self, cx, cy, view, label_at=None,
+                       clip=(0, 0, 3000, 2400), label="ALT CABINET CAM",
+                       color="#6B4E8C"):
+        """Alternative observer on the bottom edge of the upper cabinets."""
+        def inside(q):
+            return clip[0] <= q[0] <= clip[2] and clip[1] <= q[1] <= clip[3]
+
+        x0, y0, x1, y1 = view
+        rect = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        clipped = clip_poly(rect, clip)
+        if clipped:
+            self.c.poly([self.p(*q) for q in clipped],
+                        fill=mix(FLOOR, color, 0.10))
+        for a, b in zip(rect, rect[1:] + rect[:1]):
+            seg = clip_segment(a, b, clip)
+            if seg:
+                self.c.dashed([self.p(*seg[0]), self.p(*seg[1])], dash=4, gap=5,
+                              fill=color, width=0.9)
+        cxm, cym = (x0 + x1) / 2, (y0 + y1) / 2
+        if inside((cxm, cym)):
+            seg = clip_segment((cx, cy), (cxm, cym), clip)
+            if seg:
+                self.c.dashed([self.p(*seg[0]), self.p(*seg[1])], dash=3, gap=5,
+                              fill=color, width=0.7)
+        px, py = self.p(cx, cy)
+        self.c.rect([px - 14, py - 9, px + 14, py + 9], fill=color, outline=INK,
+                    width=0.7, radius=2)
+        self.c.ellipse([px - 4, py - 4, px + 4, py + 4], fill="#E4DCEF", outline=INK)
+        # 30-degree downward tick, to distinguish it from the hood camera
+        self.c.line([(px, py + 9), (px, py + 16)], fill=color, width=1.5)
+        if label_at:
+            a = self.p(*label_at)
+            self.c.line([(px + 14, py - 7), (a[0], a[1])], fill="#8C8A80", width=0.8)
+            self.c.text(a[0] + (6 if a[0] >= px else -6), a[1] - 6, label,
+                        size=10, color=color, family="mono",
+                        anchor=("la" if a[0] >= px else "ra"))
+
     def scalebar(self, x, y, length=1000, label="1 m"):
         p0 = self.p(x, y)
         p1 = self.p(x + length, y)
@@ -482,6 +519,7 @@ def legend(c, x, y, accent):
         ("keep", "heat keep-out"),
         ("dock", "tool dock"),
         ("cam", "hood camera"),
+        ("ccam", "cabinet cam"),
         ("hood", "hood outline"),
     ]
     for i, (kind, label) in enumerate(items):
@@ -503,6 +541,10 @@ def legend(c, x, y, accent):
             c.rect([xx + 2, yy + 5, xx + 14, yy + 15], fill=acc["deep"], outline=INK,
                    width=0.8, radius=2)
             c.ellipse([xx + 6, yy + 8, xx + 10, yy + 12], fill="#DCE8E5", outline=INK)
+        elif kind == "ccam":
+            c.rect([xx + 2, yy + 5, xx + 14, yy + 15], fill="#6B4E8C", outline=INK,
+                   width=0.8, radius=2)
+            c.ellipse([xx + 6, yy + 8, xx + 10, yy + 12], fill="#E4DCEF", outline=INK)
         elif kind == "hood":
             c.rect([xx, yy + 3, xx + 16, yy + 17], outline="#8E8576", width=1)
         c.text(xx + 24, yy + 5, label, size=10, color=INK_SOFT, family="mono")
@@ -528,4 +570,5 @@ def footer(c, text, accent):
     c.text(70, 1456, text, 11, MUTED, family="mono")
     c.text(W - 70, 1456, "Seeed reBot B601-RS  ·  6+1 DOF  ·  754.7 mm reach  ·  2.5 kg rated payload",
            11, MUTED, family="mono", anchor="ra")
+
 

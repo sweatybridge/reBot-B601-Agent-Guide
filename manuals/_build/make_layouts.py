@@ -53,6 +53,8 @@ def layout_a():
                   clip=(0, 0, 3000, 2400))
     p.line([(1200, 1865), (1200, 2400)], fill="#8C8A80", width=0.9, dash=True)
     p.hood(900, 1900, 600, 500, label="HOOD")
+    p.cabinet_camera(700, 350, view=(800, 150, 1700, 600), label_at=(520, 800),
+                     clip=(0, 0, 3000, 2400))
 
     p.cabinet(0, 0, 700, 350)
     p.cabinet(2200, 0, 200, 350)
@@ -181,6 +183,8 @@ def layout_b():
                   clip=(0, 0, 3200, 2600))
     p.line([(640, 1000), (0, 1000)], fill="#8C8A80", width=0.9, dash=True)
     p.hood(0, 850, 600, 500, label="HOOD")
+    p.cabinet_camera(1300, 350, view=(200, 200, 1000, 700), label_at=(1600, 1150),
+                     clip=(0, 0, 3200, 2600))
     p.circle(560, 120, 55, fill="#EDE8DC", outline="#8E8576", width=1)
     c.text(p.p(560, 120)[0], p.p(560, 120)[1], "SPICE", size=8, color=INK_SOFT,
            family="mono", anchor="mm")
@@ -289,6 +293,8 @@ def layout_c():
                   clip=(0, 0, 4200, 3600))
     p.line([(650, 640), (650, 0)], fill="#8C8A80", width=0.9, dash=True)
     p.hood(400, 0, 500, 600, label="HOOD")
+    p.cabinet_camera(2250, 2200, view=(1700, 1800, 2500, 2600), label_at=(2600, 1500),
+                     clip=(1000, 1700, 3200, 2700), label="ALT SOFFIT CAM")
     p.sink(1400, 1850, 350, 300)
     p.board(2200, 1900, 400, 300)
     p.circle(2600, 2450, 90, fill="#3C4645", outline="#8E9997", width=1)
@@ -359,6 +365,8 @@ if __name__ == "__main__":
     layout_a()
     layout_b()
     layout_c()
+
+
 
 
 

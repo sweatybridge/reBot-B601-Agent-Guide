@@ -144,6 +144,27 @@ The camera is optional; omit it and the arm still runs from the fixed camera.
 Mount it at least 600 mm above the worktop and 100 mm from the hood corner, and
 keep the lens out of the direct burner plume.
 
+### 4.5 Alternative: under-cabinet camera
+
+The same module can sit on the **bottom edge of the upper cabinet at (700, 350)**,
+lens **1350 AFF** (450 mm above the worktop), pitched **30° down**. It looks across
+the sink and prep tail — the dashed purple rectangle in the plan is 800–1700 ×
+150–600 — so it sees the **arm motion** that the hood camera cannot. Trade-offs:
+it is lower and oblique, it picks up cabinet-door vibration, and it has no view of
+the hob. Choose it for arm supervision; choose the hood camera for hob monitoring.
+Do not fit both unless the host has two camera ports and you need both views.
+
+| Item | Value |
+|---|---|
+| Mount | bottom edge of the upper cabinet; 10–40 mm clamp + 30° wedge |
+| Lens height | 1350 AFF (450 mm above worktop) |
+| View at worktop | ≈1.2 × 0.9 m, centred on the sink/base |
+| Cable | USB-C through the cabinet; drip loop; strain relief |
+| Trade-off | oblique/lower view, door vibration; no heat or steam |
+
+Keep the camera outside the arm's 600 mm disc; at (700, 350) it is 850 mm from the
+base and cannot be struck by the arm.
+
 ## 5. Coverage map
 
 | Zone | Distance from base | Task | Tool |
@@ -322,8 +343,9 @@ clean drainboard.
   after every cycle; the board is wiped, not just brushed.
 - **Knife block:** 738 mm away, inside the 755 mm maximum but outside the 600 mm
   working envelope. Still treated as a no-go zone; the arm never reaches across it.
-- **Camera:** local processing only; LED when active. The hood camera is a context
-  view, not a safety-rated stop; the hob interlock and the arm's limits do that.
+- **Camera:** local processing only; LED when active. The hood and cabinet cameras
+  are context views, not safety-rated stops; the hob interlock and the arm's limits
+  do that.
 
 ## 9. Out of scope here
 
@@ -348,7 +370,7 @@ clean drainboard.
 8. Verify 850 mm from the base to the end of the upper run; 1500 mm clear to the ceiling (≥700 required).
 9. Mark the 600 mm arc on the counter with removable tape for commissioning.
 10. Run a dry cycle, then a force-capped wipe on a scrap board; log the force peak.
-11. *(Optional)* Fit the hood camera at (1200, 1865); set the lens vertical; calibrate to the base.
+11. *(Optional)* Choose one camera: hood at (1200, 1865), or under-cabinet at (700, 350); set the lens, calibrate.
 
 ## 11. Bill of materials
 
@@ -364,6 +386,7 @@ clean drainboard.
 | RGB-D camera | 1 | 1.9 m, 30° down |
 | Optional hood camera (12 MP, 120°, USB 3.0, IP65) | 1 | Cooker-hood edge, 1500 AFF |
 | Hood-edge clamp + 1/4"-20 ball head | 1 | 10–40 mm flange; lens axis vertical |
+| Alternative under-cabinet bracket + 30° wedge | 1 | If the cabinet camera is chosen |
 | USB-C cable, 5 V 2 A supply, strain relief | 1 | Along hood; drip loop |
 | Hob current sensor / smart isolator | 1 | Interlock |
 | IR surface thermometer | 1 | <40 °C check |
@@ -376,7 +399,7 @@ clean drainboard.
 |---|---|
 | Each cycle | Empty the bin; rinse the sponge; wipe the tool handles |
 | Daily | Wipe the arm with a damp cloth; inspect the base bolts; check the cable |
-| Weekly | Check gripper pads; verify the tool dock alignment; clean the fixed and hood camera lenses; check the hood clamp |
+| Weekly | Check gripper pads; verify the tool dock alignment; clean the fixed, hood, and cabinet camera lenses; check both clamps |
 | Monthly | Re-check the 600 mm reach with a test target; verify torque limits |
 | After raw egg | Dispose of the pad; disinfect the tool and the sink deck; log |
 | Every 6 months | Re-torque the base; inspect the backer for corrosion |
