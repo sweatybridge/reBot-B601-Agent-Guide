@@ -1,0 +1,27 @@
+# systemd unit for the edge HTTP server.
+#
+#   sudo install -m 644 examples/edge-rust/rebot-edge.service /etc/systemd/system/
+#   sudo install -m 755 dist/rebot-edge /usr/local/bin/rebot-edge
+#   sudo sh -c 'head -c 32 /dev/urandom | base64 > /etc/rebot-edge.token && chmod 600 /etc/rebot-edge.token'
+#   sudo systemctl daemon-reload && sudo systemctl enable --now rebot-edge
+#
+# --allow-execute is what lets POST /play move the arm; drop it to keep the
+# board read-only over HTTP (POST /play?dry=1 still validates trajectories).
+# The token is read from a file so it does not show up in `ps`.
+[Unit]
+Description=B601 edge player over HTTP
+Documentation=https://github.com/sweatybridge/reBot-B601-Agent-Guide
+After=network-online.target can0-setup.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rebot-edge serve --listen 0.0.0.0:8081 --token-file /etc/rebot-edge.token --allow-execute
+Restart=on-failure
+RestartSec=2
+# SocketCAN needs CAP_NET_RAW and CAP_NET_ADMIN; root is the simple answer on a
+# bench board. If you drop to a user, add AmbientCapabilities=CAP_NET_RAW.
+User=root
+
+[Install]
+WantedBy=multi-user.target

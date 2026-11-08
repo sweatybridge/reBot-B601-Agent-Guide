@@ -26,10 +26,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Command as Process, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1598,11 +1600,58 @@ struct DumpArgs {
     ids_spec: String,
 }
 
+/// `rebot-edge serve`: the same binary, reachable over HTTP instead of argv.
+///
+/// The server does not reimplement the player. `POST /play` writes the body to a
+/// temp file and re-executes this binary with the configured flags, so a
+/// trajectory over HTTP and the same file on the command line go through one
+/// code path, one validation, and one signal handler. `/stop` is a SIGTERM to
+/// that child, which is exactly what Ctrl-C does: ramp home, then drop torque.
+#[derive(Debug, Clone)]
+struct ServeArgs {
+    listen: String,
+    token: String,
+    token_file: String,
+    allow_execute: bool,
+    allow_no_token: bool,
+    channel: String,
+    ids_spec: String,
+    model: String,
+    model_spec: String,
+    kp_spec: String,
+    kd_spec: String,
+    ramp: f64,
+    stay_enabled: bool,
+    track: bool,
+}
+
+impl Default for ServeArgs {
+    fn default() -> Self {
+        Self {
+            listen: "0.0.0.0:8081".into(),
+            token: String::new(),
+            token_file: String::new(),
+            allow_execute: false,
+            allow_no_token: false,
+            channel: "can0".into(),
+            ids_spec: "1,2,3,4,5,6,7".into(),
+            model: "rs-00".into(),
+            model_spec: DEFAULT_MODEL_SPEC.into(),
+            kp_spec: "50,2:150,3:150".into(),
+            kd_spec: "3,2:10,3:10,4:5,5:4,6:4,7:4".into(),
+            ramp: 2.0,
+            stay_enabled: false,
+            track: false,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Command {
     Help,
     Version,
     Dump(Box<DumpArgs>),
+    Serve(Box<ServeArgs>),
     Run(Box<Args>),
 }
 
@@ -1612,11 +1661,17 @@ rebot-edge - replay a planned joint-space trajectory on a B601-RS over SocketCAN
 USAGE:
     rebot-edge [OPTIONS] <TRAJECTORY.json>
     rebot-edge dump [--channel IFACE] [--ids 1,2,...]
+    rebot-edge serve [OPTIONS]
 
 The input is the JSON written by host/plan_with_pinocchio.py (format
 'rebot-joint-trajectory'). Dry run is the default; nothing moves without
 --execute. `dump` is the read-only pose snapshot (parameter 0x7019) that the
 planner takes as its `--joints` input; it enables nothing.
+
+`serve` replaces the ssh path: it exposes GET /health, GET /pose,
+POST /play?dry=1, POST /play (trajectory JSON in the body) and POST /stop over
+plain HTTP. Execution stays off until the server is started with
+--allow-execute, and a token is required on anything but 0.0.0.0.
 
 OPTIONS:
     --channel <IFACE>        SocketCAN interface (default: can0)
@@ -1649,11 +1704,25 @@ EXAMPLES:
     rebot-edge trajectories/seq_pino_peel.json
     sudo ./rebot-edge trajectories/seq_pino_peel.json --execute --track
     ./rebot-edge dump --ids 1,2,3,4,5,6,7 > current.json
+    sudo ./rebot-edge serve --listen 0.0.0.0:8081 --token secret --allow-execute
+
+SERVE OPTIONS:
+    --listen <ADDR>          Address to bind (default: 0.0.0.0:8081)
+    --token <SECRET>         Shared secret for every request except GET /health
+    --token-file <FILE>      Read the secret from a file instead (keeps it out of ps)
+    --allow-execute          Let POST /play move the arm (default: dry runs only)
+    --allow-no-token         Permit a non-loopback listen without a token
+    --ids <SPEC>             Joints for GET /pose (default: 1,2,3,4,5,6,7)
+    --channel/--model/--model-spec/--kp/--kd/--ramp/--stay-enabled/--track
+                             Defaults for the player that /play re-executes
 ";
 
 fn parse_args(argv: Vec<String>) -> Result<Command> {
     if argv.first().map(String::as_str) == Some("dump") {
         return parse_dump_args(argv.into_iter().skip(1).collect());
+    }
+    if argv.first().map(String::as_str) == Some("serve") {
+        return parse_serve_args(argv.into_iter().skip(1).collect());
     }
 
     let mut args = Args::default();
@@ -1761,6 +1830,46 @@ fn parse_dump_args(argv: Vec<String>) -> Result<Command> {
     }
 
     Ok(Command::Dump(Box::new(DumpArgs { channel, ids_spec })))
+}
+
+fn parse_serve_args(argv: Vec<String>) -> Result<Command> {
+    let mut serve = ServeArgs::default();
+    let mut iter = argv.into_iter().peekable();
+
+    while let Some(raw) = iter.next() {
+        let (flag, inline) = if raw.starts_with("--") {
+            match raw.split_once('=') {
+                Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
+                None => (raw.clone(), None),
+            }
+        } else {
+            (raw.clone(), None)
+        };
+
+        match flag.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
+            "--listen" => serve.listen = take_value(&mut iter, inline, "--listen")?,
+            "--token" => serve.token = take_value(&mut iter, inline, "--token")?,
+            "--token-file" => serve.token_file = take_value(&mut iter, inline, "--token-file")?,
+            "--allow-execute" => serve.allow_execute = true,
+            "--allow-no-token" => serve.allow_no_token = true,
+            "--channel" => serve.channel = take_value(&mut iter, inline, "--channel")?,
+            "--ids" => serve.ids_spec = take_value(&mut iter, inline, "--ids")?,
+            "--model" => serve.model = take_value(&mut iter, inline, "--model")?,
+            "--model-spec" => serve.model_spec = take_value(&mut iter, inline, "--model-spec")?,
+            "--kp" => serve.kp_spec = take_value(&mut iter, inline, "--kp")?,
+            "--kd" => serve.kd_spec = take_value(&mut iter, inline, "--kd")?,
+            "--ramp" => {
+                serve.ramp = parse_number(&take_value(&mut iter, inline, "--ramp")?, "--ramp")?
+            }
+            "--stay-enabled" => serve.stay_enabled = true,
+            "--track" => serve.track = true,
+            _ => bail!("unknown serve option '{flag}' (try --help)"),
+        }
+    }
+
+    Ok(Command::Serve(Box::new(serve)))
 }
 
 fn take_value(
@@ -2355,7 +2464,7 @@ fn parse_ids(spec: &str) -> Result<Vec<u8>> {
 
 /// Read-only pose snapshot: parameter 0x7019 from every requested motor. No
 /// enable, no torque, no frames other than the parameter reads.
-fn dump_joints(channel: &str, ids_spec: &str) -> Result<i32> {
+fn pose_payload(channel: &str, ids_spec: &str) -> Result<serde_json::Value> {
     let ids = parse_ids(ids_spec)?;
     if !can_is_up(channel) {
         bail!(
@@ -2370,15 +2479,549 @@ fn dump_joints(channel: &str, ids_spec: &str) -> Result<i32> {
         q.push(round6(bus.read_position(*id, Duration::from_millis(500))?));
     }
 
-    let payload = serde_json::json!({
+    Ok(serde_json::json!({
         "ids": ids,
         "q": q,
         "timestamp": utc_timestamp(),
         "channel": channel,
         "note": "read-only snapshot, parameter 0x7019 (mechanical position, rad)",
-    });
-    println!("{}", serde_json::to_string_pretty(&payload)?);
+    }))
+}
+
+fn dump_joints(channel: &str, ids_spec: &str) -> Result<i32> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&pose_payload(channel, ids_spec)?)?
+    );
     Ok(0)
+}
+
+// --------------------------------------------------------------------------- //
+// HTTP server
+// --------------------------------------------------------------------------- //
+
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 32 * 1024;
+/// The board has half a gigabyte; a handler thread costs a stack, so cap them.
+const MAX_CONNECTIONS: usize = 32;
+static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct ConnectionGuard;
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        LIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+struct Request {
+    method: String,
+    path: String,
+    query: BTreeMap<String, String>,
+    token: Option<String>,
+    body: Vec<u8>,
+}
+
+struct ServerState {
+    args: ServeArgs,
+    started: Instant,
+    playing: AtomicBool,
+    stopping: AtomicBool,
+    child: AtomicI32,
+}
+
+fn is_loopback(listen: &str) -> bool {
+    let host = listen.rsplit_once(':').map(|(host, _)| host).unwrap_or(listen);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+fn serve(mut args: ServeArgs) -> Result<i32> {
+    if args.token.is_empty() && !args.token_file.is_empty() {
+        // Kept out of argv: /proc/<pid>/cmdline is world-readable on the board.
+        args.token = fs::read_to_string(&args.token_file)
+            .map_err(|error| Error::new(format!("cannot read {}: {error}", args.token_file)))?
+            .trim()
+            .to_string();
+    }
+    if args.token.is_empty() && !is_loopback(&args.listen) && !args.allow_no_token {
+        bail!(
+            "refusing to listen on {} without a token: pass --token <secret>, \
+             bind 127.0.0.1, or --allow-no-token if the network is trusted",
+            args.listen
+        );
+    }
+
+    let listener = TcpListener::bind(&args.listen).map_err(|error| {
+        Error::new(format!(
+            "cannot bind {}: {error}\n(is another rebot-edge serve running?)",
+            args.listen
+        ))
+    })?;
+
+    println!("rebot-edge {} http", env!("CARGO_PKG_VERSION"));
+    println!("  listen      : http://{}", args.listen);
+    println!("  channel     : {}", args.channel);
+    println!(
+        "  execute     : {}",
+        if args.allow_execute {
+            "on (POST /play moves the arm)"
+        } else {
+            "off (dry run only; start with --allow-execute)"
+        }
+    );
+    println!(
+        "  auth        : {}",
+        if args.token.is_empty() {
+            "none".to_string()
+        } else {
+            "X-Rebot-Token".to_string()
+        }
+    );
+    println!("  GET  /health   GET /pose   POST /play?dry=1   POST /play   POST /stop");
+
+    let state = Arc::new(ServerState {
+        args,
+        started: Instant::now(),
+        playing: AtomicBool::new(false),
+        stopping: AtomicBool::new(false),
+        child: AtomicI32::new(0),
+    });
+
+    for connection in listener.incoming() {
+        match connection {
+            Ok(stream) => {
+                if LIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    LIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+                    eprintln!("http: connection limit reached, dropping a request");
+                    continue;
+                }
+                let state = Arc::clone(&state);
+                thread::spawn(move || {
+                    let _guard = ConnectionGuard;
+                    let mut stream = stream;
+                    if let Err(error) = handle_connection(&mut stream, &state) {
+                        eprintln!("http: {error}");
+                    }
+                });
+            }
+            Err(error) => eprintln!("http: accept failed: {error}"),
+        }
+    }
+    Ok(0)
+}
+
+fn handle_connection(stream: &mut TcpStream, state: &ServerState) -> Result<()> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
+    let mut reader = BufReader::new(stream.try_clone()?);
+
+    let request = match read_request(&mut reader, MAX_BODY_BYTES) {
+        Ok(request) => request,
+        Err(error) => {
+            let status = if error.0.starts_with("body too large") {
+                413
+            } else {
+                400
+            };
+            return write_json(stream, status, &serde_json::json!({
+                "ok": false,
+                "error": error.0,
+            }));
+        }
+    };
+
+    let (status, payload) = route(state, &request);
+    write_json(stream, status, &payload)
+}
+
+fn write_json(stream: &mut TcpStream, status: u16, payload: &serde_json::Value) -> Result<()> {
+    let body = serde_json::to_string(payload)?;
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         Cache-Control: no-store\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_request<R: BufRead>(reader: &mut R, limit: usize) -> Result<Request> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        bail!("empty request");
+    }
+    let mut parts = line.trim_end().split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or_default().to_string();
+    if method.is_empty() || target.is_empty() {
+        bail!("malformed request line");
+    }
+
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), parse_query(query)),
+        None => (target, BTreeMap::new()),
+    };
+
+    let mut content_length = 0usize;
+    let mut token: Option<String> = None;
+    let mut header_bytes = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header)? == 0 {
+            bail!("headers ended early");
+        }
+        header_bytes += header.len();
+        if header_bytes > MAX_HEADER_BYTES {
+            bail!("headers too large");
+        }
+        let header = header.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            let value = value.trim();
+            match name.trim().to_ascii_lowercase().as_str() {
+                "content-length" => {
+                    content_length = value.parse().map_err(|_| {
+                        Error::new(format!("content-length is not a number: {value}"))
+                    })?
+                }
+                "x-rebot-token" => token = Some(value.to_string()),
+                "authorization" => {
+                    if let Some(rest) = value.strip_prefix("Bearer ") {
+                        token = Some(rest.trim().to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if content_length > limit {
+        bail!("body too large: {content_length} bytes (limit {limit})");
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+
+    Ok(Request {
+        method,
+        path,
+        query,
+        token,
+        body,
+    })
+}
+
+fn parse_query(text: &str) -> BTreeMap<String, String> {
+    let mut query = BTreeMap::new();
+    for pair in text.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            query.insert(percent_decode(key), percent_decode(value));
+        }
+    }
+    query
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// `%2C` and `+` are how a host encodes `,` and a space in a query string; the
+/// gain specs (`50,2:150,3:150`) travel that way.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                match (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2])) {
+                    (Some(high), Some(low)) => {
+                        out.push(high * 16 + low);
+                        index += 3;
+                    }
+                    _ => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn authorised(state: &ServerState, request: &Request) -> bool {
+    if state.args.token.is_empty() {
+        return true;
+    }
+    match &request.token {
+        Some(token) => constant_time_eq(token.as_bytes(), state.args.token.as_bytes()),
+        None => false,
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in a.iter().zip(b.iter()) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+fn route(state: &ServerState, request: &Request) -> (u16, serde_json::Value) {
+    if request.path == "/health" {
+        return (200, health(state));
+    }
+    if !authorised(state, request) {
+        return (401, serde_json::json!({
+            "ok": false,
+            "error": "missing or wrong X-Rebot-Token",
+        }));
+    }
+
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/pose") => {
+            let ids = request
+                .query
+                .get("ids")
+                .map(String::as_str)
+                .unwrap_or(&state.args.ids_spec);
+            match pose_payload(&state.args.channel, ids) {
+                Ok(payload) => (200, payload),
+                Err(error) => (503, serde_json::json!({ "ok": false, "error": error.0 })),
+            }
+        }
+        ("POST", "/play") => handle_play(state, request),
+        ("POST", "/stop") => stop(state),
+        ("GET", "/play") | ("POST", "/pose") | ("POST", "/health") | ("GET", "/stop") => {
+            (405, serde_json::json!({ "ok": false, "error": "wrong method for this path" }))
+        }
+        _ => (404, serde_json::json!({ "ok": false, "error": "no such path" })),
+    }
+}
+
+fn health(state: &ServerState) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "channel": state.args.channel,
+        "can_up": can_is_up(&state.args.channel),
+        "allow_execute": state.args.allow_execute,
+        "playing": state.playing.load(Ordering::SeqCst),
+        "uptime_s": state.started.elapsed().as_secs(),
+    })
+}
+
+fn handle_play(state: &ServerState, request: &Request) -> (u16, serde_json::Value) {
+    let dry = request
+        .query
+        .get("dry")
+        .map(|value| value == "1" || value == "true")
+        .unwrap_or(false);
+
+    if !dry && !state.args.allow_execute {
+        return (403, serde_json::json!({
+            "ok": false,
+            "error": "execution is disabled: start the server with --allow-execute",
+        }));
+    }
+
+    let text = match std::str::from_utf8(&request.body) {
+        Ok(text) => text,
+        Err(_) => return (400, serde_json::json!({
+            "ok": false,
+            "error": "the body must be UTF-8 JSON",
+        })),
+    };
+    if text.trim().is_empty() {
+        return (400, serde_json::json!({
+            "ok": false,
+            "error": "the body must be the trajectory JSON",
+        }));
+    }
+    if let Err(error) = parse_trajectory(Path::new("<http>"), text) {
+        return (400, serde_json::json!({ "ok": false, "error": error.0 }));
+    }
+
+    if state
+        .playing
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return (409, serde_json::json!({
+            "ok": false,
+            "error": "a trajectory is already playing; POST /stop first",
+        }));
+    }
+    state.stopping.store(false, Ordering::SeqCst);
+
+    let result = run_child(state, text, dry, request);
+    state.playing.store(false, Ordering::SeqCst);
+    result
+}
+
+fn run_child(
+    state: &ServerState,
+    text: &str,
+    dry: bool,
+    request: &Request,
+) -> (u16, serde_json::Value) {
+    let path = std::env::temp_dir().join(format!(
+        "rebot-play-{}-{}.json",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    if let Err(error) = fs::write(&path, text) {
+        return (500, serde_json::json!({ "ok": false, "error": format!("cannot write {}: {error}", path.display()) }));
+    }
+
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            let _ = fs::remove_file(&path);
+            return (500, serde_json::json!({ "ok": false, "error": format!("cannot find my own binary: {error}") }));
+        }
+    };
+
+    let mut command = Process::new(executable);
+    command.arg(&path);
+    command.arg(if dry { "--check" } else { "--execute" });
+    command.arg(format!("--channel={}", state.args.channel));
+    command.arg(format!("--model={}", state.args.model));
+    command.arg(format!("--model-spec={}", state.args.model_spec));
+    command.arg(format!(
+        "--kp={}",
+        request.query.get("kp").unwrap_or(&state.args.kp_spec)
+    ));
+    command.arg(format!(
+        "--kd={}",
+        request.query.get("kd").unwrap_or(&state.args.kd_spec)
+    ));
+    command.arg(format!("--ramp={}", state.args.ramp));
+    if state.args.stay_enabled {
+        command.arg("--stay-enabled");
+    }
+    if state.args.track {
+        command.arg("--track");
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = fs::remove_file(&path);
+            return (500, serde_json::json!({ "ok": false, "error": format!("cannot start the player: {error}") }));
+        }
+    };
+    state.child.store(child.id() as i32, Ordering::SeqCst);
+
+    let output = child.wait_with_output();
+    state.child.store(0, Ordering::SeqCst);
+    let _ = fs::remove_file(&path);
+
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            return (500, serde_json::json!({ "ok": false, "error": format!("the player did not finish: {error}") }))
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if state.stopping.load(Ordering::SeqCst) {
+        state.stopping.store(false, Ordering::SeqCst);
+        return (200, serde_json::json!({
+            "ok": true,
+            "stopped": true,
+            "output": stdout,
+            "note": "SIGTERM sent: the player ramps home and drops torque",
+        }));
+    }
+    if output.status.success() {
+        (200, serde_json::json!({
+            "ok": true,
+            "executed": !dry,
+            "output": stdout,
+        }))
+    } else {
+        let code = output.status.code().unwrap_or(-1);
+        (500, serde_json::json!({
+            "ok": false,
+            "exit_code": code,
+            "error": if stderr.trim().is_empty() { format!("the player exited with {code}") } else { stderr.trim().to_string() },
+            "output": stdout,
+        }))
+    }
+}
+
+fn stop(state: &ServerState) -> (u16, serde_json::Value) {
+    if !state.args.allow_execute {
+        return (403, serde_json::json!({
+            "ok": false,
+            "error": "execution is disabled: start the server with --allow-execute",
+        }));
+    }
+    let pid = state.child.load(Ordering::SeqCst);
+    if pid <= 0 {
+        return (200, serde_json::json!({
+            "ok": true,
+            "stopping": false,
+            "note": "nothing is playing",
+        }));
+    }
+    state.stopping.store(true, Ordering::SeqCst);
+    let signal = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if signal != 0 {
+        let error = io::Error::last_os_error();
+        state.stopping.store(false, Ordering::SeqCst);
+        return (500, serde_json::json!({
+            "ok": false,
+            "error": format!("cannot signal {pid}: {error}"),
+        }));
+    }
+    (200, serde_json::json!({ "ok": true, "stopping": true, "pid": pid }))
 }
 
 // --------------------------------------------------------------------------- //
@@ -2408,6 +3051,7 @@ fn run() -> Result<i32> {
             return Ok(0);
         }
         Command::Dump(args) => return dump_joints(&args.channel, &args.ids_spec),
+        Command::Serve(args) => return serve(*args),
         Command::Run(args) => *args,
     };
 
@@ -3114,5 +3758,151 @@ mod tests {
         assert!((last_joint_2.position - 0.25).abs() < 1e-3);
         assert!((last_joint_1.torque - 0.3).abs() < 1e-3);
         assert!((last_joint_2.torque - 0.2).abs() < 1e-3);
+    }
+
+    // -- HTTP server ------------------------------------------------------- //
+
+    fn serve_state(allow_execute: bool, token: &str) -> ServerState {
+        ServerState {
+            args: ServeArgs {
+                allow_execute,
+                token: token.to_string(),
+                ..ServeArgs::default()
+            },
+            started: Instant::now(),
+            playing: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            child: AtomicI32::new(0),
+        }
+    }
+
+    fn http_request(method: &str, path: &str, token: Option<&str>, body: &str) -> Request {
+        Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: BTreeMap::new(),
+            token: token.map(str::to_string),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn http_request_line_and_body_are_parsed() {
+        let raw = "POST /play?dry=1&kp=50 HTTP/1.1\r\n\
+                   Host: pi\r\n\
+                   X-Rebot-Token: secret\r\n\
+                   Content-Length: 7\r\n\
+                   \r\n\
+                   {\"a\":1}";
+        let mut reader = std::io::Cursor::new(raw.as_bytes());
+        let request = read_request(&mut reader, MAX_BODY_BYTES).unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/play");
+        assert_eq!(request.query.get("dry").map(String::as_str), Some("1"));
+        assert_eq!(request.query.get("kp").map(String::as_str), Some("50"));
+        assert_eq!(request.token.as_deref(), Some("secret"));
+        assert_eq!(request.body, b"{\"a\":1}");
+    }
+
+    #[test]
+    fn http_bearer_token_and_bad_length_are_handled() {
+        let raw = "GET /pose HTTP/1.1\r\nAuthorization: Bearer abc\r\n\r\n";
+        let mut reader = std::io::Cursor::new(raw.as_bytes());
+        let request = read_request(&mut reader, MAX_BODY_BYTES).unwrap();
+        assert_eq!(request.token.as_deref(), Some("abc"));
+
+        let raw = "POST /play HTTP/1.1\r\nContent-Length: nope\r\n\r\n";
+        let mut reader = std::io::Cursor::new(raw.as_bytes());
+        assert!(read_request(&mut reader, MAX_BODY_BYTES).is_err());
+
+        let raw = "POST /play HTTP/1.1\r\nContent-Length: 999999\r\n\r\n";
+        let mut reader = std::io::Cursor::new(raw.as_bytes());
+        let error = read_request(&mut reader, 1024).unwrap_err();
+        assert!(error.0.contains("body too large"));
+    }
+
+    #[test]
+    fn http_requires_the_token_except_for_health() {
+        let state = serve_state(false, "secret");
+        let (status, _) = route(&state, &http_request("GET", "/health", None, ""));
+        assert_eq!(status, 200);
+
+        let (status, _) = route(&state, &http_request("GET", "/pose", None, ""));
+        assert_eq!(status, 401);
+
+        let (status, _) = route(&state, &http_request("GET", "/pose", Some("wrong"), ""));
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn http_routes_are_checked() {
+        let state = serve_state(false, "secret");
+        let (status, _) = route(&state, &http_request("GET", "/nope", Some("secret"), ""));
+        assert_eq!(status, 404);
+
+        let (status, _) = route(&state, &http_request("GET", "/play", Some("secret"), ""));
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn http_play_is_gated_and_validated_before_it_spawns() {
+        let locked = serve_state(false, "secret");
+        let (status, payload) = route(&locked, &http_request("POST", "/play", Some("secret"), "{}"));
+        assert_eq!(status, 403);
+        assert!(payload["error"].as_str().unwrap().contains("--allow-execute"));
+
+        // Enabled, but the body is not a trajectory: rejected before any spawn,
+        // which is why this test can run without CAN or a child process.
+        let open = serve_state(true, "secret");
+        let (status, payload) = route(&open, &http_request("POST", "/play", Some("secret"), "{\"format\":\"x\"}"));
+        assert_eq!(status, 400);
+        assert!(payload["error"].as_str().unwrap().contains("rebot-joint-trajectory"));
+
+        let (status, _) = route(&open, &http_request("POST", "/play", Some("secret"), ""));
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn http_token_compare_is_length_aware() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn http_refuses_a_second_play_and_stop_is_gated() {
+        let state = serve_state(true, "secret");
+        state.playing.store(true, Ordering::SeqCst);
+        let payload = "{\"format\":\"rebot-joint-trajectory\",\"ids\":[1],\"control_hz\":30,\
+                       \"waypoints\":[{\"t\":0.0,\"q\":[0.0]},{\"t\":0.1,\"q\":[0.1]}]}";
+        let (status, body) = route(&state, &http_request("POST", "/play", Some("secret"), payload));
+        assert_eq!(status, 409);
+        assert!(body["error"].as_str().unwrap().contains("/stop"));
+
+        let locked = serve_state(false, "secret");
+        let (status, _) = route(&locked, &http_request("POST", "/stop", Some("secret"), ""));
+        assert_eq!(status, 403);
+
+        let idle = serve_state(true, "secret");
+        let (status, body) = route(&idle, &http_request("POST", "/stop", Some("secret"), ""));
+        assert_eq!(status, 200);
+        assert_eq!(body["stopping"], false);
+    }
+
+    #[test]
+    fn http_query_is_percent_decoded() {
+        assert_eq!(percent_decode("50%2C2%3A150"), "50,2:150");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn http_loopback_detection() {
+        assert!(is_loopback("127.0.0.1:8081"));
+        assert!(is_loopback("localhost:8081"));
+        assert!(is_loopback("[::1]:8081"));
+        assert!(!is_loopback("0.0.0.0:8081"));
+        assert!(!is_loopback("192.168.1.23:8081"));
     }
 }

@@ -103,6 +103,69 @@ The planner's `--joints` input is still a read-only pose JSON. The former
 `dump` reads parameter `0x7019` from each motor, enables nothing and sends no
 torque. It needs `can0` up, like the player.
 
+## HTTP server
+
+`serve` exposes the same two operations over the network, so the host does not
+need ssh, a key, or anything copied onto the board:
+
+```bash
+sudo ./rebot-edge serve --listen 0.0.0.0:8081 --token "$(cat /etc/rebot-edge.token)"
+# dry runs only until you say otherwise:
+sudo ./rebot-edge serve --listen 0.0.0.0:8081 --token ... --allow-execute
+```
+
+| request | does |
+|---|---|
+| `GET /health` | version, channel, `can_up`, `allow_execute`, `playing`, uptime; no token needed |
+| `GET /pose` | the `dump` JSON, same fields, read-only |
+| `POST /play?dry=1` | validates the body (`--check`), moves nothing |
+| `POST /play` | plays the body's trajectory; needs `--allow-execute` and the token |
+| `POST /stop` | SIGTERM to the playing child: ramp home, then drop torque |
+
+The body of `POST /play` is the trajectory JSON itself -- the host posts the file
+it just planned, so nothing is copied onto the board and there is no second
+transport. `?kp=` and `?kd=` override the gains the server was started with.
+
+The server does not reimplement the player. It writes the body to a temp file and
+re-executes this same binary with `--check` or `--execute`, which means one
+validation, one playback loop and one signal handler for both paths; an invalid
+body is rejected before any child starts, and a crash in the player cannot take
+the server with it. One trajectory at a time: a second `POST /play` while playing
+gets `409`, and `POST /stop` is the way out. Bodies are capped at 4 MB and the
+connection count at 32, so a stray client cannot exhaust the board.
+
+**Auth and exposure.** A non-loopback `--listen` without `--token` is refused at
+startup (override with `--allow-no-token` on a bench you trust). There is no TLS:
+this is a LAN service, and the honest boundary is "the board's network plus a
+shared secret". Do not port-forward it.
+
+### Deploying it
+
+```bash
+# 1. cross-build for the board (armv6 here; see the TARGET list at the top)
+docker build --target bin --output dist \
+    --build-arg TARGET=arm-unknown-linux-musleabihf examples/edge-rust
+
+# 2. copy and install
+scp dist/rebot-edge qh812@raspberrypi:/tmp/
+scp examples/edge-rust/rebot-edge.service qh812@raspberrypi:/tmp/
+ssh qh812@raspberrypi
+  sudo install -m 755 /tmp/rebot-edge /usr/local/bin/rebot-edge
+  head -c 32 /dev/urandom | base64 | tr -d '\n' | sudo tee /etc/rebot-edge.token
+  sudo chmod 600 /etc/rebot-edge.token
+  sudo install -m 644 /tmp/rebot-edge.service /etc/systemd/system/
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now rebot-edge
+
+# 3. check it from the workstation
+curl -s http://<board-ip>:8081/health
+```
+
+[`rebot-edge.service`](rebot-edge.service) is the unit: it waits for
+`can0-setup.service`, restarts on failure, and reads the token from
+`/etc/rebot-edge.token` so it never appears in `ps`. Drop `--allow-execute` from
+its `ExecStart` to keep the board read-only over HTTP.
+
 ## Input
 
 The file is the planner's `rebot-joint-trajectory` format. Only a subset is used
