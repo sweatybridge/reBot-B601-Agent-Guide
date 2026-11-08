@@ -134,7 +134,7 @@ Layout C has no wall upper cabinets near the island, so the alternative is the
 **bottom edge of the overhead cabinet/soffit** at **(2250, 2200)**, lens **1450
 AFF**, looking straight down with a view rectangle of 1700–2500 × 1800–2600. This
 is the best **arm-motion** view in Layout C: it sees the links, the tool, and the
-island disc from above.
+island disc from above. Section C–C marks the module **C2** and shows its sight lines.
 
 ![Verified fold-under pose](assets/under-cabinet-reach.png)
 
@@ -379,6 +379,7 @@ and honey never contaminates the dry brush.
 | Monthly | Re-torque the mount; re-run the 1.0 kg payload test; check the brakes |
 | After wine or honey | Discard the cloth; clean the tool handle; log |
 | Every 6 months | Inspect the ceiling plate and joists; re-calibrate gravity feedforward |
+
 
 
 

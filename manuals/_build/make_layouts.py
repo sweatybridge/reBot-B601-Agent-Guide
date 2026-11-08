@@ -115,10 +115,12 @@ def layout_a():
     s.rect(1400, 1350, 300, 900, fill="#EFE7D8", outline="#A79C88", width=1)
     s.line([(1550, 1350), (1550, 2250)], fill="#D5CBBB", width=0.8)
     cc = s.p(1550, 1350)
-    c.rect([cc[0] - 8, cc[1] + 2, cc[0] + 8, cc[1] + 10], fill="#6B4E8C",
-           outline=INK, width=0.7, radius=2)
-    c.ellipse([cc[0] - 3, cc[1] + 8, cc[0] + 3, cc[1] + 14], fill="#E4DCEF", outline=INK)
-    c.text(cc[0] + 12, cc[1] + 4, "CAB CAM", size=8, color="#6B4E8C", family="mono")
+    c.rect([cc[0] - 15, cc[1] + 1, cc[0] + 15, cc[1] + 13], fill="#6B4E8C",
+           outline=INK, width=0.8, radius=2)
+    c.ellipse([cc[0] - 4, cc[1] + 9, cc[0] + 4, cc[1] + 17], fill="#E4DCEF", outline=INK)
+    c.dashed([cc, s.p(1200, 940)], dash=6, gap=6, fill="#6B4E8C", width=0.8)
+    c.dashed([cc, s.p(1900, 900)], dash=6, gap=6, fill="#6B4E8C", width=0.8)
+    c.text(cc[0] + 20, cc[1] - 2, "C2  CAB CAM", size=8, color="#6B4E8C", family="mono")
     # PSU and base labels
     s.rect(800, 140, 220, 190, fill="#E4DCCB", outline="#A79C88", width=1)
     c.text(s.p(910, 350)[0], s.p(910, 350)[1], "48V PSU", size=8, color=INK_SOFT,
@@ -146,6 +148,8 @@ def layout_a():
     c.text(1770, 330, "camera cabinet over base", size=9, color=ACCENTS[acc]["deep"], family="mono")
     c.text(1770, 344, "450 underside; fold-under", size=9, color=ACCENTS[acc]["deep"], family="mono")
     c.text(1540, 890, "FLOOR", size=9, color=MUTED, family="mono")
+    c.text(2130, 884, "C2 = optional cabinet camera", size=8, color=MUTED,
+           family="mono", anchor="ra")
     c.text(s.p(1200, 700)[0] + 8, s.p(1200, 700)[1] - 4, "SINK", size=8, color=MUTED,
            family="mono")
 
@@ -249,10 +253,12 @@ def layout_b():
     s.line([(1850, 1350), (1850, 2250)], fill="#D5CBBB", width=0.8)
     s.rect(0, 1350, 350, 900, fill="#EFE7D8", outline="#A79C88", width=1)
     cc = s.p(350, 1350)
-    c.rect([cc[0] - 8, cc[1] + 2, cc[0] + 8, cc[1] + 10], fill="#6B4E8C",
-           outline=INK, width=0.7, radius=2)
-    c.ellipse([cc[0] - 3, cc[1] + 8, cc[0] + 3, cc[1] + 14], fill="#E4DCEF", outline=INK)
-    c.text(cc[0] + 12, cc[1] + 4, "CAB CAM", size=8, color="#6B4E8C", family="mono")
+    c.rect([cc[0] - 15, cc[1] + 1, cc[0] + 15, cc[1] + 13], fill="#6B4E8C",
+           outline=INK, width=0.8, radius=2)
+    c.ellipse([cc[0] - 4, cc[1] + 9, cc[0] + 4, cc[1] + 17], fill="#E4DCEF", outline=INK)
+    c.dashed([cc, s.p(200, 900)], dash=6, gap=6, fill="#6B4E8C", width=0.8)
+    c.dashed([cc, s.p(900, 900)], dash=6, gap=6, fill="#6B4E8C", width=0.8)
+    c.text(cc[0] + 20, cc[1] - 2, "C2  CAB CAM", size=8, color="#6B4E8C", family="mono")
 
     s.reach(430, 900, 600, 755)
     s.arm([(430, 900), (430, 990), (620, 1230), (900, 1140), (820, 950)],
@@ -268,6 +274,8 @@ def layout_b():
     c.text(s.p(1650, 700)[0], s.p(1650, 700)[1], "SINK ON OTHER LEG", size=8, color=MUTED,
            family="mono", anchor="ma")
     c.text(1540, 890, "FLOOR", size=9, color=MUTED, family="mono")
+    c.text(2130, 884, "C2 = optional cabinet camera", size=8, color=MUTED,
+           family="mono", anchor="ra")
 
     notes_panel(c, (1510, 925, 2140, 1430), "DEPLOYMENT NOTES", [
         ("Corner bay", "Base sits in the 600 × 600 dead corner; 220 mm from the sink rim."),
@@ -350,10 +358,12 @@ def layout_c():
     s.rect(1950, 1450, 300, 950, fill="#E4DACA", outline="#A79C88", width=1)
     s.line([(1950, 1450), (2250, 1450)], fill=ACCENTS[acc]["main"], width=2)
     cc = s.p(2250, 1450)
-    c.rect([cc[0] - 8, cc[1] + 2, cc[0] + 8, cc[1] + 10], fill="#6B4E8C",
-           outline=INK, width=0.7, radius=2)
-    c.ellipse([cc[0] - 3, cc[1] + 8, cc[0] + 3, cc[1] + 14], fill="#E4DCEF", outline=INK)
-    c.text(cc[0] - 12, cc[1] + 4, "SOFFIT CAM", size=8, color="#6B4E8C",
+    c.rect([cc[0] - 15, cc[1] + 1, cc[0] + 15, cc[1] + 13], fill="#6B4E8C",
+           outline=INK, width=0.8, radius=2)
+    c.ellipse([cc[0] - 4, cc[1] + 9, cc[0] + 4, cc[1] + 17], fill="#E4DCEF", outline=INK)
+    c.dashed([cc, s.p(1900, 900)], dash=6, gap=6, fill="#6B4E8C", width=0.8)
+    c.dashed([cc, s.p(2400, 900)], dash=6, gap=6, fill="#6B4E8C", width=0.8)
+    c.text(cc[0] - 20, cc[1] - 2, "C2  SOFFIT CAM", size=8, color="#6B4E8C",
            family="mono", anchor="ra")
 
     s.reach_below(2100, 1450, 600, 755)
@@ -371,6 +381,8 @@ def layout_c():
     c.text(s.p(2100, 820)[0], s.p(2100, 820)[1], "600 WORK", size=8, color=ACCENTS[acc]["main"],
            family="mono", anchor="ma")
     c.text(1540, 890, "FLOOR", size=9, color=MUTED, family="mono")
+    c.text(2130, 884, "C2 = optional cabinet camera", size=8, color=MUTED,
+           family="mono", anchor="ra")
 
     notes_panel(c, (1510, 925, 2140, 1430), "DEPLOYMENT NOTES", [
         ("Overhead mount", "300 × 300 plate into ceiling joists; 550 mm above the worktop."),
@@ -390,6 +402,8 @@ if __name__ == "__main__":
     layout_a()
     layout_b()
     layout_c()
+
+
 
 
 

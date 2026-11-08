@@ -140,7 +140,7 @@ the grease film weekly; a greasy lens is the main failure mode above a hob.
 A 300 × 350 mm camera cabinet sits **over the base at (430, 350)**, underside
 **450 mm** above the worktop. The camera is on its bottom edge, lens **1350 AFF**,
 pitched **30° down**, with a view rectangle of 100–1000 × 100–750. It covers the
-corner, base, and sink edge — the arm motion, without looking through the hob.
+corner, base, and sink edge — the arm motion, without looking through the hob. Section B–B marks the module **C2** and shows its sight lines.
 
 ![Verified fold-under pose](assets/under-cabinet-reach.png)
 
@@ -392,6 +392,7 @@ surface that will be wiped afterwards.
 | Monthly | Re-check the 3 N force cap on glass; test the gas isolation |
 | After raw egg | Dispose of pad and cover; disinfect; log the human verification |
 | Every 6 months | Re-torque the base; inspect the corner plate for corrosion |
+
 
 
 

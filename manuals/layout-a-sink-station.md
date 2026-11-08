@@ -151,7 +151,7 @@ keep the lens out of the direct burner plume.
 A 300 × 350 mm camera cabinet sits **over the base at (1550, 350)**, underside
 **450 mm** above the worktop. The camera is on its bottom edge, lens **1350 AFF**,
 pitched **30° down**; the dashed purple rectangle in the plan (900–2100 × 100–650)
-is its view of the sink, base, and arm.
+is its view of the sink, base, and arm. Section A–A marks the module **C2** and shows its sight lines.
 
 ![Verified fold-under pose](assets/under-cabinet-reach.png)
 
@@ -415,6 +415,7 @@ clean drainboard.
 | Monthly | Re-check the 600 mm reach with a test target; verify torque limits |
 | After raw egg | Dispose of the pad; disinfect the tool and the sink deck; log |
 | Every 6 months | Re-torque the base; inspect the backer for corrosion |
+
 
 
 
