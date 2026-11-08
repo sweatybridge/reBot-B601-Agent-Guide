@@ -106,6 +106,28 @@ and the worktop is a hard keep-out, and the tool tethers are mandatory.
   tethered to the dock, not to the arm.
 - **Vacuum** canister in the island cabinet; hose through the soffit on a boom.
 
+### 4.4 Optional hood camera
+
+![Hood-edge camera detail](assets/hood-camera-detail.png)
+
+A 12 MP, 120° module clamps to the front edge of the back-wall hood at
+**(650, 640)**, lens at **1500 AFF**. It covers the **hob and cooking wall**, not
+the island worktop behind it. In this layout it is a cooking/safety view; the
+ceiling camera above the arm remains the primary view for cleaning.
+
+| Item | Value |
+|---|---|
+| Module | 12 MP, 1/1.7", 120° diagonal, 30 fps, USB 3.0 UVC, IP65 |
+| Size / mass | 62 × 62 × 48 mm / 190 g |
+| Mount | 10–40 mm edge clamp, 1/4"-20 ball head, lens axis vertical |
+| View at worktop | 1.66 × 1.25 m, ≈2.4 px/mm (5 mm ≈ 12 px) |
+| Cable | USB-C along the hood to the wall; 5 V 2 A; drip loop; strain relief |
+| Calibration | intrinsic + hand-eye to the base; checkerboard on the hob |
+| Privacy | local UVC only; LED when active; no cloud by default |
+
+Optional. If the ceiling camera already covers the island, this module adds
+cooking-zone context only; it does not improve the arm's reach or accuracy.
+
 ## 5. Coverage map
 
 | Zone | Distance from mount | Task | Tool |
@@ -277,6 +299,8 @@ and honey never contaminates the dry brush.
   payload derate, gravity feedforward, and a 20 % torque margin are all mandatory.
 - **Mount structure.** The 300 × 300 plate is rated for 4× the arm mass. Inspect
   the lag bolts monthly; vibration loosens them.
+- **Camera.** Local processing only; LED when active. The hood camera looks at the
+  back-wall hob, not the island; the ceiling camera above the arm is primary.
 
 ## 9. Out of scope here
 
@@ -299,6 +323,7 @@ and honey never contaminates the dry brush.
 8. Mount the camera above the arm, offset 300 mm; calibrate hand–eye.
 9. Load-test the mount with 4× the arm mass; check for deflection.
 10. Run a 1.0 kg payload test at full down reach; verify the torque margin.
+11. *(Optional)* Fit the hood camera at (650, 640); set the lens vertical; calibrate to the base.
 
 ## 11. Bill of materials
 
@@ -312,6 +337,9 @@ and honey never contaminates the dry brush.
 | Tools T1–T8 | 1 set | <300 g, tethered |
 | Vacuum canister + boom + hose | 1 | Tool weight <200 g |
 | RGB-D camera | 1 | Above the arm, 300 mm offset |
+| Optional hood camera (12 MP, 120°, USB 3.0, IP65) | 1 | Back-wall hood edge, 1500 AFF |
+| Hood-edge clamp + 1/4"-20 ball head | 1 | 10–40 mm flange; lens axis vertical |
+| USB-C cable, 5 V 2 A supply, strain relief | 1 | Along hood; drip loop |
 | Drop detection / tool tether kit | 1 | Mandatory |
 | GFCI + drip loop | 1 | Island cabinet |
 | Disposable pads, cloths, neutral cleaner | — | Consumables |
@@ -322,10 +350,11 @@ and honey never contaminates the dry brush.
 |---|---|
 | Each cycle | Wipe the wrist; check the tool tethers; empty the chute |
 | Daily | Inspect the mount bolts for movement; check the cable at the soffit |
-| Weekly | Clean the camera; check the vacuum hose; verify the park pose |
+| Weekly | Clean the ceiling and hood camera lenses; check the hood clamp; check the vacuum hose; verify the park pose |
 | Monthly | Re-torque the mount; re-run the 1.0 kg payload test; check the brakes |
 | After wine or honey | Discard the cloth; clean the tool handle; log |
 | Every 6 months | Inspect the ceiling plate and joists; re-calibrate gravity feedforward |
+
 
 
 

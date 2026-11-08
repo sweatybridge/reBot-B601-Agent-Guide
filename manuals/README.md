@@ -19,6 +19,7 @@ within its operating limits.
 | Mount | Counter base, end of run | Counter base, dead corner | Ceiling / soffit, inverted |
 | Covers | Sink, drainboard, prep tail | Sink leg + near hob burners | Central prep disc only |
 | Cooktop | Opposite run, 1.45 m away | Adjacent leg, cold-clean only | Back wall, 2.2 m away |
+| Optional hood cam | Hob + aisle approach | Hob + corner + sink edge | Hob only |
 | Best for | Wet cleanup after cooking | Widest task mix, dead-space reuse | Zero worktop footprint, downward cleaning |
 | Main limit | Only the wet end | Heat interlock is mandatory | Payload derated when inverted |
 | Manual | [Layout A](layout-a-sink-station.md) | [Layout B](layout-b-corner-bay.md) | [Layout C](layout-c-overhead-island.md) |
@@ -73,6 +74,27 @@ reaches roughly **600 mm above the counter**.
 - It cannot open the oven, climb, clean the floor, clean inside the sink basin,
   handle knives, or sterilise a biohazard by itself.
 
+## Optional hood camera
+
+Each layout can take a **12 MP, 120° camera module clamped to the front edge of the
+cooker hood**, lens at 1500 AFF (600 mm above the worktop). It looks straight down
+and gives a **1.66 × 1.25 m view** of the cooking zone at ≈2.4 px/mm. It is a
+context/safety view, not a metrology camera; the arm's wrist camera remains primary
+for contact tasks.
+
+![Hood-edge camera detail](assets/hood-camera-detail.png)
+
+| | A | B | C |
+|---|---|---|---|
+| Camera position | (1200, 1865) | (640, 1000) | (650, 640) |
+| Sees | Hob + aisle | Hob + corner + sink edge | Hob + cooking wall |
+| Misses | Sink / prep board | Far corners / upper cabinets | Island prep disc |
+
+The module is optional. It uses a 10–40 mm edge clamp and a 1/4"-20 ball head,
+routes USB-C along the hood, and processes locally with an active LED; no cloud by
+default. It is not a safety-rated stop — the heat interlock and the arm's limits
+remain the safety functions.
+
 ## The tool set
 
 The gripper picks a standard 20 mm tool handle from the dock. All tools are under
@@ -113,9 +135,11 @@ These apply in every layout:
 Each layout sheet has a **plan** at a stated scale with a 1 m scale bar, a
 **schematic section**, and deployment notes. The plan shows the base, the 600 mm
 working radius, the 755 mm maximum, the 40° dead wedge, the tool dock, and the
-heat keep-out. The mess cards are close-ups: the arm enters from the side that
-matches the layout, the tool is the one named in the footer, and the annotations
-give the size window and the limiting condition.
+heat keep-out. It also shows the optional hood camera as a small module icon at
+the hood edge, with a dashed rectangle for its useful view. The mess cards are
+close-ups: the arm enters from the side that matches the layout, the tool is the
+one named in the footer, and the annotations give the size window and the
+limiting condition.
 
 ## Files
 
@@ -127,6 +151,7 @@ give the size window and the limiting condition.
 | `assets/layout-a-plan.png` | Layout A plan + section |
 | `assets/layout-b-plan.png` | Layout B plan + section |
 | `assets/layout-c-plan.png` | Layout C plan + section |
+| `assets/hood-camera-detail.png` | Optional hood-edge camera mount and coverage |
 | `assets/layout-{a,b,c}-mess-{01..05}.png` | 15 mess illustrations |
 
 ## Sources

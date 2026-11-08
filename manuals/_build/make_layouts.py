@@ -49,6 +49,10 @@ def layout_a():
     p.grinder(1880, 500)
     p.knife(2260, 150, 120, 200)
     p.hob(900, 1800, 600, 500)
+    p.hood_camera(1200, 1865, fov=(750, 1650, 1650, 2300), label_at=(1260, 1600),
+                  clip=(0, 0, 3000, 2400))
+    p.line([(1200, 1865), (1200, 2400)], fill="#8C8A80", width=0.9, dash=True)
+    p.hood(900, 1900, 600, 500, label="HOOD")
 
     p.cabinet(0, 0, 700, 350)
     p.cabinet(2200, 0, 200, 350)
@@ -173,6 +177,10 @@ def layout_b():
     p.fridge(2600, 0, 600, 700)
     p.sink(650, 100, 600, 400)
     p.hob(100, 750, 400, 500)
+    p.hood_camera(640, 1000, fov=(0, 400, 1000, 1500), label_at=(1150, 1300),
+                  clip=(0, 0, 3200, 2600))
+    p.line([(640, 1000), (0, 1000)], fill="#8C8A80", width=0.9, dash=True)
+    p.hood(0, 850, 600, 500, label="HOOD")
     p.circle(560, 120, 55, fill="#EDE8DC", outline="#8E8576", width=1)
     c.text(p.p(560, 120)[0], p.p(560, 120)[1], "SPICE", size=8, color=INK_SOFT,
            family="mono", anchor="mm")
@@ -277,6 +285,10 @@ def layout_c():
     p.fridge(2800, 0, 600, 700)
     p.sink(1600, 100, 500, 400)
     p.hob(400, 100, 500, 400)
+    p.hood_camera(650, 640, fov=(250, -50, 1050, 650), label_at=(1050, 950),
+                  clip=(0, 0, 4200, 3600))
+    p.line([(650, 640), (650, 0)], fill="#8C8A80", width=0.9, dash=True)
+    p.hood(400, 0, 500, 600, label="HOOD")
     p.sink(1400, 1850, 350, 300)
     p.board(2200, 1900, 400, 300)
     p.circle(2600, 2450, 90, fill="#3C4645", outline="#8E9997", width=1)
@@ -347,6 +359,12 @@ if __name__ == "__main__":
     layout_a()
     layout_b()
     layout_c()
+
+
+
+
+
+
 
 
 

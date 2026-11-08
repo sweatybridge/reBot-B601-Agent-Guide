@@ -19,7 +19,7 @@ Please follow the workflow in AGENTS.md (https://github.com/Welt-liu/reBot-B601-
 - [Write Motor ID](en/references/write-motor-id.md) — Set motor IDs 1–7
 - [Zero Calibration](en/references/write-motor-zero.md) — Calibrate motor zero positions
 - [Examples](examples/README.md) — `edge-rust/` (Pi), `host/` (workstation) and `trajectories/` code, including the measured trajectory pipeline
-- [Kitchen Deployment Manuals](manuals/README.md) — three kitchen layouts and 15 mess-cleaning scenarios for the B601-RS
+- [Kitchen Deployment Manuals](manuals/README.md) — three kitchen layouts, an optional hood camera, and 15 mess-cleaning scenarios for the B601-RS
 
 ### 中文
 
@@ -34,3 +34,4 @@ Please follow the workflow in AGENTS.md (https://github.com/Welt-liu/reBot-B601-
 - [写入电机 ID](zh/references/write-motor-id.md) — 写入电机 ID 1–7
 - [零点校准](zh/references/write-motor-zero.md) — 校准电机零点
 - [厨房部署手册](manuals/README.md) — 3 种厨房布局与 15 种清理场景（英文）
+

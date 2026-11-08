@@ -53,6 +53,28 @@ def clip_poly(points, rect):
     return pts
 
 
+def clip_segment(a, b, rect):
+    """Liang-Barsky clip of a segment to an axis-aligned rectangle."""
+    x0, y0, x1, y1 = rect
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, ax - x0), (dx, x1 - ax), (-dy, ay - y0), (dy, y1 - ay)):
+        if p == 0:
+            if q < 0:
+                return None
+        else:
+            r = q / p
+            if p < 0:
+                t0 = max(t0, r)
+            else:
+                t1 = min(t1, r)
+    if t0 > t1:
+        return None
+    return ((ax + dx * t0, ay + dy * t0), (ax + dx * t1, ay + dy * t1))
+
+
 class Plan:
     def __init__(self, c: Canvas, ox, oy, s, accent):
         self.c, self.ox, self.oy, self.s, self.acc = c, ox, oy, s, accent
@@ -287,6 +309,48 @@ class Plan:
             self.c.text(p[0], p[1] - 5, label, size=9, color=self.acc["deep"],
                         family="mono", anchor="ma")
 
+    def hood(self, x0, y0, w, d, label="HOOD"):
+        self.rect(x0, y0, w, d, fill=None, outline="#8E8576", width=1.2)
+        p = self.p(x0 + w / 2, y0 + d / 2)
+        self.c.text(p[0], p[1], label, size=9, color="#8E8576", family="mono",
+                    anchor="mm", tracking=0.8)
+
+    def hood_camera(self, cx, cy, fov, label_at=None,
+                    clip=(0, 0, 3000, 2400), label="OPTIONAL HOOD CAM"):
+        """Top-down camera on the hood edge: useful view rectangle + module icon."""
+        def inside(q):
+            return clip[0] <= q[0] <= clip[2] and clip[1] <= q[1] <= clip[3]
+
+        x0, y0, x1, y1 = fov
+        rect = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        clipped = clip_poly(rect, clip)
+        if clipped:
+            self.c.poly([self.p(*q) for q in clipped],
+                        fill=mix(FLOOR, self.acc["light"], 0.16))
+        cxm, cym = (x0 + x1) / 2, (y0 + y1) / 2
+        for a, b in zip(rect, rect[1:] + rect[:1]):
+            seg = clip_segment(a, b, clip)
+            if seg:
+                self.c.dashed([self.p(*seg[0]), self.p(*seg[1])], dash=7, gap=5,
+                              fill=self.acc["main"], width=1.0)
+        if inside((cxm, cym)):
+            seg = clip_segment((cx, cy), (cxm, cym), clip)
+            if seg:
+                self.c.dashed([self.p(*seg[0]), self.p(*seg[1])], dash=5, gap=6,
+                              fill=self.acc["mid"], width=0.7)
+        # module body at the hood edge, lens facing down
+        px, py = self.p(cx, cy)
+        self.c.rect([px - 16, py - 10, px + 16, py + 10], fill=self.acc["deep"],
+                    outline=INK, width=0.7, radius=2)
+        self.c.ellipse([px - 5, py - 5, px + 5, py + 5], fill="#DCE8E5",
+                       outline=INK)
+        if label_at:
+            a = self.p(*label_at)
+            self.c.line([(px + 16, py - 8), (a[0], a[1])], fill="#8C8A80", width=0.8)
+            self.c.text(a[0] + (6 if a[0] >= px else -6), a[1] - 6, label,
+                        size=11, color=self.acc["deep"], family="mono",
+                        anchor=("la" if a[0] >= px else "ra"))
+
     def scalebar(self, x, y, length=1000, label="1 m"):
         p0 = self.p(x, y)
         p1 = self.p(x + length, y)
@@ -417,6 +481,8 @@ def legend(c, x, y, accent):
         ("dead", "40° dead wedge"),
         ("keep", "heat keep-out"),
         ("dock", "tool dock"),
+        ("cam", "hood camera"),
+        ("hood", "hood outline"),
     ]
     for i, (kind, label) in enumerate(items):
         xx = x + (i % 3) * 200
@@ -433,6 +499,12 @@ def legend(c, x, y, accent):
             c.rect([xx, yy + 2, xx + 16, yy + 18], outline=KEEPOUT, width=1)
         elif kind == "dock":
             c.rect([xx, yy + 3, xx + 16, yy + 17], outline=acc["mid"], width=1)
+        elif kind == "cam":
+            c.rect([xx + 2, yy + 5, xx + 14, yy + 15], fill=acc["deep"], outline=INK,
+                   width=0.8, radius=2)
+            c.ellipse([xx + 6, yy + 8, xx + 10, yy + 12], fill="#DCE8E5", outline=INK)
+        elif kind == "hood":
+            c.rect([xx, yy + 3, xx + 16, yy + 17], outline="#8E8576", width=1)
         c.text(xx + 24, yy + 5, label, size=10, color=INK_SOFT, family="mono")
 
 
@@ -456,3 +528,4 @@ def footer(c, text, accent):
     c.text(70, 1456, text, 11, MUTED, family="mono")
     c.text(W - 70, 1456, "Seeed reBot B601-RS  ·  6+1 DOF  ·  754.7 mm reach  ·  2.5 kg rated payload",
            11, MUTED, family="mono", anchor="ra")
+
