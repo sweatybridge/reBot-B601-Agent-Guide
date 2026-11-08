@@ -54,7 +54,7 @@ python3 -m venv ~/mb-probe
 1. 换用 64 位主机（Pi Zero 2 W / Pi 3 / Pi 4 / Pi 5 配 64 位系统，或任意 x86_64 Linux 机器）——同一块 CAN HAT，`pip install motorbridge` 直接可用
 2. 为该架构从源码编译 `motor_abi` + `ws_gateway`（在 Pi Zero W 上需要数小时，超出本文档范围）
 3. 把 CAN 转接板换到受支持的主机上
-4. 继续使用这块 32 位板，改用 Rust edge 回放器（`examples/edge-rust/`，直接走 SocketCAN，板上不需要 Python 或 numpy）——已在 Pi Zero W 上验证可用。板上只做关节空间，但配合离线规划器（`examples/host/plan_with_pinocchio.py`，在 Docker 容器中运行）可以把笛卡尔运动转成关节轨迹交给二进制回放，每个路点都带 Pinocchio 重力前馈。仍然没有 Studio 校准界面。详见 [Pi Zero W 演示开发与验证](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/demo-validation-pi-zero.md)
+4. 继续使用这块 32 位板，改用 Rust edge 回放器（`examples/edge-rust/`，直接走 SocketCAN，板上不需要 Python 或 numpy）——已在 Pi Zero W 上验证可用。板上只做关节空间，但配合离线规划器（`examples/host/plan_with_pinocchio.py`，在 Docker 容器中运行）可以把笛卡尔运动转成关节轨迹交给二进制回放，每个路点都带 Pinocchio 重力前馈。仍然没有 Studio 校准界面。详见 [Pi Zero W 演示开发与验证](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/demo-validation-pi-zero.md)
 
 > CAN HAT 本身仍然在第一步配置，32 位板同样可以配置；只有 Python／ABI 这一侧需要受支持的架构。
 
@@ -73,7 +73,7 @@ python3 -m venv ~/mb-probe
 
 ## 第一步：环境初始化
 
-运行 [环境初始化参考](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md) 完成以下安装：
+运行 [环境初始化参考](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md) 完成以下安装：
 
 - [ ] Python 环境准备（Miniforge 或已有 Python）
 - [ ] motorbridge 安装
@@ -83,10 +83,10 @@ CAN 通路的配置取决于转接方式，而不只是操作系统：
 
 | 转接方式 | 参考文档 |
 |---------|---------|
-| PCAN-USB（Linux / Windows / macOS） | [环境初始化](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md) |
-| CANable / candleLight（SocketCAN） | [环境初始化](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md) |
-| **CAN HAT，SPI 接口的 MCP2515**（树莓派常见） | [CAN HAT 配置](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/setup-can-hat.md) |
-| Damiao USB 串口 | [环境初始化](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md) |
+| PCAN-USB（Linux / Windows / macOS） | [环境初始化](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md) |
+| CANable / candleLight（SocketCAN） | [环境初始化](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md) |
+| **CAN HAT，SPI 接口的 MCP2515**（树莓派常见） | [CAN HAT 配置](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/setup-can-hat.md) |
+| Damiao USB 串口 | [环境初始化](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md) |
 
 完成后确保 motorbridge-cli 可用：
 
@@ -94,7 +94,7 @@ CAN 通路的配置取决于转接方式，而不只是操作系统：
 motorbridge-cli --help
 ```
 
-> **Windows 用户**：使用 Miniforge 创建 conda 环境，不要使用系统 Python 直接 `pip install motorbridge`。如果已安装 `uv`，使用独立 uv venv 也是认可的替代方案（见参考文档中的 uv 小节）——无论哪种方式，都不要装进系统 Python。不需要配置 can0。详见 [环境初始化参考](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md)。
+> **Windows 用户**：使用 Miniforge 创建 conda 环境，不要使用系统 Python 直接 `pip install motorbridge`。如果已安装 `uv`，使用独立 uv venv 也是认可的替代方案（见参考文档中的 uv 小节）——无论哪种方式，都不要装进系统 Python。不需要配置 can0。详见 [环境初始化参考](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/setup-environment.md)。
 >
 > **32 位树莓派系统用户**：Miniforge 没有 `armv6l`/`armv7l` 构建，motorbridge 也没有对应架构的 wheel。必须先解决第零步。
 
@@ -102,11 +102,11 @@ motorbridge-cli --help
 
 ## 第二步：写入电机 ID
 
-运行 [写入电机ID参考](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/write-motor-id.md)
+运行 [写入电机ID参考](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/write-motor-id.md)
 
 该参考文档会引导你完成：
 
-1. **确认 CAN 接口**（`can0`，bitrate `1000000`；使用 CAN HAT 时接口必须已 up **且重启后依然有效**——见 [CAN HAT 配置](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/setup-can-hat.md)）
+1. **确认 CAN 接口**（`can0`，bitrate `1000000`；使用 CAN HAT 时接口必须已 up **且重启后依然有效**——见 [CAN HAT 配置](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/setup-can-hat.md)）
 2. **逐颗电机设置 ID**（共 7 颗电机，ID 范围 1–7）
    - 每次仅连接一颗电机
    - 扫描确认当前电机 ID（默认 127，部分批次已预设为 1~7）
@@ -118,7 +118,7 @@ motorbridge-cli --help
 
 ## 第三步：校准零点
 
-参考 [零点校准文档](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/write-motor-zero.md)。
+参考 [零点校准文档](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/write-motor-zero.md)。
 
 该文档会引导你完成：
 
@@ -131,7 +131,7 @@ motorbridge-cli --help
 > ssh -L 9002:127.0.0.1:9002 <用户名>@<主机>
 > ```
 >
-> 先在板子上以后台方式启动 gateway（脱离 SSH 会话也能存活），保持这条转发用的 SSH 会话不关，再让用户打开 <https://motorbridge.github.io/motorbridge-studio/> 并连接到 `127.0.0.1:9002`。完整流程见 [零点校准参考](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/zh/references/write-motor-zero.md)。
+> 先在板子上以后台方式启动 gateway（脱离 SSH 会话也能存活），保持这条转发用的 SSH 会话不关，再让用户打开 <https://motorbridge.github.io/motorbridge-studio/> 并连接到 `127.0.0.1:9002`。完整流程见 [零点校准参考](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/zh/references/write-motor-zero.md)。
 
 ---
 

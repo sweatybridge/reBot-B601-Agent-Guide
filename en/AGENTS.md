@@ -54,7 +54,7 @@ python3 -m venv ~/mb-probe
 1. Use a 64-bit host board (Pi Zero 2 W / Pi 3 / Pi 4 / Pi 5 with a 64-bit OS, or any x86_64 Linux box) — same CAN HAT, `pip install motorbridge` just works
 2. Build `motor_abi` + `ws_gateway` from source for that architecture (hours on a Pi Zero W, and outside the scope of this guide)
 3. Move the CAN adapter to a supported host
-4. Keep the 32-bit board and use the Rust edge player (`examples/edge-rust/`, SocketCAN, no Python or numpy on the board) — verified on a Pi Zero W. Joint-space only on the board, but an offline planner (`examples/host/plan_with_pinocchio.py`, run in a Docker container) turns cartesian moves into joint trajectories the binary replays, with Pinocchio gravity feedforward baked into each waypoint. Still no Studio calibration UI. See [Demo Validation on Pi Zero W](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/demo-validation-pi-zero.md)
+4. Keep the 32-bit board and use the Rust edge player (`examples/edge-rust/`, SocketCAN, no Python or numpy on the board) — verified on a Pi Zero W. Joint-space only on the board, but an offline planner (`examples/host/plan_with_pinocchio.py`, run in a Docker container) turns cartesian moves into joint trajectories the binary replays, with Pinocchio gravity feedforward baked into each waypoint. Still no Studio calibration UI. See [Demo Validation on Pi Zero W](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/demo-validation-pi-zero.md)
 
 > The CAN HAT itself is configured in Step 1 and can be set up on a 32-bit board regardless; it is only the Python/ABI side that needs a supported architecture.
 
@@ -73,7 +73,7 @@ Please confirm which form of robotic arm you have:
 
 ## Step 1: Environment Initialization
 
-See [Environment Setup Reference](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) to complete the following:
+See [Environment Setup Reference](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) to complete the following:
 
 - [ ] Python environment setup (Miniforge or existing Python)
 - [ ] motorbridge installation
@@ -83,10 +83,10 @@ The CAN path depends on the adapter, not just the OS:
 
 | Adapter | Reference |
 |---------|-----------|
-| PCAN-USB (Linux / Windows / macOS) | [Environment Setup](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) |
-| CANable / candleLight (SocketCAN) | [Environment Setup](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) |
-| **CAN HAT, MCP2515 over SPI** (typical Raspberry Pi) | [CAN HAT Reference](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/setup-can-hat.md) |
-| Damiao USB serial | [Environment Setup](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) |
+| PCAN-USB (Linux / Windows / macOS) | [Environment Setup](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) |
+| CANable / candleLight (SocketCAN) | [Environment Setup](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) |
+| **CAN HAT, MCP2515 over SPI** (typical Raspberry Pi) | [CAN HAT Reference](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/setup-can-hat.md) |
+| Damiao USB serial | [Environment Setup](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) |
 
 After completion, verify motorbridge-cli is available:
 
@@ -94,7 +94,7 @@ After completion, verify motorbridge-cli is available:
 motorbridge-cli --help
 ```
 
-> **Windows users**: Use Miniforge to create a conda environment — do not use system Python directly. If you already use `uv`, an isolated uv venv is an accepted alternative (see the uv section of the reference) — either way, never install into a system Python. No can0 configuration needed. See [Environment Setup Reference](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) for details.
+> **Windows users**: Use Miniforge to create a conda environment — do not use system Python directly. If you already use `uv`, an isolated uv venv is an accepted alternative (see the uv section of the reference) — either way, never install into a system Python. No can0 configuration needed. See [Environment Setup Reference](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/setup-environment.md) for details.
 >
 > **32-bit Raspberry Pi OS users**: Miniforge ships no `armv6l`/`armv7l` builds, and motorbridge has no wheels for those architectures. Step 0 must be resolved first.
 
@@ -102,11 +102,11 @@ motorbridge-cli --help
 
 ## Step 2: Write Motor IDs
 
-See [Write Motor ID Reference](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/write-motor-id.md)
+See [Write Motor ID Reference](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/write-motor-id.md)
 
 This reference guides you through:
 
-1. **Confirm the CAN interface** (`can0` at bitrate `1000000`; on a CAN HAT it must be up **and** persistent — see the [CAN HAT Reference](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/setup-can-hat.md))
+1. **Confirm the CAN interface** (`can0` at bitrate `1000000`; on a CAN HAT it must be up **and** persistent — see the [CAN HAT Reference](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/setup-can-hat.md))
 2. **Set motor IDs one by one** (7 motors total, ID range 1–7)
    - Connect only one motor at a time
    - Scan to confirm the current motor ID (default: 127, some batches pre-set to 1–7)
@@ -118,7 +118,7 @@ This reference guides you through:
 
 ## Step 3: Zero Calibration
 
-See the [Zero Calibration Reference](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/write-motor-zero.md).
+See the [Zero Calibration Reference](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/write-motor-zero.md).
 
 This reference guides you through:
 
@@ -131,7 +131,7 @@ This reference guides you through:
 > ssh -L 9002:127.0.0.1:9002 <user>@<host>
 > ```
 >
-> Start the gateway on the board first (detached, so it outlives the SSH session), keep the forwarding SSH session open, then have the user open <https://motorbridge.github.io/motorbridge-studio/> pointed at `127.0.0.1:9002`. The [Zero Calibration Reference](https://github.com/Welt-liu/reBot-B601-Agent-Guide/blob/main/en/references/write-motor-zero.md) has the full sequence.
+> Start the gateway on the board first (detached, so it outlives the SSH session), keep the forwarding SSH session open, then have the user open <https://motorbridge.github.io/motorbridge-studio/> pointed at `127.0.0.1:9002`. The [Zero Calibration Reference](https://github.com/sweatybridge/reBot-B601-Agent-Guide/blob/main/en/references/write-motor-zero.md) has the full sequence.
 
 ---
 
