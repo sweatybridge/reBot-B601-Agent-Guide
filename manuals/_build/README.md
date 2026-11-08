@@ -13,6 +13,7 @@ From the repository root, with Pillow available in `.rebot-venv`:
 .\.rebot-venv\Scripts\python.exe manuals\_build\make_cards.py
 .\.rebot-venv\Scripts\python.exe manuals\_build\make_layouts.py
 .\.rebot-venv\Scripts\python.exe manuals\_build\make_camera_detail.py
+.\.rebot-venv\Scripts\python.exe manuals\_build\make_reach_detail.py
 .\.rebot-venv\Scripts\python.exe manuals\_build\make_atlas.py
 ```
 
@@ -35,7 +36,7 @@ uv pip install --python .rebot-venv\Scripts\python.exe --cache-dir $env:UV_CACHE
 | `plans.py` | Plan and section primitives, including the hood, camera and view rectangle |
 | `make_cards.py` | Builds the 15 mess cards |
 | `make_layouts.py` | Builds the 3 layout sheets |
-| `make_camera_detail.py` | Builds `assets/hood-camera-detail.png` |
+| `make_camera_detail.py` | Builds `assets/hood-camera-detail.png` |\n| `make_reach_detail.py` | Builds `assets/under-cabinet-reach.png` |\n| `fold_under_probe.py` | Samples low-link fold-under poses for the reach claim |\n| `under_cabinet_probe.py` | Joint-point and link helpers shared by the probes |
 | `make_atlas.py` | Builds `assets/mess-atlas.png` |
 | `workspace_probe.py` | Samples the tool-down cleaning envelope (pure stdlib) |
 | `reach_bands.py` | Reach by height and wall-approach bands |
@@ -70,7 +71,8 @@ Run them if the chain or the joint limits change:
 - The optional hood camera is the teal module at the hood edge; the optional
   under-cabinet camera is the purple module at the cabinet/soffit bottom edge.
   The dashed rectangles are their useful views on the worktop, not full optical
-  footprints.
+  footprints. `under-cabinet-reach.png` records the verified fold-under pose; the
+  clear-height rule is a collision-planning check, not a kinematic limit.
 
 ## Editing dimensions
 
@@ -81,5 +83,7 @@ If a base position or appliance size changes, update it in **both** places:
 
 The dimension annotations on the sheet are the source of truth for the plan; the
 manual repeats the same numbers for the reader.
+
+
 
 

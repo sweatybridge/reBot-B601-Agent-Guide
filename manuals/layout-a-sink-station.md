@@ -48,9 +48,11 @@ Three design moves make the layout work:
 
 1. **The base sits on a 250 mm bay between the sink and the board.** The arm's
    foot is 180 mm, leaving 35 mm either side for the cable and finger clearance.
-2. **The upper cabinets stop 850 mm from the base.** A 450 mm-high cabinet inside
-   the arm's elbow sweep would be hit on every reach; the run ends early and the
-   wall above the sink stays open.
+2. **The main upper run stops 850 mm from the base; a 300 × 350 camera cabinet
+   sits over the base at a 450 mm underside.** The arm is not excluded from
+   under-cabinet work: it folds below the cabinet (tested highest link 375 mm),
+   and the collision check is run on the actual path. The main run still ends
+   early for lighting and tool clearance.
 3. **The cooktop is across the aisle.** The arm cannot reach it even at 755 mm,
    and the 1100 mm aisle keeps heat, steam, and splatter out of the arm's zone.
 
@@ -66,8 +68,8 @@ Three design moves make the layout work:
 | Reach to cooktop | 1450 mm | Outside 755 mm — human only |
 | Vertical reach, splashback | 320 mm above counter | Inside the ~600 mm vertical envelope |
 | Payload, tool + residue | <0.5 kg | 20 % of rated payload |
-| Clear height above counter | 700 mm required | 1500 mm to ceiling; no cabinet over the bay |
-| Upper cabinet inside 700 mm | None (run ends at x = 700) | Pass |
+| Clear height above counter | Collision-free pose; 450 mm camera cabinet workable | 1500 mm to ceiling; tested 75 mm link clearance |
+| Upper cabinet over base | 300 × 350 camera cabinet, 450 mm underside | Pass with fold-under path |
 | Base joint sector | 320° usable, 40° dead into wall | Pass |
 | Water at base | 350 mm to the sink rim, 260 mm clear from the foot | Pass with GFCI |
 
@@ -99,8 +101,8 @@ Three design moves make the layout work:
 
 | Item | Requirement | Provided |
 |---|---|---|
-| Clear height above counter | 700 mm | 1500 mm to ceiling; no cabinet over the bay |
-| Upper cabinet distance | ≥700 mm from base axis | 850 mm (run ends at x = 700) |
+| Clear height above counter | collision-free pose | 450 mm camera cabinet; 75 mm tested link clearance |
+| Upper cabinet distance | no fixed 700 mm rule | main run 850 mm; camera cabinet over the base |
 | Rear clearance | 100 mm for the elbow and cable | 150 mm |
 | Front clearance | 300 mm keep-clear | 1100 mm aisle |
 | Tool dock | within 300 mm | 295 mm (x = 1250–1410, front edge) |
@@ -146,24 +148,33 @@ keep the lens out of the direct burner plume.
 
 ### 4.5 Alternative: under-cabinet camera
 
-The same module can sit on the **bottom edge of the upper cabinet at (700, 350)**,
-lens **1350 AFF** (450 mm above the worktop), pitched **30° down**. It looks across
-the sink and prep tail — the dashed purple rectangle in the plan is 800–1700 ×
-150–600 — so it sees the **arm motion** that the hood camera cannot. Trade-offs:
-it is lower and oblique, it picks up cabinet-door vibration, and it has no view of
-the hob. Choose it for arm supervision; choose the hood camera for hob monitoring.
-Do not fit both unless the host has two camera ports and you need both views.
+A 300 × 350 mm camera cabinet sits **over the base at (1550, 350)**, underside
+**450 mm** above the worktop. The camera is on its bottom edge, lens **1350 AFF**,
+pitched **30° down**; the dashed purple rectangle in the plan (900–2100 × 100–650)
+is its view of the sink, base, and arm.
+
+![Verified fold-under pose](assets/under-cabinet-reach.png)
+
+A fixed 700 mm clear-height rule is **not a kinematic limit**.
+A tested 6-DOF pose puts the tool **178 mm behind the cabinet edge** with the
+highest link at **375 mm** — 75 mm below the 450 mm underside. A 350k-sample IK
+sweep found fold-under poses across the full 0–0.77 m tool radius, including 32
+poses at 0.70–0.80 m with all links below 430 mm. What matters is a
+collision-checked fold-under path, not a spherical vertical envelope.
 
 | Item | Value |
 |---|---|
-| Mount | bottom edge of the upper cabinet; 10–40 mm clamp + 30° wedge |
+| Mount | bottom edge of the 300 × 350 camera cabinet; 10–40 mm clamp + 30° wedge |
 | Lens height | 1350 AFF (450 mm above worktop) |
 | View at worktop | ≈1.2 × 0.9 m, centred on the sink/base |
+| Tested clearance | 75 mm at the highest link; 178 mm reach under the cabinet |
 | Cable | USB-C through the cabinet; drip loop; strain relief |
 | Trade-off | oblique/lower view, door vibration; no heat or steam |
 
-Keep the camera outside the arm's 600 mm disc; at (700, 350) it is 850 mm from the
-base and cannot be struck by the arm.
+Keep the camera and cable **50 mm outside the swept links**; the arm can work
+below the cabinet, but the bracket must not sit in the path of the wrist or
+forearm. Choose this for arm supervision; choose the hood camera for hob
+monitoring. Do not fit both unless the host has two camera ports.
 
 ## 5. Coverage map
 
@@ -367,10 +378,10 @@ clean drainboard.
 5. Fit the tool dock at x = 1250–1410, y = 510–585 (front edge), 295 mm from the base.
 6. Fit the bin or compost pull-out under the sink, within 400 mm.
 7. Mount the RGB-D camera at 1.9 m, looking down at 30°; calibrate hand–eye.
-8. Verify 850 mm from the base to the end of the upper run; 1500 mm clear to the ceiling (≥700 required).
+8. Verify the main run ends 850 mm from the base; fit the 300 × 350 camera cabinet over the base at a 450 mm underside; collision-check the fold-under path.
 9. Mark the 600 mm arc on the counter with removable tape for commissioning.
 10. Run a dry cycle, then a force-capped wipe on a scrap board; log the force peak.
-11. *(Optional)* Choose one camera: hood at (1200, 1865), or under-cabinet at (700, 350); set the lens, calibrate.
+11. *(Optional)* Choose one camera: hood at (1200, 1865), or under-cabinet at (1550, 350); set the lens, calibrate.
 
 ## 11. Bill of materials
 
@@ -384,6 +395,7 @@ clean drainboard.
 | Tools T1–T8 | 1 set | <300 g each |
 | Canister vacuum + 32 mm hose + boom | 1 | Hose supported, not wrist-loaded |
 | RGB-D camera | 1 | 1.9 m, 30° down |
+| Camera cabinet, 300 × 350 × 900 | 1 | Over the base; 450 mm underside |
 | Optional hood camera (12 MP, 120°, USB 3.0, IP65) | 1 | Cooker-hood edge, 1500 AFF |
 | Hood-edge clamp + 1/4"-20 ball head | 1 | 10–40 mm flange; lens axis vertical |
 | Alternative under-cabinet bracket + 30° wedge | 1 | If the cabinet camera is chosen |
@@ -403,6 +415,8 @@ clean drainboard.
 | Monthly | Re-check the 600 mm reach with a test target; verify torque limits |
 | After raw egg | Dispose of the pad; disinfect the tool and the sink deck; log |
 | Every 6 months | Re-torque the base; inspect the backer for corrosion |
+
+
 
 
 

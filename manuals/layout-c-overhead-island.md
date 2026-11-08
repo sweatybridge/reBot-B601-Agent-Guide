@@ -134,8 +134,14 @@ Layout C has no wall upper cabinets near the island, so the alternative is the
 **bottom edge of the overhead cabinet/soffit** at **(2250, 2200)**, lens **1450
 AFF**, looking straight down with a view rectangle of 1700–2500 × 1800–2600. This
 is the best **arm-motion** view in Layout C: it sees the links, the tool, and the
-island disc from above. It does not see the back-wall hob, and it must not reduce
-the 550 mm clearance or hang into the arm's disc.
+island disc from above.
+
+![Verified fold-under pose](assets/under-cabinet-reach.png)
+
+The soffit is 550 mm above the worktop, higher than the 450 mm cabinet in the
+tested pose, so the same fold-under logic applies with more margin. The camera
+sits at the edge of the 300 × 300 plate; keep the bracket and cable **50 mm
+outside the swept links**. It does not see the back-wall hob.
 
 | Item | Value |
 |---|---|

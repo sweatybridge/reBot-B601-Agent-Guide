@@ -82,22 +82,27 @@ Use one, or both only if the host has two camera ports.
 | Option | Mount | Lens height | View | Best for |
 |---|---|---|---|---|
 | **Hood edge** | front edge of the cooker hood | 1500 AFF | 1.66 × 1.25 m, straight down | Hob / cooking zone |
-| **Under-cabinet** | bottom edge of the upper cabinets (soffit in C) | 1350 AFF (1450 in C) | ≈1.2 × 0.9 m, oblique (straight down in C) | Arm motion |
+| **Under-cabinet** | bottom edge of a 300 × 350 camera cabinet over the base (soffit in C) | 1350 AFF (1450 in C) | ≈1.2 × 0.9 m, oblique (straight down in C) | Arm motion |
 
 ![Hood-edge camera detail](assets/hood-camera-detail.png)
 
 | | A | B | C |
 |---|---|---|---|
 | Hood camera | (1200, 1865) | (640, 1000) | (650, 640) |
-| Under-cabinet camera | (700, 350) | (1300, 350) | (2250, 2200) soffit |
-| Cabinet camera sees | Sink, base, prep tail | Corner, base, sink edge | Arm and island disc |
+| Under-cabinet camera | (1550, 350) | (430, 350) | (2250, 2200) soffit |
+| Cabinet camera sees | Sink, base, arm | Corner, base, arm | Arm and island disc |
 
-The hood camera is the cooking-zone view. The under-cabinet camera is the arm-motion
-view: lower, oblique, and clear of heat and steam, but it picks up cabinet-door
-vibration. In Layout C there are no wall upper cabinets near the island, so the
-alternative uses the **bottom edge of the overhead cabinet/soffit** instead. Both
-are context/safety views, not metrology cameras or safety-rated stops; the wrist
-and ceiling cameras remain primary for contact tasks.
+The hood camera is the cooking-zone view. The under-cabinet camera is the
+arm-motion view: it sits on a 300 × 350 mm camera cabinet over the base at a
+450 mm underside. A tested 6-DOF fold-under pose puts the tool 178 mm behind the
+edge with a 375 mm highest link — 75 mm below the cabinet. The old 700 mm
+clear-height rule is not a kinematic limit; use collision-checked fold-under
+paths. In Layout C there are no wall upper cabinets near the island, so the
+alternative uses the **bottom edge of the overhead cabinet/soffit** instead.
+Both are context/safety views, not metrology cameras or safety-rated stops; the
+wrist and ceiling cameras remain primary.
+
+![Verified fold-under pose](assets/under-cabinet-reach.png)
 
 The module uses a 10–40 mm edge clamp and a 1/4"-20 ball head, routes USB-C along
 the hood or through the cabinet, and processes locally with an active LED; no cloud
@@ -160,6 +165,7 @@ footer, and the annotations give the size window and the limiting condition.
 | `assets/layout-b-plan.png` | Layout B plan + section |
 | `assets/layout-c-plan.png` | Layout C plan + section |
 | `assets/hood-camera-detail.png` | Optional hood-edge camera mount and coverage |
+| `assets/under-cabinet-reach.png` | Verified 6-DOF fold-under pose below a 450 mm cabinet |
 | `assets/layout-{a,b,c}-mess-{01..05}.png` | 15 mess illustrations |
 
 ## Sources
@@ -173,5 +179,7 @@ footer, and the annotations give the size window and the limiting condition.
   [`en/references/demo-validation-pi-zero.md`](../en/references/demo-validation-pi-zero.md).
 - Working-envelope sampling: `manuals/_build/workspace_probe.py` and
   `manuals/_build/reach_bands.py` in this repository.
+
+
 
 

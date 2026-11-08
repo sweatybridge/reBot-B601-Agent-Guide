@@ -21,7 +21,7 @@ the cold-clean boundary at the hob; the hatched wedge faces the corner.*
 | Arm base | (430, 430), inside the 600 × 600 corner |
 | Working radius | 600 mm (solid), 755 mm reserve |
 | Covers | Sink leg, near hob burners, corner prep, chute, dock |
-| Does not cover | Far hob burners (681–714 mm), upper cabinets, fridge |
+| Does not cover | Far hob burners (681–714 mm), main upper runs (870 mm), fridge |
 | Best for | Widest task mix: wet, dry, greasy, biohazard, clutter |
 | Mount | Counter base, through-bolted through the corner block |
 | Mandatory extra | Hob heat interlock and burner lockout |
@@ -58,7 +58,7 @@ does not have:
 | Reach to splashback behind hob | 536–926 mm | Corner end inside 600 mm; the rest is reserve/out of scope |
 | Reach to spice station | 336 mm | Comfortable |
 | Reach to compost chute | 214 mm | Comfortable |
-| Reach to upper cabinets | 870 mm | Outside 755 mm |
+| Camera cabinet over base | 300 × 350, 450 underside | Fold-under path; tested 75 mm clearance |
 | Heat exposure | Hob inside the disc | **Cold-clean only**; 300 mm exclusion |
 | Base joint sector | 320° usable, 40° dead into corner | Pass |
 | Payload, tool + residue | <0.5 kg | 20 % of rated payload |
@@ -85,8 +85,8 @@ does not have:
 
 | Item | Requirement | Provided |
 |---|---|---|
-| Clear height above counter | 700 mm | 1500 mm to ceiling; no cabinet within 870 mm |
-| Upper cabinet distance | ≥700 mm from base axis | 870 mm on both legs |
+| Clear height above counter | collision-free pose | 450 mm camera cabinet; tested 75 mm link clearance |
+| Upper cabinet distance | no fixed 700 mm rule | main runs 870 mm; camera cabinet over the base |
 | Rear/corner clearance | 100 mm service | 150 mm in the void |
 | Front clearance | 300 mm keep-clear | 1100 mm to the aisle |
 | Hob exclusion | 300 mm while hot | 300 mm marked; interlocked |
@@ -137,19 +137,24 @@ the grease film weekly; a greasy lens is the main failure mode above a hob.
 
 ### 4.5 Alternative: under-cabinet camera
 
-The same module can sit on the **bottom edge of the leg-1 upper cabinet at
-(1300, 350)**, lens **1350 AFF**, pitched **30° down**, with a view rectangle of
-200–1000 × 200–700. That covers the corner, the base, and the sink edge: the arm
-motion, seen from the side rather than from above the hob. It is 870 mm from the
-base and outside the 600 mm disc. Trade-offs: lower and oblique, cabinet-door
-vibration, no view of the far burners. Choose it when arm supervision matters more
-than hob monitoring; otherwise keep the hood camera.
+A 300 × 350 mm camera cabinet sits **over the base at (430, 350)**, underside
+**450 mm** above the worktop. The camera is on its bottom edge, lens **1350 AFF**,
+pitched **30° down**, with a view rectangle of 100–1000 × 100–750. It covers the
+corner, base, and sink edge — the arm motion, without looking through the hob.
+
+![Verified fold-under pose](assets/under-cabinet-reach.png)
+
+The arm can work below this cabinet: the tested pose reaches 178 mm behind the
+edge with a 375 mm highest link, 75 mm below the 450 mm underside. The 700 mm
+clear-height rule is not a kinematic limit; use a collision-checked fold-under
+path instead. Keep the camera and cable 50 mm outside the swept links.
 
 | Item | Value |
 |---|---|
-| Mount | bottom edge of the upper cabinet; 10–40 mm clamp + 30° wedge |
+| Mount | bottom edge of the camera cabinet; 10–40 mm clamp + 30° wedge |
 | Lens height | 1350 AFF (450 mm above worktop) |
 | View at worktop | ≈1.2 × 0.9 m, centred on the corner/base |
+| Tested clearance | 75 mm at the highest link; 178 mm reach under the cabinet |
 | Cable | USB-C through the cabinet; drip loop; strain relief |
 | Trade-off | oblique/lower view, door vibration; no heat or steam |
 
@@ -165,7 +170,8 @@ than hob monitoring; otherwise keep the hood camera.
 | Splashback, corner end | 536–600 mm, 0–350 mm up | Tomato splatter | T3, T7 |
 | Spice station | 336 mm | Paprika | T1, T3 |
 | Far burners | 681–714 mm | **Human only** | — |
-| Upper cabinets | 870 mm | **Human only** | — |
+| Camera cabinet (over base) | 450 mm underside | Arm folds under | — |
+| Main upper runs | 870 mm | **Human only** | — |
 
 ## 6. Five messes the arm can clear
 
@@ -351,8 +357,8 @@ surface that will be wiped afterwards.
 7. Mark the 300 mm exclusion zone around the hob with removable tape.
 8. Mount the camera at 1.9 m, 30° down, looking into the corner; calibrate.
 9. Run a cold dry cycle; then a 3 N wipe on a scrap tile; log the force peak.
-10. Verify the upper runs start 870 mm from the base on both legs.
-11. *(Optional)* Choose one camera: hood at (640, 1000), or under-cabinet at (1300, 350); set the lens, calibrate.
+10. Verify the main upper runs start 870 mm from the base; fit the 300 × 350 camera cabinet over the base at a 450 mm underside; collision-check the fold-under path.
+11. *(Optional)* Choose one camera: hood at (640, 1000), or under-cabinet at (430, 350); set the lens, calibrate.
 
 ## 11. Bill of materials
 
@@ -368,6 +374,7 @@ surface that will be wiped afterwards.
 | Hob interlock: current sensor + IR/thermocouple | 1 | Refuses start when hot |
 | Gas isolation / smart valve | 1 | Cold-clean mode |
 | RGB-D camera | 1 | Corner view, 1.9 m |
+| Camera cabinet, 300 × 350 × 900 | 1 | Over the base; 450 mm underside |
 | Optional hood camera (12 MP, 120°, USB 3.0, IP65) | 1 | Cooker-hood edge, 1500 AFF |
 | Hood-edge clamp + 1/4"-20 ball head | 1 | 10–40 mm flange; lens axis vertical |
 | Alternative under-cabinet bracket + 30° wedge | 1 | If the cabinet camera is chosen |
@@ -385,6 +392,7 @@ surface that will be wiped afterwards.
 | Monthly | Re-check the 3 N force cap on glass; test the gas isolation |
 | After raw egg | Dispose of pad and cover; disinfect; log the human verification |
 | Every 6 months | Re-torque the base; inspect the corner plate for corrosion |
+
 
 
 

@@ -53,14 +53,17 @@ def layout_a():
                   clip=(0, 0, 3000, 2400))
     p.line([(1200, 1865), (1200, 2400)], fill="#8C8A80", width=0.9, dash=True)
     p.hood(900, 1900, 600, 500, label="HOOD")
-    p.cabinet_camera(700, 350, view=(800, 150, 1700, 600), label_at=(520, 800),
+    p.cabinet_camera(1550, 350, view=(900, 100, 2100, 650), label_at=(900, 900),
                      clip=(0, 0, 3000, 2400))
 
     p.cabinet(0, 0, 700, 350)
+    p.cabinet(1400, 0, 300, 350)
     p.cabinet(2200, 0, 200, 350)
+    c.text(p.p(1550, 175)[0], p.p(1550, 175)[1], "CAMERA", size=8, color=MUTED,
+           family="mono", anchor="mm")
     c.text(p.p(350, 168)[0], p.p(350, 168)[1], "UPPER CABINETS", size=10, color=INK_SOFT,
            family="mono", anchor="mm", tracking=0.6)
-    c.text(p.p(350, 168)[0], p.p(350, 168)[1] + 14, "END 850 mm FROM BASE", size=9,
+    c.text(p.p(350, 168)[0], p.p(350, 168)[1] + 14, "MAIN RUN ENDS 850 mm", size=9,
            color=MUTED, family="mono", anchor="mm", tracking=0.4)
 
     # arm, dock, cable
@@ -104,11 +107,18 @@ def layout_a():
     s.line([(950, 900), (950, 1160)], fill=STEEL_DARK, width=3)
     s.line([(950, 1160), (1030, 1160), (1030, 1080)], fill=STEEL_DARK, width=3)
     c.text(s.p(950, 1180)[0], s.p(950, 1180)[1], "FAUCET", size=8, color=MUTED, family="mono")
-    # upper cabinet
+    # upper cabinet + camera cabinet over the base
     s.rect(0, 1350, 700, 900, fill="#EFE7D8", outline="#A79C88", width=1)
     s.line([(350, 1350), (350, 2250)], fill="#D5CBBB", width=0.8)
     s.line([(175, 1430), (175, 1500)], fill="#A79C88", width=2)
     s.line([(525, 1430), (525, 1500)], fill="#A79C88", width=2)
+    s.rect(1400, 1350, 300, 900, fill="#EFE7D8", outline="#A79C88", width=1)
+    s.line([(1550, 1350), (1550, 2250)], fill="#D5CBBB", width=0.8)
+    cc = s.p(1550, 1350)
+    c.rect([cc[0] - 8, cc[1] + 2, cc[0] + 8, cc[1] + 10], fill="#6B4E8C",
+           outline=INK, width=0.7, radius=2)
+    c.ellipse([cc[0] - 3, cc[1] + 8, cc[0] + 3, cc[1] + 14], fill="#E4DCEF", outline=INK)
+    c.text(cc[0] + 12, cc[1] + 4, "CAB CAM", size=8, color="#6B4E8C", family="mono")
     # PSU and base labels
     s.rect(800, 140, 220, 190, fill="#E4DCCB", outline="#A79C88", width=1)
     c.text(s.p(910, 350)[0], s.p(910, 350)[1], "48V PSU", size=8, color=INK_SOFT,
@@ -129,19 +139,19 @@ def layout_a():
     p0 = s.p(1200, 940)
     c.rect([p0[0] - 6, p0[1] + 2, p0[0] + 14, p0[1] + 10], fill="#E9C84B", outline="#A98B1F")
 
-    s.dim_h(700, 1550, 1290, "850 clear")
+    s.dim_h(700, 1400, 1290, "700 gap")
     s.dim_v(1320, 900, 1350, "450", side="right")
     s.dim_v(2050, 0, 900, "900", side="left")
     c.text(1560, 238, "CEILING 2400", size=9, color=MUTED, family="mono")
-    c.text(1770, 330, "no cabinet inside", size=9, color=ACCENTS[acc]["deep"], family="mono")
-    c.text(1770, 344, "700 mm of base", size=9, color=ACCENTS[acc]["deep"], family="mono")
+    c.text(1770, 330, "camera cabinet over base", size=9, color=ACCENTS[acc]["deep"], family="mono")
+    c.text(1770, 344, "450 underside; fold-under", size=9, color=ACCENTS[acc]["deep"], family="mono")
     c.text(1540, 890, "FLOOR", size=9, color=MUTED, family="mono")
     c.text(s.p(1200, 700)[0] + 8, s.p(1200, 700)[1] - 4, "SINK", size=8, color=MUTED,
            family="mono")
 
     notes_panel(c, (1510, 925, 2140, 1430), "DEPLOYMENT NOTES", [
         ("Base position", "350 mm to the sink rim (260 mm clear of the foot); 600 mm to the centre."),
-        ("Clear height", "Upper run stops 850 mm from the base; 1500 mm to ceiling (≥700 required)."),
+        ("Clear height", "Camera cabinet over base, 450 mm underside; fold-under pose tested at 75 mm clearance."),
         ("Dead wedge", "40° sector faces the wall. Service access is from the front."),
         ("Cooktop", "Opposite run, 1.45 m away — outside the 755 mm reach."),
         ("Services", "48V PSU in the sink cabinet; cable via a grommet; GFCI."),
@@ -183,7 +193,7 @@ def layout_b():
                   clip=(0, 0, 3200, 2600))
     p.line([(640, 1000), (0, 1000)], fill="#8C8A80", width=0.9, dash=True)
     p.hood(0, 850, 600, 500, label="HOOD")
-    p.cabinet_camera(1300, 350, view=(200, 200, 1000, 700), label_at=(1600, 1150),
+    p.cabinet_camera(430, 350, view=(100, 100, 1000, 750), label_at=(1000, 1250),
                      clip=(0, 0, 3200, 2600))
     p.circle(560, 120, 55, fill="#EDE8DC", outline="#8E8576", width=1)
     c.text(p.p(560, 120)[0], p.p(560, 120)[1], "SPICE", size=8, color=INK_SOFT,
@@ -195,7 +205,10 @@ def layout_b():
     p.dock(820, 525, 160, 75)
 
     p.cabinet(1300, 0, 1100, 350)
+    p.cabinet(280, 0, 300, 350)
     p.cabinet(0, 1300, 350, 1100)
+    c.text(p.p(430, 175)[0], p.p(430, 175)[1], "CAMERA", size=8, color=MUTED,
+           family="mono", anchor="mm")
     c.text(p.p(1850, 175)[0], p.p(1850, 175)[1], "UPPER CABINETS", size=10,
            color=INK_SOFT, family="mono", anchor="mm", tracking=0.6)
     c.text(p.p(175, 1850)[0], p.p(175, 1850)[1], "UPPER", size=10, color=INK_SOFT,
@@ -231,9 +244,15 @@ def layout_b():
     s.rect(750, 900, 500, 30, fill="#2B3231", outline="#171D1C")
     s.rect(860, 930, 220, 40, fill="#3E4745", outline="#1F2625")
     s.line([(1080, 950), (1180, 950)], fill="#1F2625", width=5)
-    # upper cabinet
+    # upper cabinet + camera cabinet over the base
     s.rect(1300, 1350, 1100, 900, fill="#EFE7D8", outline="#A79C88", width=1)
     s.line([(1850, 1350), (1850, 2250)], fill="#D5CBBB", width=0.8)
+    s.rect(0, 1350, 350, 900, fill="#EFE7D8", outline="#A79C88", width=1)
+    cc = s.p(350, 1350)
+    c.rect([cc[0] - 8, cc[1] + 2, cc[0] + 8, cc[1] + 10], fill="#6B4E8C",
+           outline=INK, width=0.7, radius=2)
+    c.ellipse([cc[0] - 3, cc[1] + 8, cc[0] + 3, cc[1] + 14], fill="#E4DCEF", outline=INK)
+    c.text(cc[0] + 12, cc[1] + 4, "CAB CAM", size=8, color="#6B4E8C", family="mono")
 
     s.reach(430, 900, 600, 755)
     s.arm([(430, 900), (430, 990), (620, 1230), (900, 1140), (820, 950)],
@@ -253,7 +272,7 @@ def layout_b():
     notes_panel(c, (1510, 925, 2140, 1430), "DEPLOYMENT NOTES", [
         ("Corner bay", "Base sits in the 600 × 600 dead corner; 220 mm from the sink rim."),
         ("Dual coverage", "Sink centre 536 mm; near burners 462–509 mm."),
-        ("Cabinet line", "Upper runs start 870 mm from the base; 1500 mm to ceiling."),
+        ("Cabinet line", "Main runs start 870 mm; a 300 × 350 camera cabinet sits over the base at 450 mm."),
         ("Heat interlock", "Hob surface < 40 °C, gas off, burner lockout before entry."),
         ("Waste + tools", "Compost chute 214 mm; tool dock 401 mm (inside the 450 mm rule)."),
         ("Human only", "Far burners and the upper cabinets stay outside the envelope."),
@@ -330,6 +349,12 @@ def layout_c():
     # soffit and mount
     s.rect(1950, 1450, 300, 950, fill="#E4DACA", outline="#A79C88", width=1)
     s.line([(1950, 1450), (2250, 1450)], fill=ACCENTS[acc]["main"], width=2)
+    cc = s.p(2250, 1450)
+    c.rect([cc[0] - 8, cc[1] + 2, cc[0] + 8, cc[1] + 10], fill="#6B4E8C",
+           outline=INK, width=0.7, radius=2)
+    c.ellipse([cc[0] - 3, cc[1] + 8, cc[0] + 3, cc[1] + 14], fill="#E4DCEF", outline=INK)
+    c.text(cc[0] - 12, cc[1] + 4, "SOFFIT CAM", size=8, color="#6B4E8C",
+           family="mono", anchor="ra")
 
     s.reach_below(2100, 1450, 600, 755)
     s.arm([(2100, 1450), (2100, 1360), (2250, 1160), (2050, 1000), (2050, 900)],
@@ -365,6 +390,9 @@ if __name__ == "__main__":
     layout_a()
     layout_b()
     layout_c()
+
+
+
 
 
 
