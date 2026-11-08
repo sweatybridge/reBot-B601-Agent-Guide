@@ -1,0 +1,25 @@
+# MediaMTX for the phone preview: one WHIP publisher, one reader on the host.
+#
+#   mediamtx mediamtx.yml
+#   mediamtx /path/to/mediamtx.yml      (Windows binary: mediamtx.exe mediamtx.yml)
+#
+# The phone publishes to /phone/whip through capture_server.py (same origin, so
+# no CORS and no second certificate). The workstation reads the same stream at
+# /live (WHEP) or, from Python, at rtsp://127.0.0.1:8554/phone.
+#
+# Media is not proxied: the phone sends RTP straight to the host's UDP port 8189
+# after the WHIP handshake, so that port must be reachable on the LAN and the
+# host firewall must allow it. If the host has several interfaces, list the one
+# the phone should use in webrtcAdditionalHosts.
+logLevel: info
+
+rtsp: yes
+rtspAddress: :8554
+
+webrtc: yes
+webrtcAddress: :8889
+# webrtcAdditionalHosts: [192.168.1.23]
+
+paths:
+  phone:
+    source: publisher

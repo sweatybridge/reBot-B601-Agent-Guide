@@ -19,6 +19,7 @@ Please follow the workflow in AGENTS.md (https://github.com/sweatybridge/reBot-B
 - [Write Motor ID](en/references/write-motor-id.md) — Set motor IDs 1–7
 - [Zero Calibration](en/references/write-motor-zero.md) — Calibrate motor zero positions
 - [Examples](examples/README.md) — `edge-rust/` (Pi), `host/` (workstation) and `trajectories/` code, including the measured trajectory pipeline
+- [Phone Capture](examples/host/capture/README.md) — a phone browser as a calibrated camera: tap an object in the phone or workstation view and the arm plans to it
 - [Kitchen Deployment Manuals](manuals/README.md) — three kitchen layouts, optional hood or under-cabinet cameras, and 15 mess-cleaning scenarios for the B601-RS
 
 ### 中文

@@ -1,0 +1,11 @@
+# Host side of the phone-capture pipeline.
+#
+#   uv pip install -r examples/host/capture/requirements.txt
+#
+# `plan_to_target.py` is NOT in this list: it runs in the Pinocchio container
+# (examples/host/Dockerfile.pinocchio) and imports pinocchio from there.
+# opencv-contrib is the one that matters: cv2.aruco lives in the contrib build.
+aiohttp>=3.9
+numpy>=1.24
+opencv-contrib-python-headless>=4.9
+cryptography>=42

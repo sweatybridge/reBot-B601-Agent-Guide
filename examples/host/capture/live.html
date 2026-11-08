@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B601 live preview</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: #0b0d10; color: #e8eaed;
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    border-bottom: 1px solid #262c34; background: #14181d; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: #ff6b6b; }
+  #dot.ok { background: #45c98a; }
+  #dot.wait { background: #f0b429; }
+  #state { color: #9aa4b2; margin-left: auto; font-variant-numeric: tabular-nums; }
+  main { flex: 1 1 auto; min-height: 0; background: #000; position: relative; }
+  video { width: 100%; height: 100%; object-fit: contain; display: block; }
+  #hint { position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; color: #9aa4b2; text-align: center; padding: 24px; }
+  #hint[hidden] { display: none; }
+  #tapStatus { min-height: 18px; padding: 0 14px; color: #9aa4b2; font-size: 12.5px; }
+  footer { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid #262c34;
+    background: #14181d; }
+  button { font: inherit; font-weight: 600; padding: 10px 16px; border-radius: 10px;
+    border: 1px solid #262c34; background: #1b2027; color: #e8eaed; cursor: pointer; }
+  button.primary { background: #4ea1ff; border-color: #4ea1ff; color: #04121f; }
+  button:disabled { opacity: .45; cursor: default; }
+  a { color: #4ea1ff; }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot"></span>
+  <strong>Phone preview</strong>
+  <span id="state">idle</span>
+</header>
+<main>
+  <video id="video" autoplay muted playsinline></video>
+  <div id="hint">Start the camera and "Live preview" on the phone, then connect. Tap the image to plan the arm to that point.</div>
+</main>
+<div id="tapStatus"></div>
+<footer>
+  <button class="primary" id="connect">Connect</button>
+  <button id="disconnect" disabled>Disconnect</button>
+  <a href="/" style="margin-left:auto;align-self:center">capture page</a>
+</footer>
+<script src="/viewer.js"></script>
+<script>
+"use strict";
+const video = document.getElementById("video");
+const hint = document.getElementById("hint");
+const dot = document.getElementById("dot");
+const stateText = document.getElementById("state");
+const tapStatus = document.getElementById("tapStatus");
+const connectButton = document.getElementById("connect");
+const disconnectButton = document.getElementById("disconnect");
+
+let pc = null;
+let sessionUrl = null;
+let token = localStorage.getItem("rebot.token") || "";
+
+// Same module the phone page uses: tap the decoded stream, plan, optionally move.
+const planner = TapPlanner.create({
+  video: video,
+  stage: document.querySelector("main"),
+  token: () => token,
+  source: "live",
+  onStatus: (message, kind) => {
+    tapStatus.textContent = message;
+    tapStatus.style.color = kind === "bad" ? "#ff6b6b" : kind === "good" ? "#45c98a" : "#9aa4b2";
+  },
+});
+planner.enable();
+
+function setState(text, kind) {
+  stateText.textContent = text;
+  dot.className = kind || "";
+}
+
+function waitForIce(connection, milliseconds) {
+  if (connection.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, milliseconds || 2500);
+    function done() {
+      clearTimeout(timer);
+      connection.removeEventListener("icegatheringstatechange", check);
+      resolve();
+    }
+    function check() {
+      if (connection.iceGatheringState === "complete") done();
+    }
+    connection.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+async function connect() {
+  if (pc) return;
+  connectButton.disabled = true;
+  setState("connecting", "wait");
+  const connection = new RTCPeerConnection({ iceServers: [] });
+  pc = connection;
+  connection.addTransceiver("video", { direction: "recvonly" });
+  connection.ontrack = (event) => {
+    video.srcObject = event.streams[0];
+    hint.hidden = true;
+  };
+  connection.onconnectionstatechange = () => {
+    setState(connection.connectionState, connection.connectionState === "connected" ? "ok" : "wait");
+    if (connection.connectionState === "failed" || connection.connectionState === "disconnected") {
+      hint.hidden = false;
+      hint.textContent = "media did not arrive - check UDP 8189 between the phone and this host";
+    }
+  };
+  video.addEventListener("loadedmetadata", () => {
+    setState(video.videoWidth + "x" + video.videoHeight, "ok");
+  }, { once: true });
+
+  try {
+    await connection.setLocalDescription(await connection.createOffer());
+    await waitForIce(connection, 2500);
+    const response = await fetch("/whep", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/sdp" },
+        token ? { "X-Rebot-Token": token } : {}),
+      body: connection.localDescription.sdp,
+    });
+    if (!response.ok) throw new Error("whep " + response.status + ": " + (await response.text()).slice(0, 120));
+    sessionUrl = response.headers.get("Location");
+    await connection.setRemoteDescription({ type: "answer", sdp: await response.text() });
+    connectButton.textContent = "Reconnect";
+    disconnectButton.disabled = false;
+  } catch (error) {
+    setState("failed", "");
+    hint.hidden = false;
+    hint.textContent = String(error.message || error);
+    disconnect();
+  } finally {
+    connectButton.disabled = false;
+  }
+}
+
+async function disconnect() {
+  disconnectButton.disabled = true;
+  const connection = pc;
+  const url = sessionUrl;
+  pc = null;
+  sessionUrl = null;
+  video.srcObject = null;
+  if (connection) {
+    try { connection.close(); } catch (error) { /* already closed */ }
+  }
+  if (url) {
+    const session = String(url).split("/").filter(Boolean).pop();
+    if (session) {
+      try {
+        await fetch("/whep/" + encodeURIComponent(session), {
+          method: "DELETE",
+          headers: token ? { "X-Rebot-Token": token } : {},
+        });
+      } catch (error) { /* best effort */ }
+    }
+  }
+  setState("idle", "");
+}
+
+connectButton.addEventListener("click", connect);
+disconnectButton.addEventListener("click", disconnect);
+
+(async () => {
+  try {
+    const health = await (await fetch("/health", { cache: "no-store" })).json();
+    if (!health.whep) {
+      hint.textContent = "live preview is disabled on the host (--no-whip)";
+      connectButton.disabled = true;
+      return;
+    }
+  } catch (error) {
+    hint.textContent = "cannot reach the capture server";
+  }
+})();
+</script>
+</body>
+</html>

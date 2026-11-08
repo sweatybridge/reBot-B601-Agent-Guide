@@ -116,11 +116,30 @@ agreeing to 0.000 Nm.
 Not adopted: `tau_scale` 1.0/0.98/0.98/1/1/1 (2 % next to the model's 30-40 %
 gap) and CAN `rate: 500` (this rig runs 1 Mbit/s).
 
+## Phone camera -> plan
+
+`capture/` turns one still from a phone browser into a point in the base frame
+and then into the same trajectory JSON. The live preview is WebRTC (WHIP through
+MediaMTX); planning never sees the video. Tap an object in the phone page or in
+the workstation's `/live` page and the host plans to it; a second, confirmed tap
+executes it on the arm. It uses a calibrated still plus an ArUco tag for the
+extrinsics, so a handheld phone is fine as long as the tag is in the same frame
+as the target.
+
+```bash
+python examples/host/capture/selftest.py          # offline: no phone, no arm
+docker compose -f examples/host/capture/compose.yaml up -d --build
+```
+
+The host side is one compose file -- capture server, MediaMTX, the arm gateway
+(Pinocchio, over HTTP to `rebot-edge serve` on the board) and a `tools` image for
+the CLIs. See [`capture/README.md`](capture/README.md).
+
 ## Files
 
 | file | job |
 |---|---|
-| `edge-rust/src/main.rs` | the whole edge: CLI, dump, CAN, MIT frames, playback, logging |
+| `edge-rust/src/main.rs` | the whole edge: CLI, dump, HTTP server, CAN, MIT frames, playback, logging |
 | `edge-rust/Dockerfile` | static musl cross-build for armv6/armv7/aarch64 + host tests |
 | `edge-rust/README.md` | build targets, trajectory schema, options, measured results |
 | `host/Dockerfile.pinocchio` | python 3.11 + Pinocchio + `reBotArm_control_py`, pinned |
@@ -128,6 +147,7 @@ gap) and CAN `rate: 500` (this rig runs 1 Mbit/s).
 | `host/repeat_pino.ps1` | one-shot: dump pose, plan, save, optionally replay |
 | `host/rebot_ik.py` | the URDF transcription (model reference, used by the docs) |
 | `trajectories/seq_pino_peel.json` | the trajectory |
+| `capture/` | phone camera: page, HTTPS server, arm gateway, tap-to-plan |
 
 ## Notes
 
