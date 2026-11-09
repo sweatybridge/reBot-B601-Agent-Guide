@@ -37,10 +37,10 @@ phone page (tap) ─┐
 
 ```bash
 # in the compose stack (nothing else needed)
-docker compose -f examples/host/capture/compose.yaml --profile tools run --rm tools selftest.py
+docker compose -f examples/host/compose.yaml --profile tools run --rm tools tests/selftest.py
 
 # or from a venv, see "Or run it on the host directly" below
-python examples/host/capture/selftest.py
+python examples/host/tests/selftest.py
 ```
 
 43 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
@@ -56,7 +56,7 @@ captures once, and checks the stored tap and image size:
 # with the capture server already running
 chrome --headless=new --remote-debugging-port=9333 --ignore-certificate-errors \
     --user-data-dir=/tmp/rebot-chrome about:blank
-python examples/host/capture/browser_check.py --connect 9333 \
+python examples/host/tests/browser_check.py --connect 9333 \
     --url "https://127.0.0.1:8443/?token=test-token"
 ```
 
@@ -70,10 +70,10 @@ gateway (Pinocchio, talking HTTP to `rebot-edge serve`) and a one-shot `tools`
 container (certificates, calibration, tags).
 
 ```bash
-cd examples/host/capture
+cd examples/host
 cp .env.example .env            # REBOT_HOST_IP, tag placement, REBOT_EDGE_URL
 docker compose up -d --build
-docker compose --profile tools run --rm tools make_cert.py --host rebot-host
+docker compose --profile tools run --rm tools app/make_cert.py --host rebot-host
 docker compose restart capture
 ```
 
@@ -87,9 +87,9 @@ docker compose restart capture
 Everything after that is a tap or a command:
 
 ```bash
-docker compose --profile tools run --rm tools calibrate_intrinsics.py
-docker compose --profile tools run --rm tools make_tag.py --id 0 --size 80
-docker compose --profile tools run --rm tools selftest.py
+docker compose --profile tools run --rm tools app/calibrate_intrinsics.py
+docker compose --profile tools run --rm tools app/make_tag.py --id 0 --size 80
+docker compose --profile tools run --rm tools tests/selftest.py
 ```
 
 Four things that matter:
@@ -113,9 +113,9 @@ gateway needs `REBOT_EDGE_URL` to point at the board's `rebot-edge serve`;
 without a reachable edge the stack still plans from taps but every plan fails at
 the pose, which is what the panel will say.
 
-In the commands that follow, `python examples/host/capture/<script>.py` is either
+In the commands that follow, `python examples/host/app/<script>.py` is either
 the venv form or, in containers,
-`docker compose --profile tools run --rm tools <script>.py`.
+`docker compose --profile tools run --rm tools app/<script>.py`.
 
 ## Or run it on the host directly
 
@@ -123,7 +123,7 @@ The same code runs from a host venv; this is the shorter loop while editing the
 page or the geometry, because it skips a rebuild.
 
 ```bash
-uv pip install -r examples/host/capture/requirements.txt
+uv pip install -r examples/host/requirements.txt
 ```
 
 `opencv-contrib` is required: `cv2.aruco` is not in the plain build.
@@ -133,7 +133,7 @@ Download a MediaMTX binary from <https://github.com/bluenviron/mediamtx/releases
 and run it with the config next to this file:
 
 ```bash
-mediamtx examples/host/capture/mediamtx.yml
+mediamtx examples/host/deploy/mediamtx.yml
 ```
 
 ## TLS: the phone will not open the camera without it
@@ -142,11 +142,11 @@ mediamtx examples/host/capture/mediamtx.yml
 
 ```bash
 # compose: REBOT_HOST_IP from .env becomes the certificate's IP
-docker compose --profile tools run --rm tools make_cert.py --host rebot-host
+docker compose --profile tools run --rm tools app/make_cert.py --host rebot-host
 docker compose restart capture
 
 # host venv
-python examples/host/capture/make_cert.py --host rebot-host --ip 192.168.1.23
+python examples/host/app/make_cert.py --host rebot-host --ip 192.168.1.23
 ```
 
 Install `tls/ca.pem` on the phone once:
@@ -161,9 +161,9 @@ Install `tls/ca.pem` on the phone once:
 it is:
 
 ```bash
-python examples/host/capture/capture_server.py \
-    --cert examples/host/capture/tls/cert.pem \
-    --key  examples/host/capture/tls/key.pem \
+python examples/host/app/capture_server.py \
+    --cert examples/host/state/tls/cert.pem \
+    --key  examples/host/state/tls/key.pem \
     --token pick-something
 ```
 
@@ -175,7 +175,7 @@ stays installed.
 ## Print the tag and tape it down
 
 ```bash
-python examples/host/capture/make_tag.py --id 0 --size 80
+python examples/host/app/make_tag.py --id 0 --size 80
 ```
 
 Print at 100 % (no "fit to page"), then **measure the black square** and pass the
@@ -199,8 +199,8 @@ Take 15-20 shots of a printed checkerboard with **Calibration mode** on: tilt it
 put it in the corners, fill the frame, then pull back. Then:
 
 ```bash
-python examples/host/capture/calibrate_intrinsics.py \
-    --captures examples/host/capture/captures --cols 9 --rows 6 --square 0.025
+python examples/host/app/state/calibrate_intrinsics.py \
+    --captures examples/host/state/captures --cols 9 --rows 6 --square 0.025
 ```
 
 It writes `calib/<device>.json`. The RMS gate is 1 px; drop views above 2 px
@@ -247,16 +247,16 @@ commands:
 
 ```bash
 # 1. capture -> base-frame point, with a picture of what it believed
-docker compose --profile tools run --rm tools locate_target.py \
-    --capture /app/captures/<id> --calib /app/calib/<device>.json \
+docker compose --profile tools run --rm tools app/locate_target.py \
+    --capture /app/state/captures/<id> --calib /app/state/calib/<device>.json \
     --tag-size 0.080 --tag-x 0.35 --tag-y -0.20 --tag-yaw 15 \
-    --annotate /app/captures/<id>/annotated.jpg
+    --annotate /app/state/captures/<id>/annotated.jpg
 
 # 2. point -> trajectory, through the same code the gateway runs
-docker compose run --rm --entrypoint python planner /work/capture/plan_to_target.py \
-    --joints /app/work/current.json \
-    --target /app/captures/<id>/target.json \
-    --out /app/out/seq.json --tool-axis z-
+docker compose run --rm --entrypoint python planner /app/app/plan_to_target.py \
+    --joints /app/state/work/current.json \
+    --target /app/state/captures/<id>/target.json \
+    --out /app/state/out/seq.json --tool-axis z-
 
 # 3. the gate as always
 ./rebot-edge seq.json --check
@@ -270,8 +270,8 @@ the arm is known to reach from. A top-down grasp needs the local axis that point
 out of the gripper. Ask the model instead of guessing:
 
 ```bash
-docker compose run --rm --entrypoint python planner /work/capture/plan_to_target.py \
-    --joints /app/work/current.json --inspect
+docker compose run --rm --entrypoint python planner /app/app/plan_to_target.py \
+    --joints /app/state/work/current.json --inspect
 ```
 
 It prints each local axis of `gripper_end` in the base frame and its angle from

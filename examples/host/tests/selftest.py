@@ -8,7 +8,7 @@ worst moment. This rebuilds all three from synthetic images with a known camera
 and checks the numbers against ground truth, then round-trips a capture through
 the real HTTP server.
 
-    python examples/host/capture/selftest.py
+    python examples/host/tests/selftest.py
 
 Everything here is deterministic. If it fails, the pipeline is wrong, not the
 measurement.
@@ -28,7 +28,8 @@ import cv2
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+APP = HERE.parent / "app"
+sys.path.insert(0, str(APP))
 
 import calib as calib_mod  # noqa: E402
 import calibrate_intrinsics as calib_cli  # noqa: E402

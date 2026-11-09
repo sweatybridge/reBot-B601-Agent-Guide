@@ -2,11 +2,10 @@
 #
 #   mediamtx  WebRTC relay: the phone publishes here, /live reads here
 #   capture   HTTPS endpoint, tap -> capture -> plan, WHIP/WHEP relay   -> :8443
-#   planner   the arm gateway: pose over ssh, Pinocchio planning, optional execute
+#   planner   the arm gateway: edge /pose, Pinocchio planning, optional execute
 #   tools     one-shot CLI: calibrate, make_tag, make_cert, selftest
 #
-#   cp .env.example .env        # REBOT_HOST_IP, REBOT_TOKEN, tag placement
-#   mkdir -p secrets && cp ~/.ssh/id_ed25519 secrets/    # only needed to move the arm
+#   cp .env.example .env        # REBOT_HOST_IP, tag placement, REBOT_EDGE_URL
 #   docker compose up -d --build
 #   docker compose --profile tools run --rm tools calibrate_intrinsics.py
 #
@@ -14,6 +13,9 @@
 # network and is reached through the relay in capture_server.py; only the media
 # port 8189/udp is published, because after the handshake the phone sends RTP
 # straight to <REBOT_HOST_IP>:8189.
+#
+# Everything that persists lives in ./state/{captures,calib,tls,tags,out,work},
+# mounted at /app/state so the paths are the same inside and outside.
 name: rebot-capture
 
 services:
@@ -27,7 +29,7 @@ services:
       MTX_WEBRTCIPSFROMINTERFACES: "no"
       MTX_WEBRTCADDITIONALHOSTS: ${REBOT_HOST_IP:-}
     volumes:
-      - ./mediamtx.yml:/mediamtx.yml:ro
+      - ./deploy/mediamtx.yml:/mediamtx.yml:ro
     ports:
       - "8189:8189/udp"
 
@@ -41,14 +43,14 @@ services:
       - "${REBOT_PORT:-8443}:8443"
     environment:
       REBOT_PORT: "8443"
-      REBOT_CERT: /app/tls/cert.pem
-      REBOT_KEY: /app/tls/key.pem
+      REBOT_CERT: /app/state/tls/cert.pem
+      REBOT_KEY: /app/state/tls/key.pem
       REBOT_TOKEN: ${REBOT_TOKEN:-}
       REBOT_MEDIAMTX: http://mediamtx:8889
       REBOT_PLANNER: http://planner:8000
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_EXECUTE: ${REBOT_EXECUTE:-0}
-      REBOT_CALIB_DIR: /app/calib
+      REBOT_CALIB_DIR: /app/state/calib
       REBOT_TAG_SIZE: ${REBOT_TAG_SIZE:-0.080}
       REBOT_TAG_X: ${REBOT_TAG_X:-0.0}
       REBOT_TAG_Y: ${REBOT_TAG_Y:-0.0}
@@ -57,11 +59,9 @@ services:
       REBOT_TOOL_AXIS: ${REBOT_TOOL_AXIS:-current}
       REBOT_YAW: ${REBOT_YAW:-0.0}
     volumes:
-      - ./captures:/app/captures
-      - ./calib:/app/calib
-      - ./tls:/app/tls
+      - ./state:/app/state
     healthcheck:
-      test: ["CMD", "python", "healthcheck.py"]
+      test: ["CMD", "python", "app/healthcheck.py"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -70,12 +70,13 @@ services:
   planner:
     build:
       # Pinocchio publishes no win_amd64 wheels, so the arm gateway is its own
-      # image; the scripts are mounted, not copied.
-      context: ../../..
+      # image; the app is mounted, not copied, so edits need no rebuild.
+      context: ../..
       dockerfile: examples/host/Dockerfile.pinocchio
     image: rebot-pino
     restart: unless-stopped
-    command: ["python", "/work/capture/planner_server.py"]
+    command: ["python", "/app/app/planner_server.py"]
+    working_dir: /app
     environment:
       REBOT_EDGE_URL: ${REBOT_EDGE_URL:-http://raspberrypi:8081}
       REBOT_EDGE_TOKEN: ${REBOT_EDGE_TOKEN:-}
@@ -83,11 +84,10 @@ services:
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_KP: ${REBOT_KP:-50,2:150,3:150}
       REBOT_KD: ${REBOT_KD:-3,2:10,3:10,4:5,5:4,6:4,7:4}
-      REBOT_OUT: /app/out
+      REBOT_OUT: /app/state/out
     volumes:
-      - .:/work/capture:ro
-      - ./out:/app/out
-      - ./work:/app/work
+      - ./app:/app/app:ro
+      - ./state:/app/state
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 30s
@@ -104,8 +104,4 @@ services:
     environment:
       REBOT_HOST_IP: ${REBOT_HOST_IP:-}
     volumes:
-      - ./captures:/app/captures
-      - ./calib:/app/calib
-      - ./tls:/app/tls
-      - ./tags:/app/tags
-      - ./work:/app/work
+      - ./state:/app/state

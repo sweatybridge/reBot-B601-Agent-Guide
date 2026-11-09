@@ -6,8 +6,8 @@ The phone page has a "calibration" capture mode that writes `purpose: calib`
 captures. Point it at a printed board in 15-20 different poses -- tilt it, put it
 in the corners, fill the frame and then pull back -- and run this on the host:
 
-    python examples/host/capture/calibrate_intrinsics.py \
-        --captures examples/host/capture/captures --cols 9 --rows 6 --square 0.025
+    python examples/host/app/calibrate_intrinsics.py \
+        --captures examples/host/state/captures --cols 9 --rows 6 --square 0.025
 
 Output is `calib/<device>.json`, which `locate_target.py` reads. The RMS gate
 matters more than the number of views: a 0.5 px fit on 12 good views beats
@@ -129,10 +129,11 @@ def annotate(image, corners, cols, rows):
 
 def main(argv=None):
     here = Path(__file__).resolve().parent
+    state = here.parent / "state"
     parser = argparse.ArgumentParser(description="Fit phone-camera intrinsics from checkerboard captures.")
-    parser.add_argument("--captures", default=str(here / "captures"),
+    parser.add_argument("--captures", default=str(state / "captures"),
                         help="capture root written by capture_server.py")
-    parser.add_argument("--out", default=str(here / "calib"), help="where calibration JSONs go")
+    parser.add_argument("--out", default=str(state / "calib"), help="where calibration JSONs go")
     parser.add_argument("--cols", type=int, default=9, help="inner corners across")
     parser.add_argument("--rows", type=int, default=6, help="inner corners down")
     parser.add_argument("--square", type=float, default=0.025, help="square side, metres")

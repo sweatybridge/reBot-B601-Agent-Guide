@@ -27,7 +27,9 @@ MIN_HZ, MAX_HZ = 5.0, 200.0
 
 
 def waypoint(t, q, tau=None):
-    return {"t": float(t), "q": [float(v) for v in q],
+    # Six decimals is microseconds: enough for the player's scheduler, and it
+    # keeps the files readable instead of 0.03333333333333333.
+    return {"t": round(float(t), 6), "q": [float(v) for v in q],
             "tau": [float(v) for v in tau] if tau is not None else None}
 
 
@@ -52,8 +54,9 @@ def build(waypoints, control_hz, limits, steps, extra=None, hold_start=None, hol
         "waypoints": cleaned,
     }
     if hold_start is not None and hold_end is not None:
-        payload["hold_start_s"] = float(hold_start)
-        payload["hold_end_s"] = float(hold_end)
+        # Same 1e-6 as the waypoint times: these are seconds, not a checksum.
+        payload["hold_start_s"] = round(float(hold_start), 6)
+        payload["hold_end_s"] = round(float(hold_end), 6)
     if extra:
         payload.update(extra)
     payload = {key: value for key, value in payload.items() if value is not None}

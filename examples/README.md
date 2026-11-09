@@ -15,7 +15,7 @@ the edge only ever sends joint angles and torques it was handed.
 ## The loop
 
 ```
-  edge-rust dump          host/plan_with_pinocchio.py (container)        edge-rust
+  edge-rust dump          host/app/plan_with_pinocchio.py (container)        edge-rust
 arm ───────────► current.json ──────────────────────────────► seq.json ───────────► arm
      (read 0x7019,          (their IK + Pinocchio g(q),         (30 Hz frames,
       no torque)             one tau per waypoint)               dry run by default)
@@ -27,7 +27,7 @@ arm ───────────► current.json ────────�
 
 # 2. host: plan with Seeed's stack, inside the container
 docker build -t rebot-pino -f examples/host/Dockerfile.pinocchio .
-pwsh -File examples/host/repeat_pino.ps1            # plan and save
+pwsh -File examples/host/deploy/repeat_pino.ps1            # plan and save
 
 # 3. edge: replay it (dry run first)
 ./rebot-edge trajectories/seq_pino_peel.json
@@ -35,11 +35,11 @@ sudo ./rebot-edge trajectories/seq_pino_peel.json --execute --track
 ```
 
 On a POSIX host, the container can be run with a bind mount instead of
-`docker cp`:
+`docker cp` (from the repository root):
 
 ```bash
 docker run --rm -v "$PWD:/work" rebot-pino python \
-    /work/host/plan_with_pinocchio.py --joints /work/current.json --out /work/seq.json
+    /work/examples/host/app/plan_with_pinocchio.py --joints /work/current.json --out /work/seq.json
 ```
 
 ## Build the Rust player
@@ -93,13 +93,13 @@ The Rust player has been measured from 30 Hz to 200 Hz on this arm; see
 
 ## The model
 
-`host/rebot_ik.py` carries the B601-RS chain transcribed from Seeed's
+`host/app/rebot_ik.py` carries the B601-RS chain transcribed from Seeed's
 `urdf/RS/urdf/ReBot_Arm_RS.urdf`; the container reads the original file through
 Pinocchio. The two were checked against each other: joint origins, axes and
 limits identical, link masses and CoMs agreeing to 4e-9 m, gravity torques
 agreeing to 0.000 Nm.
 
-![model](host/arm_model.png)
+![model](host/docs/arm_model.png)
 
 ## Vendor configuration
 
@@ -118,8 +118,8 @@ gap) and CAN `rate: 500` (this rig runs 1 Mbit/s).
 
 ## Phone camera -> plan
 
-`capture/` turns one still from a phone browser into a point in the base frame
-and then into the same trajectory JSON. The live preview is WebRTC (WHIP through
+`host/` turns one still from a phone browser into a point in the base frame and
+then into the same trajectory JSON. The live preview is WebRTC (WHIP through
 MediaMTX); planning never sees the video. Tap an object in the phone page or in
 the workstation's `/live` page and the host plans to it; a second, confirmed tap
 executes it on the arm. It uses a calibrated still plus an ArUco tag for the
@@ -127,13 +127,14 @@ extrinsics, so a handheld phone is fine as long as the tag is in the same frame
 as the target.
 
 ```bash
-python examples/host/capture/selftest.py          # offline: no phone, no arm
-docker compose -f examples/host/capture/compose.yaml up -d --build
+python examples/host/tests/selftest.py          # offline: no phone, no arm
+docker compose -f examples/host/compose.yaml up -d --build
 ```
 
 The host side is one compose file -- capture server, MediaMTX, the arm gateway
 (Pinocchio, over HTTP to `rebot-edge serve` on the board) and a `tools` image for
-the CLIs. See [`capture/README.md`](capture/README.md).
+the CLIs. See [`host/README.md`](host/README.md) for the map and
+[`host/docs/phone-camera.md`](host/docs/phone-camera.md) for the detail.
 
 ## Files
 
@@ -143,11 +144,14 @@ the CLIs. See [`capture/README.md`](capture/README.md).
 | `edge-rust/Dockerfile` | static musl cross-build for armv6/armv7/aarch64 + host tests |
 | `edge-rust/README.md` | build targets, trajectory schema, options, measured results |
 | `host/Dockerfile.pinocchio` | python 3.11 + Pinocchio + `reBotArm_control_py`, pinned |
-| `host/plan_with_pinocchio.py` | plans with their IK, adds `tau`, writes the JSON (runs in the container) |
-| `host/repeat_pino.ps1` | one-shot: dump pose, plan, save, optionally replay |
-| `host/rebot_ik.py` | the URDF transcription (model reference, used by the docs) |
+| `host/app/plan_with_pinocchio.py` | plans with their IK, adds `tau`, writes the JSON (runs in the container) |
+| `host/deploy/repeat_pino.ps1` | one-shot: dump pose, plan, save, optionally replay |
+| `host/app/rebot_ik.py` | the URDF transcription (model reference, used by the docs) |
+| `host/compose.yaml` | capture, MediaMTX, arm gateway and tools |
+| `host/app/` | the services, the vision code and both planners |
+| `host/web/` | the phone page, the live viewer and their shared tap module |
+| `host/tests/` | `selftest.py` (offline) and `browser_check.py` (headless Chrome) |
 | `trajectories/seq_pino_peel.json` | the trajectory |
-| `capture/` | phone camera: page, HTTPS server, arm gateway, tap-to-plan |
 
 ## Notes
 

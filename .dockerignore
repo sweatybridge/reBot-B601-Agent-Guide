@@ -1,5 +1,5 @@
 # Build context for the repo root: `docker build -f examples/host/Dockerfile.pinocchio .`
-# and `docker compose --profile plan build planner`.
+# and `docker compose build planner`.
 #
 # The Pinocchio image clones its own sources and copies nothing from here, so the
 # context only needs to be small, not complete.
@@ -11,11 +11,7 @@
 **/*.pyc
 examples/edge-rust/target
 examples/edge-rust/dist
-examples/host/capture/captures
-examples/host/capture/calib
-examples/host/capture/tls
-examples/host/capture/work
-examples/host/capture/out
-examples/host/capture/tags
-examples/host/capture/.selftest-work
+examples/host/state
+examples/host/.env
+examples/host/tests/.selftest-work
 manuals/assets

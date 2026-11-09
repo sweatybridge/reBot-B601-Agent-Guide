@@ -30,7 +30,8 @@ def main(argv=None):
     parser.add_argument("--dpi", type=int, default=300, help="render resolution for printing")
     parser.add_argument("--border", type=float, default=10.0, help="white quiet zone, mm")
     parser.add_argument("--dictionary", default="DICT_4X4_50")
-    parser.add_argument("--out", default="tags", help="output directory")
+    parser.add_argument("--out", default=str(Path(__file__).resolve().parent.parent / "state" / "tags"),
+                        help="output directory")
     args = parser.parse_args(argv)
 
     if args.size <= 0 or args.border < 0:

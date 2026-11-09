@@ -47,7 +47,8 @@ sys.path.insert(0, str(HERE))
 
 import plan_to_target as planner  # noqa: E402
 
-OUT_DIR = Path(os.environ.get("REBOT_OUT", "/app/out"))
+ROOT = HERE.parent
+OUT_DIR = Path(os.environ.get("REBOT_OUT", str(ROOT / "state" / "out")))
 EDGE_URL = os.environ.get("REBOT_EDGE_URL", "http://raspberrypi:8081").rstrip("/")
 EDGE_TOKEN = os.environ.get("REBOT_EDGE_TOKEN", "")
 TOKEN = os.environ.get("REBOT_PLANNER_TOKEN", "")

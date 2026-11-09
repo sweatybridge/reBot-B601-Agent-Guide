@@ -43,6 +43,9 @@ from reBotArm_control_py.kinematics.robot_model import (
 )
 from reBotArm_control_py.trajectory import IKParams
 
+from plan_to_target import PlanError, posture
+import traj
+
 MOTOR7_OPEN = 4.90
 MOTOR7_CLOSED = -0.015
 
@@ -54,12 +57,10 @@ def ease(x):
 def load_dump(path):
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
-    ids = [int(i) for i in data["ids"]]
-    q = [float(v) for v in data["q"]]
-    if ids[:6] != [1, 2, 3, 4, 5, 6]:
-        raise SystemExit("%s: expected motor ids 1..6 first, got %s" % (path, ids))
-    gripper = q[6] if len(q) >= 7 else MOTOR7_CLOSED
-    return np.array(q[:6], dtype=float), float(gripper)
+    try:
+        return posture(data)
+    except PlanError as error:
+        raise SystemExit("%s: %s" % (path, error)) from error
 
 
 def main(argv=None):
@@ -249,24 +250,23 @@ def main(argv=None):
             t += period
             append(q, MOTOR7_OPEN + (MOTOR7_CLOSED - MOTOR7_OPEN) * ease(i / n))
 
-    payload = {
-        "format": "rebot-joint-trajectory",
-        "version": 1,
-        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "control_hz": args.hz,
-        "ids": [1, 2, 3, 4, 5, 6, 7],
-        "limits": [[float(lo), float(hi)] for lo, hi in zip(lower, upper)] + [[-0.1, 5.0]],
-        "steps": ("pinocchio: open, lift %.2f/%.2f/%.2f m with world orientation held, "
-                  "grip 6 cm, hold %.1f s, return" % (args.dx, args.dy, args.dz, args.hold_s)),
-        "duration_s": round(t, 6),
-        "hold_start_s": round(hold_start, 6),
-        "hold_end_s": round(hold_end, 6),
-        "dynamics": {
-            "source": "reBotArm_control_py.compute_generalized_gravity (Pinocchio RNEA)",
-            "tau": "gravity torque of the planned pose, per waypoint",
+    # One payload builder for both planners: traj.build owns the schema, the
+    # duration and the hold window, so this file cannot drift from the player's
+    # expectations (or from plan_to_target.py).
+    payload = traj.build(
+        waypoints, args.hz,
+        [[float(lo), float(hi)] for lo, hi in zip(lower, upper)] + [[-0.1, 5.0]],
+        ("pinocchio: open, lift %.2f/%.2f/%.2f m with world orientation held, "
+         "grip 6 cm, hold %.1f s, return" % (args.dx, args.dy, args.dz, args.hold_s)),
+        extra={
+            "dynamics": {
+                "source": "reBotArm_control_py.compute_generalized_gravity (Pinocchio RNEA)",
+                "tau": "gravity torque of the planned pose, per waypoint",
+            },
         },
-        "waypoints": waypoints,
-    }
+        hold_start=hold_start,
+        hold_end=hold_end,
+    )
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, separators=(",", ":"))
 

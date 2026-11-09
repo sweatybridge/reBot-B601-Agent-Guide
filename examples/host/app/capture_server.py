@@ -7,7 +7,7 @@ TLS endpoint the phone talks to; it also relays the WebRTC signaling to MediaMTX
 so the page is same-origin and MediaMTX can stay on plain loopback. Nothing here
 touches the arm -- the output is a directory on disk that the planner reads.
 
-    python examples/host/capture/capture_server.py --cert tls/cert.pem --key tls/key.pem
+    python examples/host/app/capture_server.py --cert tls/cert.pem --key tls/key.pem
 
 Writes one directory per capture:
 
@@ -42,7 +42,10 @@ from aiohttp import ClientSession, ClientTimeout, web
 import locate_target as locator
 
 VERSION = "0.1.0"
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent      # app/
+ROOT = HERE.parent                          # the host directory
+WEB_DIR = ROOT / "web"
+STATE = ROOT / "state"                       # captures, calib, tls, tags, out, work
 
 CAPTURE_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -107,7 +110,7 @@ async def handle_live(request: web.Request) -> web.StreamResponse:
 
 
 async def handle_viewer_js(request: web.Request) -> web.StreamResponse:
-    script = HERE / "viewer.js"
+    script = WEB_DIR / "viewer.js"
     if not script.is_file():
         return web.Response(text="viewer.js is missing next to capture_server.py", status=500)
     return web.Response(text=script.read_text(encoding="utf-8"),
@@ -116,7 +119,7 @@ async def handle_viewer_js(request: web.Request) -> web.StreamResponse:
 
 
 async def _page(request: web.Request, name: str) -> web.StreamResponse:
-    page = HERE / name
+    page = WEB_DIR / name
     if not page.is_file():
         return web.Response(text="%s is missing next to capture_server.py" % name, status=500)
     return web.Response(text=page.read_text(encoding="utf-8"), content_type="text/html",
@@ -493,7 +496,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Phone capture endpoint for the B601 host.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.environ.get("REBOT_PORT", "8443")))
-    parser.add_argument("--captures", default=str(HERE / "captures"))
+    parser.add_argument("--captures", default=str(STATE / "captures"))
     parser.add_argument("--cert", default=os.environ.get("REBOT_CERT", ""),
                         help="PEM certificate chain (TLS)")
     parser.add_argument("--key", default=os.environ.get("REBOT_KEY", ""),
@@ -510,7 +513,7 @@ def main(argv=None):
     parser.add_argument("--execute", action="store_true",
                         default=os.environ.get("REBOT_EXECUTE", "0") == "1",
                         help="allow /execute to move the arm (also needs the gateway's flag)")
-    parser.add_argument("--calib-dir", default=os.environ.get("REBOT_CALIB_DIR", str(HERE / "calib")))
+    parser.add_argument("--calib-dir", default=os.environ.get("REBOT_CALIB_DIR", str(STATE / "calib")))
     parser.add_argument("--calib", default=os.environ.get("REBOT_CALIB", ""),
                         help="calibration JSON; default is the newest in --calib-dir")
     parser.add_argument("--tag-size", type=float,

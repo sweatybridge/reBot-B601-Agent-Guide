@@ -9,15 +9,15 @@ stream (`getUserMedia` returns a 1280x960 test pattern), clicks a known pixel,
 captures once, and checks the stored tap and image size.
 
     # terminal 1
-    python examples/host/capture/capture_server.py --token test-token
+    python examples/host/app/capture_server.py --token test-token
     # terminal 2
-    python examples/host/capture/browser_check.py --url "https://127.0.0.1:8443/?token=test-token"
+    python examples/host/tests/browser_check.py --url "https://127.0.0.1:8443/?token=test-token"
 
 If the shell cannot launch a browser itself (confined sandboxes block Chromium's
 IPC), start one separately and attach:
 
     chrome --headless=new --remote-debugging-port=9333 --user-data-dir=/tmp/x about:blank
-    python examples/host/capture/browser_check.py --connect 9333 --url "..."
+    python examples/host/tests/browser_check.py --connect 9333 --url "..."
 
 Needs Chrome or Edge on the machine. It is a check of the page, not of the
 camera: the lens, the focus and the intrinsics are still the phone's problem.
@@ -38,6 +38,7 @@ from pathlib import Path
 import aiohttp
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 WINDOWS_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -290,7 +291,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Headless check of phone.html against a running server.")
     parser.add_argument("--url", default="http://127.0.0.1:8443/",
                         help="the page as the phone would open it, token included")
-    parser.add_argument("--captures", default=str(HERE / "captures"),
+    parser.add_argument("--captures", default=str(ROOT / "state" / "captures"),
                         help="the server's capture directory, to see the upload arrive")
     parser.add_argument("--chrome", default="", help="browser executable")
     parser.add_argument("--connect", type=int, default=0,

@@ -7,19 +7,12 @@ examples/edge-rust/target/
 examples/edge-rust/dist/
 examples/edge-rust/.bench/
 
-# Phone capture local state (examples/host/capture): captures, certs, per-phone
-# calibration and printable tags are machine-specific, not part of the guide
-examples/host/capture/captures/
-examples/host/capture/calib/
-examples/host/capture/tls/
-examples/host/capture/tags/
-examples/host/capture/work/
-examples/host/capture/out/
-examples/host/capture/tags/
-examples/host/capture/.env
-examples/host/capture/.selftest-work/
-examples/host/capture/.e2e-*
-examples/host/capture/.build-context/
+# Host local state (examples/host): captures, certs, per-phone calibration,
+# printable tags and generated plans are machine-specific
+examples/host/state/
+examples/host/.env
+examples/host/tests/.selftest-work/
+examples/host/tests/.e2e-*
 
 # Local tooling / venvs (machine-specific, not part of the guide)
 .rebot-venv/

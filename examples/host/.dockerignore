@@ -1,0 +1,9 @@
+# Build context for examples/host/Dockerfile.
+state/
+.env
+tests/.selftest-work/
+tests/.e2e-*
+docs/
+deploy/
+__pycache__/
+*.pyc

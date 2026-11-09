@@ -1,6 +1,6 @@
 # Host side of the phone-capture pipeline.
 #
-#   uv pip install -r examples/host/capture/requirements.txt
+#   uv pip install -r examples/host/requirements.txt
 #
 # `plan_to_target.py` is NOT in this list: it runs in the Pinocchio container
 # (examples/host/Dockerfile.pinocchio) and imports pinocchio from there.

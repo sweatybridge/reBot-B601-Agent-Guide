@@ -1,7 +1,7 @@
 # One-shot repeat of the no-measurement Pinocchio trajectory.
 #
-#   pwsh -File examples/host/repeat_pino.ps1            # plan + save the JSON
-#   pwsh -File examples/host/repeat_pino.ps1 -Replay    # plan, save, and play it on the arm
+#   pwsh -File examples/host/deploy/repeat_pino.ps1            # plan + save the JSON
+#   pwsh -File examples/host/deploy/repeat_pino.ps1 -Replay    # plan, save, and play it on the arm
 #
 # Needs: Docker Desktop with the rebot-pino image (built from
 # examples/host/Dockerfile.pinocchio), ssh access to the Pi, and the Rust edge
@@ -20,7 +20,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$repo = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 Set-Location $repo
 
 # 1. where is the arm now (read-only)
@@ -37,7 +37,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 $id = docker create $Image python /work/plan.py --joints /work/current.json --out /work/seq.json
 try {
-    docker cp examples/host/plan_with_pinocchio.py "${id}:/work/plan.py" | Out-Null
+    docker cp examples/host/app/plan_with_pinocchio.py "${id}:/work/plan.py" | Out-Null
     docker cp $dump "${id}:/work/current.json" | Out-Null
     docker start -a $id
     if ($LASTEXITCODE -ne 0) { throw "the planner failed" }
