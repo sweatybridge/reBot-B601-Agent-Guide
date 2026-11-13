@@ -87,8 +87,10 @@ The dry run still opens the CAN socket and reads `0x7019` from every motor
 
 `--execute` prints the drift between the plan's start pose and the measured one,
 refuses to start if it is more than 20°, eases onto the plan start with
-`--ramp`, streams the waypoints, then ramps home and disables torque. Ctrl-C or
-SIGTERM interrupts at the next tick, ramps home and then disables.
+`--ramp`, streams the waypoints, then ramps home and disables torque. The way home
+is timed by the distance it covers -- a cosine ease capped at 0.35 rad/s, at least
+3 s -- not by a constant, so a long return is not rushed. Ctrl-C or SIGTERM
+interrupts at the next tick, ramps home the same way and then disables.
 
 ## Pose snapshot
 

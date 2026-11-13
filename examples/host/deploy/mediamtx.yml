@@ -20,6 +20,37 @@ webrtc: yes
 webrtcAddress: :8889
 # webrtcAdditionalHosts: [192.168.1.23]
 
+# The control API, used by the capture server to start and stop recording around
+# a calibration sweep. It stays on the compose network: port 9997 is not
+# published, so only the containers can reach it.
+api: yes
+apiAddress: :9997
+
+# MediaMTX defaults to this list *without* `api`, which is why the control API
+# answers 401 until it is granted. Publishing is the phone (WHIP), reading is the
+# capture server's RTSP pull.
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+
 paths:
   phone:
     source: publisher
+    # Recording is off by default and switched on per sweep through the API
+    # (`PATCH /v3/config/paths/patch/phone {"record": true}`), so the disk only
+    # fills with passes someone asked for. The path is mounted from the host at
+    # ./state/recordings; the capture server reads the same files.
+    record: no
+    recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    # Ten seconds is enough to cover one pose with a nearby keyframe, and keeps
+    # the decode for an extracted frame short.
+    recordSegmentDuration: 10s
+    recordDeleteAfter: 0s

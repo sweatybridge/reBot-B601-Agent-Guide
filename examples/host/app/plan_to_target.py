@@ -359,6 +359,10 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         "target_point": [float(v) for v in point],
         "target_tag_reproj_px": (target.get("tag") or {}).get("reproj_px"),
         "calib_fingerprint": target.get("calib_fingerprint"),
+        # A fixed camera: which rig, how good, and whether its mount still held
+        # at capture time. The tag path has `target_tag_reproj_px` instead.
+        "rig": target.get("rig"),
+        "witness": target.get("witness"),
     }
     steps = ("tap target: approach %.0f mm above [%.3f %.3f %.3f], descend, grip %.2f rad, "
              "lift %.0f mm%s" % (options.approach * 1000, point[0], point[1], point[2],

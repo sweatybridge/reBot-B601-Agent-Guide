@@ -11,7 +11,7 @@ The design is two planes, not one video pipe:
 |---|---|---|
 | what | 640x360 - 1280x720, 15-30 fps | one full-resolution JPEG |
 | how | WebRTC (WHIP) through MediaMTX | `POST /capture` |
-| needs | best effort | calibration + tag + frozen arm |
+| needs | best effort | calibration, a fitted rig (or a tag), a still arm |
 | kept | no | yes, next to the trajectory |
 
 Video is for the person holding the phone. The planner only ever sees an
@@ -24,7 +24,7 @@ phone page (tap) ─┐
 /live page  (tap) ─┘                                      │
                                                           ▼
                                    capture server: locate_target.py
-                                   calib + ArUco PnP + table plane
+                                   calib + rig (or ArUco PnP) + table plane
                                                           │
                                                           ▼
                                    arm gateway (planner container)
@@ -43,10 +43,12 @@ docker compose -f examples/host/compose.yaml --profile tools run --rm tools test
 python examples/host/tests/selftest.py
 ```
 
-43 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
-tag recovers a known 3D point to a fraction of a millimetre, a capture round-trips
-through the real HTTP server, and the trajectory payload is checked against the
-player's own rules. If this fails, the pipeline is wrong, not your measurement.
+77 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
+tag recovers a known 3D point to a fraction of a millimetre, a camera pose is
+recovered from eight synthetic arm poses with a 30 px mis-click in the set, a
+capture round-trips through the real HTTP server, and the trajectory payload is
+checked against the player's own rules. If this fails, the pipeline is wrong,
+not your measurement.
 
 The page is the one part that needs a browser. `browser_check.py` runs it in
 headless Chrome: it substitutes a canvas for the camera, taps a known pixel,
@@ -71,7 +73,7 @@ container (certificates, calibration, tags).
 
 ```bash
 cd examples/host
-cp .env.example .env            # REBOT_HOST_IP, tag placement, REBOT_EDGE_URL
+cp .env.example .env            # REBOT_HOST_IP, REBOT_EDGE_URL, camera mode
 docker compose up -d --build
 docker compose --profile tools run --rm tools app/make_cert.py --host rebot-host
 docker compose restart capture
@@ -82,7 +84,7 @@ docker compose restart capture
 | `capture` | the HTTPS endpoint the phone opens; tap -> capture -> plan | `8443/tcp` |
 | `mediamtx` | WebRTC relay: phone in, `/live` out | `8189/udp` |
 | `planner` | the arm gateway: edge `/pose`, Pinocchio planning, optional execute | nothing |
-| `tools` | `calibrate_intrinsics.py`, `make_tag.py`, `make_cert.py`, `selftest.py` | nothing |
+| `tools` | `calibrate_intrinsics.py`, `calibrate_extrinsics.py`, `make_tag.py`, `make_cert.py`, `selftest.py` | nothing |
 
 Everything after that is a tap or a command:
 
@@ -172,7 +174,10 @@ token is remembered in `localStorage` and stripped from the address bar. If the
 host's IP changes, `make_cert.py --reuse --ip <new-ip>` mints a new leaf; the CA
 stays installed.
 
-## Print the tag and tape it down
+## Print the tag and tape it down (handheld only)
+
+Skip this section if the camera is on a bracket: the next one replaces it, and
+no tag is needed at all.
 
 ```bash
 python examples/host/app/make_tag.py --id 0 --size 80
@@ -192,6 +197,195 @@ The tag supplies the extrinsics on every frame, so a handheld phone is fine.
 Which means the rule that matters: **the tag must be visible in the same frame
 as the target**. If the phone moves after the pose was solved, the target moves
 with it.
+
+## Fix the camera, fit the rig once, then never place a tag
+
+A bracket turns the extrinsics from a per-frame measurement into a constant, and
+a constant can be measured without printing anything: the arm is an object of
+known geometry standing in the middle of the scene.
+
+**One tap, then the arm sweeps.** Take one still, tap the tool tip in it, and the
+sweep does the rest:
+
+```bash
+# 1. one still, with the pose the arm actually had
+docker compose --profile tools run --rm tools app/calibrate_extrinsics.py \
+    --capture-pose --camera rtsp://mediamtx:8554/phone
+# 2. open the frame it names, read the tool tip's pixel, then sweep and fit
+... app/calibrate_extrinsics.py --auto --camera rtsp://mediamtx:8554/phone \
+    --from /app/state/captures/<id> --uv 812 455
+# 3. audit it: residuals, leave-one-out, the error a tap costs
+... app/calibrate_extrinsics.py --check
+```
+
+The sweep moves the arm through the eight checked poses in `sweep.py`, takes a
+still at each with the joint angles attached, finds the tool tip, fits
+`T_base<-cam` and the tip's offset in `gripper_end`, and either writes the rig or
+refuses with the reason:
+
+    unknowns   T_cam<-base (6) + tip offset (3)
+    residuals  one detected tip per pose  (2 per pose)
+
+Every leg is a cosine-eased joint move -- zero velocity at both ends -- capped at
+`sweep.PEAK_SPEED` (0.35 rad/s, about 20 deg/s). The whole pass is about three and
+a half minutes. The gateway recomputes the duration from the pose it is actually
+in, so a caller can ask for a slower move but never a faster one.
+
+The board treats a move as a round trip: when a trajectory ends, the player
+ramps the arm back to the pose the move started from. So the whole sweep is **one
+trajectory** -- park, pose 1, pose 2, ... pose 8 -- with a **hold** at each
+(`sweep.HOLD_SECONDS`, 1.5 s), and the board walks the arm back to park once, at
+the end. One `/move`, one motor enable cycle, and no return leg between poses:
+about 105 s of motion instead of 190. The arm begins and ends at the same pose, by
+construction, and the way back is timed by its distance (a cosine ease capped at
+0.35 rad/s, at least 3 s) rather than a fixed second count, so a long return is
+never rushed.
+
+**Gravity sag is compensated in the command.** The MIT frame has no integral
+term, so a loaded joint rests `tau_g / kp` away from what it was told. This arm
+settles as `held = command - sag` -- a sign that comes from j2's axis, not from
+intuition, and was measured rather than assumed: commanding `target - sag` moved
+every pose by another |sag|. `rebot_ik.gravity_torques` -- the URDF model the
+planner already uses -- predicts the sag to within about 20%, and correctly
+predicts none on j1 (vertical axis: that residual is friction). So `/move` asks
+for `aim()`, the fixed point of `command = target + sag`, and the arm holds the
+poses the table was validated at. That matters for geometry, not for the solver:
+100 mrad is 60 mm at the tool, against a 12 mm clearance margin. What the *fit*
+uses is unchanged either way -- the pose the arm actually held, measured.
+
+**The pass is recorded, not photographed.** MediaMTX already has the stream, so
+it does the recording: the capture server starts and stops it through the
+control API, and samples the arm's pose 15 times a second into `poses.jsonl`
+alongside. Afterwards each pose is found by *time*: a **hold** is a window where
+the arm actually stopped -- consecutive samples within `sweep_video.STILL_RAD`,
+lasting at least 0.5 s -- and the holds are matched to the poses in sweep order,
+nearest first. The frame at the middle of the matched window is saved as
+`pose-N.jpg`.
+
+The offset between the commanded pose and the held one is reported, not required
+to be zero. The servo holds a gravity-loaded joint *below* its command (there is
+no integral term), and the real sweep settles **31-108 mrad** low; the fit uses
+the **measured** pose, so a steady offset is not an error. `MAX_OFFSET_RAD`
+(150 mrad) only rejects a stop that is nowhere near the pose it should be.
+
+That window is why the hold still exists. A frame arrives older than the moment
+it is received, so a timestamp alone would pair it with the wrong pose; but
+*while the arm holds*, every frame in the window shows the same pose whatever the
+latency is. A pose the arm merely passed through has no window and is refused
+rather than guessed.
+
+    state/recordings/phone/2026-11-13_10-23-21-813025.mp4   MediaMTX segments
+    state/captures/<id>/poses.jsonl                         pose, 15 Hz
+    state/captures/<id>/pose-1.jpg .. pose-8.jpg            one per pose
+    state/captures/<id>/poses.json                          how each was chosen
+
+Recording is off by default (`record: no` on the path) and switched on per sweep,
+so the disk only fills with passes someone asked for. Three things must be true:
+`api: yes` in `mediamtx.yml` (it is, and the API is published on loopback only),
+a `./state/recordings` volume for MediaMTX, and the camera must be that stream --
+`REBOT_CAMERA=rtsp://mediamtx:8554/phone`, since a USB device or a snapshot URL
+has no path to record. `REBOT_MEDIAMTX_API` and `REBOT_RECORDINGS` point at the
+API and the shared directory.
+
+Then set `REBOT_EXTRINSICS=state/calib/extrinsics-fixed.json`, restart `capture`,
+and `/health` will report `"mode": "fixed"` with the rig's fingerprint. Taps no
+longer look for a marker.
+
+**Why one tap is enough.** A tap is two constraints, not a pose: it fixes the ray
+back from a known 3D point, so the camera can sit anywhere on that ray, at any
+distance, with any roll about it. The sweep enumerates that family coarsely --
+the tap pins the *pixel*, so every candidate points its search window at the
+right place -- and keeps the candidate whose eight detections agree with each
+other. The measurement decides, not a guess about where the bracket was bolted.
+
+**Two numbers to read before trusting it.**
+
+- `predicted` is what a tap costs over the work area, in millimetres -- not a
+  reprojection error. Under ~5 mm is a normal install; the synthetic fit in the
+  selftest reaches 0.6 mm.
+- `condition` names the direction the sweep left weakest. If it says `tz`, every
+  pose was at the same distance; if `rz`, every wrist was at the same angle.
+
+**The model becomes part of the calibration.** The tag is independent of the
+arm; this is not. A joint-zero error of 5 mrad rotates the estimated camera
+about the base by 5 mrad, which is 3 mm at a 0.6 m reach, and it is invisible in
+the residual because the model and the image agree with each other. Zero the arm
+properly before fitting, and refit after anything that changes the zeros.
+
+### The mount can still move
+
+The tag made stale extrinsics impossible. A bracket gives that up, so the fit
+also writes a **witness**: the frame it was fitted on plus a grid of background
+patches, with the arm masked out by the kinematic model. Every later capture
+tracks those patches and refuses the tap when the background moved more than
+`REBOT_WITNESS_MAX_PX` (default 2 px, under a millimetre at 1 m) or when the
+field of view changed (focus, zoom). The drift it measured goes into
+`target.json` and the trajectory's `capture` block, so a bad plan is
+attributable afterwards.
+
+That gate is the replacement for "the tag was in this frame". Turn it off by
+capturing without a rig, at the cost of the old failure mode: a moved camera
+biases every plan with nothing in the log to show for it.
+
+### The same thing over the API
+
+`POST /calibrate/extrinsics` is that pass in one call. The tap comes from
+`POST /capture/pose` and a pixel:
+
+```bash
+# one still, with the pose the arm actually had
+curl -sk -X POST https://127.0.0.1:8443/capture/pose -H "X-Rebot-Token: $REBOT_TOKEN"
+# {"ok": true, "id": "20261113T101500Z-a1b2c3", "image_url": "/captures/.../frame.jpg"}
+
+curl -sk -X POST https://127.0.0.1:8443/calibrate/extrinsics \
+  -H "X-Rebot-Token: $REBOT_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"confirm": true, "capture": "20261113T101500Z-a1b2c3", "u": 812, "v": 455}'
+```
+
+`REBOT_CAMERA` names the stream (`rtsp://mediamtx:8554/phone`, an HTTP snapshot
+URL, or `device:0` for a USB camera).
+
+The panel is the same flow with the picture in it: **Capture one pose** takes a
+still from `REBOT_CAMERA` and records the pose, the image appears in the card, a
+tap on the tool tip marks the pixel, and **Run the sweep from this tap** starts
+the arm. Nothing is typed and there is no second path.
+
+| route | what it does |
+|---|---|
+| `POST /capture/pose` | one still plus `GET /pose`, written as a capture |
+| `POST /calibrate/extrinsics` | `{confirm, capture, u, v}` sweeps, fits, verifies, writes |
+| `GET /calibrate` | running state, progress, the last verdict, the current rig |
+
+Three gates, because this moves the arm with nobody at the panel: `REBOT_EXECUTE=1`
+on the host, `--allow-execute` on the edge, and `"confirm": true` in the body.
+The sweep also refuses to start if the path from the current pose back to park
+is not clear, and every leg is re-checked against the capsule model before the
+gateway sends it.
+
+The gateway does not need the edge to hold anything: the hold is in the
+trajectory the gateway builds, and the host takes the still inside it. If the
+panel reports that the arm "never stood still where it was sent", the hold was
+missed -- check that the board is not slower than the plan, and that the arm is
+not stuck (the message says which).
+
+**The detector is the honest weak link.** It differences each pose against the
+median of the other seven, takes the distal end of the arm silhouette near the
+model's projection, and fits. On the capsule model the selftest uses, that lands
+the camera to about 1 deg and 10 mm -- a bootstrap, not a rig -- so the
+verification refuses it. The API says so rather than writing a bad file: `422`,
+with the per-pose detections and the failed check in the body. Run it again with
+the arm still and the tip clearly in view; a real gripper's jaws are a sharper
+edge than a constant-radius capsule, and `"background": "<arm-free still>"`
+removes the remaining ghosting from the median.
+
+`GET /calibrate` reports whether a sweep is running and how the last one ended.
+A successful POST hot-loads the rig, so the next tap uses it without a restart.
+
+Both pages carry the same call as a panel: the **Rig** button in the bottom
+right corner (or `?rig=1` on the URL) shows whether the host will move the arm,
+takes the bracket's position, runs the sweep with a progress line, and renders
+the verdict -- the reasons, the per-pose table, and the captures to re-click if
+it refuses. It is `viewer.js`, so the phone page and `/live` behave identically.
 
 ## Calibrate once per phone camera
 
@@ -230,8 +424,9 @@ Nothing is typed and nothing is reordered by hand. The frame that was tapped is
 saved next to its `target.json` and its trajectory, so a bad move can be
 replayed and understood afterwards.
 
-- **The tag must be visible in the same frame as the object.** That is the rule
-  the whole design rests on: the tag supplies the extrinsics on every tap.
+- **One of two things supplies the extrinsics.** With `REBOT_EXTRINSICS` set, a
+  fitted rig does, and nothing else has to be in frame. Without it, the tag must
+  be visible in the same frame as the object, on every tap.
 - **Execution is off by default.** `REBOT_EXECUTE=0` means taps produce plans in
   `out/` and nothing moves. Set it to 1 in `.env` and start the edge with
   `--allow-execute` to get the button; it still asks twice.
@@ -288,6 +483,10 @@ move. `--unpark-j3 0` disables it; the leg is mirrored at the end of the plan.
 
 - **In-plane accuracy** is a few millimetres at 0.6-1.5 m with a good `K`; the
   synthetic test measures 0.15 mm, the real phone will be worse.
+- **A fitted rig has its own error, reported rather than assumed.** The sweep
+  prints what a click costs over the work area; below ~5 mm is normal, and it is
+  dominated by the arm model, not by the clicks. The tag path has no such
+  dependence on the arm -- that independence is what it costs to print one.
 - **Out of plane** comes from the table-plane assumption (`--plane-z`). It is
   exact for things lying on the worktop and wrong for anything with height: a
   40 mm object is 40 mm off. Approach vertically and let the existing 6 cm close
@@ -327,6 +526,17 @@ move. `--unpark-j3 0` disables it; the leg is mirrored at the end of the plan.
 | compose: live preview never connects, `/health` is fine | `REBOT_HOST_IP` is empty or is the container's address; set the host's LAN IP in `.env` and restart |
 | compose: `pull access denied for rebot-pino` | the planner image is not built; `docker compose build planner` |
 | tap: "no ArUco marker in the frame" | the tag is outside the frame the tap came from; aim so the tag and the object are both in view |
+| tap: "the camera moved since the extrinsics were fitted" | the witness caught a knock: refit, or put the mount back |
+| tap: "cannot verify the camera mount: only N of 64 witness patches" | the view changed too much to compare -- lens covered, lights off, or the camera moved far |
+| tap: "this rig was fitted at 4032x3024 but the camera is calibrated at ..." | the capture size changed (a different page mode or phone); refit at that size |
+| "no extrinsics at ..." on start-up | `REBOT_EXTRINSICS` points at a file that is not there; run `--auto` or unset it |
+| the panel: "not reachable: cannot reach the arm gateway" | the capture server can not open a socket to `REBOT_PLANNER`; in compose it is `http://planner:8000` -- check `docker compose ps planner` |
+| the panel: "the gateway refused /pose" | the gateway answered, so the route or the method is wrong; `/pose` is a GET, `/plan`, `/execute`, `/move` are POSTs |
+| "pose N never stood still where it was sent" | the arm never reached the pose inside the hold: `/play` returned 200, so check `can_up`, the e-stop and the motor enables first |
+| "the board's CAN channel is down" | the interface exists but is not up; `ip link set can0 up type can bitrate 1000000` on the board |
+| `--auto`: "the sweep leaves ... free to N mm" | the poses were too similar: add height and wrist variation (edit `sweep.py`) |
+| `--auto`: "the poses are degenerate (rank ...)" | every pose in one plane; move the arm in 3D |
+| `--auto`: "a capture has no pose" | the still was not taken with `/capture/pose` (or `--capture-pose`) |
 | tap: "arm gateway unreachable" | the `planner` service is down; `docker compose ps` |
 | tap: "cannot reach the edge" | the board is not running `rebot-edge serve`, or `REBOT_EDGE_URL` is wrong |
 | tap: the edge answers 401 | `REBOT_EDGE_TOKEN` does not match `--token` on the board |
@@ -339,17 +549,23 @@ move. `--unpark-j3 0` disables it; the leg is mirrored at the end of the plan.
 |---|---|
 | `compose.yaml` | the host stack: `capture`, `mediamtx`, `tools`, `planner` |
 | `Dockerfile` | the capture server and every one-shot tool, in one image |
-| `.env.example` | `REBOT_HOST_IP`, `REBOT_TOKEN`, `REBOT_PORT` |
+| `.env.example` | `REBOT_HOST_IP`, `REBOT_TOKEN`, `REBOT_PORT`, `REBOT_EXTRINSICS` |
 | `healthcheck.py` | compose healthcheck for the capture service |
 | `phone.html` | the page on the phone: preview, tap-to-plan, calibration mode, WHIP |
 | `live.html` | workstation viewer: WHEP playback and the same tap-to-plan |
 | `viewer.js` | shared tap -> capture -> plan -> execute panel |
-| `capture_server.py` | TLS endpoint, `/capture`, `/plan`, `/execute`, WHIP/WHEP relay |
+| `capture_server.py` | TLS endpoint, `/capture`, `/plan`, `/execute`, the calibration routes, WHIP/WHEP relay |
 | `planner_server.py` | the arm gateway: edge `/pose`, planning, gated execution |
 | `make_cert.py` | local CA + leaf certificate for the phone |
-| `make_tag.py` | printable ArUco tag at a measured size |
+| `make_tag.py` | printable ArUco tag at a measured size (handheld mode only) |
 | `calibrate_intrinsics.py` | checkerboard fit -> `calib/<device>.json` |
-| `locate_target.py` | capture -> `target.json` (PnP + table plane), annotated JPEG |
+| `calibrate_extrinsics.py` | tool-tip sweep -> `calib/extrinsics-<mount>.json` + witness |
+| `extrinsics.py` | the rig: DLT + Levenberg-Marquardt, covariance, predicted error |
+| `witness.py` | did the camera move? background patches, arm masked out |
+| `sweep.py` | the fixed eight-pose sequence, and the check that keeps it clear of the table |
+| `auto_calibrate.py` | drives the sweep, grabs the stills, finds the tip, verifies |
+| `camera.py` | where an automatic still comes from: RTSP, HTTP snapshot, device |
+| `locate_target.py` | capture -> `target.json` (rig or PnP, + table plane), annotated JPEG |
 | `plan_to_target.py` | the planner: target + pose -> trajectory JSON, CLI and gateway |
 | `traj.py` | payload assembly + the player's schema checks, no Pinocchio |
 | `selftest.py` | offline proof of all of the above |

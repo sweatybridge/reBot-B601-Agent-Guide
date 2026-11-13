@@ -30,7 +30,16 @@ services:
       MTX_WEBRTCADDITIONALHOSTS: ${REBOT_HOST_IP:-}
     volumes:
       - ./deploy/mediamtx.yml:/mediamtx.yml:ro
+      # Calibration sweeps are recorded here by MediaMTX and read back by the
+      # capture server, which mounts ./state at /app/state.
+      - ./state/recordings:/recordings
     ports:
+      # RTSP is published so a host-run tool (or a debugger) can read the same
+      # stream the capture server uses: rtsp://127.0.0.1:8554/phone.
+      - "8554:8554"
+      # The control API on loopback only: a CLI run on this host needs it to
+      # record a sweep; nothing on the LAN can reach it.
+      - "127.0.0.1:9997:9997"
       - "8189:8189/udp"
 
   capture:
@@ -48,9 +57,19 @@ services:
       REBOT_TOKEN: ${REBOT_TOKEN:-}
       REBOT_MEDIAMTX: http://mediamtx:8889
       REBOT_PLANNER: http://planner:8000
+      # Where a sweep is recorded (MediaMTX writes it; this server reads it) and
+      # the API that starts and stops that recording.
+      REBOT_RECORDINGS: /app/state/recordings
+      REBOT_MEDIAMTX_API: http://mediamtx:9997
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_EXECUTE: ${REBOT_EXECUTE:-0}
       REBOT_CALIB_DIR: /app/state/calib
+      # Empty means the handheld tag path; set it to a rig from
+      # calibrate_extrinsics.py --auto and taps need no tag at all.
+      REBOT_EXTRINSICS: ${REBOT_EXTRINSICS:-}
+      REBOT_WITNESS_MAX_PX: ${REBOT_WITNESS_MAX_PX:-2.0}
+      # Where the automatic calibration sweep reads its stills.
+      REBOT_CAMERA: ${REBOT_CAMERA:-rtsp://mediamtx:8554/phone}
       REBOT_TAG_SIZE: ${REBOT_TAG_SIZE:-0.080}
       REBOT_TAG_X: ${REBOT_TAG_X:-0.0}
       REBOT_TAG_Y: ${REBOT_TAG_Y:-0.0}
@@ -59,6 +78,11 @@ services:
       REBOT_TOOL_AXIS: ${REBOT_TOOL_AXIS:-current}
       REBOT_YAW: ${REBOT_YAW:-0.0}
     volumes:
+      # Mounted as well as copied, so a change to the server or the panel takes
+      # effect on restart instead of a rebuild. The image still stands alone
+      # where the checkout is not present.
+      - ./app:/app/app:ro
+      - ./web:/app/web:ro
       - ./state:/app/state
     healthcheck:
       test: ["CMD", "python", "app/healthcheck.py"]

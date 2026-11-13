@@ -3,21 +3,27 @@
 """Turn one phone capture into a point in the arm's base frame.
 
 The phone gives a JPEG, a tap coordinate and nothing else -- no depth, no pose.
-The metric part comes from an ArUco tag lying flat on the worktop at a known
-offset from the arm base: solvePnP on that tag gives `T_cam<-tag`, the placement
-gives `T_base<-tag`, and the two compose into `T_base<-cam`. The tap is then a
-ray, and the ray meets the table plane where the target is.
+There are two ways to supply the missing pose, and they are the same geometry
+with a different source for `T_base<-cam`:
 
+* **Fixed camera** (`--extrinsics`): the pose is a file, fitted once from the
+  arm's tool tip. Nothing else has to be visible; the tap ray meets the table
+  plane and that is the target. A witness frame checks the mount has not moved.
+* **Handheld phone** (the tag): `solvePnP` on an ArUco tag lying flat on the
+  worktop at a known offset from the base gives `T_cam<-tag`; the placement gives
+  `T_base<-tag`; the two compose into `T_base<-cam`. That is why the tag has to
+  be in the same frame as the target.
+
+    python locate_target.py --capture captures/<id> --calib calib/<device>.json \
+        --extrinsics calib/extrinsics-fixed.json
     python locate_target.py --capture captures/<id> --calib calib/<device>.json \
         --tag-size 0.080 --tag-x 0.35 --tag-y -0.20 --tag-yaw 15
 
 `locate_capture()` is the same code the capture server calls when someone taps
 the video, so a tap and a command line cannot drift apart.
 
-The tag has to be visible **in the same frame as the target**, otherwise the
-extrinsics are stale -- the phone is handheld, and a phone that moved 10 cm after
-the pose was solved puts the target 10 cm off. This is the one rule the whole
-design hangs on.
+The metric part always comes from the intrinsics and the table plane; the tag
+never supplied scale, only the camera pose.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -36,6 +43,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import calib as calib_mod  # noqa: E402
+import extrinsics  # noqa: E402
+import witness as witness_mod  # noqa: E402
 
 ARUCO_DICTS = {
     "4x4_50": "DICT_4X4_50",
@@ -65,6 +74,9 @@ class Options:
     dictionary: str = "4x4_50"
     tag_id: int | None = None
     annotate: str = ""
+    extrinsics: object | None = None      # extrinsics.Rig; a fixed camera, no tag in frame
+    witness: object | None = None         # witness.Reference; proves the mount has not moved
+    witness_max_px: float = 2.0
 
 
 def tag_object_points(tag_size):
@@ -155,27 +167,26 @@ def base_from_camera(R_cam_tag, t_cam_tag, T_base_tag):
     return T_base_tag @ np.linalg.inv(T_cam_tag)
 
 
-def ray_plane(K, T_base_cam, u, v, plane_z):
-    """Intersect the pixel's ray with the horizontal plane, in the base frame."""
-    pixel = np.array([float(u), float(v), 1.0])
-    direction_cam = np.linalg.solve(np.asarray(K, dtype=float), pixel)
-    R = T_base_cam[:3, :3]
-    origin = T_base_cam[:3, 3]
-    direction = R @ direction_cam
-    norm = float(np.linalg.norm(direction))
-    if norm < 1e-12:
-        raise LocateError("degenerate ray for pixel (%s, %s)" % (u, v))
-    direction /= norm
+def ray_plane(K, T_base_cam, u, v, plane_z, dist=None):
+    """Intersect the pixel's ray with the horizontal plane, in the base frame.
 
-    if abs(direction[2]) < 1e-6:
-        raise LocateError("the tap ray is parallel to the table plane; pick a point further away")
-    s = (float(plane_z) - origin[2]) / direction[2]
-    if s <= 0.0:
-        raise LocateError("the tap ray points away from the table plane "
-                          "(is the plane above the camera?)")
-    point = origin + s * direction
-    grazing = math.degrees(math.asin(min(1.0, abs(direction[2]))))
-    return point, s, grazing
+    The intersection itself lives in `extrinsics.py`, so the tag path and the
+    fixed-camera path cannot disagree about it. It undoes the lens distortion
+    first, which the old version skipped: `K` was fitted with `dist`, so the ray
+    has to be too, or a click near the frame edge lands a few millimetres out.
+    """
+    try:
+        return extrinsics.ray_plane(K, dist, T_base_cam, u, v, plane_z)
+    except extrinsics.ExtrinsicsError as error:
+        message = str(error)
+        if "parallel" in message:
+            raise LocateError("the tap ray is parallel to the table plane; pick a point further "
+                              "away") from error
+        if "away from" in message:
+            raise LocateError("the tap ray points away from the table plane "
+                              "(is the plane above the camera?)") from error
+        raise LocateError(message) from error
+
 
 
 def project(K, T_base_cam, point):
@@ -221,11 +232,12 @@ def tap_from_meta(meta, image_size):
 def annotate(image, corners, tag_size, T_base_cam, K, dist, point, tap, out_path):
     """Draw what the solver believed: tag axes, the tap, the point projected back."""
     out = image.copy()
-    cv2.aruco.drawDetectedMarkers(out, [corners.reshape(-1, 1, 2).astype(np.float32)])
-    ok, rvec, tvec = cv2.solvePnP(tag_object_points(tag_size), corners.reshape(-1, 1, 2),
-                                  K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
-    if ok:
-        cv2.drawFrameAxes(out, K, dist, rvec, tvec, tag_size / 2.0, 2)
+    if corners is not None:
+        cv2.aruco.drawDetectedMarkers(out, [corners.reshape(-1, 1, 2).astype(np.float32)])
+        ok, rvec, tvec = cv2.solvePnP(tag_object_points(tag_size), corners.reshape(-1, 1, 2),
+                                      K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        if ok:
+            cv2.drawFrameAxes(out, K, dist, rvec, tvec, tag_size / 2.0, 2)
     if tap is not None:
         cv2.circle(out, (int(round(tap[0])), int(round(tap[1]))), 9, (0, 220, 255), 2)
         cv2.drawMarker(out, (int(round(tap[0])), int(round(tap[1]))), (0, 220, 255),
@@ -243,18 +255,46 @@ def locate(image, meta, calibration, options: Options):
     """Image + tap -> target payload. Pure enough to test, no printing."""
     height, width = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, ARUCO_DICTS[options.dictionary]))
-    tag_id, corners = detect_tag(gray, dictionary, options.tag_id)
 
-    R_cam_tag, t_cam_tag, reproj = tag_pose(corners, options.tag_size, calibration.K, calibration.dist)
-    if reproj > options.max_reproj:
-        raise LocateError(
-            "tag reprojection %.2f px is above %.2f: the phone may have moved during the "
-            "exposure, or the printed size is not %.1f mm"
-            % (reproj, options.max_reproj, options.tag_size * 1000))
+    tag_id, corners, reproj = None, None, 0.0
+    if options.extrinsics is not None:
+        # A fixed camera: the pose is a file, so nothing has to be printed and
+        # nothing has to be in frame except the thing being tapped.
+        if options.point_mode == "tag":
+            raise LocateError("point-mode 'tag' needs a tag in the frame; this camera has a "
+                              "fitted pose, so tap the target instead")
+        try:
+            extrinsics.verify_pair(calibration, options.extrinsics)
+        except extrinsics.ExtrinsicsError as error:
+            raise LocateError(str(error)) from error
+        T_base_cam = np.asarray(options.extrinsics.T_base_cam, dtype=float)
+    else:
+        dictionary = cv2.aruco.getPredefinedDictionary(
+            getattr(cv2.aruco, ARUCO_DICTS[options.dictionary]))
+        tag_id, corners = detect_tag(gray, dictionary, options.tag_id)
 
-    T_base_tag = tag_in_base(options.tag_x, options.tag_y, options.tag_z, options.tag_yaw)
-    T_base_cam = base_from_camera(R_cam_tag, t_cam_tag, T_base_tag)
+        R_cam_tag, t_cam_tag, reproj = tag_pose(corners, options.tag_size, calibration.K,
+                                                calibration.dist)
+        if reproj > options.max_reproj:
+            raise LocateError(
+                "tag reprojection %.2f px is above %.2f: the phone may have moved during the "
+                "exposure, or the printed size is not %.1f mm"
+                % (reproj, options.max_reproj, options.tag_size * 1000))
+
+        T_base_tag = tag_in_base(options.tag_x, options.tag_y, options.tag_z, options.tag_yaw)
+        T_base_cam = base_from_camera(R_cam_tag, t_cam_tag, T_base_tag)
+
+    report = None
+    if options.witness is not None:
+        try:
+            report = witness_mod.check(options.witness, gray, options.witness_max_px)
+        except witness_mod.WitnessError as error:
+            raise LocateError("cannot verify the camera mount: %s" % error) from error
+        if not report.get("ok"):
+            raise LocateError(
+                "the camera moved since the extrinsics were fitted (%s). Refit with "
+                "calibrate_extrinsics.py --fit, or put the mount back." % report.get("reason"))
+
 
     tap = options.tap if options.tap is not None else tap_from_meta(meta, (width, height))
     if options.point_mode == "tag":
@@ -264,8 +304,9 @@ def locate(image, meta, calibration, options: Options):
     else:
         if tap is None:
             raise LocateError("no tap in the capture; tap the target before capturing")
-        point, _distance, grazing = ray_plane(calibration.K, T_base_cam, tap[0], tap[1], options.plane_z)
-        source = "tap+plane"
+        point, _distance, grazing = ray_plane(calibration.K, T_base_cam, tap[0], tap[1],
+                                              options.plane_z, calibration.dist)
+        source = "tap+fixed" if options.extrinsics is not None else "tap+plane"
         if grazing > options.max_grazing:
             raise LocateError(
                 "the tap ray meets the table at %.0f deg (limit %.0f): a grazing view turns "
@@ -273,20 +314,13 @@ def locate(image, meta, calibration, options: Options):
                 % (grazing, options.max_grazing))
 
     radius = float(np.linalg.norm(point))
-    return {
+    payload = {
         "format": "rebot-target",
         "version": 1,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "source": source,
         "calib_fingerprint": calibration.fingerprint,
         "image_size": [int(width), int(height)],
-        "tag": {
-            "id": int(tag_id),
-            "size_m": float(options.tag_size),
-            "placement": {"x": options.tag_x, "y": options.tag_y,
-                          "z": options.tag_z, "yaw_deg": options.tag_yaw},
-            "reproj_px": float(reproj),
-        },
         "tap": {"u": float(tap[0]), "v": float(tap[1])} if tap is not None else None,
         "plane_z": float(options.plane_z),
         "point": [float(v) for v in point],
@@ -295,6 +329,19 @@ def locate(image, meta, calibration, options: Options):
         "_corners": corners,
         "_T_base_cam": T_base_cam,
     }
+    if options.extrinsics is not None:
+        payload["rig"] = options.extrinsics.provenance()
+    else:
+        payload["tag"] = {
+            "id": int(tag_id),
+            "size_m": float(options.tag_size),
+            "placement": {"x": options.tag_x, "y": options.tag_y,
+                          "z": options.tag_z, "yaw_deg": options.tag_yaw},
+            "reproj_px": float(reproj),
+        }
+    if report is not None:
+        payload["witness"] = report
+    return payload
 
 
 def locate_capture(directory, calib_path, options: Options):
@@ -332,6 +379,10 @@ def main(argv=None):
     parser.add_argument("--tag-y", type=float, default=0.0, help="tag centre, base y, m")
     parser.add_argument("--tag-z", type=float, default=0.0, help="tag face height above base plane, m")
     parser.add_argument("--tag-yaw", type=float, default=0.0, help="tag rotation about base z, deg")
+    parser.add_argument("--extrinsics", default=os.environ.get("REBOT_EXTRINSICS", ""),
+                        help="extrinsics JSON for a fixed camera; then no tag is needed")
+    parser.add_argument("--witness-max-px", type=float, default=2.0,
+                        help="refuse a capture whose background moved more than this, px")
     parser.add_argument("--plane-z", type=float, default=0.0, help="worktop height in base frame, m")
     parser.add_argument("--tap", nargs=2, type=float, metavar=("U", "V"),
                         help="override the tap stored in meta.json, image pixels")
@@ -346,12 +397,20 @@ def main(argv=None):
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
+    try:
+        rig = extrinsics.load_rig(args.extrinsics) if args.extrinsics else None
+        reference = (witness_mod.load_for(rig, Path(args.extrinsics).resolve().parent)
+                     if rig is not None else None)
+    except (extrinsics.ExtrinsicsError, witness_mod.WitnessError) as error:
+        raise SystemExit(str(error)) from error
+
     options = Options(
         tag_size=args.tag_size, tag_x=args.tag_x, tag_y=args.tag_y, tag_z=args.tag_z,
         tag_yaw=args.tag_yaw, plane_z=args.plane_z,
         tap=tuple(args.tap) if args.tap else None, point_mode=args.point_mode,
         max_reproj=args.max_reproj, max_grazing=args.max_grazing, max_reach=args.max_reach,
         dictionary=args.dictionary, tag_id=args.tag_id, annotate=args.annotate,
+        extrinsics=rig, witness=reference, witness_max_px=args.witness_max_px,
     )
     try:
         payload = locate_capture(args.capture, args.calib, options)
@@ -374,8 +433,19 @@ def main(argv=None):
         tilt = math.degrees(math.acos(max(-1.0, min(1.0, float(T[2, 2])))))
         print("capture    : %s" % payload["capture"])
         print("calibration: %s" % camera.describe())
-        print("tag        : id %d, %.0f mm, reprojection %.2f px"
-              % (payload["tag"]["id"], payload["tag"]["size_m"] * 1000, payload["tag"]["reproj_px"]))
+        if payload.get("rig"):
+            rig_info = payload["rig"]
+            print("rig        : %s, %d poses, %.1f mm rms, %.1f mm predicted, fitted %s"
+                  % (rig_info.get("fingerprint"), rig_info.get("poses", 0),
+                     rig_info.get("rms_mm") or 0.0, rig_info.get("predicted_mm") or 0.0,
+                     rig_info.get("fitted", "")))
+        if payload.get("tag"):
+            print("tag        : id %d, %.0f mm, reprojection %.2f px"
+                  % (payload["tag"]["id"], payload["tag"]["size_m"] * 1000,
+                     payload["tag"]["reproj_px"]))
+        if payload.get("witness"):
+            print("mount      : %.2f px of drift since the fit (limit %.2f)"
+                  % (payload["witness"]["drift_px"], args.witness_max_px))
         print("camera     : [%+.3f %+.3f %+.3f] m, optical axis %.1f deg from vertical"
               % (T[0, 3], T[1, 3], T[2, 3], tilt))
         if payload["tap"]:

@@ -122,8 +122,14 @@ gap) and CAN `rate: 500` (this rig runs 1 Mbit/s).
 then into the same trajectory JSON. The live preview is WebRTC (WHIP through
 MediaMTX); planning never sees the video. Tap an object in the phone page or in
 the workstation's `/live` page and the host plans to it; a second, confirmed tap
-executes it on the arm. It uses a calibrated still plus an ArUco tag for the
-extrinsics, so a handheld phone is fine as long as the tag is in the same frame
+executes it on the arm.
+
+The extrinsics come from one of two places. On a bracket, they are fitted once
+from the arm itself: take one still, tap the tool tip in it, and the rig sweeps
+eight poses and fits -- no tag, no printed target, no measured position, and a
+witness frame then refuses taps if the camera has moved since. One
+`POST /calibrate/extrinsics` does the whole pass. On a handheld phone, an ArUco
+tag in the frame supplies them per tap, so the tag has to stay in the same frame
 as the target.
 
 ```bash

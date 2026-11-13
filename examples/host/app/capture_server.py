@@ -32,6 +32,7 @@ import re
 import socket
 import ssl
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,9 +40,16 @@ from pathlib import Path
 from aiohttp import ClientSession, ClientTimeout, web
 
 # The same locate code the CLI runs: a tap and a shell command cannot drift.
+import auto_calibrate
+import camera as camera_mod
+import calib as calib_mod
+import extrinsics
 import locate_target as locator
+import mediamtx
+import sweep
+import witness
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HERE = Path(__file__).resolve().parent      # app/
 ROOT = HERE.parent                          # the host directory
 WEB_DIR = ROOT / "web"
@@ -49,7 +57,7 @@ STATE = ROOT / "state"                       # captures, calib, tls, tags, out, 
 
 CAPTURE_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-PURPOSES = {"plan", "calib", "debug"}
+PURPOSES = {"plan", "calib", "extrinsics", "debug"}
 RESERVED_META = {"id", "frame", "server"}
 
 
@@ -86,6 +94,24 @@ def read_meta(directory: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+@web.middleware
+async def json_errors(request: web.Request, handler):
+    """Every error leaves as JSON, with its reason in `error`.
+
+    aiohttp's `HTTPUnprocessableEntity(text=...)` answers `text/plain`, and the
+    panel parses JSON -- so a 422 with a perfectly good explanation ("no
+    calibration in /app/state/calib: run calibrate_intrinsics.py once") arrived
+    as the useless "server said 422". JSON is the contract for this API.
+    """
+    try:
+        return await handler(request)
+    except web.HTTPException as error:
+        if error.headers.get("Content-Type", "").startswith("application/json"):
+            raise
+        message = (error.text or "").strip() or error.reason or ("HTTP %d" % error.status)
+        return web.json_response({"ok": False, "error": message}, status=error.status)
 
 
 def token_middleware(token: str):
@@ -141,7 +167,12 @@ async def handle_health(request: web.Request) -> web.Response:
         "auth": bool(app["token"]),
         "planner": app["planner"],
         "execute": app["execute"],
-        "calib": sorted(p.name for p in app["calib"].glob("*.json")) if app["calib"].is_dir() else [],
+        "calib": sorted(p.name for p in app["calib"].glob("*.json")
+                        if not p.name.startswith(("extrinsics-", "witness-"))),
+        "mode": "fixed" if app["rig"] is not None else "handheld",
+        "rig": (None if app["rig"] is None else
+                dict(app["rig"].provenance(), path=str(app["extrinsics_path"]),
+                     witness=bool(app["witness"]))),
         "tag": app["tag"],
         "plane_z": app["plane_z"],
     })
@@ -243,6 +274,10 @@ async def handle_capture(request: web.Request) -> web.Response:
             "content_type": "image/jpeg",
             "server_version": VERSION,
         }
+        if purpose in ("extrinsics", "calib"):
+            # The pose is taken here, not by the client: a calibration click is
+            # only worth anything if the joints are the ones the arm had.
+            record["server"]["pose"] = await capture_pose(app)
         (directory / "meta.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
     except Exception:
@@ -312,7 +347,9 @@ def resolve_calibration(app, requested=None) -> Path:
         candidate = Path(app["calib_file"])
         if candidate.is_file():
             return candidate
-    options = sorted(folder.glob("*.json")) if folder.is_dir() else []
+    options = sorted(p for p in folder.glob("*.json")
+                     if not p.name.startswith(("extrinsics-", "witness-"))) \
+        if folder.is_dir() else []
     if not options:
         raise web.HTTPUnprocessableEntity(
             text="no calibration in %s: run calibrate_intrinsics.py once for this phone" % folder)
@@ -321,28 +358,65 @@ def resolve_calibration(app, requested=None) -> Path:
 
 def locate_options(app, body):
     tag = dict(app["tag"])
-    for key in ("size", "x", "y", "yaw"):
-        if key in body:
-            tag[key] = float(body[key])
+    if app["rig"] is None:
+        for key in ("size", "x", "y", "yaw"):
+            if key in body:
+                tag[key] = float(body[key])
     return locator.Options(
         tag_size=tag["size"], tag_x=tag["x"], tag_y=tag["y"], tag_yaw=tag["yaw"],
         plane_z=float(body.get("plane_z", app["plane_z"])),
         annotate="",
+        extrinsics=app["rig"],
+        witness=app["witness"],
+        witness_max_px=app["witness_max_px"],
     )
 
 
-async def planner_call(app, path, body, timeout=120):
-    """POST to the arm gateway; returns (status, payload)."""
+async def capture_pose(app):
+    """`GET /pose` twice, 120 ms apart, so a moving arm is caught at upload time.
+
+    A calibration click is only useful if the arm was still when the shutter
+    opened. The two reads cannot prove that, but they do catch the common case
+    -- the arm still settling from the move that put it there.
+    """
+    status, payload = await planner_call(app, "/pose", {}, timeout=10, method="GET")
+    if status != 200:
+        return {"error": payload.get("error", "the arm gateway refused /pose")}
+    first = payload.get("pose") or {}
+    if not isinstance(first.get("q"), list):
+        return {"error": "the arm gateway returned no joint angles"}
+    await asyncio.sleep(0.12)
+    second_status, second_payload = await planner_call(app, "/pose", {}, timeout=10, method="GET")
+    second = (second_payload.get("pose") or {}) if second_status == 200 else {}
+    record = dict(first)
+    if isinstance(second.get("q"), list) and len(second["q"]) == len(first["q"]):
+        moved = max(abs(float(a) - float(b)) for a, b in zip(first["q"], second["q"]))
+        record["moved_rad"] = moved
+        record["settled"] = moved < 0.005
+    else:
+        record["settled"] = None
+    return record
+
+
+async def planner_call(app, path, body, timeout=120, method="POST"):
+    """Call the arm gateway; returns (status, payload).
+
+    The method matters: `/pose` is a GET on the gateway and a POST gets a 404.
+    The capture server used to POST everything, which made the panel report "the
+    arm is not reachable" on a gateway that was answering fine.
+    """
     headers = {"X-Rebot-Token": app["planner_token"]} if app["planner_token"] else {}
     url = app["planner"].rstrip("/") + path
     try:
-        async with app["client"].post(url, json=body, headers=headers,
-                                      timeout=ClientTimeout(total=timeout)) as answer:
+        async with app["client"].request(method, url, json=body, headers=headers,
+                                         timeout=ClientTimeout(total=timeout)) as answer:
             payload = await answer.json(content_type=None)
             return answer.status, payload
     except Exception as exc:  # noqa: BLE001 - surfaced to the viewer
-        logging.warning("planner %s failed: %s", url, exc)
-        return 502, {"ok": False, "error": "arm gateway unreachable at %s (%s)" % (url, exc)}
+        logging.warning("planner %s %s failed: %s", method, url, exc)
+        return 502, {"ok": False,
+                     "error": "cannot reach the arm gateway at %s (%s)" % (url, exc),
+                     "unreachable": True}
 
 
 async def handle_plan(request: web.Request) -> web.Response:
@@ -417,8 +491,224 @@ async def handle_execute(request: web.Request) -> web.Response:
 
 
 async def handle_pose(request: web.Request) -> web.Response:
-    status, payload = await planner_call(request.app, "/pose", {}, timeout=30)
+    status, payload = await planner_call(request.app, "/pose", {}, timeout=30, method="GET")
     return web.json_response(payload, status=status)
+
+
+def click_for(app, capture_id, u, v):
+    """The tap the sweep starts from: a capture id and a pixel on the tool tip."""
+    capture_id = str(capture_id or "")
+    if not CAPTURE_ID.match(capture_id):
+        raise web.HTTPBadRequest(text="'capture' must be a capture id")
+    directory = Path(app["captures"]) / capture_id
+    meta_path = directory / "meta.json"
+    if not meta_path.is_file():
+        raise web.HTTPNotFound(text="no capture %s" % capture_id)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    pose = (meta.get("server") or {}).get("pose") or {}
+    q = pose.get("q")
+    if not isinstance(q, list) or len(q) < 6:
+        raise web.HTTPUnprocessableEntity(
+            text="capture %s has no pose: take it with /capture/pose" % capture_id)
+    width, height = (meta.get("image_size") or [0, 0])[:2]
+    u, v = float(u), float(v)
+    if not (0.0 <= u <= float(width) and 0.0 <= v <= float(height)):
+        raise web.HTTPUnprocessableEntity(
+            text="the tap (%.0f, %.0f) is outside the %dx%d frame" % (u, v, width, height))
+    return {"q": [float(value) for value in q[:6]], "uv": (u, v),
+            # The tap's own pixels are the gripper's appearance, so the detector
+            # has a model of the thing it is looking for, not just a ray.
+            "image": str(directory / "frame.jpg")}
+
+
+def run_sweep(app, camera_url, calibration_path, body):
+    """Drive the arm, take the stills, fit, verify, maybe write -- off the loop.
+
+    Runs in a worker thread: it is minutes of blocking HTTP to the gateway plus
+    OpenCV work, and holding the event loop would freeze the phone page's
+    WebRTC relay for the whole sweep.
+    """
+    def note(pose, phase):
+        app["progress"] = {"pose": int(pose), "of": len(sweep.POSES), "phase": phase,
+                           "started": app["calibration_started"]}
+
+    click = click_for(app, body["capture"], body.get("u"), body.get("v"))
+
+    # latency=0: the sweep records continuously and picks its frames afterwards,
+    # so draining the stream would only throw away frames it could have used.
+    eye = camera_mod.open_source(camera_url, latency=0.0)
+    try:
+        probe = eye.read()
+        size = (probe.shape[1], probe.shape[0])
+        calibration = calib_mod.load(calibration_path, image_size=size)
+        options = auto_calibrate.Options(
+            plane_z=float(body.get("plane_z", app["plane_z"])),
+            settle_s=float(body.get("settle", 0.5)),
+            background=str(body["background"]) if body.get("background") else "median",
+            click=click,
+        )
+        arm = auto_calibrate.ArmGateway(app["planner"], app["planner_token"])
+        # The sweep is recorded by MediaMTX, so the camera must be its stream:
+        # a USB device or a snapshot URL has no path to record.
+        path = mediamtx.path_from_camera(camera_url)
+        if not path:
+            raise auto_calibrate.AutoError(
+                "the sweep is recorded by MediaMTX, so REBOT_CAMERA must be its RTSP path "
+                "(rtsp://mediamtx:8554/phone); %r cannot be recorded" % camera_url)
+        recorder = mediamtx.Recorder(app["mediamtx_api"], path=path,
+                                     recordings=app["recordings"])
+        result = auto_calibrate.run(arm, eye, calibration, options, app["captures"],
+                                    recorder=recorder, mount="fixed", progress=note)
+    finally:
+        eye.close()
+
+    rig_path = app["calib"] / ("extrinsics-%s.json" % result.fit.rig.mount)
+    _rig, verdict, written = auto_calibrate.commit(
+        result, calibration, options, rig_path,
+        calib_path=str(calibration_path), mount="fixed")
+    payload = auto_calibrate.report(result, verdict)
+    payload["written"] = str(written) if written else None
+    return payload
+
+
+async def handle_calibrate(request: web.Request) -> web.Response:
+    """`POST /calibrate/extrinsics` -- one call, eight poses, a rig or a refusal.
+
+    This moves the arm without a human at the panel, so it needs the same two
+    gates as an execution (the host's `--execute` and the edge's
+    `--allow-execute`) plus an explicit `confirm`: a stray POST must not start a
+    sweep.
+    """
+    app = request.app
+    if not app["execute"]:
+        raise web.HTTPForbidden(text="the calibration sweep moves the arm: start the capture "
+                                    "server with REBOT_EXECUTE=1 and the edge with "
+                                    "--allow-execute")
+    if not app["camera"]:
+        raise web.HTTPUnprocessableEntity(text="no camera: set REBOT_CAMERA or pass camera=")
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
+    if body.get("confirm") is not True:
+        raise web.HTTPBadRequest(text='send {"confirm": true}: this moves the arm through %d poses'
+                                      % len(sweep.POSES))
+    for field in ("capture", "u", "v"):
+        if body.get(field) is None:
+            raise web.HTTPBadRequest(
+                text="starting a sweep needs 'capture', 'u' and 'v': one still with the tool "
+                     "tip tapped in it")
+    if app["calibrating"]:
+        return web.json_response({"ok": False, "error": "a calibration sweep is already running"},
+                                 status=409)
+
+    calibration_path = resolve_calibration(app, body.get("calib"))
+    camera_url = body.get("camera") or app["camera"]
+
+    app["calibrating"] = True
+    app["progress"] = {"pose": 0, "of": len(sweep.POSES), "phase": "starting",
+                       "started": time.time()}
+    app["calibration_started"] = app["progress"]["started"]
+    app["last_calibration"] = {"state": "running", "started": utc_now(), "camera": camera_url}
+    try:
+        payload = await asyncio.to_thread(run_sweep, app, camera_url, calibration_path, body)
+    except (auto_calibrate.AutoError, camera_mod.CameraError,
+            extrinsics.ExtrinsicsError) as error:
+        logging.warning("calibration refused: %s", error)
+        app["last_calibration"] = {"state": "failed", "error": str(error), "at": utc_now()}
+        return web.json_response({"ok": False, "error": str(error)}, status=422)
+    except Exception as error:      # noqa: BLE001 - a sweep must not kill the server
+        logging.exception("calibration crashed")
+        app["last_calibration"] = {"state": "failed", "at": utc_now(),
+                                   "error": "%s: %s" % (type(error).__name__, error)}
+        return web.json_response({"ok": False, "error": "%s: %s"
+                                  % (type(error).__name__, error)}, status=500)
+    finally:
+        app["calibrating"] = False
+        app["progress"] = None
+
+    app["last_calibration"] = {"state": "ok" if payload["ok"] else "refused",
+                               "at": utc_now(), "verification": payload.get("verification")}
+    if payload["ok"] and payload.get("written"):
+        # Use it now, not after a restart: the next tap should be on the new rig.
+        try:
+            app["rig"] = extrinsics.load_rig(payload["written"])
+            app["extrinsics_path"] = payload["written"]
+            app["witness"] = witness.load_for(app["rig"], Path(payload["written"]).parent)
+        except (extrinsics.ExtrinsicsError, witness.WitnessError) as error:
+            logging.warning("calibration wrote %s but it could not be loaded: %s",
+                            payload["written"], error)
+        logging.info("calibration wrote %s", payload.get("written"))
+    return web.json_response(payload, status=200 if payload["ok"] else 422)
+
+
+async def handle_calibrate_status(request: web.Request) -> web.Response:
+    """`GET /calibrate` -- is a sweep running, and how did the last one end?"""
+    app = request.app
+    return web.json_response({
+        "ok": True,
+        "running": bool(app["calibrating"]),
+        "progress": app["progress"],
+        "camera": app["camera"],
+        "execute": app["execute"],
+        "sweep": {"poses": len(sweep.POSES), "home": list(sweep.HOME),
+                  "seconds": round(sweep.sweep_seconds())},
+        "last": app["last_calibration"],
+        "rig": (None if app["rig"] is None else app["rig"].provenance()),
+    })
+
+
+def grab_one(app, camera_url):
+    """One still from the fixed camera, with the pose the arm actually had."""
+    import cv2
+
+    eye = camera_mod.open_source(camera_url)
+    try:
+        frame = eye.read()
+    finally:
+        eye.close()
+
+    arm = auto_calibrate.ArmGateway(app["planner"], app["planner_token"])
+    first = arm.pose()
+    time.sleep(0.2)
+    second = arm.pose()
+    moved = max(abs(float(a) - float(b)) for a, b in zip(first["q"], second["q"]))
+    if moved > 0.01:
+        raise auto_calibrate.AutoError(
+            "the arm moved while the frame was taken (%.0f mrad): hold it still and capture "
+            "again" % (1000.0 * moved))
+
+    capture_id = new_capture_id()
+    directory = Path(app["captures"]) / capture_id
+    directory.mkdir(parents=True, exist_ok=False)
+    cv2.imwrite(str(directory / "frame.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    (directory / "meta.json").write_text(json.dumps({
+        "purpose": "extrinsics",
+        "image_size": [int(frame.shape[1]), int(frame.shape[0])],
+        "server": {"id": capture_id, "pose": first, "captured_at": utc_now(),
+                   "source": "capture-pose"},
+    }, indent=2) + "\n", encoding="utf-8")
+    return {"ok": True, "id": capture_id,
+            "image_url": "/captures/%s/frame.jpg" % capture_id,
+            "image_size": [int(frame.shape[1]), int(frame.shape[0])],
+            "pose": first}
+
+
+async def handle_capture_pose(request: web.Request) -> web.Response:
+    """`POST /capture/pose` -- one still + pose, for the click path."""
+    app = request.app
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        body = {}
+    camera_url = body.get("camera") or app["camera"]
+    if not camera_url:
+        raise web.HTTPUnprocessableEntity(text="no camera: set REBOT_CAMERA or pass camera=")
+    try:
+        payload = await asyncio.to_thread(grab_one, app, camera_url)
+    except (auto_calibrate.AutoError, camera_mod.CameraError) as error:
+        return web.json_response({"ok": False, "error": str(error)}, status=422)
+    return web.json_response(payload)
 
 
 async def handle_file(request: web.Request) -> web.StreamResponse:
@@ -448,7 +738,7 @@ async def handle_favicon(request: web.Request) -> web.Response:
 
 def build_app(args) -> web.Application:
     app = web.Application(client_max_size=args.max_mb * 1024 * 1024,
-                          middlewares=[token_middleware(args.token)])
+                          middlewares=[json_errors, token_middleware(args.token)])
     app["args"] = args
     app["captures"] = Path(args.captures).resolve()
     app["max_bytes"] = args.max_mb * 1024 * 1024
@@ -464,6 +754,29 @@ def build_app(args) -> web.Application:
     app["calib"] = Path(args.calib_dir).resolve()
     app["calib_file"] = args.calib
     app["tag"] = {"size": args.tag_size, "x": args.tag_x, "y": args.tag_y, "yaw": args.tag_yaw}
+    app["extrinsics_path"] = args.extrinsics
+    app["witness_max_px"] = float(args.witness_max_px)
+    app["camera"] = args.camera
+    app["mediamtx_api"] = (getattr(args, "mediamtx_api", "")
+                           or os.environ.get("REBOT_MEDIAMTX_API", "http://127.0.0.1:9997")).rstrip("/")
+    app["recordings"] = Path(getattr(args, "recordings", "")
+                             or os.environ.get("REBOT_RECORDINGS", str(STATE / "recordings"))).resolve()
+    app["calibrating"] = False
+    app["last_calibration"] = None
+    app["progress"] = None
+    app["calibration_started"] = None
+    app["rig"] = None
+    app["witness"] = None
+    if args.extrinsics:
+        path = Path(args.extrinsics)
+        try:
+            app["rig"] = extrinsics.load_rig(path)
+        except extrinsics.ExtrinsicsError as error:
+            raise SystemExit(str(error)) from error
+        try:
+            app["witness"] = witness.load_for(app["rig"], path.resolve().parent)
+        except witness.WitnessError as error:
+            raise SystemExit("the rig's witness frame cannot be used: %s" % error) from error
     app["plane_z"] = args.plane_z
     app["tool_axis"] = args.tool_axis
     app["yaw"] = args.yaw
@@ -478,6 +791,9 @@ def build_app(args) -> web.Application:
     app.router.add_post("/plan", handle_plan)
     app.router.add_post("/execute", handle_execute)
     app.router.add_get("/pose", handle_pose)
+    app.router.add_post("/calibrate/extrinsics", handle_calibrate)
+    app.router.add_get("/calibrate", handle_calibrate_status)
+    app.router.add_post("/capture/pose", handle_capture_pose)
     app.router.add_get("/viewer.js", handle_viewer_js)
     app.router.add_get("/captures/{id}/{name}", handle_file)
     app.router.add_get("/favicon.ico", handle_favicon)
@@ -522,6 +838,19 @@ def main(argv=None):
     parser.add_argument("--tag-x", type=float, default=float(os.environ.get("REBOT_TAG_X", "0.0")))
     parser.add_argument("--tag-y", type=float, default=float(os.environ.get("REBOT_TAG_Y", "0.0")))
     parser.add_argument("--tag-yaw", type=float, default=float(os.environ.get("REBOT_TAG_YAW", "0.0")))
+    parser.add_argument("--extrinsics", default=os.environ.get("REBOT_EXTRINSICS", ""),
+                        help="fixed-camera rig JSON; then taps need no tag")
+    parser.add_argument("--camera", default=os.environ.get("REBOT_CAMERA", ""),
+                        help="rtsp://, http:// snapshot, or device:N, for the automatic sweep")
+    parser.add_argument("--mediamtx-api", default=os.environ.get("REBOT_MEDIAMTX_API",
+                                                                 "http://127.0.0.1:9997"),
+                        help="MediaMTX control API, used to record a sweep")
+    parser.add_argument("--recordings", default=os.environ.get("REBOT_RECORDINGS",
+                                                               str(STATE / "recordings")),
+                        help="where MediaMTX writes its recordings")
+    parser.add_argument("--witness-max-px", type=float,
+                        default=float(os.environ.get("REBOT_WITNESS_MAX_PX", "2.0")),
+                        help="refuse a capture whose background drifted more than this, px")
     parser.add_argument("--plane-z", type=float, default=float(os.environ.get("REBOT_PLANE_Z", "0.0")))
     parser.add_argument("--tool-axis", default=os.environ.get("REBOT_TOOL_AXIS", "current"))
     parser.add_argument("--yaw", type=float, default=float(os.environ.get("REBOT_YAW", "0")))
@@ -561,8 +890,17 @@ def main(argv=None):
     print("  planner  : %s%s" % (app["planner"],
                                   "  (execute on)" if app["execute"] else "  (execute off)"))
     print("  calib    : %s" % app["calib"])
-    print("  tag      : %.0f mm at (%.3f, %.3f) yaw %.1f deg, plane z %.3f"
-          % (args.tag_size * 1000, args.tag_x, args.tag_y, args.tag_yaw, args.plane_z))
+    if app["rig"] is None:
+        print("  tag      : %.0f mm at (%.3f, %.3f) yaw %.1f deg, plane z %.3f"
+              % (args.tag_size * 1000, args.tag_x, args.tag_y, args.tag_yaw, args.plane_z))
+    else:
+        rig = app["rig"]
+        print("  camera   : fixed, %s, rms %.2f px" % (rig.fingerprint, rig.rms_px))
+        print("             %s" % rig.describe().splitlines()[0])
+        print("             witness %s, limit %.1f px"
+              % ("on" if app["witness"] is not None else "MISSING", app["witness_max_px"]))
+    if app["camera"]:
+        print("  sweep    : %s (POST /calibrate/extrinsics)" % app["camera"])
     print("  auth     : %s" % ("token required on writes" if args.token else "open on the LAN"))
     web.run_app(app, host=args.host, port=args.port, ssl_context=ssl_context,
                 print=None, shutdown_timeout=2.0)

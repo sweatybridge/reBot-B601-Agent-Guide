@@ -139,10 +139,14 @@
   <details>
     <summary>How to use</summary>
     <ol>
-      <li>Print the tag at 100 % (<code>make_tag.py</code>) and tape it flat on the worktop; measure the black square.</li>
       <li>Tap the target on the preview. The crosshair is what the host will use.</li>
-      <li>Capture. The tag must be visible in the same frame as the target.</li>
+      <li>Capture. With a fixed camera the target is the only thing that has to be in frame.</li>
       <li>On the host: <code>locate_target.py</code>, then <code>plan_to_target.py</code> in the Pinocchio container.</li>
+      <li>First time with a fixed camera: press <b>Rig</b>, capture one pose, tap the tool
+          tip in the picture, then run the sweep. The arm drives eight poses, the stills are
+          taken for you, and the camera pose is fitted and verified — no tag anywhere.</li>
+      <li>Handheld only: print the tag at 100 % (<code>make_tag.py</code>) and tape it flat
+          on the worktop; it has to stay in the same frame as the target.</li>
     </ol>
   </details>
 </footer>
@@ -467,7 +471,7 @@ async function capture() {
     } else if (meta.tap) {
       log("saved " + captureLink(data.id) + " at (" + meta.tap.u + ", " + meta.tap.v + ") px", "good");
     } else {
-      log("saved " + captureLink(data.id) + " with no tap; tap before capturing, or use the tag centre", "warn");
+      log("saved " + captureLink(data.id) + " with no tap; tap before capturing", "warn");
     }
     renderChips();
   } catch (error) {

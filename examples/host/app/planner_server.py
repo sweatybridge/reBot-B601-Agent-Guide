@@ -21,6 +21,7 @@ routes.
     GET  /pose                proxy of the edge's pose
     POST /plan                {target, pose?, options?} -> /app/out/<id>.json
     POST /execute             {id, kp?, kd?} -> POST /play on the edge
+    POST /move                {q, seconds?, gripper?} -> joint-space move, no IK
 
 `/execute` refuses unless REBOT_EXECUTE=1. The file it sends was produced by the
 same `plan()` the CLI uses, and the edge re-checks limits and steps before any
@@ -45,7 +46,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import numpy as np  # noqa: E402
+
 import plan_to_target as planner  # noqa: E402
+import rebot_ik  # noqa: E402
+import sweep  # noqa: E402
+import traj  # noqa: E402
 
 ROOT = HERE.parent
 OUT_DIR = Path(os.environ.get("REBOT_OUT", str(ROOT / "state" / "out")))
@@ -136,6 +142,139 @@ def plan_one(body):
     summary["compute_s"] = round(time.time() - started, 2)
     return {"ok": True, "id": plan_id, "path": str(path), "bytes": path.stat().st_size,
             "summary": summary, "execute": EXECUTE}
+
+
+def move_one(body):
+    """Move the arm to a joint pose, in joint space, through the same gate.
+
+    This exists for the automatic calibration sweep: it has to put the arm in
+    eight specific poses without a human pressing a button eight times. It is
+    not a general motion API -- there is no Cartesian target here, so there is
+    no IK to fail, no singularity to cross, and no path that a collision check
+    has not already approved against the capsule model.
+    """
+    if not EXECUTE:
+        raise GatewayError("execution is disabled on this host (REBOT_EXECUTE=1 to allow it)", 403)
+    requested = body.get("targets")
+    if requested is None:
+        q = body.get("q")
+        if not isinstance(q, (list, tuple)) or len(q) != 6:
+            raise GatewayError("'q' must be six joint angles, or 'targets' a list of them")
+        requested = [q]
+    if not isinstance(requested, (list, tuple)) or not requested:
+        raise GatewayError("'targets' must be a non-empty list")
+
+    targets = []
+    for item in requested:
+        if not isinstance(item, (list, tuple)) or len(item) != 6:
+            raise GatewayError("every target must be six joint angles")
+        pose = np.asarray([float(v) for v in item], dtype=float)
+        if not np.all(np.isfinite(pose)):
+            raise GatewayError("every target must be finite")
+        if not sweep.command_ok(pose):
+            raise GatewayError("a target is outside the joint limits: [%s]"
+                               % ", ".join("%+.3f" % v for v in pose), 422)
+        if not sweep.within_limits(pose, margin=0.02):
+            # The park pose sits on j2/j3's zero limit by design; commanding it is
+            # fine, but a pose pressed against a limit is worth a line in the log.
+            logging.info("a target is within 0.02 rad of a limit: [%s]",
+                         ", ".join("%+.3f" % v for v in pose))
+        targets.append(pose)
+
+    current = dump_pose()
+    if not isinstance(current.get("q"), list) or len(current["q"]) < 6:
+        raise GatewayError("the edge's pose has no q", 502)
+    q_from = np.asarray([float(v) for v in current["q"]], dtype=float)
+    if q_from.size < 7:
+        q_from = np.append(q_from, 0.0)
+    gripper = float(body["gripper"]) if "gripper" in body else float(q_from[6])
+
+    # Every leg, not just the first: a chain is only as safe as its worst
+    # interpolation, and the segments between poses are new ground. It is checked
+    # on the *targets*, because that is where the arm will actually be: the
+    # gravity compensation below only raises the commands to get it there.
+    chain = [q_from[:6]] + targets
+    for index, (start, end) in enumerate(zip(chain, chain[1:]), start=1):
+        if not sweep.path_safe(start, end):
+            raise GatewayError(
+                "leg %d of the move dips within a link radius of the worktop; move the arm "
+                "clear first" % index, 422)
+
+    # A player that cannot reach the bus still exits 0, so the move "succeeds"
+    # and the arm never leaves its pose. Ask the board before sending anything.
+    health_status, health = edge_request("GET", "/health", timeout=5)
+    if health_status == 200 and health.get("can_up") is False:
+        raise GatewayError(
+            "the board's CAN channel is down (%s): bring it up before moving"
+            % (health.get("channel") or "can0"), 503)
+
+    # The controller has no integral term, so a joint under load rests tau_g/kp
+    # away from its command. Command the offset so the arm *holds* the poses the
+    # table was validated at -- it is the geometry that matters, not the number
+    # in the file, and a 6 deg set-down is 60 mm at the tool.
+    kp = sweep.kp_vector(body.get("kp") or KP)
+    commands = []
+    applied = []
+    for index, target in enumerate(targets):
+        command = sweep.aim(target, kp)
+        clipped = np.clip(command, rebot_ik.LIMITS[:, 0], rebot_ik.LIMITS[:, 1])
+        if not np.allclose(clipped, command, atol=1e-9):
+            logging.warning("pose %d is at a joint limit: %.0f mrad of sag cannot be "
+                            "compensated", index + 1,
+                            1000.0 * float(np.max(np.abs(command - clipped))))
+        commands.append(clipped)
+        applied.append(round(1000.0 * float(np.max(np.abs(clipped - target))), 1))
+
+    chain = [q_from[:6]] + commands
+    wanted = [sweep.seconds_for(start, end) for start, end in zip(chain, chain[1:])]
+    given = body.get("seconds")
+    if given is None:
+        seconds = list(wanted)
+    elif isinstance(given, (list, tuple)):
+        if len(given) != len(wanted):
+            raise GatewayError("'seconds' must be one per leg (%d, got %d)"
+                               % (len(wanted), len(given)))
+        seconds = [max(value, float(given[index])) for index, value in enumerate(wanted)]
+    else:
+        seconds = [max(value, float(given)) for value in wanted]
+    # A caller may ask for a slower leg, never a quicker one: the policy is the
+    # floor, so even the error-path return to park cannot snap back.
+    seconds = [max(sweep.MIN_SECONDS, min(sweep.MAX_SECONDS, value)) for value in seconds]
+    # The board returns the arm to `q_from` when the file ends, so a hold at each
+    # pose is the only window in which that pose physically exists -- the
+    # calibration sweep picks its frames out of exactly those windows.
+    hold = max(0.0, min(30.0, float(body.get("hold") or 0.0)))
+    limits = [[float(lo), float(hi)] for lo, hi in rebot_ik.LIMITS] + [[-0.1, 5.0]]
+    points = [np.append(pose, gripper) for pose in chain]
+    try:
+        if len(targets) == 1:
+            trajectory = traj.joint_move(q_from, points[-1], seconds[0], limits=limits,
+                                         hold_s=hold,
+                                         label="calibration move to [%s]"
+                                               % ", ".join("%+.2f" % v for v in targets[0]))
+        else:
+            trajectory = traj.joint_sequence(points, seconds, hold_s=hold, limits=limits,
+                                             label="%d poses, one pass" % len(targets))
+    except ValueError as error:
+        raise GatewayError(str(error), 422) from error
+
+    query = urllib.parse.urlencode({
+        "kp": str(body.get("kp") or KP),
+        "kd": str(body.get("kd") or KD),
+    })
+    total = sum(seconds) + hold * len(targets)
+    status, payload = edge_request("POST", "/play?" + query, body=trajectory,
+                                   timeout=max(600.0, 4.0 * total))
+    if status != 200:
+        raise GatewayError(payload.get("error", "the edge refused the move"), 502)
+
+    # The arm is back at q_from now: that is the board's one-shot semantics, not
+    # a failure. Whether the move *happened* is the sweep's question, and it
+    # answers it from the poses recorded during the holds.
+    logging.info("moved through %d pose(s), %.1f s of motion, held %.1f s each, "
+                 "sag compensation %s mrad", len(targets), sum(seconds), hold, applied)
+    return {"ok": True, "seconds": round(sum(seconds), 2), "hold": hold,
+            "poses": len(targets), "sag_mrad": applied, "pose": dump_pose()}
 
 
 def execute_one(body):
@@ -233,6 +372,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, plan_one(self._body()))
             elif self.path == "/execute":
                 self._send(200, execute_one(self._body()))
+            elif self.path == "/move":
+                self._send(200, move_one(self._body()))
             else:
                 self._send(404, {"ok": False, "error": "no such route"})
         except GatewayError as error:

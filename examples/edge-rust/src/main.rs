@@ -52,7 +52,14 @@ const MAX_HZ: f64 = 200.0;
 const MIT_POSITION_LIMIT: f64 = 4.0 * std::f64::consts::PI;
 const DEFAULT_MODEL_SPEC: &str = "1:rs-06,2:rs-06,3:rs-06";
 const HOST_ID: u8 = 0xFF;
-const DEFAULT_JOINT_STEP_RAMP_S: f64 = 1.5;
+// The return leg. It used to be a flat 1.5 s whatever the distance, so a long
+// way back was rushed: 3 rad in 1.5 s is 2 rad/s, five times the speed the host
+// moves at. The duration now follows the same rule as the way out -- a cosine
+// ease (`ease_in_out`, peak = pi/2 x average) capped at a peak speed -- so the
+// arm comes home as gradually as it left, and a short nudge still takes long
+// enough to have a beginning and an end.
+const RETURN_PEAK_SPEED: f64 = 0.35; // rad/s, matches sweep.PEAK_SPEED
+const RETURN_MIN_S: f64 = 3.0;       // matches sweep.MIN_SECONDS
 
 // RobStride communication types (see robstride_dynamics/protocol.py).
 const COMM_OPERATION_CONTROL: u32 = 1;
@@ -1490,9 +1497,11 @@ impl<T: Transport> Arm<T> {
         let home = self.start.clone();
 
         // Ramp home first, then hold; attempt the disable even if the ramp fails,
-        // so a bad status frame cannot leave torque on by accident.
+        // so a bad status frame cannot leave torque on by accident. The ramp is
+        // timed by the distance it has to cover, not by a constant.
+        let duration = ramp_duration(&self.last, &home);
         let ramp = self
-            .move_leg(&home, DEFAULT_JOINT_STEP_RAMP_S, "home", track, false)
+            .move_leg(&home, duration, "home", track, false)
             .and_then(|_| self.hold(&home, 0.5, false));
 
         if stay_enabled {
@@ -1510,6 +1519,18 @@ impl<T: Transport> Arm<T> {
 
 fn ease_in_out(t: f64) -> f64 {
     0.5 * (1.0 - (std::f64::consts::PI * t.clamp(0.0, 1.0)).cos())
+}
+
+fn ramp_duration(from: &[f64], to: &[f64]) -> f64 {
+    let travel = from
+        .iter()
+        .zip(to)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    if !travel.is_finite() {
+        return RETURN_MIN_S;
+    }
+    (0.5 * std::f64::consts::PI * travel / RETURN_PEAK_SPEED).max(RETURN_MIN_S)
 }
 
 fn sleep_until(deadline: Instant) {
@@ -3904,5 +3925,25 @@ mod tests {
         assert!(is_loopback("[::1]:8081"));
         assert!(!is_loopback("0.0.0.0:8081"));
         assert!(!is_loopback("192.168.1.23:8081"));
+    }
+
+    #[test]
+    fn the_return_ramp_follows_distance_not_a_constant() {
+        // A short way back still gets the floor, so it has a beginning and an end.
+        let short = ramp_duration(&[0.0, 0.0], &[0.2, 0.0]);
+        assert!((short - RETURN_MIN_S).abs() < 1e-9, "short ramp {short}");
+
+        // A long one takes longer, and lands exactly on the speed cap.
+        let long = ramp_duration(&[0.0, 0.0], &[2.0, 0.0]);
+        assert!(long > short, "long {long} vs short {short}");
+        let peak = 0.5 * std::f64::consts::PI * 2.0 / long;
+        assert!(
+            (peak - RETURN_PEAK_SPEED).abs() < 1e-6,
+            "peak {peak} should be {RETURN_PEAK_SPEED}"
+        );
+
+        // A constant 1.5 s -- the old behaviour -- would be far above the cap.
+        let old_peak = 0.5 * std::f64::consts::PI * 2.0 / 1.5;
+        assert!(old_peak > 4.0 * RETURN_PEAK_SPEED);
     }
 }
