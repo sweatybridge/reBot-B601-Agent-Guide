@@ -78,6 +78,16 @@ class Options:
     lift: float = 0.10
     lift_s: float = 1.5
     return_s: float = 3.0
+    # Hover instead of pick: go to `hover_m` above the target and stop there (and
+    # come back, because the board ends every move where it began). A tap that
+    # only marks a place on the table wants this, not a grasp sequence.
+    hover: bool = False
+    hover_m: float = 0.10
+    # Where the tool tip sits below `gripper_end`, in metres. The planner aims the
+    # *frame*; the tip is this far along the tool axis, so the flange has to be
+    # lifted by it for the tip to reach the requested height. Fixed mode can take
+    # this from the rig; handheld has only a typed number.
+    tip_m: float = 0.0
     tool_axis: str = "current"
     yaw: float = 0.0
     payload: float = 0.0
@@ -217,11 +227,14 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
 
     point = validate_target_meta(target)
     radius = float(np.linalg.norm(point[:2]))
-    if point[2] < options.min_z:
+    # With a hover the arm never descends to the table; judge the height it will
+    # actually reach, or every tap on the worktop would be refused as "into it".
+    judged = point + np.array([0.0, 0.0, float(options.hover_m) if options.hover else 0.0])
+    if judged[2] < options.min_z:
         raise PlanError("target z %.4f is below --min-z %.4f: refusing to plan into the table"
-                        % (point[2], options.min_z))
-    if point[2] > options.max_z:
-        raise PlanError("target z %.3f is above --max-z %.3f" % (point[2], options.max_z))
+                        % (judged[2], options.min_z))
+    if judged[2] > options.max_z:
+        raise PlanError("target z %.3f is above --max-z %.3f" % (judged[2], options.max_z))
     if radius > options.max_reach:
         raise PlanError("target is %.3f m from the base axis, above --max-reach %.2f"
                         % (radius, options.max_reach))
@@ -335,22 +348,32 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         p0 = T_unparked[:3, 3].copy()
         R_work = work_orientation(R0, options.tool_axis, options.yaw)
 
-    seed = cartesian(p0, pre, R0, R_work, options.approach_s, 0.4, seed, "approach")
-    seed = cartesian(pre, point, R_work, R_work, options.descend_s, 1.0, seed, "descend")
-    gripper_leg(options.grasp_q, options.grasp_s)
-    hold_start = state["t"]
-    hold(options.hold_s)
-    hold_end = state["t"]
-    seed = cartesian(point, point + np.array([0.0, 0.0, options.lift]),
-                     R_work, R_work, options.lift_s, 1.0, seed, "lift")
-
-    if not options.no_return:
-        seed = cartesian(point + np.array([0.0, 0.0, options.lift]), p0,
-                         R_work, R0, options.return_s, 0.4, seed, "return")
-        gripper_leg(options.open_q, options.grasp_s)
-        if unparked:
-            joint_leg(np.array(waypoints[-1]["q"][:n_arm], dtype=float),
-                      {k: -v for k, v in unpark.items()}, options.unpark_s, "park")
+    if options.hover:
+        # One leg out, a hold, and the way back. The tap meant "this place": the
+        # arm visits it and stops, with no descend, grip or lift.
+        hover_point = point + np.array([0.0, 0.0, float(options.hover_m) + float(options.tip_m)])
+        seed = cartesian(p0, hover_point, R0, R_work, options.approach_s, 0.4, seed, "hover")
+        hold_start = state["t"]
+        hold(options.hold_s)
+        hold_end = state["t"]
+        if not options.no_return:
+            cartesian(hover_point, p0, R_work, R0, options.return_s, 0.4, seed, "return")
+    else:
+        seed = cartesian(p0, pre, R0, R_work, options.approach_s, 0.4, seed, "approach")
+        seed = cartesian(pre, point, R_work, R_work, options.descend_s, 1.0, seed, "descend")
+        gripper_leg(options.grasp_q, options.grasp_s)
+        hold_start = state["t"]
+        hold(options.hold_s)
+        hold_end = state["t"]
+        seed = cartesian(point, point + np.array([0.0, 0.0, options.lift]),
+                         R_work, R_work, options.lift_s, 1.0, seed, "lift")
+        if not options.no_return:
+            seed = cartesian(point + np.array([0.0, 0.0, options.lift]), p0,
+                             R_work, R0, options.return_s, 0.4, seed, "return")
+            gripper_leg(options.open_q, options.grasp_s)
+            if unparked:
+                joint_leg(np.array(waypoints[-1]["q"][:n_arm], dtype=float),
+                          {k: -v for k, v in unpark.items()}, options.unpark_s, "park")
 
     provenance = {
         "capture": target.get("capture"),
@@ -364,10 +387,15 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         "rig": target.get("rig"),
         "witness": target.get("witness"),
     }
-    steps = ("tap target: approach %.0f mm above [%.3f %.3f %.3f], descend, grip %.2f rad, "
-             "lift %.0f mm%s" % (options.approach * 1000, point[0], point[1], point[2],
-                                 options.grasp_q, options.lift * 1000,
-                                 "" if options.no_return else ", return and open"))
+    if options.hover:
+        steps = ("tap target: hover %.0f mm above [%.3f %.3f %.3f]%s"
+                 % (options.hover_m * 1000, point[0], point[1], point[2],
+                    "" if options.no_return else ", then return"))
+    else:
+        steps = ("tap target: approach %.0f mm above [%.3f %.3f %.3f], descend, grip %.2f rad, "
+                 "lift %.0f mm%s" % (options.approach * 1000, point[0], point[1], point[2],
+                                     options.grasp_q, options.lift * 1000,
+                                     "" if options.no_return else ", return and open"))
     payload = traj.build(
         waypoints, options.hz,
         [[float(lo), float(hi)] for lo, hi in zip(lower, upper)] + [[-0.1, 5.0]],
@@ -511,8 +539,6 @@ def main(argv=None):
         raise SystemExit(str(error)) from error
 
     print(describe(summary))
-    if target.get("source") == "tag-centre":
-        print("  warning: this target is the tag centre, not a tapped point")
 
     if args.print_only:
         print("  (--print-only: not written)")

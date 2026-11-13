@@ -84,13 +84,12 @@ docker compose restart capture
 | `capture` | the HTTPS endpoint the phone opens; tap -> capture -> plan | `8443/tcp` |
 | `mediamtx` | WebRTC relay: phone in, `/live` out | `8189/udp` |
 | `planner` | the arm gateway: edge `/pose`, Pinocchio planning, optional execute | nothing |
-| `tools` | `calibrate_intrinsics.py`, `calibrate_extrinsics.py`, `make_tag.py`, `make_cert.py`, `selftest.py` | nothing |
+| `tools` | `calibrate_intrinsics.py`, `calibrate_extrinsics.py`, `make_cert.py`, `selftest.py` | nothing |
 
 Everything after that is a tap or a command:
 
 ```bash
 docker compose --profile tools run --rm tools app/calibrate_intrinsics.py
-docker compose --profile tools run --rm tools app/make_tag.py --id 0 --size 80
 docker compose --profile tools run --rm tools tests/selftest.py
 ```
 
@@ -174,24 +173,27 @@ token is remembered in `localStorage` and stripped from the address bar. If the
 host's IP changes, `make_cert.py --reuse --ip <new-ip>` mints a new leaf; the CA
 stays installed.
 
-## Print the tag and tape it down (handheld only)
+## Paste the marker on the base (handheld only)
 
 Skip this section if the camera is on a bracket: the next one replaces it, and
-no tag is needed at all.
+no marker is needed at all.
 
-```bash
-python examples/host/app/make_tag.py --id 0 --size 80
+The sheet is `examples/host/docs/base-marker.pdf`: an ArUco 4x4, id 0, **4 cm**
+across the black square, on a 70 x 82 mm page with a 15 mm quiet zone and a 4 cm
+bar. Print it at actual size (no "fit to page") and check the bar with a ruler.
+
+Paste it **upright on the side of the base**, not flat on the worktop: a phone
+held at chest height then sees it face-on instead of at a glancing angle. Record
+its centre `x, y, z` in the base frame (metres) and the heading its printed face
+points to (degrees, counter-clockwise from base +x):
+
+```
+REBOT_MARKER_AT=0.14,0.0,0.06,180
+REBOT_MARKER_SIZE=0.05
 ```
 
-Print at 100 % (no "fit to page"), then **measure the black square** and pass the
-measured value as `--tag-size`. `--tag-size` is the side of the black square,
-border included -- not the sheet and not the white margin.
-
-Tape it flat on the worktop where the phone sees it **in the same frame as the
-target**, and note where it sits relative to the arm base: `--tag-x`, `--tag-y`
-(from the base's origin, metres) and `--tag-yaw` (degrees). Measurements are
-easier than they sound: the base origin is the centre of the J1 axis, and the
-tape measure is the calibration.
+`docs/base-marker.md` has the measurement detail. A tag lying flat on the worktop
+is no longer supported.
 
 The tag supplies the extrinsics on every frame, so a handheld phone is fine.
 Which means the rule that matters: **the tag must be visible in the same frame
@@ -557,7 +559,7 @@ move. `--unpark-j3 0` disables it; the leg is mirrored at the end of the plan.
 | `capture_server.py` | TLS endpoint, `/capture`, `/plan`, `/execute`, the calibration routes, WHIP/WHEP relay |
 | `planner_server.py` | the arm gateway: edge `/pose`, planning, gated execution |
 | `make_cert.py` | local CA + leaf certificate for the phone |
-| `make_tag.py` | printable ArUco tag at a measured size (handheld mode only) |
+| `base_marker.py` | the printable marker sheet and its PnP (see `base-marker.md`) |
 | `calibrate_intrinsics.py` | checkerboard fit -> `calib/<device>.json` |
 | `calibrate_extrinsics.py` | tool-tip sweep -> `calib/extrinsics-<mount>.json` + witness |
 | `extrinsics.py` | the rig: DLT + Levenberg-Marquardt, covariance, predicted error |

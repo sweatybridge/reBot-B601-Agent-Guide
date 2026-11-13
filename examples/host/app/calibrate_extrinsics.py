@@ -48,6 +48,7 @@ sys.path.insert(0, str(HERE))
 ROOT = HERE.parent
 STATE = ROOT / "state"
 
+import base_marker  # noqa: E402
 import extrinsics as ex  # noqa: E402
 import mediamtx  # noqa: E402
 import rebot_ik  # noqa: E402
@@ -181,12 +182,14 @@ def command_auto(args):
         raise CliError("that capture has no pose: take it with --capture-pose")
 
     out = resolve(args.out or (STATE / "calib" / "extrinsics-fixed.json"))
+    marker = base_marker.parse_spec(getattr(args, 'marker_at', ''), getattr(args, 'marker_size', base_marker.SIZE_M))
     options = auto.Options(
         plane_z=float(args.plane_z if args.plane_z is not None else 0.0),
         settle_s=float(args.settle),
         work_radius=float(args.work_radius),
-        click={"q": q, "uv": (float(args.uv[0]), float(args.uv[1])),
-               "image": str(directory / "frame.jpg")},
+        click=None if marker else {"q": q, "uv": (float(args.uv[0]), float(args.uv[1])),
+                                   "image": str(directory / "frame.jpg")},
+        marker=marker,
     )
 
     # latency=0: the sweep records continuously and picks frames afterwards.
@@ -332,6 +335,12 @@ def main(argv=None):
                         help="the capture holding the tapped tool tip")
     parser.add_argument("--uv", nargs=2, type=float, metavar=("U", "V"),
                         help="the tool tip's pixel in that capture")
+    parser.add_argument("--marker-at", default=os.environ.get("REBOT_MARKER_AT", ""),
+                        help="'x,y,z' or 'x,y,z,yaw' of the base marker in the robot's frame "
+                             "(metres, radians): with it, no tap is needed")
+    parser.add_argument("--marker-size", type=float,
+                        default=float(os.environ.get("REBOT_MARKER_SIZE", "0.04")),
+                        help="the marker's printed side in metres (default 0.04)")
     parser.add_argument("--camera", default=os.environ.get("REBOT_CAMERA", ""),
                         help="rtsp://, http:// snapshot, or device:N")
     parser.add_argument("--mediamtx-api", default=os.environ.get("REBOT_MEDIAMTX_API",

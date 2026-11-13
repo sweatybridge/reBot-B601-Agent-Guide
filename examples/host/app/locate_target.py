@@ -43,6 +43,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import calib as calib_mod  # noqa: E402
+import base_marker
 import extrinsics  # noqa: E402
 import witness as witness_mod  # noqa: E402
 
@@ -67,7 +68,6 @@ class Options:
     tag_yaw: float = 0.0
     plane_z: float = 0.0
     tap: tuple | None = None
-    point_mode: str = "tap"
     max_reproj: float = 1.5
     max_grazing: float = 80.0
     max_reach: float = 0.75
@@ -152,11 +152,15 @@ def rotz(deg):
 
 
 def tag_in_base(x, y, z, yaw_deg):
-    """`T_base<-tag`: the printed face is up, its +x along the base x at yaw 0."""
-    T = np.eye(4)
-    T[:3, :3] = rotz(yaw_deg)
-    T[:3, 3] = [float(x), float(y), float(z)]
-    return T
+    """`T_base<-marker`: the tag stands on the side of the base.
+
+    Its printed face points along the heading `yaw_deg` and its +y is the base's
+    +z, so the image reads upright to a phone held in front of it. There is no
+    flat-on-the-worktop variant any more: a tag lying down is seen at a glancing
+    angle by a handheld phone, which is what made it fragile.
+    """
+    return base_marker.base_from_marker((x, y, z), math.radians(float(yaw_deg)),
+                                        mode="vertical")
 
 
 def base_from_camera(R_cam_tag, t_cam_tag, T_base_tag):
@@ -260,9 +264,6 @@ def locate(image, meta, calibration, options: Options):
     if options.extrinsics is not None:
         # A fixed camera: the pose is a file, so nothing has to be printed and
         # nothing has to be in frame except the thing being tapped.
-        if options.point_mode == "tag":
-            raise LocateError("point-mode 'tag' needs a tag in the frame; this camera has a "
-                              "fitted pose, so tap the target instead")
         try:
             extrinsics.verify_pair(calibration, options.extrinsics)
         except extrinsics.ExtrinsicsError as error:
@@ -297,21 +298,16 @@ def locate(image, meta, calibration, options: Options):
 
 
     tap = options.tap if options.tap is not None else tap_from_meta(meta, (width, height))
-    if options.point_mode == "tag":
-        point = (T_base_tag @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
-        source = "tag-centre"
-        tap = None
-    else:
-        if tap is None:
-            raise LocateError("no tap in the capture; tap the target before capturing")
-        point, _distance, grazing = ray_plane(calibration.K, T_base_cam, tap[0], tap[1],
-                                              options.plane_z, calibration.dist)
-        source = "tap+fixed" if options.extrinsics is not None else "tap+plane"
-        if grazing > options.max_grazing:
-            raise LocateError(
-                "the tap ray meets the table at %.0f deg (limit %.0f): a grazing view turns "
-                "every pixel of the tap into centimetres -- aim further down"
-                % (grazing, options.max_grazing))
+    if tap is None:
+        raise LocateError("no tap in the capture; tap the target before capturing")
+    point, _distance, grazing = ray_plane(calibration.K, T_base_cam, tap[0], tap[1],
+                                          options.plane_z, calibration.dist)
+    source = "tap+fixed" if options.extrinsics is not None else "tap+marker"
+    if grazing > options.max_grazing:
+        raise LocateError(
+            "the tap ray meets the table at %.0f deg (limit %.0f): a grazing view turns "
+            "every pixel of the tap into centimetres -- aim further down"
+            % (grazing, options.max_grazing))
 
     radius = float(np.linalg.norm(point))
     payload = {
@@ -373,12 +369,11 @@ def main(argv=None):
     parser.add_argument("--out", default="", help="target.json (default: <capture>/target.json)")
     parser.add_argument("--dictionary", default="4x4_50", choices=sorted(ARUCO_DICTS))
     parser.add_argument("--tag-id", type=int, default=None, help="default: largest marker in view")
-    parser.add_argument("--tag-size", type=float, default=0.080,
-                        help="black square side including the border, metres")
-    parser.add_argument("--tag-x", type=float, default=0.0, help="tag centre, base x, m")
-    parser.add_argument("--tag-y", type=float, default=0.0, help="tag centre, base y, m")
-    parser.add_argument("--tag-z", type=float, default=0.0, help="tag face height above base plane, m")
-    parser.add_argument("--tag-yaw", type=float, default=0.0, help="tag rotation about base z, deg")
+    parser.add_argument("--marker-at", default="",
+                        help="the base marker's centre and heading: 'x,y,z,yaw' in metres and "
+                             "degrees (yaw is the way its face points)")
+    parser.add_argument("--marker-size", type=float, default=0.04,
+                        help="the marker's printed side, metres")
     parser.add_argument("--extrinsics", default=os.environ.get("REBOT_EXTRINSICS", ""),
                         help="extrinsics JSON for a fixed camera; then no tag is needed")
     parser.add_argument("--witness-max-px", type=float, default=2.0,
@@ -386,8 +381,6 @@ def main(argv=None):
     parser.add_argument("--plane-z", type=float, default=0.0, help="worktop height in base frame, m")
     parser.add_argument("--tap", nargs=2, type=float, metavar=("U", "V"),
                         help="override the tap stored in meta.json, image pixels")
-    parser.add_argument("--point-mode", choices=("tap", "tag"), default="tap",
-                        help="'tag' uses the tag centre (self-test / sanity check)")
     parser.add_argument("--max-reproj", type=float, default=1.5,
                         help="reject a tag pose above this reprojection error, px")
     parser.add_argument("--max-grazing", type=float, default=80.0,
@@ -404,14 +397,21 @@ def main(argv=None):
     except (extrinsics.ExtrinsicsError, witness_mod.WitnessError) as error:
         raise SystemExit(str(error)) from error
 
+    marker = base_marker.parse_spec(args.marker_at, args.marker_size)
+    if rig is None and marker is None:
+        raise SystemExit("a capture needs either --extrinsics (a fixed camera) or --marker-at "
+                         "(the base marker): without one the camera pose is unknown")
     options = Options(
-        tag_size=args.tag_size, tag_x=args.tag_x, tag_y=args.tag_y, tag_z=args.tag_z,
-        tag_yaw=args.tag_yaw, plane_z=args.plane_z,
-        tap=tuple(args.tap) if args.tap else None, point_mode=args.point_mode,
+        plane_z=args.plane_z,
+        tap=tuple(args.tap) if args.tap else None,
         max_reproj=args.max_reproj, max_grazing=args.max_grazing, max_reach=args.max_reach,
         dictionary=args.dictionary, tag_id=args.tag_id, annotate=args.annotate,
         extrinsics=rig, witness=reference, witness_max_px=args.witness_max_px,
     )
+    if marker is not None:
+        options.tag_size = float(marker["size_m"])
+        options.tag_x, options.tag_y, options.tag_z = marker["at"]
+        options.tag_yaw = float(__import__("math").degrees(marker["yaw"]))
     try:
         payload = locate_capture(args.capture, args.calib, options)
     except LocateError as error:

@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import math
 import logging
 import os
 import re
@@ -41,6 +42,7 @@ from aiohttp import ClientSession, ClientTimeout, web
 
 # The same locate code the CLI runs: a tap and a shell command cannot drift.
 import auto_calibrate
+import base_marker
 import camera as camera_mod
 import calib as calib_mod
 import extrinsics
@@ -173,7 +175,9 @@ async def handle_health(request: web.Request) -> web.Response:
         "rig": (None if app["rig"] is None else
                 dict(app["rig"].provenance(), path=str(app["extrinsics_path"]),
                      witness=bool(app["witness"]))),
-        "tag": app["tag"],
+        "tag": (None if app.get("marker") is None else
+                {"size_m": app["marker"]["size_m"], "at": list(app["marker"]["at"]),
+                 "yaw_deg": math.degrees(app["marker"]["yaw"])}),
         "plane_z": app["plane_z"],
     })
 
@@ -357,14 +361,42 @@ def resolve_calibration(app, requested=None) -> Path:
 
 
 def locate_options(app, body):
-    tag = dict(app["tag"])
+    """The locator's options: a rig for a fixed camera, the base marker for a handheld one.
+
+    Three ways in, in order of specificity: an explicit mode in the request, the
+    server's configured default, and -- when neither is set -- whatever the profile
+    can actually do (a rig if one was fitted, otherwise the marker).
+    """
+    explicit = str(body.get("mode") or "").strip().lower()
+    mode = explicit or str(app.get("mode") or "").strip().lower()
+    if not mode:
+        mode = "fixed" if app.get("rig") is not None else "handheld"
+    plane_z = float(body.get("plane_z", app["plane_z"]))
+    if mode.startswith("hand"):
+        marker = app.get("marker")
+        if not marker:
+            raise locator.LocateError(
+                "handheld mode needs the base marker: print docs/base-marker.pdf at 100%, "
+                "paste it upright on the side of the base, and set REBOT_MARKER_AT to its "
+                "centre and heading")
+        at = marker["at"]
+        return locator.Options(
+            tag_size=float(marker["size_m"]),
+            tag_x=float(at[0]), tag_y=float(at[1]), tag_z=float(at[2]),
+            tag_yaw=math.degrees(float(marker.get("yaw", 0.0))),
+            tag_id=marker.get("id"),
+            plane_z=plane_z,
+            annotate="",
+            extrinsics=None,
+            witness=app["witness"],
+            witness_max_px=app["witness_max_px"],
+        )
     if app["rig"] is None:
-        for key in ("size", "x", "y", "yaw"):
-            if key in body:
-                tag[key] = float(body[key])
+        raise locator.LocateError(
+            "fixed mode needs a rig: run the calibration sweep once, or switch to handheld "
+            "with the base marker")
     return locator.Options(
-        tag_size=tag["size"], tag_x=tag["x"], tag_y=tag["y"], tag_yaw=tag["yaw"],
-        plane_z=float(body.get("plane_z", app["plane_z"])),
+        plane_z=plane_z,
         annotate="",
         extrinsics=app["rig"],
         witness=app["witness"],
@@ -439,7 +471,11 @@ async def handle_plan(request: web.Request) -> web.Response:
         raise web.HTTPNotFound(text="no frame for %s" % capture_id)
 
     calibration = resolve_calibration(app, body.get("calib"))
-    options = locate_options(app, body)
+    try:
+        options = locate_options(app, body)
+    except locator.LocateError as error:
+        return web.json_response({"ok": False, "stage": "locate", "capture": capture_id,
+                                  "error": str(error)}, status=422)
     options.annotate = str(directory / "annotated.jpg")
 
     # locate_target.py is CPU work (aruco + PnP): keep it off the event loop.
@@ -457,7 +493,14 @@ async def handle_plan(request: web.Request) -> web.Response:
                                   "error": "%s: %s" % (type(error).__name__, error)}, status=500)
     target.pop("_out", None)
 
-    plan_options = {"tool_axis": app["tool_axis"], "yaw": float(body.get("yaw", app["yaw"]))}
+    plan_options = {"tool_axis": app["tool_axis"], "yaw": float(body.get("yaw", app["yaw"])),
+                    # A tap marks a place: the arm visits it at the hover height. The
+                    # pick sequence is still available, but it is not what a tap means.
+                    "hover": bool(body.get("hover", app["hover"])),
+                    "hover_m": float(body.get("hover_m", app["hover_m"])),
+                    # The planner aims the flange; the tip is below it. A fitted rig
+                    # knows that distance exactly, a handheld profile has to be told.
+                    "tip_m": float(body.get("tip_m", app["tip_m"]))}
     plan_options.update(body.get("options") or {})
 
     status, payload = await planner_call(app, "/plan", {"target": target, "options": plan_options})
@@ -532,7 +575,14 @@ def run_sweep(app, camera_url, calibration_path, body):
         app["progress"] = {"pose": int(pose), "of": len(sweep.POSES), "phase": phase,
                            "started": app["calibration_started"]}
 
-    click = click_for(app, body["capture"], body.get("u"), body.get("v"))
+    click = None
+    if body.get("capture") and body.get("u") is not None and body.get("v") is not None:
+        click = click_for(app, body["capture"], body.get("u"), body.get("v"))
+    marker = body.get("marker") or app.get("marker")
+    if click is None and not marker:
+        raise auto_calibrate.AutoError(
+            "a sweep needs either a tap ('capture', 'u', 'v') or a base marker: set "
+            "REBOT_MARKER_AT once the tag is pasted on the plate")
 
     # latency=0: the sweep records continuously and picks its frames afterwards,
     # so draining the stream would only throw away frames it could have used.
@@ -546,6 +596,7 @@ def run_sweep(app, camera_url, calibration_path, body):
             settle_s=float(body.get("settle", 0.5)),
             background=str(body["background"]) if body.get("background") else "median",
             click=click,
+            marker=marker,
         )
         arm = auto_calibrate.ArmGateway(app["planner"], app["planner_token"])
         # The sweep is recorded by MediaMTX, so the camera must be its stream:
@@ -593,11 +644,14 @@ async def handle_calibrate(request: web.Request) -> web.Response:
     if body.get("confirm") is not True:
         raise web.HTTPBadRequest(text='send {"confirm": true}: this moves the arm through %d poses'
                                       % len(sweep.POSES))
-    for field in ("capture", "u", "v"):
-        if body.get(field) is None:
-            raise web.HTTPBadRequest(
-                text="starting a sweep needs 'capture', 'u' and 'v': one still with the tool "
-                     "tip tapped in it")
+    marker = body.get("marker") or app.get("marker")
+    if not marker:
+        for field in ("capture", "u", "v"):
+            if body.get(field) is None:
+                raise web.HTTPBadRequest(
+                    text="starting a sweep needs 'capture', 'u' and 'v' (one still with the tool "
+                         "tip tapped in it), or a base marker: paste the tag and set "
+                         "REBOT_MARKER_AT")
     if app["calibrating"]:
         return web.json_response({"ok": False, "error": "a calibration sweep is already running"},
                                  status=409)
@@ -654,6 +708,9 @@ async def handle_calibrate_status(request: web.Request) -> web.Response:
         "sweep": {"poses": len(sweep.POSES), "home": list(sweep.HOME),
                   "seconds": round(sweep.sweep_seconds())},
         "last": app["last_calibration"],
+        # The base marker, when one is configured: the panel can then start a
+        # sweep without asking for a tap.
+        "marker": app["marker"],
         "rig": (None if app["rig"] is None else app["rig"].provenance()),
     })
 
@@ -753,7 +810,6 @@ def build_app(args) -> web.Application:
     app["execute"] = bool(args.execute)
     app["calib"] = Path(args.calib_dir).resolve()
     app["calib_file"] = args.calib
-    app["tag"] = {"size": args.tag_size, "x": args.tag_x, "y": args.tag_y, "yaw": args.tag_yaw}
     app["extrinsics_path"] = args.extrinsics
     app["witness_max_px"] = float(args.witness_max_px)
     app["camera"] = args.camera
@@ -761,6 +817,25 @@ def build_app(args) -> web.Application:
                            or os.environ.get("REBOT_MEDIAMTX_API", "http://127.0.0.1:9997")).rstrip("/")
     app["recordings"] = Path(getattr(args, "recordings", "")
                              or os.environ.get("REBOT_RECORDINGS", str(STATE / "recordings"))).resolve()
+    # "x,y,z,yaw" in metres and radians: where the 5 cm tag sits on the base plate
+    # in the robot's own frame. With this set, a sweep needs no tap at all.
+    app["marker"] = base_marker.parse_spec(getattr(args, "marker_at", "")
+                                or os.environ.get("REBOT_MARKER_AT", ""),
+                                getattr(args, "marker_size", 0.0)
+                                or float(os.environ.get("REBOT_MARKER_SIZE", "0.04")))
+    # How a tap becomes a point: "fixed" projects through the rig a sweep fitted,
+    # "handheld" solves the camera from the base marker on every tap. Empty means
+    # "whatever this profile can do". The page may switch per tap either way.
+    app["mode"] = (getattr(args, "mode", "")
+                   or os.environ.get("REBOT_MODE", "")).strip().lower()
+    app["hover"] = (getattr(args, "hover", "")
+                    or os.environ.get("REBOT_HOVER", "1")) != "0"
+    # The tool tip below the flange: fixed mode can take it from the rig, but a
+    # handheld profile and the planner's fallback need a number.
+    app["tip_m"] = float(getattr(args, "tip_mm", 0.0)
+                         or os.environ.get("REBOT_TIP_MM", "35")) / 1000.0
+    app["hover_m"] = float(getattr(args, "hover_m", 0.0)
+                           or os.environ.get("REBOT_HOVER_M", "0.10"))
     app["calibrating"] = False
     app["last_calibration"] = None
     app["progress"] = None
@@ -832,12 +907,18 @@ def main(argv=None):
     parser.add_argument("--calib-dir", default=os.environ.get("REBOT_CALIB_DIR", str(STATE / "calib")))
     parser.add_argument("--calib", default=os.environ.get("REBOT_CALIB", ""),
                         help="calibration JSON; default is the newest in --calib-dir")
-    parser.add_argument("--tag-size", type=float,
-                        default=float(os.environ.get("REBOT_TAG_SIZE", "0.080")),
-                        help="black square side including the border, m")
-    parser.add_argument("--tag-x", type=float, default=float(os.environ.get("REBOT_TAG_X", "0.0")))
-    parser.add_argument("--tag-y", type=float, default=float(os.environ.get("REBOT_TAG_Y", "0.0")))
-    parser.add_argument("--tag-yaw", type=float, default=float(os.environ.get("REBOT_TAG_YAW", "0.0")))
+    parser.add_argument("--marker-at", default=os.environ.get("REBOT_MARKER_AT", ""),
+                        help="'x,y,z' or 'x,y,z,yaw' of the base marker in the robot's frame "
+                             "(metres, radians): with it, a sweep needs no tap")
+    parser.add_argument("--marker-size", type=float,
+                        default=float(os.environ.get("REBOT_MARKER_SIZE", "0.04")),
+                        help="the marker's printed side in metres (default 0.04)")
+    parser.add_argument("--mode", default=os.environ.get("REBOT_MODE", ""),
+                        choices=("", "fixed", "handheld"),
+                        help="fixed: rig from a sweep; handheld: the base marker on every tap")
+    parser.add_argument("--hover-m", type=float,
+                        default=float(os.environ.get("REBOT_HOVER_M", "0.10")),
+                        help="how far above the tapped point the arm ends, in metres")
     parser.add_argument("--extrinsics", default=os.environ.get("REBOT_EXTRINSICS", ""),
                         help="fixed-camera rig JSON; then taps need no tag")
     parser.add_argument("--camera", default=os.environ.get("REBOT_CAMERA", ""),
@@ -891,14 +972,19 @@ def main(argv=None):
                                   "  (execute on)" if app["execute"] else "  (execute off)"))
     print("  calib    : %s" % app["calib"])
     if app["rig"] is None:
-        print("  tag      : %.0f mm at (%.3f, %.3f) yaw %.1f deg, plane z %.3f"
-              % (args.tag_size * 1000, args.tag_x, args.tag_y, args.tag_yaw, args.plane_z))
+        marker = app["marker"]
+        print("  marker   : %s" % ("%.0f mm at (%.3f, %.3f, %.3f), heading %.1f deg"
+                                   % (marker["size_m"] * 1000, marker["at"][0], marker["at"][1],
+                                      marker["at"][2], math.degrees(marker["yaw"]))
+                                   if marker else "none: handheld mode will refuse, fixed needs a rig"))
     else:
         rig = app["rig"]
         print("  camera   : fixed, %s, rms %.2f px" % (rig.fingerprint, rig.rms_px))
         print("             %s" % rig.describe().splitlines()[0])
         print("             witness %s, limit %.1f px"
               % ("on" if app["witness"] is not None else "MISSING", app["witness_max_px"]))
+    print("  mode     : %s, hover %.0f mm, tip %.0f mm below the flange"
+          % (app["mode"] or "auto", app["hover_m"] * 1000, app["tip_m"] * 1000))
     if app["camera"]:
         print("  sweep    : %s (POST /calibrate/extrinsics)" % app["camera"])
     print("  auth     : %s" % ("token required on writes" if args.token else "open on the LAN"))

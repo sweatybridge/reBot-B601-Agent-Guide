@@ -43,6 +43,7 @@ import cv2
 import numpy as np
 
 import extrinsics as ex
+import base_marker
 import mediamtx
 import rebot_ik
 import sweep
@@ -184,6 +185,10 @@ class Options:
     # sweep searches the family of poses that tap allows and lets its own
     # detections pick one.
     click: dict | None = None
+    # A printed marker flat on the base plate: {"at": [x, y, z], "yaw": rad,
+    # "size_m": m, "id": int}. When present it *replaces* the tap: the PnP gives
+    # the camera pose outright, so the seed is exact and the sweep only verifies.
+    marker: dict | None = None
 
 
 @dataclass
@@ -745,10 +750,10 @@ def bootstrap(options: "Options"):
     whose detections across the sweep agree with each other -- which is the
     measurement, not a guess about where the bracket was bolted.
     """
-    if not options.click:
+    if not options.click and not options.marker:
         raise AutoError(
-            "a sweep needs one tap: take a still, tap the tool tip in it, and pass that "
-            "capture and pixel. There is no position to type and no second path.")
+            "a sweep needs a way in: either a still with the tool tip tapped in it, or the "
+            "marker pasted on the base with REBOT_MARKER_AT set. There is no position to type.")
     return options.click
 
 
@@ -898,8 +903,33 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
 
     K, dist = calibration.K, calibration.dist
     bootstrap(options)
-    T_guess = bootstrap_from_click(frames, poses, options.click, K, dist, options, size,
-                                        background=background)
+    T_guess = None
+    if options.marker:
+        # The marker gives the camera outright; there is nothing to search. The
+        # sweep then only verifies, and the tip detector's projection lands on
+        # the gripper instead of hunting for it.
+        try:
+            T_guess = base_marker.camera_pose(
+                frames[0], K, dist,
+                at=options.marker.get("at", (0.0, 0.0, 0.0)),
+                yaw=float(options.marker.get("yaw", 0.0)),
+                size_m=float(options.marker.get("size_m", base_marker.SIZE_M)),
+                marker_id=(int(options.marker["id"]) if options.marker.get("id") is not None
+                           else base_marker.MARKER_ID))
+        except base_marker.MarkerError as error:
+            if not options.click:
+                raise AutoError(
+                    "the base marker could not be read: %s. Is the tag pasted on the side of "
+                    "the base, facing the camera, printed at 100%% (5 cm), and lit? See "
+                    "docs/base-marker.md" % error) from error
+            # A tap was supplied as well: fall back rather than fail the pass, and
+            # say so, because a tag that is configured but not visible is a setup
+            # problem the operator should know about.
+            warnings.append("the base marker could not be read (%s); starting from the tap"
+                            % error)
+    if T_guess is None:
+        T_guess = bootstrap_from_click(frames, poses, options.click, K, dist, options, size,
+                                       background=background)
     note(0, "fitting")
     fit_options = ex.FitOptions(plane_z=float(options.plane_z), image_size=size,
                                 work_radius=float(options.work_radius),

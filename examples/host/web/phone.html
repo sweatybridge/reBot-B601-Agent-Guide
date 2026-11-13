@@ -120,7 +120,7 @@
 <main>
   <div id="stage">
     <video id="video" playsinline muted autoplay></video>
-    <div id="hint">Tap <strong>Start camera</strong>, then tap the object you want the arm to reach.</div>
+    <div id="hint">Tap <strong>Start camera</strong>, keep the base tag in frame, then tap the object you want the arm to reach.</div>
   </div>
   <div id="log" aria-live="polite"></div>
 </main>
@@ -131,6 +131,7 @@
     <button class="action" id="shot" disabled>Capture</button>
   </div>
   <div class="row">
+    <button class="chip" id="camera">Camera: handheld tag</button>
     <button class="chip" id="calib">Calibration mode: off</button>
     <button class="chip" id="live">Live preview: off</button>
     <button class="chip" id="lock">Lock focus: -</button>
@@ -139,14 +140,18 @@
   <details>
     <summary>How to use</summary>
     <ol>
-      <li>Tap the target on the preview. The crosshair is what the host will use.</li>
-      <li>Capture. With a fixed camera the target is the only thing that has to be in frame.</li>
-      <li>On the host: <code>locate_target.py</code>, then <code>plan_to_target.py</code> in the Pinocchio container.</li>
-      <li>First time with a fixed camera: press <b>Rig</b>, capture one pose, tap the tool
-          tip in the picture, then run the sweep. The arm drives eight poses, the stills are
-          taken for you, and the camera pose is fitted and verified — no tag anywhere.</li>
-      <li>Handheld only: print the tag at 100 % (<code>make_tag.py</code>) and tape it flat
-          on the worktop; it has to stay in the same frame as the target.</li>
+      <li><b>Handheld (the default).</b> The tag is taped to the side of the base. Hold the phone
+          so that <em>the tag and the target are both in frame</em>, then tap the target: the host
+          solves the camera from the tag in that exact frame and sends the arm 10 cm above the
+          point.</li>
+      <li>Capture, check the crosshair, then <b>Move the arm</b>. There is no calibration step and
+          the phone can move between taps &mdash; the tag re-solves the camera every time.</li>
+      <li>If the tag is not in frame the plan is refused rather than guessed. Turn the phone
+          until it is, or switch to a fixed camera.</li>
+      <li><b>Fixed camera (optional).</b> Press <b>Camera</b> to switch, then <b>Rig</b> once:
+          capture one pose, tap the tool tip in it, and let the arm sweep eight poses. After that
+          taps need no tag.</li>
+      <li>Printing the tag and giving the host its position: <code>docs/base-marker.md</code>.</li>
     </ol>
   </details>
 </footer>
@@ -162,6 +167,7 @@ const hint = $("#hint");
 const logBox = $("#log");
 const startButton = $("#start");
 const shotButton = $("#shot");
+const cameraButton = $("#camera");
 const calibButton = $("#calib");
 const liveButton = $("#live");
 const lockButton = $("#lock");
@@ -581,6 +587,17 @@ shotButton.addEventListener("click", capture);
 clearButton.addEventListener("click", () => {
   planner.clear();
   log("tap cleared", "warn");
+});
+// Which of the two ways in this phone uses. Handheld is the default: the tag on
+// the base sets the camera on every tap. "Fixed rig" uses the pose a sweep fitted.
+cameraButton.addEventListener("click", () => {
+  const next = TapPlanner.getMode() === "fixed" ? "handheld" : "fixed";
+  TapPlanner.setMode(next);
+  cameraButton.textContent = "Camera: " + (next === "fixed" ? "fixed rig" : "handheld tag");
+  cameraButton.classList.toggle("on", next === "fixed");
+  log(next === "fixed"
+    ? "fixed camera: taps use the rig (press Rig once if none is fitted)"
+    : "handheld: the base tag sets the camera on every tap", "warn");
 });
 calibButton.addEventListener("click", () => {
   state.calib = !state.calib;

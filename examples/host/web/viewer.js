@@ -113,6 +113,21 @@
    * The panel is created by `create()`, so both pages have it without knowing.
    */
 
+  // How a tap becomes a point: "fixed" projects through the rig a sweep fitted;
+  // "handheld" solves the camera from the base marker in the tapped frame. Both
+  // end with the tool tip 10 cm above the tapped place. The page owns the choice
+  // (a chip), because it applies to every tap, not to the rig card.
+  let cameraMode = "handheld";
+
+  function setMode(value) {
+    cameraMode = value === "fixed" ? "fixed" : "handheld";
+    return cameraMode;
+  }
+
+  function getMode() {
+    return cameraMode;
+  }
+
   function createRig(getToken) {
     styleOnce();
 
@@ -302,9 +317,12 @@
     function render() {
       const info = status || {};
       const rig = info.rig;
-      const rows = ['<h2>Camera rig</h2>',
-        '<div class="rp-sub">Tap the tool tip in one still, then let the arm sweep eight poses. '
-        + "The tap is the starting pose; no tag, no measured position.</div>", '<div class="rp-kv">'];
+      const rows = ['<h2>Camera rig &middot; fixed camera</h2>',
+        '<div class="rp-sub">One sweep fits where a bolted-down camera looks. Tap the tool tip '
+        + "in one still, the arm drives eight poses and the stills are taken for you; the pose is "
+        + "fitted and verified, and after that taps need no tag. <b>Handheld mode does not use "
+        + "this card</b> &mdash; there the base tag sets the camera on every tap.</div>",
+        '<div class="rp-kv">'];
 
       rows.push("<span>Arm</span><span>" + (info.execute
         ? (armState && !armState.ok
@@ -328,6 +346,10 @@
       if (info.error) rows.push('<div class="rp-bad">' + escapeHtml(info.error) + "</div>");
 
       if (!running) {
+        if (cameraMode !== "fixed") {
+          rows.push('<div class="rp-sub">The page is set to <b>handheld + base tag</b>: switch '
+            + "it in the <b>Camera</b> chip before fitting a rig for a bolted-down camera.</div>");
+        }
         rows.push('<div class="rp-row"><button data-action="capture"'
           + (pending ? " disabled" : "") + ">"
           + (shot ? "Retake the still" : "Capture one pose") + "</button>"
@@ -353,19 +375,25 @@
         rows.push('<div class="rp-sub">' + progressText() + "</div>");
         rows.push('<div class="rp-sub">The arm is moving on its own; keep clear of the cell.</div>');
       } else {
-        const ready = info.execute && info.camera && shot && shot.point;
+        // With a base marker configured the tap is not needed: the tag's PnP
+        // gives the camera, so the sweep can start from a bare "go".
+        const hasMarker = Boolean(info.marker);
+        const ready = info.execute && info.camera && (hasMarker || (shot && shot.point));
         let hint = "step 3";
         if (!info.camera) {
           hint = "no camera: set REBOT_CAMERA and restart capture";
         } else if (!info.execute) {
           hint = "execution is off: REBOT_EXECUTE=1 on the host, --allow-execute on the edge";
+        } else if (hasMarker) {
+          hint = "the base marker sets the camera; no tap needed";
         } else if (!shot) {
           hint = "capture a pose first";
         } else if (!shot.point) {
           hint = "tap the tool tip in the picture";
         }
         rows.push('<div class="rp-row"><button class="primary" data-action="run"'
-          + (ready ? "" : " disabled") + ">Run the sweep from this tap</button>"
+          + (ready ? "" : " disabled") + ">"
+          + (hasMarker ? "Run the sweep from the base marker" : "Run the sweep from this tap") + "</button>"
           + '<span class="rp-sub rp-run-hint' + (ready ? "" : " rp-warn") + '">'
           + escapeHtml(hint) + "</span></div>");
       }
@@ -414,7 +442,8 @@
     }
 
     async function onRun() {
-      if (!shot || !shot.point) return;
+      const hasMarker = Boolean(status && status.marker);
+      if (!hasMarker && (!shot || !shot.point)) return;
       const now = Date.now();
       if (now > armedUntil) {
         // Check the arm *before* arming: a gateway that cannot see the edge is
@@ -455,12 +484,14 @@
       render();
       poll = setInterval(refresh, 1000);
 
-      const body = {
-        confirm: true,
-        capture: shot.id,
-        u: shot.point.u,
-        v: shot.point.v,
-      };
+      const body = hasMarker
+        ? { confirm: true }
+        : {
+          confirm: true,
+          capture: shot.id,
+          u: shot.point.u,
+          v: shot.point.v,
+        };
 
       try {
         const answer = await postJson("/calibrate/extrinsics", body);
@@ -665,7 +696,7 @@
         if (!upload.ok) throw new Error(saved.error || ("upload failed: " + upload.status));
         status("capture " + saved.id + ", locating the target", "");
 
-        const answer = await postJson("/plan", { capture: saved.id });
+        const answer = await postJson("/plan", { capture: saved.id, mode: cameraMode });
         if (!answer.ok) {
           status(answer.data.error || "no plan", "bad");
           showError(answer.data.error || ("plan failed: " + answer.status), answer.data.preview);
@@ -747,5 +778,5 @@
     };
   }
 
-  window.TapPlanner = { create: create, rig: createRig };
+  window.TapPlanner = { create: create, rig: createRig, setMode: setMode, getMode: getMode };
 })();

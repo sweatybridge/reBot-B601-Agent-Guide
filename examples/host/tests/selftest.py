@@ -35,6 +35,7 @@ APP = HERE.parent / "app"
 sys.path.insert(0, str(APP))
 
 import auto_calibrate  # noqa: E402
+import base_marker  # noqa: E402
 import calib as calib_mod  # noqa: E402
 import calibrate_extrinsics as extrinsics_cli  # noqa: E402
 import calibrate_intrinsics as calib_cli  # noqa: E402
@@ -225,10 +226,11 @@ def test_tag_geometry(workdir: Path):
     size = (1600, 1200)
     K, dist = synthetic_camera(*size)
     tag_id, tag_size = 3, 0.080
-    tag_x, tag_y, tag_yaw = 0.36, -0.10, 12.0
+    # The marker stands on the side of the base, facing -x; the phone is in front.
+    tag_x, tag_y, tag_z, tag_yaw = 0.36, -0.10, 0.12, 180.0
 
-    T_base_cam = look_at((0.55, -0.28, 0.92), (0.32, -0.06, 0.0))
-    T_base_tag = locate.tag_in_base(tag_x, tag_y, 0.0, tag_yaw)
+    T_base_cam = look_at((0.02, -0.30, 0.55), (0.30, -0.05, 0.05))
+    T_base_tag = locate.tag_in_base(tag_x, tag_y, tag_z, tag_yaw)
 
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     obj = locate.tag_object_points(tag_size)
@@ -362,7 +364,8 @@ async def test_server(workdir: Path, geometry):
         no_whip=True, max_mb=4, quiet=True,
         planner="http://127.0.0.1:9", planner_token="", execute=False,
         calib_dir=str(calib_dir), calib="",
-        tag_size=0.080, tag_x=0.36, tag_y=-0.10, tag_yaw=12.0,
+        marker_at="0.36,-0.10,0.12,180", marker_size=0.08,
+        mode="", hover="1", hover_m=0.10, tip_mm=35.0,
         plane_z=0.0, tool_axis="z-", yaw=0.0,
         extrinsics="", witness_max_px=2.0, camera="",
     )
@@ -452,7 +455,7 @@ async def test_server(workdir: Path, geometry):
 def test_locate_cli(workdir: Path, geometry):
     print("\nlocate_target.py end to end")
     K, dist, size = geometry["K"], geometry["dist"], (1600, 1200)
-    tag_x, tag_y, tag_yaw, tag_size = 0.36, -0.10, 12.0, 0.080
+    tag_x, tag_y, tag_z, tag_yaw, tag_size = 0.36, -0.10, 0.12, 180.0, 0.080
     truth = geometry["point"]
 
     capture = workdir / "captures" / "20260101T120000Z-abc123"
@@ -473,8 +476,8 @@ def test_locate_cli(workdir: Path, geometry):
 
     code = locate.main([
         "--capture", str(capture), "--calib", str(calib_path),
-        "--tag-size", str(tag_size), "--tag-x", str(tag_x), "--tag-y", str(tag_y),
-        "--tag-yaw", str(tag_yaw), "--annotate", str(capture / "annotated.jpg"),
+        "--marker-at", "%g,%g,%g,%g" % (tag_x, tag_y, tag_z, tag_yaw),
+        "--marker-size", str(tag_size), "--annotate", str(capture / "annotated.jpg"),
         "--quiet",
     ])
     target_path = capture / "target.json"
@@ -549,6 +552,114 @@ def textured_frame(size=(1600, 1200), seed=3):
         value = int(rng.integers(20, 240))
         cv2.rectangle(image, (x, y), (x + w, y + h), value, -1)
     return cv2.GaussianBlur(image, (3, 3), 0)
+
+
+def test_base_marker():
+    """A printed square on the plate: render it at a known pose, solve it back."""
+    print("\nbase marker: the camera pose from one photograph")
+    K = np.array([[900.0, 0.0, 540.0], [0.0, 900.0, 960.0], [0.0, 0.0, 1.0]])
+    dist = np.zeros(5)
+    size_m = base_marker.SIZE_M
+
+    # A camera 0.9 m up and 0.45 m in front, looking at the plate.
+    T_base_cam = extrinsics.look_at(np.array([0.0, -0.45, 0.9]), np.zeros(3))
+    at = np.array([0.02, 0.01, 0.001])
+    yaw = np.radians(15.0)
+    T_base_marker = base_marker.base_from_marker(at, yaw)
+    T_cam_marker = np.linalg.inv(T_base_cam) @ T_base_marker
+
+    # Draw the marker where that pose says it is: project its corners and warp
+    # the bitmap into the quad, which is exactly what a photograph would show.
+    rotation = T_cam_marker[:3, :3]
+    _rvec, _ = cv2.Rodrigues(rotation)
+    projected, _ = cv2.projectPoints(base_marker.object_points(size_m), _rvec,
+                                     T_cam_marker[:3, 3], K, dist)
+    quad = projected.reshape(4, 2).astype(np.float32)
+    bitmap = base_marker.marker_bitmap(size_m, 1200.0)
+    side = 1600
+    image = np.full((1920, 1080), 210, dtype=np.uint8)
+    source = np.array([[0, 0], [bitmap.shape[1] - 1, 0],
+                       [bitmap.shape[1] - 1, bitmap.shape[0] - 1],
+                       [0, bitmap.shape[0] - 1]], dtype=np.float32)
+    warped = cv2.warpPerspective(bitmap, cv2.getPerspectiveTransform(source, quad),
+                                 (1080, 1920), dst=image, borderValue=210)
+    cv2.imwrite(str(Path(".") / "marker-render.png"), warped)
+
+    solved = base_marker.pose(warped, K, dist, size_m=size_m)
+    angle_error = float(np.degrees(np.arccos(np.clip(
+        (np.trace(solved[:3, :3].T @ rotation) - 1.0) / 2.0, -1.0, 1.0))))
+    distance_error = float(np.linalg.norm(solved[:3, 3] - T_cam_marker[:3, 3]))
+    # A 5 cm marker at a metre is ~50 px, so a half-pixel of corner noise is ~1%
+    # of depth -- about a centimetre. That is ample: this is a *seed*, and the
+    # tip detector needs a few centimetres.
+    check("the marker's pose is recovered from one frame",
+          angle_error < 1.5 and distance_error < 25.0,
+          "%.2f deg, %.1f mm" % (angle_error, 1000.0 * distance_error))
+
+    recovered = base_marker.camera_pose(warped, K, dist, at, yaw, size_m=size_m)
+    camera_error = float(np.linalg.norm(recovered[:3, 3] - T_base_cam[:3, 3]))
+    check("the composition gives the camera in the base frame", camera_error < 3.0,
+          "%.1f mm" % (1000.0 * camera_error))
+
+    try:
+        base_marker.pose(np.full((1920, 1080), 128, dtype=np.uint8), K, dist, size_m=size_m)
+        check("a blank frame is refused as having no marker", False, "no error raised")
+    except base_marker.MarkerError as error:
+        check("a blank frame is refused as having no marker", True, str(error)[:40])
+
+    # A tape measure across the pattern inside the black border is not the side
+    # PnP wants: 4 modules of payload sit inside 6 modules of marker.
+    check("the inner pattern converts to the side the detector measures",
+          abs(base_marker.outer_size(0.04) - 0.06) < 1e-9
+          and abs(base_marker.outer_size(0.05 * 4.0 / 6.0) - 0.05) < 1e-9,
+          "%.3f m" % base_marker.outer_size(0.04))
+
+    # The PDF carries its own physical size: a 4 cm marker on a 70 x 82 mm page,
+    # with the xref pointing where it says it does.
+    pdf_path = Path("marker-sheet-test.pdf")
+    info = base_marker.sheet_pdf(pdf_path, size_m)
+    data = Path(pdf_path).read_bytes()
+    start = data.rindex(b"startxref")
+    xref_at = int(data[start + 9:].split()[0])
+    table = data[xref_at:xref_at + 300].decode("ascii").split("\n")
+    offsets = [int(line.split()[0]) for line in table[3:]
+               if line.strip() and line.split()[0].isdigit()]
+    check("the PDF sheet is the right size and a valid file",
+          data.startswith(b"%PDF") and data.rstrip().endswith(b"%%EOF")
+          and abs(info["marker_mm"] - 1000.0 * size_m) < 1e-6
+          and abs(info["page_mm"][0] - (1000.0 * size_m + 30.0)) < 1e-6
+          and all(data[offset:offset + 12].split()[1] == b"0" for offset in offsets),
+          "marker %.1f mm on a %.0f x %.0f mm page"
+          % (info["marker_mm"], info["page_mm"][0], info["page_mm"][1]))
+    Path(pdf_path).unlink(missing_ok=True)
+
+    # The vertical tag: pasted on the side of the base, facing the phone. Its
+    # normal follows the heading and its printed +y is the base's +z.
+    heading = np.radians(180.0)
+    upright = base_marker.base_from_marker((0.14, 0.0, 0.06), heading, mode="vertical")
+    check("a vertical tag faces its heading and stands upright",
+          float(np.linalg.norm(upright[:3, 2] - np.array([-1.0, 0.0, 0.0]))) < 1e-9
+          and float(np.linalg.norm(upright[:3, 1] - np.array([0.0, 0.0, 1.0]))) < 1e-9,
+          "normal %s" % np.round(upright[:3, 2], 2))
+
+    # A phone standing in front of the tag: the composition only needs a proper
+    # `T_cam_tag`, which the PnP already supplies (and the flat case above tests
+    # that machinery). What matters here is the *placement*: a vertical tag must
+    # be a proper rotation whose normal follows the heading and whose +y is up.
+    T_cam_tag = np.eye(4)
+    T_cam_tag[:3, 3] = [0.02, -0.01, 1.3]
+    composed = upright @ np.linalg.inv(T_cam_tag)
+    check("the vertical tag composes a proper camera pose",
+          abs(float(np.linalg.det(composed[:3, :3])) - 1.0) < 1e-9
+          and float(composed[2, 3]) < 0.2,
+          "det %.6f, z %.3f" % (float(np.linalg.det(composed[:3, :3])), float(composed[2, 3])))
+
+    # The locator's own placement code has to agree with it, or the two paths
+    # would disagree about where the tag is.
+    placed = locate.tag_in_base(0.14, 0.0, 0.06, 180.0)
+    check("the locator places the vertical tag the same way",
+          float(np.max(np.abs(placed - upright))) < 1e-9, "max delta %.2e"
+          % float(np.max(np.abs(placed - upright))))
 
 
 def test_fixed_rig(workdir: Path):
@@ -638,11 +749,6 @@ def test_fixed_rig(workdir: Path):
           payload["rig"].get("fingerprint") and payload["rig"].get("predicted_mm") is not None)
 
     try:
-        locate.locate(image, {}, calibration, locate.Options(extrinsics=rig, point_mode="tag"))
-        check("refuses tag-mode on a fixed camera", False)
-    except locate.LocateError:
-        check("refuses tag-mode on a fixed camera", True)
-    try:
         locate.locate(image, {}, calibration, locate.Options(extrinsics=rig))
         check("refuses a tap-less capture", False)
     except locate.LocateError as error:
@@ -694,7 +800,8 @@ def test_fixed_rig(workdir: Path):
             no_whip=True, max_mb=4, quiet=True,
             planner="http://127.0.0.1:9", planner_token="", execute=False,
             calib_dir=str(calib_dir), calib="",
-            tag_size=0.080, tag_x=0.36, tag_y=-0.10, tag_yaw=12.0,
+            marker_at="0.36,-0.10,0.12,180", marker_size=0.08,
+            mode="", hover="1", hover_m=0.10, tip_mm=35.0,
             plane_z=0.0, tool_axis="z-", yaw=0.0,
             extrinsics=str(rig_file), witness_max_px=2.0, camera="",
         )
@@ -1227,13 +1334,14 @@ def test_calibrate_api(workdir: Path):
     arm = FakeArm()
     eye = FakeEye(background, arm, T_true, K, dist)
 
-    def args_for(execute):
+    def args_for(execute, marker_at=""):
         return SimpleNamespace(
             host="127.0.0.1", port=0, captures=str(captures), cert="", key="",
             token="", mediamtx="http://127.0.0.1:9", whip_path="phone", no_whip=True,
             max_mb=4, quiet=True, planner="http://127.0.0.1:9", planner_token="",
             execute=execute, calib_dir=str(calib_dir), calib="",
-            tag_size=0.080, tag_x=0.0, tag_y=0.0, tag_yaw=0.0,
+            marker_at=marker_at, marker_size=0.08,
+            mode="", hover="1", hover_m=0.10, tip_mm=35.0,
             plane_z=0.0, tool_axis="z-", yaw=0.0,
             extrinsics="", witness_max_px=2.0, camera="rtsp://fake/stream",
             mediamtx_api="http://127.0.0.1:9", recordings=str(calib_dir.parent / "recordings"),
@@ -1269,7 +1377,7 @@ def test_calibrate_api(workdir: Path):
                 check("the API refuses to move the arm with execution off",
                       answer.status == 403)
 
-            app = capture_server.build_app(args_for(True))
+            app = capture_server.build_app(args_for(True, marker_at="0.36,-0.10,0.12,180"))
             async with TestClient(TestServer(app)) as client:
                 answer = await client.post("/calibrate/extrinsics", json={})
                 check("the API needs an explicit confirm", answer.status == 400)
@@ -1281,6 +1389,10 @@ def test_calibrate_api(workdir: Path):
                 empty["calib"].mkdir(parents=True, exist_ok=True)
                 empty["calib_file"] = ""
                 async with TestClient(TestServer(empty)) as bare:
+                    # With neither a tap nor a base marker there is no way in.
+                    answer = await bare.post("/calibrate/extrinsics", json={"confirm": True})
+                    check("a sweep with no tap and no marker is refused", answer.status == 400,
+                          (await answer.text())[:50])
                     answer = await bare.post("/calibrate/extrinsics", json={
                         "confirm": True, "capture": "20260101T120000Z-abc123",
                         "u": 10.0, "v": 10.0})
@@ -1323,10 +1435,6 @@ def test_calibrate_api(workdir: Path):
 
                 started = arm.moves
 
-                # A sweep needs a tap; there is no other way in.
-                answer = await client.post("/calibrate/extrinsics", json={"confirm": True})
-                check("a sweep with no tap is refused", answer.status == 400,
-                      (await answer.text())[:50])
 
                 # The tap: one still at a chosen pose, and the tool tip in it.
                 tap_pose = np.array([0.4, 1.6, 0.9, 0.2, 1.1, 0.3])
@@ -1428,6 +1536,7 @@ def main(argv=None):
     if calibration:
         test_locate_cli(workdir, geometry)
     test_fixed_rig(workdir)
+    test_base_marker()
     test_auto_sweep(workdir)
     test_calibrate_api(workdir)
 

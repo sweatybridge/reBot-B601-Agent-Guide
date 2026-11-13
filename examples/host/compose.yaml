@@ -3,7 +3,7 @@
 #   mediamtx  WebRTC relay: the phone publishes here, /live reads here
 #   capture   HTTPS endpoint, tap -> capture -> plan, WHIP/WHEP relay   -> :8443
 #   planner   the arm gateway: edge /pose, Pinocchio planning, optional execute
-#   tools     one-shot CLI: calibrate, make_tag, make_cert, selftest
+#   tools     one-shot CLI: calibrate, make_cert, selftest
 #
 #   cp .env.example .env        # REBOT_HOST_IP, tag placement, REBOT_EDGE_URL
 #   docker compose up -d --build
@@ -61,19 +61,24 @@ services:
       # the API that starts and stops that recording.
       REBOT_RECORDINGS: /app/state/recordings
       REBOT_MEDIAMTX_API: http://mediamtx:9997
+      # A 4 cm ArUco tag on the base: where it sits in the robot's frame,
+      # "x,y,z[,yaw]" in metres and degrees. Handheld mode reads it on every tap;
+      # fixed mode does not use it. Print docs/base-marker.pdf at actual size.
+      REBOT_MARKER_AT: ${REBOT_MARKER_AT:-}
+      REBOT_MARKER_SIZE: ${REBOT_MARKER_SIZE:-0.04}
+      REBOT_MODE: ${REBOT_MODE:-}
+      # Where the arm ends: above the tapped point, with the tip a known distance
+      # below the flange the planner aims.
+      REBOT_HOVER_M: ${REBOT_HOVER_M:-0.10}
+      REBOT_TIP_MM: ${REBOT_TIP_MM:-35}
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_EXECUTE: ${REBOT_EXECUTE:-0}
       REBOT_CALIB_DIR: /app/state/calib
-      # Empty means the handheld tag path; set it to a rig from
-      # calibrate_extrinsics.py --auto and taps need no tag at all.
+      # A rig from calibrate_extrinsics.py --auto: fixed camera, taps need no tag.
       REBOT_EXTRINSICS: ${REBOT_EXTRINSICS:-}
       REBOT_WITNESS_MAX_PX: ${REBOT_WITNESS_MAX_PX:-2.0}
       # Where the automatic calibration sweep reads its stills.
       REBOT_CAMERA: ${REBOT_CAMERA:-rtsp://mediamtx:8554/phone}
-      REBOT_TAG_SIZE: ${REBOT_TAG_SIZE:-0.080}
-      REBOT_TAG_X: ${REBOT_TAG_X:-0.0}
-      REBOT_TAG_Y: ${REBOT_TAG_Y:-0.0}
-      REBOT_TAG_YAW: ${REBOT_TAG_YAW:-0.0}
       REBOT_PLANE_Z: ${REBOT_PLANE_Z:-0.0}
       REBOT_TOOL_AXIS: ${REBOT_TOOL_AXIS:-current}
       REBOT_YAW: ${REBOT_YAW:-0.0}
