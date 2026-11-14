@@ -8,6 +8,9 @@
  *   const planner = TapPlanner.create({video, stage, token, onStatus});
  *   planner.enable();
  *
+ * `onPose(T_base_cam, source)` is optional: it fires for every solved frame,
+ * including a tap the arm refuses, so an overlay can follow a handheld camera.
+ *
  * Flow: tap -> canvas grab -> POST /capture -> POST /plan -> panel.
  * The panel's Execute button is a two-step confirm and only appears when the
  * server says execution is enabled (REBOT_EXECUTE=1).
@@ -496,7 +499,16 @@
       try {
         const answer = await postJson("/calibrate/extrinsics", body);
         result = answer.data;
-        if (answer.ok) shot = null;
+        if (answer.ok) {
+          shot = null;
+          // A new rig is live without a restart; the reach overlay can drop
+          // its "tap once" state and use the fixed camera immediately.
+          try {
+            window.dispatchEvent(new CustomEvent("rebot:rig"));
+          } catch (error) {
+            /* older browsers without CustomEvent still get the rest */
+          }
+        }
       } catch (error) {
         result = { ok: false, error: error.message };
       } finally {
@@ -668,6 +680,18 @@
       return { ok: response.ok, status: response.status, data: data };
     }
 
+    function reportPose(data) {
+      // A solved frame carries T_base_cam whether or not the arm can reach the
+      // tap; handheld mode has no other way to know the camera pose.
+      if (!data || !data.target || !Array.isArray(data.target.T_base_cam)) return;
+      if (typeof options.onPose !== "function") return;
+      try {
+        options.onPose(data.target.T_base_cam, data.target.source);
+      } catch (error) {
+        /* the overlay is a hint; a failure here must not lose the plan */
+      }
+    }
+
     async function planAt(tapped) {
       if (busy) return;
       busy = true;
@@ -697,6 +721,7 @@
         status("capture " + saved.id + ", locating the target", "");
 
         const answer = await postJson("/plan", { capture: saved.id, mode: cameraMode });
+        reportPose(answer.data);
         if (!answer.ok) {
           status(answer.data.error || "no plan", "bad");
           showError(answer.data.error || ("plan failed: " + answer.status), answer.data.preview);

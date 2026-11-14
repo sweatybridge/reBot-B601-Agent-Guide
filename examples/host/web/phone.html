@@ -64,6 +64,11 @@
     overflow: hidden; touch-action: manipulation;
   }
   #video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+  #reachCanvas {
+    position: absolute; inset: 0; width: 100%; height: 100%; display: none;
+    pointer-events: none; z-index: 5;
+  }
+  #reachCanvas.on { display: block; }
   #hint {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     text-align: center; padding: 24px; color: var(--dim); font-size: 14px; pointer-events: none;
@@ -120,6 +125,7 @@
 <main>
   <div id="stage">
     <video id="video" playsinline muted autoplay></video>
+    <canvas id="reachCanvas" aria-hidden="true"></canvas>
     <div id="hint">Tap <strong>Start camera</strong>, keep the base tag in frame, then tap the object you want the arm to reach.</div>
   </div>
   <div id="log" aria-live="polite"></div>
@@ -132,6 +138,7 @@
   </div>
   <div class="row">
     <button class="chip" id="camera">Camera: handheld tag</button>
+    <button class="chip" id="reach">Reach: off</button>
     <button class="chip" id="calib">Calibration mode: off</button>
     <button class="chip" id="live">Live preview: off</button>
     <button class="chip" id="lock">Lock focus: -</button>
@@ -151,12 +158,17 @@
       <li><b>Fixed camera (optional).</b> Press <b>Camera</b> to switch, then <b>Rig</b> once:
           capture one pose, tap the tool tip in it, and let the arm sweep eight poses. After that
           taps need no tag.</li>
+      <li><b>Reach</b> paints the band of table a tap can be planned in. With a fixed rig it is
+          exact; with the base tag in view the phone locates the tag itself and the band follows
+          the camera. If the tag is out of view, it falls back to the last tap.</li>
       <li>Printing the tag and giving the host its position: <code>docs/base-marker.md</code>.</li>
     </ol>
   </details>
 </footer>
 
 <script src="/viewer.js"></script>
+<script src="/aruco.js"></script>
+<script src="/reach.js"></script>
 <script>
 "use strict";
 
@@ -172,6 +184,8 @@ const calibButton = $("#calib");
 const liveButton = $("#live");
 const lockButton = $("#lock");
 const clearButton = $("#clear");
+const reachButton = $("#reach");
+const reachCanvas = $("#reachCanvas");
 
 const state = {
   stream: null,
@@ -572,6 +586,16 @@ async function togglePublish() {
 
 /* ----------------------------------------------------------------- wires */
 
+// The reach band is drawn here; the host only supplies K and, for a fixed
+// camera, T_base_cam. In handheld mode the camera pose is solved per tap, so
+// `onPose` anchors the overlay on the frame the last plan came from.
+const reachOverlay = window.ReachOverlay.create({
+  video: video,
+  canvas: reachCanvas,
+  token: () => state.token,
+  onStatus: (message, kind) => log(escapeHtml(message), kind),
+});
+
 // One tap = plan. The same module runs on the workstation viewer.
 const planner = TapPlanner.create({
   video: video,
@@ -579,6 +603,8 @@ const planner = TapPlanner.create({
   token: () => state.token,
   source: "phone",
   onStatus: (message, kind) => log(escapeHtml(message), kind),
+  onPose: (pose, source) => reachOverlay.setPose(pose,
+    source === "tap+marker" ? "last tap" : "last plan"),
 });
 planner.enable();
 
@@ -608,6 +634,13 @@ calibButton.addEventListener("click", () => {
     log("calibration mode: fill the frame with the checkerboard, 15-20 poses", "warn");
   }
   renderChips();
+});
+reachButton.addEventListener("click", () => {
+  const on = reachOverlay.toggle();
+  reachButton.textContent = "Reach: " + (on ? "on" : "off");
+  reachButton.classList.toggle("on", on);
+  log(on ? "reach overlay on: the shaded band is where a tap can be planned"
+    : "reach overlay off", on ? "good" : "warn");
 });
 liveButton.addEventListener("click", togglePublish);
 lockButton.addEventListener("click", toggleLock);

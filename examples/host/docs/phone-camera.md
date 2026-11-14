@@ -357,6 +357,7 @@ the arm. Nothing is typed and there is no second path.
 | `POST /capture/pose` | one still plus `GET /pose`, written as a capture |
 | `POST /calibrate/extrinsics` | `{confirm, capture, u, v}` sweeps, fits, verifies, writes |
 | `GET /calibrate` | running state, progress, the last verdict, the current rig |
+| `GET /reach.json` | `K`, `dist`, plane/hover, the tag placement, and `T_base_cam` for the phone's reach overlay |
 
 Three gates, because this moves the arm with nobody at the panel: `REBOT_EXECUTE=1`
 on the host, `--allow-execute` on the edge, and `"confirm": true` in the body.
@@ -481,6 +482,70 @@ peel `plan_with_pinocchio.py` uses, because the parked pose rests on the j2/j3
 lower stops and a Cartesian IK that begins exactly on a stop often refuses to
 move. `--unpark-j3 0` disables it; the leg is mirrored at the end of the plan.
 
+## The reach overlay on the phone
+
+The **Reach** chip paints a translucent band over the preview: the part of the
+table a tap can actually be planned in. Everything except a few numbers is done
+in the page -- `web/reach.js` holds the same six-joint chain as `rebot_ik.py`,
+runs a damped-least-squares IK to find the inner and outer radial limits of a
+tool-down pose, and projects the resulting annulus through the pinhole camera.
+The host adds one read-only route, `GET /reach.json`, which returns only what the
+browser cannot know: `K`, `dist`, `image_size`, `plane_z`, `hover_m`, `tip_m`,
+the tag's placement, and -- for a fixed camera -- `T_base_cam`.
+
+![The reach band over a real capture, with the pose solved in the browser](phone-reach.png)
+
+The screenshot above is a real capture with the pose solved in the page from the
+base tag: the inner edge clears the arm because it cannot fold the tool down any
+closer, and the outer edge is where the planner's `--max-reach` stops.
+
+Three numbers shape the band:
+
+- **Hover height.** The planner aims the flange `hover_m + tip_m` above a tapped
+  point, so the band is the set of points whose *tip* can sit `hover_m` above the
+  table. `--plane-z` moves it up or down with the worktop.
+- **The inner edge is real.** At the table the wrist cannot fold the tool down
+  closer than about 0.60 m from the base axis (0.48 m at the default 100 mm
+  hover). A tap inside it is refused by IK, not by an arbitrary radius gate.
+- **The outer edge is the planner's gate.** The kinematic reach is a few
+  centimetres wider than `--max-reach` (0.75 m); the overlay clips to the gate so
+  it never promises a plan the gateway will reject. Joint 1 stops at +-2.8 rad,
+  which is the 40 deg wedge missing behind the base.
+
+**The camera pose is measured in the page too.** With a fixed rig it is a
+constant. Without one, `web/aruco.js` finds the printed 4x4_50 tag on the base in
+the live video and solves `T_base_cam` itself on every few frames:
+
+- adaptive threshold (integral image) -> connected black components -> convex
+  hull -> the four sharpest corners;
+- a 1 px erosion breaks the thin bridge where the tag's border touches the black
+  base, so the tag becomes an island even at a grazing angle;
+- the six-by-six modules are sampled through a homography and matched against the
+  known id 0 pattern under all four rotations;
+- the four corners become a pose through a homography, refined against the fitted
+  lens distortion. A planar square has two pose solutions; the phone being above
+  the worktop rejects the mirror twin (which puts the camera below the table).
+  Corners are fitted to subpixel edge gradients at full resolution.
+
+No frame leaves the phone and there is no per-frame server call. On a desktop
+Chrome a detection takes about 25-80 ms at 810x1440, and the page runs it about
+three times a second, so the band follows a moving phone without a tap. Against
+the twelve stored bench captures, ten recovered to **17-43 mm and 0.7-2.7 deg**;
+the two misses are marginal views where the tag is small or partly merged with
+the base. A missed frame keeps the last pose for 1.2 s, then the overlay falls
+back to the pose of the last plan; with neither, it says to point the camera at
+the tag.
+
+The browser detector knows **4x4_50, id 0** only -- what `base-marker.pdf`
+prints. A different tag needs the fixed rig. A fitted rig is also more accurate
+than a 40 mm tag seen at an angle, so it remains the better choice when the
+camera can be bolted down.
+
+The projection is a `T_base<-cam` transform followed by the same Brown-Conrady
+model as `cv2.projectPoints`, so the band lands on the table rather than merely
+near it. The canvas is sized to the letterboxed video, not to the stage, so the
+band stays registered in portrait and landscape.
+
 ## What it can and cannot do
 
 - **In-plane accuracy** is a few millimetres at 0.6-1.5 m with a good `K`; the
@@ -556,6 +621,8 @@ move. `--unpark-j3 0` disables it; the leg is mirrored at the end of the plan.
 | `phone.html` | the page on the phone: preview, tap-to-plan, calibration mode, WHIP |
 | `live.html` | workstation viewer: WHEP playback and the same tap-to-plan |
 | `viewer.js` | shared tap -> capture -> plan -> execute panel |
+| `reach.js` | the phone's reachable-band canvas overlay (IK + projection, in the page) |
+| `aruco.js` | browser-side 4x4_50 detection and pose for the live handheld overlay |
 | `capture_server.py` | TLS endpoint, `/capture`, `/plan`, `/execute`, the calibration routes, WHIP/WHEP relay |
 | `planner_server.py` | the arm gateway: edge `/pose`, planning, gated execution |
 | `make_cert.py` | local CA + leaf certificate for the phone |

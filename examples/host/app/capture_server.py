@@ -38,6 +38,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 from aiohttp import ClientSession, ClientTimeout, web
 
 # The same locate code the CLI runs: a tap and a shell command cannot drift.
@@ -146,6 +147,24 @@ async def handle_viewer_js(request: web.Request) -> web.StreamResponse:
                         headers={"Cache-Control": "no-store"})
 
 
+async def handle_reach_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "reach.js"
+    if not script.is_file():
+        return web.Response(text="reach.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
+async def handle_aruco_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "aruco.js"
+    if not script.is_file():
+        return web.Response(text="aruco.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
 async def _page(request: web.Request, name: str) -> web.StreamResponse:
     page = WEB_DIR / name
     if not page.is_file():
@@ -180,6 +199,48 @@ async def handle_health(request: web.Request) -> web.Response:
                  "yaw_deg": math.degrees(app["marker"]["yaw"])}),
         "plane_z": app["plane_z"],
     })
+
+
+async def handle_reach(request: web.Request) -> web.Response:
+    """The numbers the browser overlay needs, and nothing it can compute itself.
+
+    `web/reach.js` owns the arm model, the reach search and the projection, so
+    this route only hands it what lives on the host: the camera calibration and
+    -- when a fixed rig was fitted -- `T_base_cam`. In handheld mode the camera
+    pose is a per-frame measurement, so it is null here; the page anchors the
+    overlay on the pose returned by the most recent plan instead.
+    """
+    app = request.app
+    calibration = calib_mod.load(resolve_calibration(app, request.query.get("calib")))
+    rig = app["rig"]
+    marker = app.get("marker")
+    return web.json_response({
+        "ok": True,
+        "mode": "fixed" if rig is not None else "handheld",
+        "plane_z": app["plane_z"],
+        "hover_m": app["hover_m"],
+        "tip_m": app["tip_m"],
+        # The browser locates the tag itself; it needs the tag's size, its
+        # placement in the base frame, and its heading. Dictionary 4x4_50/id 0
+        # is the only pattern the small client-side detector knows.
+        "marker": None if marker is None else {
+            "size_m": float(marker["size_m"]),
+            "at": [float(v) for v in marker["at"]],
+            "yaw_deg": math.degrees(float(marker.get("yaw", 0.0))),
+            "id": 0 if marker.get("id") is None else int(marker["id"]),
+            "dictionary": "4x4_50",
+        },
+        "calibration": {
+            "K": np.asarray(calibration.K, dtype=float).tolist(),
+            "dist": np.asarray(calibration.dist, dtype=float).reshape(-1).tolist(),
+            "image_size": [int(v) for v in calibration.image_size],
+            "fingerprint": calibration.fingerprint,
+            "rms": calibration.rms,
+        },
+        "T_base_cam": (None if rig is None
+                       else np.asarray(rig.T_base_cam, dtype=float).tolist()),
+        "rig": None if rig is None else rig.provenance(),
+    }, headers={"Cache-Control": "no-store"})
 
 
 async def handle_captures(request: web.Request) -> web.Response:
@@ -505,8 +566,12 @@ async def handle_plan(request: web.Request) -> web.Response:
 
     status, payload = await planner_call(app, "/plan", {"target": target, "options": plan_options})
     if status != 200:
+        # Return the target as well: the camera pose in it is still valid, and
+        # the phone's reach overlay anchors on it even when the arm cannot go
+        # there. A tap that fails is still a solved frame.
         return web.json_response({"ok": False, "stage": "plan", "capture": capture_id,
-                                  "error": payload.get("error", "plan failed")}, status=status)
+                                  "error": payload.get("error", "plan failed"),
+                                  "target": target}, status=status)
 
     logging.info("plan %s from tap at (%s, %s): %s", payload.get("id"),
                  (target.get("tap") or {}).get("u"), (target.get("tap") or {}).get("v"),
@@ -861,6 +926,7 @@ def build_app(args) -> web.Application:
     app.router.add_get("/", handle_index)
     app.router.add_get("/live", handle_live)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/reach.json", handle_reach)
     app.router.add_get("/captures.json", handle_captures)
     app.router.add_post("/capture", handle_capture)
     app.router.add_post("/plan", handle_plan)
@@ -870,6 +936,8 @@ def build_app(args) -> web.Application:
     app.router.add_get("/calibrate", handle_calibrate_status)
     app.router.add_post("/capture/pose", handle_capture_pose)
     app.router.add_get("/viewer.js", handle_viewer_js)
+    app.router.add_get("/reach.js", handle_reach_js)
+    app.router.add_get("/aruco.js", handle_aruco_js)
     app.router.add_get("/captures/{id}/{name}", handle_file)
     app.router.add_get("/favicon.ico", handle_favicon)
     if not args.no_whip:

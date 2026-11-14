@@ -381,6 +381,17 @@ async def test_server(workdir: Path, geometry):
               and health.get("rig") is None, str(health.get("mode")))
         check("serves the phone page", (await client.get("/")).status == 200)
 
+        reach = await (await client.get("/reach.json")).json()
+        check("reach.json gives the overlay its camera",
+              reach.get("ok") is True and reach.get("mode") == "handheld"
+              and reach.get("T_base_cam") is None
+              and len((reach.get("calibration") or {}).get("K") or []) == 3,
+              str((reach.get("calibration") or {}).get("image_size")))
+        check("reach.json gives the browser the tag placement",
+              (reach.get("marker") or {}).get("id") == 0
+              and abs((reach.get("marker") or {}).get("size_m", 0) - 0.08) < 1e-9)
+        check("serves the browser ArUco module", (await client.get("/aruco.js")).status == 200)
+
         form = FormData()
         form.add_field("meta", json.dumps({"purpose": "plan", "image_size": [image.shape[1], image.shape[0]],
                                            "tap": {"u": float(geometry["pixel"][0]),
@@ -841,6 +852,13 @@ def test_fixed_rig(workdir: Path):
             check("a tagless tap reaches the planner",
                   planned.status == 502 and answer.get("stage") == "plan",
                   "status %s, %s" % (planned.status, str(answer.get("error"))[:50]))
+            check("a failed plan still returns the solved frame",
+                  (answer.get("target") or {}).get("T_base_cam") is not None)
+
+            reach = await (await client.get("/reach.json")).json()
+            check("reach.json carries the fixed rig's pose",
+                  reach.get("mode") == "fixed"
+                  and np.asarray(reach.get("T_base_cam"), dtype=float).shape == (4, 4))
             target_path = captures / capture_id / "target.json"
             target = json.loads(target_path.read_text(encoding="utf-8")) if target_path.is_file() else {}
             check("the fixed path records a rig, not a tag",
