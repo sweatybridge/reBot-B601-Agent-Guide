@@ -7,6 +7,8 @@
 #
 # --allow-execute is what lets POST /play move the arm; drop it to keep the
 # board read-only over HTTP (POST /play?dry=1 still validates trajectories).
+# --gripper-stall 0.3 aborts a blocked motor 7 instead of pressing; the gripper
+# then holds its measured opening for the return ramp.
 # The token is read from a file so it does not show up in `ps`.
 [Unit]
 Description=B601 edge player over HTTP
@@ -16,7 +18,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/rebot-edge serve --listen 0.0.0.0:8081 --token-file /etc/rebot-edge.token --allow-execute
+ExecStart=/usr/local/bin/rebot-edge serve --listen 0.0.0.0:8081 --token-file /etc/rebot-edge.token --allow-execute --gripper-stall 0.3
 Restart=on-failure
 RestartSec=2
 # SocketCAN needs CAP_NET_RAW and CAP_NET_ADMIN; root is the simple answer on a

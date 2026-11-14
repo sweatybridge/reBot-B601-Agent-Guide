@@ -89,7 +89,11 @@ The dry run still opens the CAN socket and reads `0x7019` from every motor
 refuses to start if it is more than 20°, eases onto the plan start with
 `--ramp`, streams the waypoints, then ramps home and disables torque. The way home
 is timed by the distance it covers -- a cosine ease capped at 0.35 rad/s, at least
-3 s -- not by a constant, so a long return is not rushed. Ctrl-C or SIGTERM
+3 s -- not by a constant, so a long return is not rushed. The shutdown uses
+three times that speed (1.05 rad/s), so an open gripper auto-closes in about
+7.3 s instead of 22 s (half-closed in about 3.7 s); the arm joints return at the
+same faster rate. On a gripper stall the measured blocked opening is held
+instead, so the return does not resume the press. Ctrl-C or SIGTERM
 interrupts at the next tick, ramps home the same way and then disables.
 
 ## Pose snapshot
@@ -118,7 +122,7 @@ sudo ./rebot-edge serve --listen 0.0.0.0:8081 --token ... --allow-execute
 
 | request | does |
 |---|---|
-| `GET /health` | version, channel, `can_up`, `allow_execute`, `playing`, uptime; no token needed |
+| `GET /health` | version, channel, `can_up`, `allow_execute`, `gripper_stall_s`, `playing`, uptime; no token needed |
 | `GET /pose` | the `dump` JSON, same fields, read-only |
 | `POST /play?dry=1` | validates the body (`--check`), moves nothing |
 | `POST /play` | plays the body's trajectory; needs `--allow-execute` and the token |
@@ -211,6 +215,7 @@ Checks performed before anything is enabled:
 | `--speed X` | time scale, default 1.0 (clamped 0.1..5) |
 | `--delay S` | hold the start pose before moving |
 | `--max-follow-error RAD` | abort when a joint lags by more than this (checked twice a second) |
+| `--gripper-stall SECONDS` | abort when motor 7 is >0.15 rad from its command and moving <0.08 rad/s for this long; `0` disables |
 | `--log FILE` | write commanded/measured angles as `rebot-trajectory-log` JSON |
 | `--allow-kp-mismatch` | replay a sag-compensated file at another `kp` |
 | `--stay-enabled` | leave torque on at exit |
@@ -332,6 +337,22 @@ tracking error at speed. Per-waypoint tracking: at 30 Hz, joints 1-6 peak at
 0.28 rad. With active reporting at 100 Hz the gripper peak is 0.30 rad; at
 200 Hz it climbs to 0.77 rad as the timing slips. `--track` and `--log` share
 the same snapshot instead of competing for the status stream.
+
+## Gripper stall guard
+
+The gripper is position-controlled, so a rigid body wider than the commanded
+opening does not stop the motor by itself: the jaw sits at a position error and
+the position loop keeps pressing. `--gripper-stall 0.3` watches motor 7 during
+playback and aborts when the commanded-vs-measured gap stays above 0.15 rad while
+the measured jaw speed is below 0.08 rad/s for 0.3 s. On a stall the player holds
+the measured opening for the return ramp instead of closing further, then ramps
+home and drops torque. The flag is off by default; the shipped
+[`rebot-edge.service`](rebot-edge.service) enables 0.3 s.
+
+This is a stall guard, not a force limit: a slightly oversized object that only
+costs a few hundredths of a radian still presses gently, and a compliant object
+can settle at a gap below the threshold. Size the object inside the commanded
+opening when the grip matters.
 
 ## Safety
 

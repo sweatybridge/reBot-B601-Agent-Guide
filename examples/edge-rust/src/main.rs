@@ -52,6 +52,14 @@ const MAX_HZ: f64 = 200.0;
 const MIT_POSITION_LIMIT: f64 = 4.0 * std::f64::consts::PI;
 const DEFAULT_MODEL_SPEC: &str = "1:rs-06,2:rs-06,3:rs-06";
 const HOST_ID: u8 = 0xFF;
+// Motor 7 is the gripper on the reference arm. `--gripper-stall` watches it
+// during playback: a blocked jaw can sit at a position error indefinitely, with
+// the position loop pressing, while every other joint tracks normally.
+const GRIPPER_ID: u8 = 7;
+const GRIPPER_STALL_ERROR: f64 = 0.15; // rad of commanded-vs-measured gap
+const GRIPPER_STALL_VELOCITY: f64 = 0.08; // rad/s below which the jaw is "not moving"
+const GRIPPER_STALL_MIN_S: f64 = 0.10;
+const GRIPPER_STALL_MAX_S: f64 = 5.0;
 // The return leg. It used to be a flat 1.5 s whatever the distance, so a long
 // way back was rushed: 3 rad in 1.5 s is 2 rad/s, five times the speed the host
 // moves at. The duration now follows the same rule as the way out -- a cosine
@@ -60,6 +68,11 @@ const HOST_ID: u8 = 0xFF;
 // enough to have a beginning and an end.
 const RETURN_PEAK_SPEED: f64 = 0.35; // rad/s, matches sweep.PEAK_SPEED
 const RETURN_MIN_S: f64 = 3.0;       // matches sweep.MIN_SECONDS
+// The shutdown still returns the gripper to its pre-play angle, but at three
+// times the normal return speed: a fully open jaw then closes in ~7.3 s
+// instead of ~22 s (half-closed in ~3.7 s). The arm joints use the same
+// shutdown duration, so they also return three times as fast.
+const SHUTDOWN_PEAK_SPEED: f64 = 3.0 * RETURN_PEAK_SPEED;
 
 // RobStride communication types (see robstride_dynamics/protocol.py).
 const COMM_OPERATION_CONTROL: u32 = 1;
@@ -1493,13 +1506,18 @@ impl<T: Transport> Arm<T> {
         if !self.enabled {
             return Ok(());
         }
-        println!("  returning to start pose...");
+        println!("  returning to the start pose...");
+        // All joints, including the gripper, return to the pose measured before
+        // playback. The ramp is three times the normal return speed so an open
+        // jaw closes in about 7.3 s rather than 22 s. On a gripper stall the
+        // play loop has already rewritten `start[gripper]` to the blocked
+        // opening, so the return holds that instead of pressing further.
         let home = self.start.clone();
 
         // Ramp home first, then hold; attempt the disable even if the ramp fails,
         // so a bad status frame cannot leave torque on by accident. The ramp is
         // timed by the distance it has to cover, not by a constant.
-        let duration = ramp_duration(&self.last, &home);
+        let duration = shutdown_ramp_duration(&self.last, &home);
         let ramp = self
             .move_leg(&home, duration, "home", track, false)
             .and_then(|_| self.hold(&home, 0.5, false));
@@ -1521,7 +1539,7 @@ fn ease_in_out(t: f64) -> f64 {
     0.5 * (1.0 - (std::f64::consts::PI * t.clamp(0.0, 1.0)).cos())
 }
 
-fn ramp_duration(from: &[f64], to: &[f64]) -> f64 {
+fn ramp_duration_at(from: &[f64], to: &[f64], peak_speed: f64) -> f64 {
     let travel = from
         .iter()
         .zip(to)
@@ -1530,7 +1548,16 @@ fn ramp_duration(from: &[f64], to: &[f64]) -> f64 {
     if !travel.is_finite() {
         return RETURN_MIN_S;
     }
-    (0.5 * std::f64::consts::PI * travel / RETURN_PEAK_SPEED).max(RETURN_MIN_S)
+    (0.5 * std::f64::consts::PI * travel / peak_speed).max(RETURN_MIN_S)
+}
+
+#[cfg(test)]
+fn ramp_duration(from: &[f64], to: &[f64]) -> f64 {
+    ramp_duration_at(from, to, RETURN_PEAK_SPEED)
+}
+
+fn shutdown_ramp_duration(from: &[f64], to: &[f64]) -> f64 {
+    ramp_duration_at(from, to, SHUTDOWN_PEAK_SPEED)
 }
 
 fn sleep_until(deadline: Instant) {
@@ -1581,6 +1608,7 @@ struct Args {
     ramp: f64,
     speed: f64,
     max_follow_error: f64,
+    gripper_stall: f64,
     allow_kp_mismatch: bool,
     log: Option<PathBuf>,
     delay: f64,
@@ -1603,6 +1631,7 @@ impl Default for Args {
             ramp: 2.0,
             speed: 1.0,
             max_follow_error: 0.0,
+            gripper_stall: 0.0,
             allow_kp_mismatch: false,
             log: None,
             delay: 0.0,
@@ -1642,6 +1671,7 @@ struct ServeArgs {
     kp_spec: String,
     kd_spec: String,
     ramp: f64,
+    gripper_stall: f64,
     stay_enabled: bool,
     track: bool,
 }
@@ -1661,6 +1691,7 @@ impl Default for ServeArgs {
             kp_spec: "50,2:150,3:150".into(),
             kd_spec: "3,2:10,3:10,4:5,5:4,6:4,7:4".into(),
             ramp: 2.0,
+            gripper_stall: 0.0,
             stay_enabled: false,
             track: false,
         }
@@ -1707,6 +1738,9 @@ OPTIONS:
     --delay <SECONDS>        Hold the start pose before the motion starts
     --max-follow-error <RAD> Abort when measured position lags by more than this
                              (checked twice a second; 0 disables)
+    --gripper-stall <SECONDS> Abort if motor 7 is >0.15 rad from its command and
+                             moving <0.08 rad/s for this long; 0 disables
+                             (default: 0; the systemd unit uses 0.3)
     --log <FILE>             Write commanded and measured angles as JSON
     --allow-kp-mismatch      Play a sag-compensated file at a different kp
     --stay-enabled           Leave torque on when the script exits
@@ -1734,8 +1768,8 @@ SERVE OPTIONS:
     --allow-execute          Let POST /play move the arm (default: dry runs only)
     --allow-no-token         Permit a non-loopback listen without a token
     --ids <SPEC>             Joints for GET /pose (default: 1,2,3,4,5,6,7)
-    --channel/--model/--model-spec/--kp/--kd/--ramp/--stay-enabled/--track
-                             Defaults for the player that /play re-executes
+    --channel/--model/--model-spec/--kp/--kd/--ramp/--gripper-stall/
+    --stay-enabled/--track  Defaults for the player that /play re-executes
 ";
 
 fn parse_args(argv: Vec<String>) -> Result<Command> {
@@ -1793,6 +1827,12 @@ fn parse_args(argv: Vec<String>) -> Result<Command> {
                     "--max-follow-error",
                 )?
             }
+            "--gripper-stall" => {
+                args.gripper_stall = parse_number(
+                    &take_value(&mut iter, inline, "--gripper-stall")?,
+                    "--gripper-stall",
+                )?
+            }
             "--log" => {
                 let value = take_value(&mut iter, inline, "--log")?;
                 args.log = if value.is_empty() {
@@ -1822,6 +1862,7 @@ fn parse_args(argv: Vec<String>) -> Result<Command> {
     if !args.ramp.is_finite() || !args.speed.is_finite() || !args.delay.is_finite() {
         bail!("--ramp, --speed and --delay must be finite numbers");
     }
+    check_gripper_stall(args.gripper_stall)?;
     args.trajectory = trajectory;
     Ok(Command::Run(Box::new(args)))
 }
@@ -1884,11 +1925,18 @@ fn parse_serve_args(argv: Vec<String>) -> Result<Command> {
             "--ramp" => {
                 serve.ramp = parse_number(&take_value(&mut iter, inline, "--ramp")?, "--ramp")?
             }
+            "--gripper-stall" => {
+                serve.gripper_stall = parse_number(
+                    &take_value(&mut iter, inline, "--gripper-stall")?,
+                    "--gripper-stall",
+                )?
+            }
             "--stay-enabled" => serve.stay_enabled = true,
             "--track" => serve.track = true,
             _ => bail!("unknown serve option '{flag}' (try --help)"),
         }
     }
+    check_gripper_stall(serve.gripper_stall)?;
 
     Ok(Command::Serve(Box::new(serve)))
 }
@@ -1913,6 +1961,19 @@ fn parse_number(text: &str, flag: &str) -> Result<f64> {
         bail!("{flag}: '{text}' is not a finite number");
     }
     Ok(value)
+}
+
+fn check_gripper_stall(seconds: f64) -> Result<()> {
+    if seconds == 0.0 {
+        return Ok(());
+    }
+    if !(GRIPPER_STALL_MIN_S..=GRIPPER_STALL_MAX_S).contains(&seconds) {
+        bail!(
+            "--gripper-stall must be 0 (off) or between {GRIPPER_STALL_MIN_S:.1} and \
+             {GRIPPER_STALL_MAX_S:.1} s"
+        );
+    }
+    Ok(())
 }
 
 fn parse_gain_spec(
@@ -2199,6 +2260,14 @@ fn can_is_up(channel: &str) -> bool {
     }
 }
 
+/// A blocked gripper shows a persistent position error while its measured
+/// velocity is near zero. Normal closing lags by up to ~0.4 rad, but the jaw is
+/// moving then; this predicate deliberately requires both conditions.
+fn gripper_stall_condition(target: f64, measured: f64, velocity: f64) -> bool {
+    (target - measured).abs() > GRIPPER_STALL_ERROR
+        && velocity.abs() < GRIPPER_STALL_VELOCITY
+}
+
 fn read_drift<T: Transport>(arm: &mut Arm<T>, trajectory: &Trajectory) -> Result<f64> {
     let mut worst = 0.0_f64;
     for joint in 0..arm.ids.len() {
@@ -2314,6 +2383,9 @@ fn play<T: Transport>(
         let mut abort_reason: Option<String> = None;
         let mut stamps: Vec<Instant> = Vec::with_capacity(trajectory.raw.waypoints.len());
         let mut held = arm.start.clone();
+        let mut held_velocity = vec![0.0_f64; arm.ids.len()];
+        let gripper = arm.ids.iter().position(|id| *id == GRIPPER_ID);
+        let mut gripper_stall_since: Option<Instant> = None;
         let logging = args.log.is_some();
         let mut last_elapsed = 0.0_f64;
 
@@ -2335,6 +2407,7 @@ fn play<T: Transport>(
                     for (joint, state) in states.iter().enumerate() {
                         if let Some(state) = state {
                             held[joint] = state.position;
+                            held_velocity[joint] = state.velocity;
                         }
                     }
                 }
@@ -2343,7 +2416,35 @@ fn play<T: Transport>(
                 for (joint, state) in states.iter().enumerate() {
                     if let Some(state) = state {
                         held[joint] = state.position;
+                        held_velocity[joint] = state.velocity;
                     }
+                }
+            }
+
+            if let Some(gripper) = gripper {
+                if args.gripper_stall > 0.0
+                    && gripper_stall_condition(targets[gripper], held[gripper], held_velocity[gripper])
+                {
+                    let since = *gripper_stall_since.get_or_insert_with(Instant::now);
+                    if since.elapsed().as_secs_f64() >= args.gripper_stall {
+                        // Do not send another closing frame. Hold the measured
+                        // opening for the return ramp so the jaws stop pressing;
+                        // shut_down() then ramps the arm home and drops torque.
+                        arm.start[gripper] = held[gripper];
+                        arm.last[gripper] = held[gripper];
+                        abort_reason = Some(format!(
+                            "gripper motor {} stalled: commanded {:+.3}, measured {:+.3} \
+                             ({:.3} rad error, {:.3} rad/s); the jaws are blocked",
+                            arm.ids[gripper],
+                            targets[gripper],
+                            held[gripper],
+                            targets[gripper] - held[gripper],
+                            held_velocity[gripper]
+                        ));
+                        break;
+                    }
+                } else {
+                    gripper_stall_since = None;
                 }
             }
 
@@ -2867,6 +2968,7 @@ fn health(state: &ServerState) -> serde_json::Value {
         "channel": state.args.channel,
         "can_up": can_is_up(&state.args.channel),
         "allow_execute": state.args.allow_execute,
+        "gripper_stall_s": state.args.gripper_stall,
         "playing": state.playing.load(Ordering::SeqCst),
         "uptime_s": state.started.elapsed().as_secs(),
     })
@@ -2961,6 +3063,9 @@ fn run_child(
         request.query.get("kd").unwrap_or(&state.args.kd_spec)
     ));
     command.arg(format!("--ramp={}", state.args.ramp));
+    if state.args.gripper_stall > 0.0 {
+        command.arg(format!("--gripper-stall={}", state.args.gripper_stall));
+    }
     if state.args.stay_enabled {
         command.arg("--stay-enabled");
     }
@@ -3654,6 +3759,7 @@ mod tests {
         positions: RefCell<BTreeMap<u8, f64>>,
         enabled: RefCell<BTreeSet<u8>>,
         frames: RefCell<Vec<MockFrame>>,
+        blocked: RefCell<Option<(u8, f64)>>,
     }
 
     impl MockBus {
@@ -3662,7 +3768,13 @@ mod tests {
                 positions: RefCell::new(positions.iter().copied().collect()),
                 enabled: RefCell::new(BTreeSet::new()),
                 frames: RefCell::new(Vec::new()),
+                blocked: RefCell::new(None),
             }
+        }
+
+        fn blocked(self, id: u8, at: f64) -> Self {
+            *self.blocked.borrow_mut() = Some((id, at));
+            self
         }
 
         fn state(&self, id: u8) -> State {
@@ -3689,9 +3801,14 @@ mod tests {
                 COMM_OPERATION_CONTROL if data.len() == 8 => {
                     let position_u16 = u16::from_be_bytes([data[0], data[1]]);
                     let torque_u16 = ((id >> 8) & 0xFFFF) as u16;
-                    let position =
+                    let mut position =
                         (f64::from(position_u16) / 0x7FFF as f64 - 1.0) * MIT_POSITION_LIMIT;
                     let torque = (f64::from(torque_u16) / 0x7FFF as f64 - 1.0) * 17.0;
+                    if let Some((blocked_id, blocked_at)) = *self.blocked.borrow() {
+                        if device == blocked_id && position < blocked_at {
+                            position = blocked_at;
+                        }
+                    }
                     self.frames.borrow_mut().push(MockFrame {
                         device,
                         position,
@@ -3779,6 +3896,46 @@ mod tests {
         assert!((last_joint_2.position - 0.25).abs() < 1e-3);
         assert!((last_joint_1.torque - 0.3).abs() < 1e-3);
         assert!((last_joint_2.torque - 0.2).abs() < 1e-3);
+    }
+
+    #[test]
+    fn playback_aborts_and_holds_the_opening_on_a_blocked_gripper() {
+        // Motor 7 is commanded from open (4.90) to half-close (2.4425), but the
+        // mock jaw stops at 4.00 rad: a rigid body in the way. The guard must
+        // fire, leave the measured opening in place for the return ramp, and
+        // report a non-zero exit code instead of pressing to the target.
+        let mut waypoints = Vec::new();
+        for step in 0..31 {
+            let t = f64::from(step) / 30.0;
+            let q = 4.90 - (4.90 - 2.4425) * (f64::from(step) / 30.0);
+            waypoints.push(format!("{{\"t\":{t:.4},\"q\":[0.0,{q:.5}]}}"));
+        }
+        let text = format!(
+            "{{\"format\":\"{TRAJECTORY_FORMAT}\",\"ids\":[1,7],\"control_hz\":30,\
+             \"waypoints\":[{}]}}",
+            waypoints.join(",")
+        );
+        let trajectory = parse_trajectory(Path::new("stall.json"), &text).unwrap();
+        let mock = MockBus::new(&[(1, 0.0), (7, 4.90)]).blocked(7, 4.00);
+        let mut arm = Arm::new(
+            mock,
+            trajectory.ids.clone(),
+            vec![model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0],
+            vec![3.0, 4.0],
+            trajectory.hz,
+        );
+        let mut args = Args::default();
+        args.execute = true;
+        args.gripper_stall = 0.3;
+        let mut logged = Vec::new();
+
+        let code = play(&mut arm, &trajectory, &args, &mut logged).unwrap();
+
+        assert_eq!(code, 1, "the blocked gripper should abort playback");
+        assert!((arm.start[1] - 4.00).abs() < 1e-3, "home should hold the blocked opening");
+        assert!((arm.last[1] - 4.00).abs() < 1e-3, "the last gripper command should be the measured opening");
+        assert!((arm.start[0] - 0.0).abs() < 1e-9);
     }
 
     // -- HTTP server ------------------------------------------------------- //
@@ -3925,6 +4082,38 @@ mod tests {
         assert!(is_loopback("[::1]:8081"));
         assert!(!is_loopback("0.0.0.0:8081"));
         assert!(!is_loopback("192.168.1.23:8081"));
+    }
+
+    #[test]
+    fn gripper_stall_requires_error_and_low_velocity() {
+        // Normal closing can lag, but the jaw is moving.
+        assert!(!gripper_stall_condition(2.44, 2.20, 1.5));
+        // A blocked jaw is far from the command and not moving.
+        assert!(gripper_stall_condition(2.44, 2.00, 0.0));
+        assert!(gripper_stall_condition(4.90, 4.30, -0.01));
+        // A small contact gap is not a stall.
+        assert!(!gripper_stall_condition(2.44, 2.35, 0.0));
+    }
+
+    #[test]
+    fn gripper_stall_flag_is_validated() {
+        assert!(check_gripper_stall(0.0).is_ok());
+        assert!(check_gripper_stall(0.3).is_ok());
+        assert!(check_gripper_stall(0.01).is_err());
+        assert!(check_gripper_stall(6.0).is_err());
+    }
+
+    #[test]
+    fn shutdown_ramp_is_three_times_the_normal_return_speed() {
+        let from = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.90];
+        let to = [0.0_f64; 7];
+        let normal = ramp_duration(&from, &to);
+        let shutdown = shutdown_ramp_duration(&from, &to);
+        assert!(
+            (normal - 3.0 * shutdown).abs() < 1e-6,
+            "normal {normal} vs shutdown {shutdown}"
+        );
+        assert!(shutdown < normal);
     }
 
     #[test]

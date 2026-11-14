@@ -437,9 +437,11 @@ Move arm
 ```
 
 The gripper starts fully open -- it opens before the arm leaves its first pose
--- half-closes at odd-numbered markers and opens at even-numbered ones. The pass
-finishes back at the pose it started from, so odd/even on screen is the whole
-rule. Between markers the arm moves in joint space (checked against the table
+-- half-closes at odd-numbered markers and opens at even-numbered ones. The arm
+returns to its start pose and the gripper auto-closes to its pre-sequence angle
+at three times the old return speed (about 7.3 s from open, about 3.7 s from
+half), so odd/even on screen is the whole rule. A stalled gripper holds the
+measured blocked opening instead of pressing further. Between markers the arm moves in joint space (checked against the table
 capsule), and the tool yaw follows each marker's direction from the base, which
 is the free-yaw envelope the reach band draws.
 
@@ -592,6 +594,12 @@ band stays registered in portrait and landscape.
   gateway's own gate (`REBOT_EXECUTE=1`), the `/live` two-step button, and the
   phone's deliberate **Move arm** are there to make an accidental tap harmless,
   not to make the arm safe.
+- **The gripper is position-controlled, not force-controlled.** If a marker
+  sequence closes on something wider than the half-close opening, the jaw will
+  press against it. The edge's `--gripper-stall 0.3` (enabled by the shipped
+  systemd unit) aborts when motor 7 has a >0.15 rad position error and is moving
+  <0.08 rad/s for 0.3 s, holds the measured opening for the return ramp, then
+  ramps home. That is a stall guard, not a grip-force limit.
 - **The frame is the one you saw**, decoded in the browser, not a fresh one from
   the server: a tap and its pixels cannot drift apart. The cost is that a tap
   taken while the phone is moving is a few hundred milliseconds old.

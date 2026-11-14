@@ -1,6 +1,6 @@
 [package]
 name = "rebot-edge"
-version = "0.1.0"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.74"
 description = "Single-binary B601-RS edge player: stream a joint-space trajectory JSON over SocketCAN"
