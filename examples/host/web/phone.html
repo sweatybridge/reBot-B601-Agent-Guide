@@ -169,8 +169,9 @@
           to add a numbered marker, up to 10. Each tap is solved in the frame it was taken in, so
           the phone can move between markers.</li>
       <li><b>Move arm</b> plans and runs the markers in order. Amber odd markers half-close
-          the gripper; green even markers open it, starting fully open. The arm returns to where
-          it began. <b>Clear marker</b> removes the last one; Move arm is disabled with none.</li>
+          the gripper; green even markers open it, starting fully open. The pins are projected
+          onto the worktop and follow it while Reach is on. The arm returns to where it began.
+          <b>Clear marker</b> removes the last one; Move arm is disabled with none.</li>
       <li>If the tag is not in frame a marker is refused rather than guessed. Turn the phone
           until it is, or switch to a fixed camera.</li>
       <li><b>Fixed camera (optional).</b> Press <b>Camera</b> to switch, then <b>Rig</b> once:
@@ -179,9 +180,10 @@
       <li><b>Calibration mode</b> turns the Move arm button back into <b>Capture</b> for
           checkerboard shots.</li>
       <li><b>Reach</b> paints the band of table markers can be planned in. With a fixed rig it is
-          exact; with the base tag in view the phone locates the tag itself, and the phone gyro
-          keeps the band turning between tag frames. It clears after a few seconds without a
-          detection.</li>
+          exact; with the base tag in view the phone locates the tag itself, and the phone IMU
+          keeps the band turning and translating between tag frames. It clears after a few
+          seconds without a detection. By default Reach uses the tag pose alone; add
+          <code>&amp;filter=ekf</code> to the page URL to enable the 15-state IMU/EKF.</li>
       <li>Printing the tag and giving the host its position: <code>docs/base-marker.md</code>.</li>
     </ol>
   </details>
@@ -189,6 +191,7 @@
 
 <script src="/viewer.js"></script>
 <script src="/aruco.js"></script>
+<script src="/ekf.js"></script>
 <script src="/reach.js"></script>
 <script src="/markers.js"></script>
 <script>
@@ -639,6 +642,7 @@ const markersOverlay = MarkerSequence.create({
   token: () => state.token,
   onStatus: (message, kind) => log(escapeHtml(message), kind),
   onChange: () => updateStartButton(),
+  project: (point) => reachOverlay.projectPoint(point),
 });
 
 function updateStartButton() {

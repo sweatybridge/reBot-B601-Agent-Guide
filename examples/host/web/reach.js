@@ -14,9 +14,9 @@
  *
  * The server only supplies numbers it already has: the calibration (K, dist)
  * and, when a fixed-camera rig is fitted, `T_base_cam`. In handheld mode the
- * browser ArUco detector solves `T_base_cam`; between tag frames the phone gyro
- * propagates the orientation while the tag position is held. `setPose()` stays
- * for the workstation tap path.
+ * browser ArUco detector solves `T_base_cam`; between tag frames the phone IMU
+ * propagates orientation from the gyro and translation from the tag-anchored
+ * accelerometer. `setPose()` stays for the workstation tap path.
  *
  * Why the reach band is computed rather than guessed: the interesting shape is
  * not a circle. The arm cannot fold its wrist close to its own base while
@@ -25,6 +25,11 @@
  */
 (function () {
   "use strict";
+
+  // Tag-only is the default. `?filter=ekf` opts into the separate ekf.js and
+  // the IMU; `?filter=tag` remains an explicit way to say the same default.
+  const POSE_FILTER = (typeof location !== "undefined" && location.search
+    && new URLSearchParams(location.search).get("filter") === "ekf") ? "ekf" : "tag";
 
   /* ------------------------------------------------------------- arm model
    *
@@ -429,6 +434,8 @@
     const status = options.onStatus || function () {};
     const token = options.token || (() => "");
     const context = canvas.getContext("2d");
+    const useEkf = POSE_FILTER !== "tag" && Boolean(window.RebotEkf);
+    let ekf = null;
 
     let visible = false;
     let loading = false;
@@ -442,9 +449,14 @@
     let livePose = null;            // T_base_cam from the base tag, this frame
     let liveAt = 0;
     let detectTimer = null;
+    let detectFrame = 0;
     let detectMisses = 0;
     let lossLogged = false;
     let baseCamera = null;          // R_base_cam propagated by the phone gyro
+    let basePosition = null;        // p_base_cam predicted from accel + tags
+    let baseVelocity = [0, 0, 0];   // m/s in the base frame
+    let lastTagAt = 0;
+    let lastTagPosition = null;
     let motionStarted = false;
     let motionSeen = false;
     let motionPermission = "unknown";
@@ -453,6 +465,7 @@
     let motionStatusLogged = false;
     let lastMotionAt = 0;
     let animationId = 0;
+    let drawFrame = 0;
 
     function headers() {
       const value = typeof token === "function" ? token() : token;
@@ -660,6 +673,7 @@
     }
 
     function requestMotionPermission() {
+      if (!useEkf) return;
       if (motionPermission !== "unknown") return;
       if (motionRequest) return;
       if (!window.DeviceMotionEvent) {
@@ -667,8 +681,9 @@
         noteMotion("reach overlay: no motion sensor; the band updates when the tag is seen");
         return;
       }
-      // iOS gates the gyro behind a permission prompt that must be requested
-      // from a user gesture. toggle() calls this before awaiting /reach.json.
+      // iOS gates the motion sensors behind a permission prompt that must be
+      // requested from a user gesture. toggle() calls this before awaiting
+      // /reach.json.
       if (typeof window.DeviceMotionEvent.requestPermission !== "function") {
         motionPermission = "granted";
         return;
@@ -694,6 +709,7 @@
     }
 
     function startMotion() {
+      if (!useEkf) return;
       if (motionStarted || !visible || !config || config.T_base_cam) return;
       if (motionPermission !== "granted") return;
       window.addEventListener("devicemotion", onMotion);
@@ -710,18 +726,42 @@
       motionSeen = false;
       lastMotionAt = 0;
       baseCamera = null;
+      basePosition = null;
+      baseVelocity = [0, 0, 0];
+      lastTagAt = 0;
+      lastTagPosition = null;
+      ekf = null;
     }
 
     function onMotion(event) {
-      if (!visible || !motionStarted || !livePose || !baseCamera) return;
+      if (!visible || !motionStarted || !livePose) return;
+      if (!useEkf && !baseCamera) return;
+
       const rate = event.rotationRate;
-      if (!rate) return;
-      const alpha = Number(rate.alpha);
-      const beta = Number(rate.beta);
-      const gamma = Number(rate.gamma);
-      if (!Number.isFinite(alpha) || !Number.isFinite(beta) || !Number.isFinite(gamma)) {
-        return;
+      let omega = null;
+      if (rate) {
+        const alpha = Number(rate.alpha);
+        const beta = Number(rate.beta);
+        const gamma = Number(rate.gamma);
+        if (Number.isFinite(alpha) && Number.isFinite(beta) && Number.isFinite(gamma)) {
+          // DeviceMotion: alpha is about z, beta about x, gamma about y. The
+          // rear camera has x_cam=x_device, y_cam=-y_device, z_cam=-z_device.
+          omega = [beta, -gamma, -alpha].map((value) => value * Math.PI / 180);
+        }
       }
+
+      const acceleration = event.acceleration;
+      let accelCamera = null;
+      if (acceleration) {
+        const ax = Number(acceleration.x);
+        const ay = Number(acceleration.y);
+        const az = Number(acceleration.z);
+        if (Number.isFinite(ax) && Number.isFinite(ay) && Number.isFinite(az)) {
+          accelCamera = [ax, -ay, -az];
+        }
+      }
+      if (!omega && !accelCamera) return;
+
       // performance.now() keeps the integration on one clock across Safari and
       // Chrome; the event's own timeStamp origin differs between them.
       const now = performance.now();
@@ -741,34 +781,108 @@
       lastMotionAt = now;
       if (!(dt > 0 && dt < 0.2)) return;
 
-      // DeviceMotion: alpha is about z, beta about x, gamma about y. The rear
-      // camera has x_cam = x_device, y_cam = -y_device, z_cam = -z_device.
-      const omega = [beta, -gamma, -alpha].map((value) => value * Math.PI / 180);
-      const magnitude = Math.hypot(omega[0], omega[1], omega[2]);
-      if (magnitude < 1e-6) return;
-      const axis = [omega[0] / magnitude, omega[1] / magnitude, omega[2] / magnitude];
-      baseCamera = matMul(baseCamera, axisAngle(axis, magnitude * dt));
+      if (useEkf) {
+        if (ekf) ekf.predict(omega, accelCamera, dt);
+        return;
+      }
+
+      if (omega) {
+        const magnitude = Math.hypot(omega[0], omega[1], omega[2]);
+        if (magnitude > 1e-6) {
+          const axis = [omega[0] / magnitude, omega[1] / magnitude, omega[2] / magnitude];
+          baseCamera = matMul(baseCamera, axisAngle(axis, magnitude * dt));
+        }
+      }
+
+      if (!basePosition) return;
+      // The tag gives an absolute position every detection; between detections
+      // the accelerometer rides out translation (including lowering the phone),
+      // and the tag-derived velocity covers devices with no linear acceleration.
+      let a = [0, 0, 0];
+      if (accelCamera) {
+        a = matVec(baseCamera, accelCamera).map((value) =>
+          Math.max(-20, Math.min(20, value)));
+      }
+      basePosition = [
+        basePosition[0] + baseVelocity[0] * dt + 0.5 * a[0] * dt * dt,
+        basePosition[1] + baseVelocity[1] * dt + 0.5 * a[1] * dt * dt,
+        basePosition[2] + baseVelocity[2] * dt + 0.5 * a[2] * dt * dt,
+      ];
+      baseVelocity = [
+        Math.max(-3, Math.min(3, baseVelocity[0] + a[0] * dt)),
+        Math.max(-3, Math.min(3, baseVelocity[1] + a[1] * dt)),
+        Math.max(-3, Math.min(3, baseVelocity[2] + a[2] * dt)),
+      ];
     }
 
-    function applyTagOrientation(T) {
+    function applyTagPose(T) {
+      const now = performance.now();
+      const p = [T[0][3], T[1][3], T[2][3]];
+
+      if (useEkf) {
+        if (!ekf) {
+          ekf = window.RebotEkf.create({
+            positionNoise: 0.030,
+            orientationNoise: 0.030,
+            velocityNoise: 0.15,
+            accelNoise: 0.60,
+          });
+        }
+        ekf.updateTag(T, now);
+        lastMotionAt = now;
+        return;
+      }
+
+      if (lastTagPosition && lastTagAt && now - lastTagAt > 30) {
+        const dt = (now - lastTagAt) / 1000;
+        const measured = [
+          (p[0] - lastTagPosition[0]) / dt,
+          (p[1] - lastTagPosition[1]) / dt,
+          (p[2] - lastTagPosition[2]) / dt,
+        ];
+        baseVelocity = [
+          Math.max(-3, Math.min(3, 0.5 * baseVelocity[0] + 0.5 * measured[0])),
+          Math.max(-3, Math.min(3, 0.5 * baseVelocity[1] + 0.5 * measured[1])),
+          Math.max(-3, Math.min(3, 0.5 * baseVelocity[2] + 0.5 * measured[2])),
+        ];
+      } else {
+        baseVelocity = [0, 0, 0];
+      }
+      basePosition = p;
+      lastTagPosition = p;
+      lastTagAt = now;
+
       const target = rotationFromPose(T);
       if (!baseCamera || !motionSeen) {
-        // No gyro samples: follow the tag directly, as the old overlay did.
+        // No motion samples: follow the tag directly, as the old overlay did.
         baseCamera = target;
       } else {
         baseCamera = blendOrientation(baseCamera, target, 0.6);
       }
-      lastMotionAt = performance.now();
+      lastMotionAt = now;
     }
 
     function predictedPose() {
       if (!livePose) return null;
+      if (useEkf) {
+        const pose = ekf ? ekf.pose() : null;
+        if (!pose) return livePose;
+        const R = pose.rotation;
+        const p = pose.position;
+        return [
+          [R[0][0], R[0][1], R[0][2], p[0]],
+          [R[1][0], R[1][1], R[1][2], p[1]],
+          [R[2][0], R[2][1], R[2][2], p[2]],
+          [0, 0, 0, 1],
+        ];
+      }
       if (!baseCamera) return livePose;
       const R = baseCamera;
+      const p = basePosition || [livePose[0][3], livePose[1][3], livePose[2][3]];
       return [
-        [R[0][0], R[0][1], R[0][2], livePose[0][3]],
-        [R[1][0], R[1][1], R[1][2], livePose[1][3]],
-        [R[2][0], R[2][1], R[2][2], livePose[2][3]],
+        [R[0][0], R[0][1], R[0][2], p[0]],
+        [R[1][0], R[1][1], R[1][2], p[1]],
+        [R[2][0], R[2][1], R[2][2], p[2]],
         [0, 0, 0, 1],
       ];
     }
@@ -799,6 +913,10 @@
         clearTimeout(detectTimer);
         detectTimer = null;
       }
+      if (detectFrame && typeof video.cancelVideoFrameCallback === "function") {
+        video.cancelVideoFrameCallback(detectFrame);
+      }
+      detectFrame = 0;
       stopMotion();
       stopAnimation();
     }
@@ -822,7 +940,7 @@
       }
       startMotion();
       if (livePose) startAnimation();
-      if (detectTimer) {
+      if (detectTimer || detectFrame) {
         // The camera may have just produced its first frame after the overlay
         // was switched on; restart the grace rather than clearing immediately.
         if (!livePose) {
@@ -836,8 +954,23 @@
       if (!livePose) liveAt = Date.now();
       lossLogged = false;
 
+      function scheduleDetect() {
+        if (!visible || !config || config.T_base_cam || detectTimer || detectFrame) return;
+        if (typeof video.requestVideoFrameCallback === "function") {
+          // One tag solve per camera frame, not a fixed 320 ms timer: the
+          // absolute anchor is then only one frame old when the phone moves.
+          detectFrame = video.requestVideoFrameCallback(() => {
+            detectFrame = 0;
+            tick();
+          });
+        } else {
+          detectTimer = setTimeout(tick, 66);
+        }
+      }
+
       function tick() {
         detectTimer = null;
+        detectFrame = 0;
         if (!visible || !config || config.T_base_cam) return;
         if (video.videoWidth && video.videoHeight) {
           let found = null;
@@ -847,7 +980,7 @@
             lastError = error.message;
           }
           if (found && found.T_base_cam) {
-            applyTagOrientation(found.T_base_cam);
+            applyTagPose(found.T_base_cam);
             livePose = found.T_base_cam;
             liveAt = Date.now();
             detectMisses = 0;
@@ -872,7 +1005,7 @@
             }
           }
         }
-        detectTimer = setTimeout(tick, 320);
+        scheduleDetect();
       }
       tick();
     }
@@ -906,7 +1039,7 @@
         return;
       }
       const label = fixed ? "fixed rig"
-        : (live ? (motionSeen ? "base tag + gyro" : "base tag")
+        : (live ? (useEkf ? "base tag + EKF" : "base tag")
           : (lastPoseLabel || "last tap"));
       drawBand(camera, pose, label);
     }
@@ -938,7 +1071,7 @@
       canvas.classList.toggle("on", visible);
       canvas.hidden = !visible;
       if (visible) {
-        // Ask for the gyro while the toggle click is still a user gesture.
+        // Ask for the motion sensors while the toggle click is still a gesture.
         if (!config || !config.T_base_cam) requestMotionPermission();
         apply();
       } else {
@@ -994,9 +1127,26 @@
       apply();
     });
 
+    function projectPoint(point) {
+      if (!config || !Array.isArray(point) || point.length < 3) return null;
+      if (!video.videoWidth || !video.videoHeight) return null;
+      const fixed = Boolean(config.T_base_cam);
+      const live = !fixed && livePose && (Date.now() - liveAt) < 3000;
+      const chosen = fixed ? config.T_base_cam : (live ? predictedPose() : null);
+      if (!chosen) return null;
+      try {
+        const camera = makeCamera(config.calibration, video.videoWidth, video.videoHeight);
+        const pixel = project(camera, matrixPose(chosen), point);
+        return pixel ? [pixel.u, pixel.v] : null;
+      } catch (error) {
+        return null;
+      }
+    }
+
     return {
       toggle: toggle,
       setPose: setPose,
+      projectPoint: projectPoint,
       get visible() { return visible; },
     };
   }

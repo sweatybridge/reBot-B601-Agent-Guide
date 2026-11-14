@@ -174,6 +174,15 @@ async def handle_markers_js(request: web.Request) -> web.StreamResponse:
                         headers={"Cache-Control": "no-store"})
 
 
+async def handle_ekf_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "ekf.js"
+    if not script.is_file():
+        return web.Response(text="ekf.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
 async def _page(request: web.Request, name: str) -> web.StreamResponse:
     page = WEB_DIR / name
     if not page.is_file():
@@ -1039,6 +1048,7 @@ def build_app(args) -> web.Application:
     app.router.add_get("/reach.js", handle_reach_js)
     app.router.add_get("/aruco.js", handle_aruco_js)
     app.router.add_get("/markers.js", handle_markers_js)
+    app.router.add_get("/ekf.js", handle_ekf_js)
     app.router.add_get("/captures/{id}/{name}", handle_file)
     app.router.add_get("/favicon.ico", handle_favicon)
     if not args.no_whip:

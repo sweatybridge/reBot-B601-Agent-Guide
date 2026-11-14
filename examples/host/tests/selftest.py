@@ -392,6 +392,7 @@ async def test_server(workdir: Path, geometry):
               and abs((reach.get("marker") or {}).get("size_m", 0) - 0.08) < 1e-9)
         check("serves the browser ArUco module", (await client.get("/aruco.js")).status == 200)
         check("serves the marker module", (await client.get("/markers.js")).status == 200)
+        check("serves the pose EKF", (await client.get("/ekf.js")).status == 200)
 
         form = FormData()
         form.add_field("meta", json.dumps({"purpose": "plan", "image_size": [image.shape[1], image.shape[0]],
@@ -428,6 +429,13 @@ async def test_server(workdir: Path, geometry):
               located.status == 200 and located_body.get("ok") is True
               and float(np.linalg.norm(marker_point - geometry["point"])) < 0.003,
               "%.2f mm" % (1000.0 * float(np.linalg.norm(marker_point - geometry["point"]))))
+        marker_pixel = marker_target.get("pixel") or [0.0, 0.0]
+        check("locate projects the target back onto the tap",
+              abs(marker_pixel[0] - geometry["pixel"][0]) < 3.0
+              and abs(marker_pixel[1] - geometry["pixel"][1]) < 3.0,
+              "(%.2f, %.2f) vs (%.2f, %.2f)" % (
+                  marker_pixel[0], marker_pixel[1],
+                  geometry["pixel"][0], geometry["pixel"][1]))
         sequenced = await client.post("/sequence", json={"targets": [marker_target]},
                                       headers={"X-Rebot-Token": "selftest-token"})
         sequence_body = await sequenced.json()

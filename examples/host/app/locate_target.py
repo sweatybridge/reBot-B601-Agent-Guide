@@ -193,11 +193,17 @@ def ray_plane(K, T_base_cam, u, v, plane_z, dist=None):
 
 
 
-def project(K, T_base_cam, point):
-    """Project a base-frame point back into the image (for the annotation)."""
+def project(K, T_base_cam, point, dist=None):
+    """Project a base-frame point back into the image (for the annotation and
+    for placing the marker on the projected worktop plane)."""
     p_cam = T_base_cam[:3, :3].T @ (np.asarray(point, dtype=float) - T_base_cam[:3, 3])
     if p_cam[2] <= 1e-9:
         return None
+    if dist is not None and np.asarray(dist).size:
+        image_points, _ = cv2.projectPoints(
+            np.asarray([p_cam], dtype=float), np.zeros(3), np.zeros(3),
+            np.asarray(K, dtype=float), np.asarray(dist, dtype=float))
+        return float(image_points[0, 0, 0]), float(image_points[0, 0, 1])
     q = np.asarray(K, dtype=float) @ p_cam
     return float(q[0] / q[2]), float(q[1] / q[2])
 
@@ -246,7 +252,7 @@ def annotate(image, corners, tag_size, T_base_cam, K, dist, point, tap, out_path
         cv2.circle(out, (int(round(tap[0])), int(round(tap[1]))), 9, (0, 220, 255), 2)
         cv2.drawMarker(out, (int(round(tap[0])), int(round(tap[1]))), (0, 220, 255),
                        cv2.MARKER_CROSS, 22, 2)
-    pixel = project(K, T_base_cam, point)
+    pixel = project(K, T_base_cam, point, dist)
     if pixel is not None:
         cv2.drawMarker(out, (int(round(pixel[0])), int(round(pixel[1]))), (60, 220, 60),
                        cv2.MARKER_TRIANGLE_UP, 18, 2)
@@ -310,6 +316,7 @@ def locate(image, meta, calibration, options: Options):
             % (grazing, options.max_grazing))
 
     radius = float(np.linalg.norm(point))
+    projected = project(calibration.K, T_base_cam, point, calibration.dist)
     payload = {
         "format": "rebot-target",
         "version": 1,
@@ -320,6 +327,8 @@ def locate(image, meta, calibration, options: Options):
         "tap": {"u": float(tap[0]), "v": float(tap[1])} if tap is not None else None,
         "plane_z": float(options.plane_z),
         "point": [float(v) for v in point],
+        "pixel": (None if projected is None
+                  else [float(projected[0]), float(projected[1])]),
         "radius": radius,
         "T_base_cam": [[float(v) for v in row] for row in T_base_cam],
         "_corners": corners,

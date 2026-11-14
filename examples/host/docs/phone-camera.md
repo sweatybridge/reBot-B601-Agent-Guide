@@ -47,7 +47,7 @@ docker compose -f examples/host/compose.yaml --profile tools run --rm tools test
 python examples/host/tests/selftest.py
 ```
 
-150 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
+152 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
 tag recovers a known 3D point to a fraction of a millimetre, a camera pose is
 recovered from eight synthetic arm poses with a 30 px mis-click in the set, a
 capture round-trips through the real HTTP server, and the trajectory payload is
@@ -423,6 +423,11 @@ pixel in the base frame and pins a numbered marker on the preview. Up to ten;
 one marker is on screen. Odd markers are amber (the gripper will half-close);
 even markers are green (it will open).
 
+A pin is drawn at the **projection of the target on the worktop plane**, not at
+the raw finger pixel. The capture stores its own projected pixel as a fallback;
+while Reach is on, the live camera pose (including the gyro prediction) reprojects
+the pin so it stays on the table as the phone moves.
+
 ![Numbered markers on the phone](phone-markers.png)
 
 ```
@@ -445,13 +450,24 @@ measured blocked opening instead of pressing further. Between markers the arm mo
 capsule), and the tool yaw follows each marker's direction from the base, which
 is the free-yaw envelope the reach band draws.
 
-The phone's **gyro is used while Reach is on**: the tag still supplies the
-absolute camera pose, and between tag frames the browser integrates
-`devicemotion.rotationRate` to keep the band turning with the phone. The tag
-position is held until the next detection; translation is not integrated from
-the accelerometer. On iOS the motion permission prompt appears when Reach is
-switched on. With no motion permission the band falls back to updating only when
-the tag is seen.
+By default Reach uses the **tag pose only**: the ArUco solve at each camera frame
+is the live camera pose, and no motion permission is requested. This is the
+simple frame-synchronous mode.
+
+To opt into the **15-state error-state EKF**, load the page with `?filter=ekf`.
+The tag is fixed to the arm base, so its solve gives an absolute camera pose in
+the base frame; `devicemotion.rotationRate` predicts orientation, and the
+accelerometer predicts camera translation. The EKF estimates position, velocity,
+orientation, gyro bias and accelerometer bias. The tag supplies both position
+and orientation measurements, with the position trusted tightly; there is no
+tag-difference velocity pseudo-measurement, so velocity is estimated by the
+filter from position updates and acceleration. The bias states let it coast
+through the frames where the tag is briefly occluded. A 6-DOF Mahalanobis gate
+rejects outlier solves (three consecutive rejects reset to the tag). Detection
+runs on each camera frame (typically 15-30 Hz).
+
+`?filter=tag` remains an explicit way to select the default. Removing the
+`ekf.js` script also leaves `reach.js` in tag-only mode.
 
 The **execution gate is unchanged**: with `REBOT_EXECUTE=0` the Move arm call
 still plans and writes `out/<id>.json`, but does not move; the log says so. With
@@ -657,6 +673,7 @@ band stays registered in portrait and landscape.
 | `live.html` | workstation viewer: WHEP playback and single-tap planning |
 | `viewer.js` | the tap -> capture -> plan -> execute panel used by `/live` and the phone's Rig button |
 | `markers.js` | numbered markers on the phone: capture, locate, pin, clear, up to 10 |
+| `ekf.js` | optional 15-state camera pose/bias EKF, enabled with `?filter=ekf`; default is tag-only |
 | `reach.js` | the phone's reachable-band canvas overlay (IK + projection, in the page) |
 | `aruco.js` | browser-side 4x4_50 detection and pose for the live handheld overlay |
 | `capture_server.py` | TLS endpoint, `/capture`, `/locate`, `/plan`, `/sequence`, `/execute`, calibration, WHIP/WHEP |

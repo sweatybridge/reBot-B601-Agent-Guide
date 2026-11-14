@@ -2,8 +2,11 @@
  *
  * A tap captures the frame under the finger, locates that pixel in the arm's
  * base frame through `POST /capture` + `POST /locate`, and keeps the target for
- * the sequence planner. The pins are DOM elements so they stay crisp and can be
- * numbered; the overlay canvas below them is untouched.
+ * the sequence planner. Each pin is drawn at the projection of its base-frame
+ * target, not at the raw finger pixel: the capture's pixel is the fallback, and
+ * the reach overlay's live pose reprojects the pins as the phone moves. The
+ * pins are DOM elements so they stay crisp and can be numbered; the overlay
+ * canvas below them is untouched.
  *
  * The page owns what Start does. This module only answers: how many markers,
  * which targets, and is a locate still in flight?
@@ -20,12 +23,14 @@
     const status = options.onStatus || function () {};
     const token = options.token || (() => "");
     const onChange = options.onChange || function () {};
+    const projectPoint = options.project || null;
 
     const markers = [];
     let busy = false;
     let enabled = true;
     let calibrating = false;
     let generation = 0;             // invalidates a locate that a clear overtook
+    let projectionTimer = 0;
 
     function headers() {
       const value = typeof token === "function" ? token() : token;
@@ -65,11 +70,37 @@
       };
     }
 
+    function projectedPixel(marker) {
+      if (projectPoint) {
+        try {
+          const live = projectPoint(marker.target.point);
+          if (live && Number.isFinite(live[0]) && Number.isFinite(live[1])) {
+            return live;
+          }
+        } catch (error) {
+          // Fall back to the capture's own projection/tap.
+        }
+      }
+      if (marker.pixel && Number.isFinite(marker.pixel[0]) && Number.isFinite(marker.pixel[1])) {
+        return marker.pixel;
+      }
+      return [marker.u, marker.v];
+    }
+
+    function scheduleProjection() {
+      if (projectionTimer || !markers.length || !projectPoint) return;
+      projectionTimer = window.setTimeout(() => {
+        projectionTimer = 0;
+        if (markers.length && !calibrating) render();
+      }, 33);
+    }
+
     function render() {
       if (!container) return;
       container.innerHTML = "";
       markers.forEach((marker, index) => {
-        const point = screenPoint(marker.u, marker.v);
+        const pixel = projectedPixel(marker);
+        const point = screenPoint(pixel[0], pixel[1]);
         if (!point) return;
         const pin = document.createElement("div");
         // Amber for odd (half-close), green for even (open); a red outline only
@@ -85,6 +116,7 @@
       });
       container.hidden = calibrating;
       container.classList.toggle("disabled", !enabled || busy);
+      scheduleProjection();
     }
 
     async function grabFrame() {
@@ -140,7 +172,8 @@
 
         if (current !== generation) return;
         const target = data.target;
-        markers.push({ u: tapped.u, v: tapped.v, target: target,
+        const pixel = Array.isArray(target.pixel) ? target.pixel : [tapped.u, tapped.v];
+        markers.push({ u: tapped.u, v: tapped.v, pixel: pixel, target: target,
           radius: Number(target.radius || 0) });
         const point = (target.point || []).map((value) => value.toFixed(3)).join(", ");
         status("marker " + markers.length + " at [" + point + "] m" +
