@@ -94,18 +94,10 @@
     document.head.appendChild(style);
   }
 
-  function videoPoint(video, clientX, clientY) {
-    const rect = video.getBoundingClientRect();
-    const width = video.videoWidth;
-    const height = video.videoHeight;
-    if (!width || !height) return null;
-    const scale = Math.min(rect.width / width, rect.height / height);
-    const offsetX = rect.left + (rect.width - width * scale) / 2;
-    const offsetY = rect.top + (rect.height - height * scale) / 2;
-    const u = (clientX - offsetX) / scale;
-    const v = (clientY - offsetY) / scale;
-    if (u < 0 || v < 0 || u > width || v > height) return null;
-    return { u: Math.round(u * 100) / 100, v: Math.round(v * 100) / 100 };
+  function escapeHtml(text) {
+    return String(text == null ? "" : text).replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[character]));
   }
 
   /* --------------------------------------------------------------- the rig
@@ -133,11 +125,6 @@
 
   function createRig(getToken) {
     styleOnce();
-
-    function headers() {
-      const value = typeof getToken === "function" ? getToken() : getToken;
-      return value ? { "X-Rebot-Token": value } : {};
-    }
 
     const open = document.createElement("button");
     open.type = "button";
@@ -172,55 +159,31 @@
     }
 
     async function load() {
-      try {
-        const response = await fetch("/calibrate", { headers: headers(), cache: "no-store" });
-        if (!response.ok) return { ok: false, error: "status " + response.status };
-        return await response.json();
-      } catch (error) {
-        return { ok: false, error: error.message };
+      const answer = await RebotApi.getJson("/calibrate", getToken);
+      if (!answer.ok) {
+        return { ok: false, error: (answer.data && answer.data.error)
+          || ("status " + answer.status) };
       }
+      return answer.data;
     }
 
     async function postJson(url, body) {
-      try {
-        const response = await fetch(url, {
-          method: "POST",
-          headers: Object.assign({ "Content-Type": "application/json" }, headers()),
-          body: JSON.stringify(body || {}),
-        });
-        // Not every answer is JSON: an older server, a proxy or a plain-text
-        // HTTPException. Show what it said instead of only the status code.
-        const text = await response.text();
-        let data;
-        try {
-          data = JSON.parse(text);
-        } catch (error) {
-          const said = (text || "").trim().slice(0, 300);
-          data = { ok: false, error: said || ("server said " + response.status) };
-        }
-        return { ok: response.ok && data.ok !== false, data: data };
-      } catch (error) {
-        return { ok: false, data: { ok: false, error: error.message } };
-      }
+      return RebotApi.postJson(url, body, getToken);
     }
 
     async function checkArm() {
-      try {
-        const response = await fetch("/pose", { headers: headers(), cache: "no-store" });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || !data.ok) {
-          armState = {
-            ok: false,
-            // "Refused" and "unreachable" are different problems: a 404 is a
-            // route that is not there, a network error is a host that is not.
-            refused: !data.unreachable,
-            error: data.error || ("the arm gateway answered " + response.status),
-          };
-        } else {
-          armState = { ok: true, q: (data.pose || {}).q || [] };
-        }
-      } catch (error) {
-        armState = { ok: false, refused: false, error: error.message };
+      const answer = await RebotApi.getJson("/pose", getToken);
+      const data = answer.data || {};
+      if (!answer.ok) {
+        armState = {
+          ok: false,
+          // "Refused" and "unreachable" are different problems: a 404 is a
+          // route that is not there, a network error is a host that is not.
+          refused: answer.status !== 0 && !data.unreachable,
+          error: data.error || ("the arm gateway answered " + answer.status),
+        };
+      } else {
+        armState = { ok: true, q: (data.pose || {}).q || [] };
       }
       return armState;
     }
@@ -241,12 +204,6 @@
                point: null };
       status = Object.assign({}, status, { error: null });
       render();
-    }
-
-    function escapeHtml(text) {
-      return String(text == null ? "" : text).replace(/[&<>"']/g, (character) => ({
-        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-      }[character]));
     }
 
     function progressText() {
@@ -573,28 +530,18 @@
     let result = null;
     let armedUntil = 0;
 
-    function tokenValue() {
-      return typeof token === "function" ? token() : token;
-    }
-
-    function headers() {
-      const value = tokenValue();
-      return value ? { "X-Rebot-Token": value } : {};
-    }
-
     function placeMarker() {
       if (!point || !video.videoWidth) {
         marker.hidden = true;
         return;
       }
-      const rect = video.getBoundingClientRect();
-      const width = video.videoWidth;
-      const height = video.videoHeight;
-      const scale = Math.min(rect.width / width, rect.height / height);
-      const x = rect.left + (rect.width - width * scale) / 2 + point.u * scale;
-      const y = rect.top + (rect.height - height * scale) / 2 + point.v * scale;
-      marker.style.left = x + "px";
-      marker.style.top = y + "px";
+      const at = RebotVideo.viewportPoint(video, point.u, point.v);
+      if (!at) {
+        marker.hidden = true;
+        return;
+      }
+      marker.style.left = at.x + "px";
+      marker.style.top = at.y + "px";
       marker.hidden = false;
     }
 
@@ -647,39 +594,6 @@
       panel.querySelector('[data-action="dismiss"]').addEventListener("click", hidePanel);
     }
 
-    function escapeHtml(text) {
-      return String(text == null ? "" : text).replace(/[&<>"']/g, (character) => ({
-        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-      }[character]));
-    }
-
-    async function grabFrame() {
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-      const blob = await new Promise((resolve, reject) => {
-        canvas.toBlob((value) => (value ? resolve(value) : reject(new Error("JPEG encode failed"))),
-          "image/jpeg", 0.95);
-      });
-      return { blob: blob, width: canvas.width, height: canvas.height };
-    }
-
-    async function postJson(url, body) {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: Object.assign({ "Content-Type": "application/json" }, headers()),
-        body: JSON.stringify(body),
-      });
-      let data = {};
-      try {
-        data = await response.json();
-      } catch (error) {
-        data = { ok: false, error: "server said " + response.status };
-      }
-      return { ok: response.ok, status: response.status, data: data };
-    }
-
     function reportPose(data) {
       // A solved frame carries T_base_cam whether or not the arm can reach the
       // tap; handheld mode has no other way to know the camera pose.
@@ -698,7 +612,7 @@
       panel.hidden = true;
       try {
         status("capturing the frame under the tap", "");
-        const frame = await grabFrame();
+        const frame = await RebotVideo.grabBlob(video);
 
         const form = new FormData();
         form.append("meta", JSON.stringify({
@@ -713,14 +627,13 @@
         }));
         form.append("frame", frame.blob, "frame.jpg");
 
-        const upload = await fetch("/capture", {
-          method: "POST", body: form, headers: headers(),
-        });
-        const saved = await upload.json().catch(() => ({}));
+        const upload = await RebotApi.postForm("/capture", form, token);
+        const saved = upload.data || {};
         if (!upload.ok) throw new Error(saved.error || ("upload failed: " + upload.status));
         status("capture " + saved.id + ", locating the target", "");
 
-        const answer = await postJson("/plan", { capture: saved.id, mode: cameraMode });
+        const answer = await RebotApi.postJson("/plan",
+          { capture: saved.id, mode: cameraMode }, token);
         reportPose(answer.data);
         if (!answer.ok) {
           status(answer.data.error || "no plan", "bad");
@@ -760,7 +673,7 @@
       button.textContent = "Moving...";
       status("executing " + result.plan.id + " on the arm", "warn");
       try {
-        const answer = await postJson("/execute", { id: result.plan.id });
+        const answer = await RebotApi.postJson("/execute", { id: result.plan.id }, token);
         if (!answer.ok) throw new Error(answer.data.error || ("execute failed: " + answer.status));
         status("arm finished: " + result.plan.id, "good");
         button.textContent = "Done";
@@ -780,7 +693,7 @@
 
     function onPointer(event) {
       if (!enabled || busy) return;
-      const tapped = videoPoint(video, event.clientX, event.clientY);
+      const tapped = RebotVideo.videoPoint(video, event.clientX, event.clientY);
       if (!tapped) return;
       point = tapped;
       placeMarker();

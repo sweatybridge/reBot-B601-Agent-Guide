@@ -398,6 +398,11 @@ async def test_server(workdir: Path, geometry):
               (reach.get("marker") or {}).get("id") == 0
               and abs((reach.get("marker") or {}).get("size_m", 0) - 0.08) < 1e-9)
         check("serves the browser ArUco module", (await client.get("/aruco.js")).status == 200)
+        check("serves the HTTP helpers", (await client.get("/api.js")).status == 200)
+        check("serves the video helpers", (await client.get("/video.js")).status == 200)
+        check("serves the reach config loader", (await client.get("/reach-config.js")).status == 200)
+        check("serves the shared geometry", (await client.get("/geometry.js")).status == 200)
+        check("serves the arm model", (await client.get("/arm-model.js")).status == 200)
         check("serves the marker module", (await client.get("/markers.js")).status == 200)
         check("serves the height control", (await client.get("/height.js")).status == 200)
         check("serves the browser locator", (await client.get("/locate.js")).status == 200)

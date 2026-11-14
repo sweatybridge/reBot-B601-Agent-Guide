@@ -48,7 +48,7 @@ docker compose -f examples/host/compose.yaml --profile tools run --rm tools test
 python examples/host/tests/selftest.py
 ```
 
-162 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
+167 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
 tag recovers a known 3D point to a fraction of a millimetre, a camera pose is
 recovered from eight synthetic arm poses with a 30 px mis-click in the set, a
 capture round-trips through the real HTTP server, and the trajectory payload is
@@ -558,9 +558,10 @@ move. `--unpark-j3 0` disables it; the leg is mirrored at the end of the plan.
 
 The **Reach** chip paints a translucent band over the preview: the part of the
 table a tap can actually be planned in. Everything except a few numbers is done
-in the page -- `web/reach.js` holds the same six-joint chain as `rebot_ik.py`,
-runs a damped-least-squares IK to find the inner and outer radial limits of a
-tool-down pose, and projects the resulting annulus through the pinhole camera.
+in the page -- `web/arm-model.js` holds the same six-joint chain as `rebot_ik.py`
+and runs a damped-least-squares IK to find the inner and outer radial limits of a
+tool-down pose; `web/geometry.js` projects the annulus through the pinhole camera,
+and `web/reach.js` orchestrates the overlay.
 The host adds one read-only route, `GET /reach.json`, which returns only what the
 browser cannot know: `K`, `dist`, `image_size`, `plane_z`, `hover_m`, `tip_m`,
 the tag's placement, and -- for a fixed camera -- `T_base_cam`.
@@ -716,7 +717,12 @@ band stays registered in portrait and landscape.
 | `locate.js` | browser ray-plane solve: pixel + camera pose -> arm-space tip |
 | `height.js` | tap-and-drag height gesture and the camera-row badge |
 | `ekf.js` | optional 15-state camera pose/bias EKF, enabled with `?filter=ekf`; default is tag-only |
-| `reach.js` | the phone's reachable-band canvas overlay (IK + projection, in the page) |
+| `geometry.js` | shared matrices, camera model, projection, undistortion, ray/plane |
+| `arm-model.js` | the six-joint chain, FK/IK, and the reach-band search |
+| `api.js` | token-aware GET/POST helpers with JSON/plain-text error parsing |
+| `video.js` | letterboxed client <-> camera pixels and frame capture |
+| `reach-config.js` | one cached `/reach.json` shared by the overlay and locator |
+| `reach.js` | the phone's reachable-band canvas and camera-pose orchestration |
 | `aruco.js` | browser-side 4x4_50 detection and pose for the live handheld overlay |
 | `capture_server.py` | TLS endpoint, `/capture`, `/locate`, `/plan`, `/sequence`, `/execute`, calibration, WHIP/WHEP |
 | `planner_server.py` | the arm gateway: edge `/pose`, one compact `/plan`, gated execution |

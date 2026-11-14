@@ -15,6 +15,7 @@
 (function () {
   "use strict";
 
+  const videoTools = (typeof window !== "undefined" && window.RebotVideo) || null;
   const MAX_MARKERS = 10;
 
   function create(options) {
@@ -33,33 +34,6 @@
     let calibrating = false;
     let generation = 0;             // invalidates a locate that a clear overtook
     let projectionTimer = 0;
-
-    function videoPoint(clientX, clientY) {
-      const rect = video.getBoundingClientRect();
-      const width = video.videoWidth;
-      const height = video.videoHeight;
-      if (!width || !height) return null;
-      const scale = Math.min(rect.width / width, rect.height / height);
-      const offsetX = rect.left + (rect.width - width * scale) / 2;
-      const offsetY = rect.top + (rect.height - height * scale) / 2;
-      const u = (clientX - offsetX) / scale;
-      const v = (clientY - offsetY) / scale;
-      if (u < 0 || v < 0 || u > width || v > height) return null;
-      return { u: Math.round(u * 100) / 100, v: Math.round(v * 100) / 100 };
-    }
-
-    function screenPoint(u, v) {
-      const rect = video.getBoundingClientRect();
-      const host = stage.getBoundingClientRect();
-      const width = video.videoWidth;
-      const height = video.videoHeight;
-      if (!width || !height) return null;
-      const scale = Math.min(rect.width / width, rect.height / height);
-      return {
-        x: rect.left - host.left + (rect.width - width * scale) / 2 + u * scale,
-        y: rect.top - host.top + (rect.height - height * scale) / 2 + v * scale,
-      };
-    }
 
     function projectedPixel(marker) {
       if (projectPoint) {
@@ -91,7 +65,7 @@
       container.innerHTML = "";
       markers.forEach((marker, index) => {
         const pixel = projectedPixel(marker);
-        const point = screenPoint(pixel[0], pixel[1]);
+        const point = videoTools.screenPoint(video, stage, pixel[0], pixel[1]);
         if (!point) return;
         const pin = document.createElement("div");
         // Amber for odd (half-close), green for even (open); a red outline only
@@ -120,7 +94,7 @@
         status("10 markers is the limit; clear one first", "warn");
         return;
       }
-      const tapped = videoPoint(clientX, clientY);
+      const tapped = videoTools.videoPoint(video, clientX, clientY);
       if (!tapped) return;
       // Freeze the badge height at the instant of the tap: the marker must
       // remember the height it was tapped at, not wherever the badge is later.

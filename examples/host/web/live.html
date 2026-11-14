@@ -46,6 +46,8 @@
   <button id="disconnect" disabled>Disconnect</button>
   <a href="/" style="margin-left:auto;align-self:center">capture page</a>
 </footer>
+<script src="/api.js"></script>
+<script src="/video.js"></script>
 <script src="/viewer.js"></script>
 <script>
 "use strict";
@@ -123,7 +125,7 @@ async function connect() {
     const response = await fetch("/whep", {
       method: "POST",
       headers: Object.assign({ "Content-Type": "application/sdp" },
-        token ? { "X-Rebot-Token": token } : {}),
+        RebotApi.headers(token)),
       body: connection.localDescription.sdp,
     });
     if (!response.ok) throw new Error("whep " + response.status + ": " + (await response.text()).slice(0, 120));
@@ -157,7 +159,7 @@ async function disconnect() {
       try {
         await fetch("/whep/" + encodeURIComponent(session), {
           method: "DELETE",
-          headers: token ? { "X-Rebot-Token": token } : {},
+          headers: RebotApi.headers(token),
         });
       } catch (error) { /* best effort */ }
     }

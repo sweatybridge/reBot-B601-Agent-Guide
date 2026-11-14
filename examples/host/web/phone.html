@@ -214,9 +214,14 @@
   </details>
 </footer>
 
+<script src="/api.js"></script>
+<script src="/video.js"></script>
 <script src="/viewer.js"></script>
 <script src="/aruco.js"></script>
 <script src="/ekf.js"></script>
+<script src="/geometry.js"></script>
+<script src="/arm-model.js"></script>
+<script src="/reach-config.js"></script>
 <script src="/reach.js"></script>
 <script src="/locate.js"></script>
 <script src="/height.js"></script>
@@ -297,14 +302,9 @@ function secureHint() {
   return "This browser does not expose getUserMedia. Use Safari on iOS or Chrome on Android.";
 }
 
-function tokenHeader() {
-  return state.token ? { "X-Rebot-Token": state.token } : {};
-}
-
 async function api(path, options) {
-  const options_ = Object.assign({ cache: "no-store" }, options || {});
-  options_.headers = Object.assign({}, options_.headers || {}, tokenHeader());
-  return fetch(path, options_);
+  return RebotApi.request(path, Object.assign({ cache: "no-store" }, options || {}),
+    () => state.token);
 }
 
 function initToken() {

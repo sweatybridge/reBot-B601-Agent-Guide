@@ -147,6 +147,51 @@ async def handle_viewer_js(request: web.Request) -> web.StreamResponse:
                         headers={"Cache-Control": "no-store"})
 
 
+async def handle_api_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "api.js"
+    if not script.is_file():
+        return web.Response(text="api.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
+async def handle_video_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "video.js"
+    if not script.is_file():
+        return web.Response(text="video.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
+async def handle_reach_config_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "reach-config.js"
+    if not script.is_file():
+        return web.Response(text="reach-config.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
+async def handle_geometry_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "geometry.js"
+    if not script.is_file():
+        return web.Response(text="geometry.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
+async def handle_arm_model_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "arm-model.js"
+    if not script.is_file():
+        return web.Response(text="arm-model.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
 async def handle_reach_js(request: web.Request) -> web.StreamResponse:
     script = WEB_DIR / "reach.js"
     if not script.is_file():
@@ -1141,6 +1186,11 @@ def build_app(args) -> web.Application:
     app.router.add_post("/capture/pose", handle_capture_pose)
     app.router.add_get("/viewer.js", handle_viewer_js)
     app.router.add_get("/reach.js", handle_reach_js)
+    app.router.add_get("/api.js", handle_api_js)
+    app.router.add_get("/video.js", handle_video_js)
+    app.router.add_get("/reach-config.js", handle_reach_config_js)
+    app.router.add_get("/geometry.js", handle_geometry_js)
+    app.router.add_get("/arm-model.js", handle_arm_model_js)
     app.router.add_get("/aruco.js", handle_aruco_js)
     app.router.add_get("/markers.js", handle_markers_js)
     app.router.add_get("/height.js", handle_height_js)
