@@ -44,6 +44,7 @@ docker run --rm -v "$PWD:/work" rebot-pino python \
 ```bash
 docker compose up -d --build
 # tap an object in either viewport; the panel plans, then offers "Move the arm"
+# switch either page to markers to collect points and run them in one pass
 ```
 
 The tap pipeline is documented end to end in
@@ -85,7 +86,7 @@ app/
   healthcheck.py          compose healthcheck for the capture service
 
 web/                      phone page, shared api/video/geometry modules, reach, locate
-tests/                    selftest.py (167 checks) and browser_check.py (Chromium)
+tests/                    selftest.py (165 checks) and browser_check.py (Chromium)
 deploy/                   mediamtx.yml, repeat_pino.ps1
 docs/                     phone-camera.md, arm_model.png
 state/                    captures, calib, tls, tags, out, work  (gitignored)

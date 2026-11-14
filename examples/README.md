@@ -120,9 +120,10 @@ gap) and CAN `rate: 500` (this rig runs 1 Mbit/s).
 
 `host/` turns one still from a phone browser into a point in the base frame and
 then into the same trajectory JSON. The live preview is WebRTC (WHIP through
-MediaMTX); planning never sees the video. Tap an object in the phone page or in
-the workstation's `/live` page and the host plans to it; a second, confirmed tap
-executes it on the arm.
+MediaMTX); planning never sees the video. In both the phone page and the
+workstation's `/live` page, one tap plans a point and a confirmed second tap
+executes it -- or a run of numbered markers becomes one pass in a single
+**Move arm**.
 
 The extrinsics come from one of two places. On a bracket, they are fitted once
 from the arm itself: take one still, tap the tool tip in it, and the rig sweeps

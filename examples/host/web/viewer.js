@@ -10,6 +10,10 @@
  *
  * `onPose(T_base_cam, source)` is optional: it fires for every solved frame,
  * including a tap the arm refuses, so an overlay can follow a handheld camera.
+ * `height()` is optional: the approach height the page's own control shows, in
+ * metres above the worktop. It becomes `hover_m` on the plan; without it the
+ * host's default applies. A page that drives taps itself keeps this planner
+ * disabled and calls `plan()` (and `mark()`) from its gesture owner.
  *
  * Flow: tap -> canvas grab -> POST /capture -> POST /plan -> panel.
  * The panel's Execute button is a two-step confirm and only appears when the
@@ -513,6 +517,7 @@
     const stage = options.stage;
     const status = options.onStatus || function () {};
     const token = options.token || (() => "");
+    const heightAt = options.height || null;
 
     const marker = document.createElement("div");
     marker.className = "tp-marker";
@@ -553,6 +558,14 @@
 
     function format(point) {
       return "[" + point.map((value) => (value >= 0 ? "+" : "") + value.toFixed(3)).join(" ") + "] m";
+    }
+
+    function withHeight(body) {
+      // The page's control is the truth when it has one: an operator who moved
+      // the badge expects the next tap to end there, not at the host's default.
+      const hover = heightAt ? Number(heightAt()) : NaN;
+      if (Number.isFinite(hover) && hover >= 0) body.hover_m = hover;
+      return body;
     }
 
     function showResult(data) {
@@ -633,7 +646,7 @@
         status("capture " + saved.id + ", locating the target", "");
 
         const answer = await RebotApi.postJson("/plan",
-          { capture: saved.id, mode: cameraMode }, token);
+          withHeight({ capture: saved.id, mode: cameraMode }), token);
         reportPose(answer.data);
         if (!answer.ok) {
           status(answer.data.error || "no plan", "bad");
@@ -710,6 +723,12 @@
       enable() { enabled = true; },
       disable() { enabled = false; },
       clear() { point = null; marker.hidden = true; hidePanel(); },
+      // A page that owns the gesture can still show where the tap landed.
+      mark(tapped) {
+        if (!tapped) return;
+        point = tapped;
+        placeMarker();
+      },
       get point() { return point; },
       plan: planAt,
       rig: rigPanel,

@@ -9,16 +9,17 @@ The design is two planes, not one video pipe:
 
 | | preview (aiming) | planning input |
 |---|---|---|
-| what | 640x360 - 1280x720, 15-30 fps | one full-resolution JPEG, or the phone's in-page solve |
-| how | WebRTC (WHIP) through MediaMTX | `POST /capture` for `/live`/calibration; phone markers solve in-page |
+| what | 640x360 - 1280x720, 15-30 fps | one full-resolution JPEG, or the marker's in-page solve |
+| how | WebRTC (WHIP) through MediaMTX | `POST /capture` for a plan tap or calibration; markers solve in-page |
 | needs | best effort | calibration and a fitted rig (or a tag) |
-| kept | no | yes for `/live` captures; phone markers keep the tip target |
+| kept | no | yes for the captures; markers keep the tip target |
 
-Video is for the person holding the phone. The phone's numbered-marker path
-solves the tap in the page: it already has the calibration, the camera pose and
-the table plane, so it sends the arm-space **tip** point straight to `/sequence`.
-`/live`, calibration and the CLI still upload an immutable frame, which is what
-makes those plans reproducible and a failure debuggable.
+Video is for the person holding the phone. The numbered-marker path on both pages
+solves the tap in the page: the page already has the calibration, the camera pose
+(a fitted rig, or the tag it found itself) and the table plane, so it sends the
+arm-space **tip** point straight to `/sequence`. A one-point plan, calibration and
+the CLI still upload an immutable frame, which is what makes those plans
+reproducible and a failure debuggable.
 
 ```
 phone page (tap) ─► browser: calib + pose (rig/tag) + table plane + height
@@ -31,12 +32,16 @@ phone page (tap) ─► browser: calib + pose (rig/tag) + table plane + height
                               │
                     [Move arm] ┴─► /execute ─► POST /play ─► rebot-edge
 
-/live page (tap) ─► /capture ─► capture server: locate_target.py ─► /plan
+/live page (tap) ─┬► /capture ─► capture server: locate_target.py ─► /plan
+                  └► browser: calib + rig pose + table plane + height ─► /sequence
 ```
 
-The geometry and the planner are shared; the UI on top differs. The phone
-collects numbered markers and **Move arm** turns them into one pass, while `/live`
-keeps the single-tap plan and its two-step Move button.
+The geometry and the planner are shared; the UI on top differs only in where a
+tap is solved. Both pages offer the same two ways in: one tap plans one point
+with the two-step **Move the arm** panel, or a run of numbered markers becomes
+one pass with **Move arm**. The phone solves each marker from the tag it finds or
+the rig it was given; `/live` is fixed-rig only, so its markers use the constant
+pose and need nothing from the host at all.
 
 ## First, prove it on your machine
 
@@ -48,7 +53,7 @@ docker compose -f examples/host/compose.yaml --profile tools run --rm tools test
 python examples/host/tests/selftest.py
 ```
 
-167 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
+165 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
 tag recovers a known 3D point to a fraction of a millimetre, a camera pose is
 recovered from eight synthetic arm poses with a 30 px mis-click in the set, a
 capture round-trips through the real HTTP server, and the trajectory payload is
@@ -363,8 +368,7 @@ the arm. Nothing is typed and there is no second path.
 | `POST /capture/pose` | one still plus `GET /pose`, written as a capture |
 | `POST /calibrate/extrinsics` | `{confirm, capture, u, v}` sweeps, fits, verifies, writes |
 | `GET /calibrate` | running state, progress, the last verdict, the current rig |
-| `GET /reach.json` | `K`, `dist`, plane/hover, the tag placement, and `T_base_cam` for the phone's reach overlay |
-| `POST /locate` | `{capture, mode}` -> base-frame point for `/live` and CLI taps |
+| `GET /reach.json` | `K`, `dist`, plane/hover, the tag placement, and `T_base_cam` for the reach overlay |
 | `POST /sequence` | `{targets:[{tip:[x,y,z], pixel?}]}` -> validates `min_z`, adds `tip_offset_m`, posts `/plan` with `gripper:"alternate"` |
 
 The arm gateway has one planning route, `POST /plan`:
@@ -399,11 +403,12 @@ removes the remaining ghosting from the median.
 `GET /calibrate` reports whether a sweep is running and how the last one ended.
 A successful POST hot-loads the rig, so the next tap uses it without a restart.
 
-Both pages carry the same call as a panel: the **Rig** button in the bottom
-right corner (or `?rig=1` on the URL) shows whether the host will move the arm,
-takes the bracket's position, runs the sweep with a progress line, and renders
-the verdict -- the reasons, the per-pose table, and the captures to re-click if
-it refuses. It is `viewer.js`, so the phone page and `/live` behave identically.
+`/live` carries the whole call as a panel: the **Rig** button in the bottom right
+corner (or `?rig=1` on the URL) shows whether the host will move the arm, takes
+the bracket's position, runs the sweep with a progress line, and renders the
+verdict -- the reasons, the per-pose table, and the captures to re-click if it
+refuses. It is the only page with that button: fitting a rig is a workstation
+job, and the phone page just picks the result up with its **Camera** chip.
 
 ## Calibrate once per phone camera
 
@@ -508,9 +513,35 @@ The edge still re-checks limits and steps.
   be visible in the same frame as the marker, on every marker tap.
 - **Every plan is also a file.** `out/<id>.json` is a normal trajectory, so
   `rebot-edge --check` works on it without the browser.
-- **The workstation's `/live` page still taps once** and plans one point with
-  `viewer.js`; that panel is unchanged. The phone's `viewer.js` instance is
-  disabled and kept only for the **Rig** button.
+- **The workstation's `/live` page does everything except the camera** -- the
+  same reach band, height badge and numbered markers, behind a
+  `Tap: plan | markers` chip. It is **fixed-rig only**: every tap there goes
+  through `REBOT_EXTRINSICS`, and a host without one refuses with "fixed mode
+  needs a rig". See
+  [The same thing from the workstation](#the-same-thing-from-the-workstation).
+
+### The same thing from the workstation
+
+`/live` is the same pipeline seen from the other end: it plays the phone's WHIP
+stream over WHEP, so it needs the phone publishing and nothing else -- no camera
+permission, no motion sensors, no tag detector. That last part is why it is
+fixed-rig only.
+
+| on `/live` | how it solves |
+|---|---|
+| one tap, `Tap: plan` | `/capture` with the tapped pixel, then `/plan` with `mode: fixed`; the panel offers the two-step **Move the arm** |
+| one tap, `Tap: markers` | nothing leaves the page: `/reach.json` gave it `K` and `T_base_cam`, and it intersects the ray with `plane_z + height` itself, through the phone's own `tipTarget` |
+| **Move arm** | every numbered marker to `/sequence`, then `/execute` |
+| drag up or down | the same badge and the same floor: plan mode sends `hover_m`, a marker freezes the height it was tapped at |
+| **Reach** | the same band, exact from `T_base_cam` in `/reach.json` |
+
+Two things follow from having no camera of its own. The marker path keeps its
+speed at the cost of the **witness check**: a marker is solved from the fitted
+constant, so a knocked bracket is only caught by a plan-mode tap or a capture
+(the phone's markers have the same property). And the page reads its token from
+the URL once (`/live?token=...`), so a bookmark can carry it, while it polls
+`/health` every five seconds, so it reports "no fixed rig" as soon as it knows one
+is missing, and recovers on its own after the host starts late or is restarted.
 
 If you would rather drive it from a shell, the same three steps exist as
 commands:
@@ -554,7 +585,7 @@ peel `plan_with_pinocchio.py` uses, because the parked pose rests on the j2/j3
 lower stops and a Cartesian IK that begins exactly on a stop often refuses to
 move. `--unpark-j3 0` disables it; the leg is mirrored at the end of the plan.
 
-## The reach overlay on the phone
+## The reach overlay
 
 The **Reach** chip paints a translucent band over the preview: the part of the
 table a tap can actually be planned in. Everything except a few numbers is done
@@ -565,6 +596,11 @@ and `web/reach.js` orchestrates the overlay.
 The host adds one read-only route, `GET /reach.json`, which returns only what the
 browser cannot know: `K`, `dist`, `image_size`, `plane_z`, `hover_m`, `tip_m`,
 the tag's placement, and -- for a fixed camera -- `T_base_cam`.
+
+`/live` loads the same overlay unchanged. It is fixed-rig only, so it is the
+simplest case there: `T_base_cam` is a constant from `/reach.json`, the band is
+exact, and nothing has to be tracked or detected. With no rig fitted the canvas
+says so and the header reads "no fixed rig: fit one with Rig".
 
 ![The reach band over a real capture, with the pose solved in the browser](phone-reach.png)
 
@@ -578,11 +614,11 @@ Three numbers shape the band:
   the planner lifts the flange by `tip_m` for IK, so the band is the set of points
   whose *tip* can sit `hover_m` above the table. `--plane-z` moves it up or down
   with the worktop. Because the intersection is direct, x/y move along the ray as
-  the height changes. The phone's tap-and-drag gesture changes `hover_m` live
-  (10 cm default, up to 60 cm; the lower bound is the tip floor above); the band
-  is redrawn for the new height, which is why its inner edge moves as the badge
-  changes. A marker keeps the height it was tapped at, so the band describes the
-  next marker while older pins keep their own heights in the plan.
+  the height changes. The tap-and-drag gesture on either page changes `hover_m`
+  live (10 cm default, up to 60 cm; the lower bound is the tip floor above); the
+  band is redrawn for the new height, which is why its inner edge moves as the
+  badge changes. A marker keeps the height it was tapped at, so the band describes
+  the next marker while older pins keep their own heights in the plan.
 - **The tip has a floor.** The planner refuses a tip point below `min_z`, which
   defaults to `REBOT_HOVER_M` (10 cm). The capture server checks the same value
   before calling the gateway. On a worktop at `z = 0` the height badge therefore
@@ -664,10 +700,11 @@ band stays registered in portrait and landscape.
   systemd unit) aborts when motor 7 has a >0.15 rad position error and is moving
   <0.08 rad/s for 0.3 s, holds the measured opening for the return ramp, then
   ramps home. That is a stall guard, not a grip-force limit.
-- **The phone marker is solved on the frame it grabbed**, in the page: the
-  camera pose, the tap ray and the tip cannot drift apart. `/live` still uploads
-  an immutable frame to `locate_target.py`. A tap taken while the phone is moving
-  is a few hundred milliseconds old either way.
+- **A marker is solved in the page**, not on the host: the pose, the tap ray and
+  the height are one calculation, and on `/live` a marker sends nothing at all.
+  A one-point plan, calibration and the CLI upload an immutable frame instead --
+  which is also the only path the witness check can guard, so a marker placed
+  after a knock is caught by the next plan tap or capture.
 
 ## Troubleshooting
 
@@ -701,6 +738,12 @@ band stays registered in portrait and landscape.
 | tap: the edge answers 401 | `REBOT_EDGE_TOKEN` does not match `--token` on the board |
 | tap: the edge answers 503 on /pose | `can0` is down on the board; see the edge README |
 | `/live` tap: no "Move the arm" button | `REBOT_EXECUTE=0`; set it to 1 and `docker compose up -d` |
+| `/live` header: "host unreachable" | no token (open `/live?token=...` once) or the capture service is down; the dot is the `/health` poll |
+| `/live` header: "no fixed rig: fit one with Rig" | `/live` plans through a rig only: run the sweep (`Rig`, or `calibrate_extrinsics.py --auto`) and set `REBOT_EXTRINSICS` |
+| `/live` tap: "fixed mode needs a rig" | same thing from the server's side; nothing on that page can plan without `REBOT_EXTRINSICS` |
+| `/live` tap: "the camera moved since the extrinsics were fitted" | the witness caught a knock since the rig was fitted; refit, or put the bracket back |
+| `/live` markers do not mention the witness | markers are solved in the page from the rig constant; only a plan tap or a capture runs the witness, so refit if the bracket may have been knocked |
+| phone: there is no Rig button | by design: fitting is a workstation job, press **Rig** on `/live`, then **Camera** on the phone |
 
 ## Files
 
@@ -711,10 +754,10 @@ band stays registered in portrait and landscape.
 | `.env.example` | `REBOT_HOST_IP`, `REBOT_TOKEN`, `REBOT_PORT`, `REBOT_EXTRINSICS` |
 | `healthcheck.py` | compose healthcheck for the capture service |
 | `phone.html` | the phone page: numbered markers, Move arm, reach overlay, calibration, WHIP |
-| `live.html` | workstation viewer: WHEP playback and single-tap planning |
-| `viewer.js` | the tap -> capture -> plan -> execute panel used by `/live` and the phone's Rig button |
-| `markers.js` | numbered markers on the phone: pin, clear, up to 10 |
-| `locate.js` | browser ray-plane solve: pixel + camera pose -> arm-space tip |
+| `live.html` | workstation viewer: WHEP playback and fixed-rig planning, with the phone's reach band, height and numbered markers |
+| `viewer.js` | the `/live` tap panel (capture -> plan -> execute) and the Rig panel; the phone page only uses its camera-mode statics |
+| `markers.js` | numbered markers: pin, clear, up to 10, on the phone and on `/live` |
+| `locate.js` | browser ray-plane solve: pixel + camera pose -> arm-space tip (also the tip step `/live` reuses) |
 | `height.js` | tap-and-drag height gesture and the camera-row badge |
 | `ekf.js` | optional 15-state camera pose/bias EKF, enabled with `?filter=ekf`; default is tag-only |
 | `geometry.js` | shared matrices, camera model, projection, undistortion, ray/plane |
@@ -722,9 +765,9 @@ band stays registered in portrait and landscape.
 | `api.js` | token-aware GET/POST helpers with JSON/plain-text error parsing |
 | `video.js` | letterboxed client <-> camera pixels and frame capture |
 | `reach-config.js` | one cached `/reach.json` shared by the overlay and locator |
-| `reach.js` | the phone's reachable-band canvas and camera-pose orchestration |
+| `reach.js` | the reachable-band canvas and camera-pose orchestration, on both pages |
 | `aruco.js` | browser-side 4x4_50 detection and pose for the live handheld overlay |
-| `capture_server.py` | TLS endpoint, `/capture`, `/locate`, `/plan`, `/sequence`, `/execute`, calibration, WHIP/WHEP |
+| `capture_server.py` | TLS endpoint, `/capture`, `/plan`, `/sequence`, `/execute`, calibration, WHIP/WHEP |
 | `planner_server.py` | the arm gateway: edge `/pose`, one compact `/plan`, gated execution |
 | `make_cert.py` | local CA + leaf certificate for the phone |
 | `base_marker.py` | the printable marker sheet and its PnP (see `base-marker.md`) |

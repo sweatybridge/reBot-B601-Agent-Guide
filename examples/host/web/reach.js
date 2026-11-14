@@ -15,7 +15,9 @@
  * and, when a fixed-camera rig is fitted, `T_base_cam`. In handheld mode the
  * browser ArUco detector solves `T_base_cam`; between tag frames the phone IMU
  * propagates orientation from the gyro and translation from the tag-anchored
- * accelerometer. `setPose()` stays for the workstation tap path.
+ * accelerometer. A page that got a pose some other way can hand it over with
+ * `setPose()`; no page needs to today, because `/live` is fixed-rig only and the
+ * phone detects its own tag.
  *
  * Why the reach band is computed rather than guessed: the interesting shape is
  * not a circle. The arm cannot fold its wrist close to its own base while
@@ -56,6 +58,9 @@
     const canvas = options.canvas;
     const status = options.onStatus || function () {};
     const token = options.token || (() => "");
+    // A page that can hand the overlay a pose but cannot detect the tag itself
+    // (the workstation) says so, instead of repeating the phone's tag advice.
+    const poseHint = options.poseHint || "";
     const context = canvas.getContext("2d");
     const useEkf = POSE_FILTER !== "tag" && Boolean(window.RebotEkf);
     let ekf = null;
@@ -689,9 +694,9 @@
       const live = !fixed && livePose && (Date.now() - liveAt) < 3000;
       const chosen = fixed ? config.T_base_cam : (live ? predictedPose() : (lastPose || null));
       if (!chosen) {
-        drawEmpty(config.marker
+        drawEmpty(poseHint || (config.marker
           ? "point the camera at the base tag"
-          : "fit a fixed rig or configure the base tag");
+          : "fit a fixed rig or configure the base tag"));
         return;
       }
       const pose = matrixPose(chosen);

@@ -108,7 +108,6 @@
     text-align: center; padding: 24px; color: var(--dim); font-size: 14px; pointer-events: none;
   }
   #hint[hidden] { display: none; }
-  #marker[hidden] { display: none; }
 
   #log {
     flex: 0 0 auto; max-height: 23vh; overflow-y: auto;
@@ -198,9 +197,9 @@
           <b>Clear marker</b> removes the last one; Move arm is disabled with none.</li>
       <li>If the tag is not in frame a marker is refused rather than guessed. Turn the phone
           until it is, or switch to a fixed camera.</li>
-      <li><b>Fixed camera (optional).</b> Press <b>Camera</b> to switch, then <b>Rig</b> once:
-          capture one pose, tap the tool tip in it, and let the arm sweep eight poses. After that
-          markers need no tag.</li>
+      <li><b>Fixed camera (optional).</b> Fit the rig once from the workstation's
+          <code>/live</code> page (<b>Rig</b>), then press <b>Camera</b> here to switch. After
+          that markers need no tag.</li>
       <li><b>Calibration mode</b> turns the Move arm button back into <b>Capture</b> for
           checkerboard shots.</li>
       <li><b>Reach</b> paints the band of table markers can be planned in, at the current
@@ -216,6 +215,8 @@
 
 <script src="/api.js"></script>
 <script src="/video.js"></script>
+<!-- viewer.js for TapPlanner.setMode/getMode only: the tap panel and the Rig
+     button it creates belong to the workstation's /live page. -->
 <script src="/viewer.js"></script>
 <script src="/aruco.js"></script>
 <script src="/ekf.js"></script>
@@ -505,7 +506,9 @@ function buildMeta(width, height) {
     purpose: state.calib ? "calib" : "plan",
     capturedAt: new Date().toISOString(),
     image_size: [width, height],
-    tap: planner.point ? { u: planner.point.u, v: planner.point.v } : null,
+    // Only calibration clicks reach here, and they carry no tap: markers keep
+    // their own targets and are never uploaded as a capture.
+    tap: null,
     settings: {
       width: settings.width,
       height: settings.height,
@@ -672,16 +675,9 @@ const reachOverlay = window.ReachOverlay.create({
   onStatus: (message, kind) => log(escapeHtml(message), kind),
 });
 
-// The old tap-to-plan module is kept only for the Rig button it creates; its
-// tap handling is off. Markers own the stage now.
-const planner = TapPlanner.create({
-  video: video,
-  stage: stage,
-  token: () => state.token,
-  source: "phone",
-  onStatus: (message, kind) => log(escapeHtml(message), kind),
-});
-planner.disable();
+// No TapPlanner instance here: this page owns its own gestures, and the rig is
+// fitted from the workstation's /live page. Only the camera-mode statics are
+// shared, so nothing in this page creates the Rig panel.
 
 // The tap's tip point is solved in the page from the same camera pose the Reach
 // band uses; the capture server only enriches and forwards it.
@@ -810,7 +806,7 @@ cameraButton.addEventListener("click", () => {
   cameraButton.classList.toggle("on", next === "fixed");
   markersOverlay.clear();
   log(next === "fixed"
-    ? "fixed camera: markers use the rig (press Rig once if none is fitted)"
+    ? "fixed camera: markers use the rig fitted from /live"
     : "handheld: the base tag sets the camera for each marker", "warn");
 });
 calibButton.addEventListener("click", () => {

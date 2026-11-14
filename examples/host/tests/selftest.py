@@ -434,22 +434,6 @@ async def test_server(workdir: Path, geometry):
               abs(meta.get("tap", {}).get("u", 0) - geometry["pixel"][0]) < 0.01
               and meta.get("server", {}).get("bytes") == len(jpeg))
 
-        located = await client.post("/locate", json={"capture": body["id"], "mode": "handheld"},
-                                    headers={"X-Rebot-Token": "selftest-token"})
-        located_body = await located.json()
-        marker_target = located_body.get("target") or {}
-        marker_point = np.asarray(marker_target.get("point") or [0.0, 0.0, 0.0], dtype=float)
-        check("locate returns the marker point",
-              located.status == 200 and located_body.get("ok") is True
-              and float(np.linalg.norm(marker_point - geometry["point"])) < 0.003,
-              "%.2f mm" % (1000.0 * float(np.linalg.norm(marker_point - geometry["point"]))))
-        marker_pixel = marker_target.get("pixel") or [0.0, 0.0]
-        check("locate projects the target back onto the tap",
-              abs(marker_pixel[0] - geometry["pixel"][0]) < 3.0
-              and abs(marker_pixel[1] - geometry["pixel"][1]) < 3.0,
-              "(%.2f, %.2f) vs (%.2f, %.2f)" % (
-                  marker_pixel[0], marker_pixel[1],
-                  geometry["pixel"][0], geometry["pixel"][1]))
         # Compact tip targets: no capture/locate, no rebot-target envelope.
         compact = [
             {"tip": [0.5, 0.0, 0.16], "pixel": [640, 480]},

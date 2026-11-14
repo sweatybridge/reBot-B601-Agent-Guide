@@ -58,12 +58,13 @@ instead — which is unmistakable on the first tap.
 Every phone tap then: solves the tag in the page on the tapped frame, composes
 `T_base_cam` from those four numbers, and intersects the tap's ray with the
 plane at the selected height — **10 cm above the worktop** by default. The
-intersection moves along the ray as the height changes. (`/live` and the CLI
-still upload the frame and run the same PnP on the host; their hover is a
-vertical offset.) Tap and drag up or down on the preview to change that height;
-the badge next to the zoom chip shows the current value. Each marker keeps the
-height it was tapped at, so changing the badge later affects the next marker
-only; the plan carries each marker's own tip point.
+intersection moves along the ray as the height changes. (The workstation's
+`/live` page is fixed-rig only and never uses the tag: it reads the constant
+`T_base_cam` from `/reach.json` and runs the identical step with the phone's own
+helper, so the two views cannot drift.) Tap and drag up or down on the preview to
+change that height; the badge next to the zoom chip shows the current value. Each
+marker keeps the height it was tapped at, so changing the badge later affects the
+next marker only; the plan carries each marker's own tip point.
 
 No calibration session, and the phone can be picked up and moved between taps.
 

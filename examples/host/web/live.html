@@ -8,78 +8,375 @@
   :root { color-scheme: dark; }
   html, body { height: 100%; margin: 0; background: #0b0d10; color: #e8eaed;
     font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  body { display: flex; flex-direction: column; }
+  body { display: flex; flex-direction: column; -webkit-tap-highlight-color: transparent; }
   header { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
     border-bottom: 1px solid #262c34; background: #14181d; }
-  #dot { width: 9px; height: 9px; border-radius: 50%; background: #ff6b6b; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: #ff6b6b; flex: 0 0 auto; }
   #dot.ok { background: #45c98a; }
   #dot.wait { background: #f0b429; }
-  #state { color: #9aa4b2; margin-left: auto; font-variant-numeric: tabular-nums; }
-  main { flex: 1 1 auto; min-height: 0; background: #000; position: relative; }
+  .chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .chip { font: inherit; font-size: 12px; font-weight: 500; color: #e8eaed;
+    background: #1b2027; border: 1px solid #262c34; border-radius: 999px;
+    padding: 5px 10px; cursor: pointer; touch-action: manipulation; }
+  .chip.on { border-color: #4ea1ff; color: #4ea1ff; }
+  .chip[disabled] { opacity: .45; cursor: default; }
+  .height-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+    font-weight: 650; font-variant-numeric: tabular-nums; color: #04121f;
+    background: #4ea1ff; border-radius: 999px; padding: 5px 10px; white-space: nowrap;
+    user-select: none; -webkit-user-select: none;
+    transition: background .15s ease, transform .15s ease; }
+  .height-badge::before { content: "⇕"; font-size: 13px; line-height: 1; opacity: .7; }
+  .height-badge.adjusting { background: #f0b429; transform: scale(1.06); }
+  #state { color: #9aa4b2; margin-left: auto; font-variant-numeric: tabular-nums;
+    font-size: 13px; white-space: nowrap; }
+  main { flex: 1 1 auto; min-height: 0; background: #000; position: relative;
+    touch-action: none; user-select: none; -webkit-user-select: none; }
+  main.adjusting { cursor: ns-resize; }
   video { width: 100%; height: 100%; object-fit: contain; display: block; }
+  #reachCanvas { position: absolute; inset: 0; width: 100%; height: 100%; display: none;
+    pointer-events: none; z-index: 5; }
+  #reachCanvas.on { display: block; }
+  #markers { position: absolute; inset: 0; pointer-events: none; z-index: 6; }
+  #markers.disabled { opacity: .5; }
+  .seq-pin {
+    position: absolute; width: 30px; height: 30px; margin: -15px 0 0 -15px;
+    border: 2px solid #45c98a; border-radius: 50%;
+    background: rgba(11, 13, 16, .55); color: #45c98a;
+    font-size: 14px; font-weight: 700; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, .6), 0 2px 8px rgba(0, 0, 0, .45);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, .9);
+  }
+  .seq-pin.half { border-color: #f0b429; color: #f0b429; }
+  .seq-pin.far { outline: 2px solid #ff6b6b; outline-offset: 2px; }
   #hint { position: absolute; inset: 0; display: flex; align-items: center;
-    justify-content: center; color: #9aa4b2; text-align: center; padding: 24px; }
+    justify-content: center; color: #9aa4b2; text-align: center; padding: 24px;
+    pointer-events: none; }
   #hint[hidden] { display: none; }
   #tapStatus { min-height: 18px; padding: 0 14px; color: #9aa4b2; font-size: 12.5px; }
   footer { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid #262c34;
-    background: #14181d; }
-  button { font: inherit; font-weight: 600; padding: 10px 16px; border-radius: 10px;
+    background: #14181d; flex-wrap: wrap; }
+  footer button { font: inherit; font-weight: 600; padding: 10px 16px; border-radius: 10px;
     border: 1px solid #262c34; background: #1b2027; color: #e8eaed; cursor: pointer; }
-  button.primary { background: #4ea1ff; border-color: #4ea1ff; color: #04121f; }
-  button:disabled { opacity: .45; cursor: default; }
-  a { color: #4ea1ff; }
+  footer button.primary { background: #4ea1ff; border-color: #4ea1ff; color: #04121f; }
+  footer button:disabled { opacity: .45; cursor: default; }
 </style>
 </head>
 <body>
 <header>
   <span id="dot"></span>
   <strong>Phone preview</strong>
+  <span class="chips">
+    <span class="height-badge" id="heightBadge"
+          title="Drag up or down in the preview to set the arm height">10 cm</span>
+    <button class="chip" id="reach" type="button">Reach: off</button>
+    <button class="chip" id="tapMode" type="button">Tap: plan</button>
+    <button class="chip" id="clear" type="button" disabled>Clear marker</button>
+  </span>
   <span id="state">idle</span>
 </header>
-<main>
+<main id="stage">
   <video id="video" autoplay muted playsinline></video>
-  <div id="hint">Start the camera and "Live preview" on the phone, then connect. Tap the image to plan the arm to that point.</div>
+  <canvas id="reachCanvas" aria-hidden="true"></canvas>
+  <div id="markers" aria-hidden="true"></div>
+  <div id="hint">Start the camera and "Live preview" on the phone, then connect. This
+    page plans through the fitted rig: tap the image to plan one point, or switch to
+    <b>Tap: markers</b> to collect several and run them in one pass. Drag up or down to
+    set the arm's height.</div>
 </main>
-<div id="tapStatus"></div>
+<div id="tapStatus" aria-live="polite"></div>
 <footer>
-  <button class="primary" id="connect">Connect</button>
-  <button id="disconnect" disabled>Disconnect</button>
-  <a href="/" style="margin-left:auto;align-self:center">capture page</a>
+  <button class="primary" id="connect" type="button">Connect</button>
+  <button id="disconnect" type="button" disabled>Disconnect</button>
+  <button id="move" type="button" hidden>Move arm</button>
 </footer>
 <script src="/api.js"></script>
 <script src="/video.js"></script>
 <script src="/viewer.js"></script>
+<script src="/geometry.js"></script>
+<script src="/arm-model.js"></script>
+<script src="/reach-config.js"></script>
+<script src="/reach.js"></script>
+<script src="/locate.js"></script>
+<script src="/height.js"></script>
+<script src="/markers.js"></script>
 <script>
 "use strict";
-const video = document.getElementById("video");
-const hint = document.getElementById("hint");
-const dot = document.getElementById("dot");
-const stateText = document.getElementById("state");
-const tapStatus = document.getElementById("tapStatus");
-const connectButton = document.getElementById("connect");
-const disconnectButton = document.getElementById("disconnect");
+const $ = (selector) => document.querySelector(selector);
+const video = $("#video");
+const stage = $("#stage");
+const hint = $("#hint");
+const dot = $("#dot");
+const stateText = $("#state");
+const tapStatus = $("#tapStatus");
+const connectButton = $("#connect");
+const disconnectButton = $("#disconnect");
+const moveButton = $("#move");
+const reachButton = $("#reach");
+const tapModeButton = $("#tapMode");
+const clearButton = $("#clear");
+const reachCanvas = $("#reachCanvas");
+const markersContainer = $("#markers");
+const heightBadge = $("#heightBadge");
 
+// What the hint says when nothing is wrong. The health loop swaps it for the
+// disabled message and back, so a host restarted with --no-whip (or without it)
+// does not leave stale advice on screen.
+const HINT_START_HTML = hint.innerHTML;
+const HINT_DISABLED = "live preview is disabled on the host (--no-whip)";
+
+const state = {
+  token: "",
+  health: null,
+  tapMode: "plan",          // "plan": one tap plans one point; "markers": taps queue up
+  busy: false,
+  busyText: "",
+};
 let pc = null;
 let sessionUrl = null;
-let token = localStorage.getItem("rebot.token") || "";
 
-// Same module the phone page uses: tap the decoded stream, plan, optionally move.
-const planner = TapPlanner.create({
-  video: video,
-  stage: document.querySelector("main"),
-  token: () => token,
-  source: "live",
-  onStatus: (message, kind) => {
-    tapStatus.textContent = message;
-    tapStatus.style.color = kind === "bad" ? "#ff6b6b" : kind === "good" ? "#45c98a" : "#9aa4b2";
-  },
-});
-planner.enable();
+/* ------------------------------------------------------------------ utils */
+
+function status(message, kind) {
+  tapStatus.textContent = message;
+  tapStatus.style.color = kind === "bad" ? "#ff6b6b"
+    : kind === "good" ? "#45c98a"
+      : kind === "warn" ? "#f0b429" : "#9aa4b2";
+}
+
+function api(path, options) {
+  return RebotApi.request(path, Object.assign({ cache: "no-store" }, options || {}),
+    () => state.token);
+}
+
+// The token can arrive in the link -- a bookmark, or the URL the phone page was
+// handed -- so read it once, remember it, and take it back out of the address
+// bar. Every other request in this page goes through `api()` afterwards.
+function initToken() {
+  const query = new URLSearchParams(location.search);
+  const hash = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const token = query.get("token") || hash.get("token") || localStorage.getItem("rebot.token") || "";
+  if (token) {
+    state.token = token;
+    localStorage.setItem("rebot.token", token);
+  }
+  if (query.has("token") || hash.has("token")) {
+    history.replaceState({}, "", location.pathname);
+  }
+}
 
 function setState(text, kind) {
   stateText.textContent = text;
   dot.className = kind || "";
 }
+
+/* ---------------------------------------------------------------- server */
+
+// The host is polled, not probed once: a page opened before the stack is up (or
+// after a restart with a different flag) has to recover on its own.
+async function healthLoop() {
+  try {
+    const response = await api("/health");
+    if (!response.ok) throw new Error("health " + response.status);
+    const data = await response.json();
+    state.health = data;
+    // point.z is the tip. The lowest accepted tip is min_z, so the lowest tap
+    // height is that minus the worktop only; the flange offset does not enter.
+    const minZ = Number(data.min_z ?? data.hover_m ?? 0.10);
+    const planeZ = Number(data.plane_z ?? 0);
+    heightControl.setRange(Math.max(0, minZ - planeZ), window.HeightControl.MAX);
+    heightControl.adoptHeight(data.hover_m);
+  } catch (error) {
+    state.health = null;
+  }
+  renderHost();
+  setTimeout(healthLoop, 5000);
+}
+
+function renderHost() {
+  // While a media session exists, its own state owns the header and the button.
+  if (pc) return;
+  const health = state.health;
+  if (!health) {
+    setState("host unreachable", "");
+    connectButton.disabled = true;
+    return;
+  }
+  if (!health.whep) {
+    setState("live preview disabled on the host", "wait");
+    connectButton.disabled = true;
+    hint.hidden = false;
+    hint.textContent = HINT_DISABLED;
+    return;
+  }
+  if (hint.textContent === HINT_DISABLED && !video.videoWidth) {
+    hint.hidden = false;
+    hint.innerHTML = HINT_START_HTML;
+  }
+  // This page only plans in fixed camera mode, so a host without a rig has
+  // nothing to plan with yet. The video is still worth connecting to: the Rig
+  // panel and the framing check do not need it.
+  if (health.mode !== "fixed") {
+    setState("no fixed rig: fit one with Rig", "wait");
+    connectButton.disabled = false;
+    return;
+  }
+  setState("host ok" + (health.latest ? " / " + String(health.latest).slice(-6) : ""), "ok");
+  connectButton.disabled = false;
+}
+
+/* ----------------------------------------------------------------- wires */
+
+const reachOverlay = window.ReachOverlay.create({
+  video: video,
+  canvas: reachCanvas,
+  token: () => state.token,
+  onStatus: status,
+  // Fixed rigs only: the band comes from `T_base_cam` in /reach.json, and there
+  // is no detector here to invent a pose when one is missing.
+  poseHint: "no fixed rig fitted: press Rig, or run calibrate_extrinsics.py --auto",
+});
+
+// The workstation has no camera pose of its own, so every tap goes through the
+// fitted rig. Saying so explicitly (rather than letting the host fall back) makes
+// a host without one refuse with "fixed mode needs a rig" instead of quietly
+// asking for a base tag that this page cannot locate.
+TapPlanner.setMode("fixed");
+
+const planner = TapPlanner.create({
+  video: video,
+  stage: stage,
+  token: () => state.token,
+  source: "live",
+  height: () => heightControl.height,
+  onStatus: status,
+});
+// One owner for the stage: the height control tells a tap from a drag and routes
+// the tap, so the planner must not also listen for pointerdown.
+planner.disable();
+
+// A tap adds a marker (or plans one point), a drag sets the arm's height above
+// the tapped place. The badge and the reach band follow it.
+const heightControl = window.HeightControl.create({
+  stage: stage,
+  badge: heightBadge,
+  initial: 0.10,
+  onTap: (x, y) => {
+    if (state.tapMode === "markers") {
+      markersOverlay.addAt(x, y);
+      return;
+    }
+    const tapped = RebotVideo.videoPoint(video, x, y);
+    if (!tapped) return;
+    planner.mark(tapped);
+    planner.plan(tapped);
+  },
+  onChange: (height) => reachOverlay.setHeight(height),
+  onStatus: status,
+});
+reachOverlay.setHeight(heightControl.height);
+
+const markersOverlay = window.MarkerSequence.create({
+  video: video,
+  stage: stage,
+  pins: markersContainer,
+  onStatus: status,
+  onChange: () => renderAction(),
+  project: (point) => reachOverlay.projectPoint(point),
+  height: () => heightControl.height,
+  locate: (tap, height) => locateHere(tap, height),
+});
+
+// A fixed rig makes the pose a constant, so a marker needs no round trip at all:
+// the same calibration and the same ray-to-raised-plane step the phone page runs,
+// from `T_base_cam` in /reach.json. The trade is the witness check, which lives on
+// the capture path -- a plan-mode tap still gets it, a marker does not (neither
+// does a marker on the phone).
+async function locateHere(tap, height) {
+  const config = await window.RebotConfig.load(() => state.token);
+  if (!Array.isArray(config.T_base_cam)) {
+    throw new Error("no fixed rig fitted: press Rig, or run calibrate_extrinsics.py --auto");
+  }
+  const tip = window.BrowserLocate.tipTarget(config.calibration, config.T_base_cam,
+    tap.u, tap.v, config.plane_z, height, video.videoWidth, video.videoHeight);
+  return { tip: tip.tip, pixel: tip.pixel, tap: tip.tap };
+}
+
+/* --------------------------------------------------------------- actions */
+
+function renderAction() {
+  const markers = state.tapMode === "markers";
+  moveButton.hidden = !markers;
+  moveButton.textContent = state.busy ? (state.busyText || "Planning...") : "Move arm";
+  moveButton.disabled = state.busy || markersOverlay.busy || markersOverlay.count === 0;
+  clearButton.disabled = state.busy || markersOverlay.count === 0;
+  tapModeButton.disabled = state.busy;
+}
+
+function applyTapMode() {
+  const markers = state.tapMode === "markers";
+  tapModeButton.textContent = "Tap: " + (markers ? "markers" : "plan");
+  tapModeButton.classList.toggle("on", markers);
+  markersOverlay.setEnabled(markers);
+  // Each mode's targets must not survive the switch: a stale "Move the arm"
+  // panel, or markers for points the operator has moved past, is worse than
+  // starting clean.
+  if (markers) planner.clear();
+  else markersOverlay.clear();
+  renderAction();
+}
+
+async function startSequence() {
+  if (state.busy || markersOverlay.count === 0) return;
+  state.busy = true;
+  state.busyText = "Planning...";
+  markersOverlay.setEnabled(false);
+  heightControl.setEnabled(false);
+  renderAction();
+  try {
+    const response = await api("/sequence", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targets: markersOverlay.targets }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || ("sequence failed: " + response.status));
+    }
+    const plan = data.plan || {};
+    const summary = plan.summary || {};
+    status("planned " + (summary.markers || markersOverlay.count) + " markers · "
+      + (summary.waypoints || 0) + " waypoints · "
+      + Number(summary.duration_s || 0).toFixed(1) + " s", "good");
+    if (!data.execute) {
+      status("execution is off on the host; the trajectory is written to out/ only", "warn");
+      return;
+    }
+    state.busyText = "Moving...";
+    renderAction();
+    status("starting " + plan.id + " on the arm", "warn");
+    const answer = await api("/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: plan.id }),
+    });
+    const result = await answer.json().catch(() => ({}));
+    if (!answer.ok || result.ok === false) {
+      throw new Error(result.error || ("execute failed: " + answer.status));
+    }
+    status("arm finished: " + plan.id, "good");
+  } catch (error) {
+    status("sequence failed: " + error.message, "bad");
+  } finally {
+    state.busy = false;
+    state.busyText = "";
+    markersOverlay.setEnabled(state.tapMode === "markers");
+    heightControl.setEnabled(true);
+    renderAction();
+  }
+}
+
+/* ----------------------------------------------------------------- live */
 
 function waitForIce(connection, milliseconds) {
   if (connection.iceGatheringState === "complete") return Promise.resolve();
@@ -122,12 +419,11 @@ async function connect() {
   try {
     await connection.setLocalDescription(await connection.createOffer());
     await waitForIce(connection, 2500);
-    const response = await fetch("/whep", {
+    const response = await RebotApi.request("/whep", {
       method: "POST",
-      headers: Object.assign({ "Content-Type": "application/sdp" },
-        RebotApi.headers(token)),
+      headers: { "Content-Type": "application/sdp" },
       body: connection.localDescription.sdp,
-    });
+    }, () => state.token);
     if (!response.ok) throw new Error("whep " + response.status + ": " + (await response.text()).slice(0, 120));
     sessionUrl = response.headers.get("Location");
     await connection.setRemoteDescription({ type: "answer", sdp: await response.text() });
@@ -137,9 +433,10 @@ async function connect() {
     setState("failed", "");
     hint.hidden = false;
     hint.textContent = String(error.message || error);
-    disconnect();
+    await disconnect();
   } finally {
-    connectButton.disabled = false;
+    if (pc) connectButton.disabled = true;
+    else renderHost();
   }
 }
 
@@ -157,31 +454,56 @@ async function disconnect() {
     const session = String(url).split("/").filter(Boolean).pop();
     if (session) {
       try {
-        await fetch("/whep/" + encodeURIComponent(session), {
+        await RebotApi.request("/whep/" + encodeURIComponent(session), {
           method: "DELETE",
-          headers: RebotApi.headers(token),
-        });
+        }, () => state.token);
       } catch (error) { /* best effort */ }
     }
   }
   setState("idle", "");
+  renderHost();
 }
 
 connectButton.addEventListener("click", connect);
 disconnectButton.addEventListener("click", disconnect);
-
-(async () => {
-  try {
-    const health = await (await fetch("/health", { cache: "no-store" })).json();
-    if (!health.whep) {
-      hint.textContent = "live preview is disabled on the host (--no-whip)";
-      connectButton.disabled = true;
-      return;
-    }
-  } catch (error) {
-    hint.textContent = "cannot reach the capture server";
+moveButton.addEventListener("click", startSequence);
+reachButton.addEventListener("click", () => {
+  const on = reachOverlay.toggle();
+  reachButton.textContent = "Reach: " + (on ? "on" : "off");
+  reachButton.classList.toggle("on", on);
+  if (!on) {
+    status("reach band off", "warn");
+    return;
   }
-})();
+  const fixed = state.health && state.health.mode === "fixed";
+  status(fixed
+    ? "reach band on: the shaded ring is where a point can be planned"
+    : "reach band needs a fixed rig: press Rig, or run calibrate_extrinsics.py --auto",
+    fixed ? "good" : "warn");
+});
+tapModeButton.addEventListener("click", () => {
+  if (state.busy) {
+    status("wait for the sequence to finish", "warn");
+    return;
+  }
+  state.tapMode = state.tapMode === "markers" ? "plan" : "markers";
+  applyTapMode();
+  status(state.tapMode === "markers"
+    ? "taps add numbered markers; Move arm runs them in order"
+    : "taps plan one point; Move the arm from the plan panel", "warn");
+});
+clearButton.addEventListener("click", () => {
+  if (markersOverlay.clearLast()) {
+    status("last marker cleared", "warn");
+  } else {
+    status(markersOverlay.busy ? "still locating a marker" : "no markers to clear", "warn");
+  }
+  renderAction();
+});
+
+initToken();
+applyTapMode();
+healthLoop();
 </script>
 </body>
 </html>
