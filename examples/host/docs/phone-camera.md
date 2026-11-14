@@ -33,6 +33,10 @@ phone page (tap) ─┐
                              [Move the arm] ──────────────┴─► POST /play ─► rebot-edge
 ```
 
+The geometry and the planner are shared; the UI on top differs. The phone
+collects numbered markers and **Move arm** turns them into one pass, while `/live`
+keeps the single-tap plan and its two-step Move button.
+
 ## First, prove it on your machine
 
 ```bash
@@ -43,7 +47,7 @@ docker compose -f examples/host/compose.yaml --profile tools run --rm tools test
 python examples/host/tests/selftest.py
 ```
 
-77 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
+150 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
 tag recovers a known 3D point to a fraction of a millimetre, a camera pose is
 recovered from eight synthetic arm poses with a 30 px mis-click in the set, a
 capture round-trips through the real HTTP server, and the trajectory payload is
@@ -358,6 +362,8 @@ the arm. Nothing is typed and there is no second path.
 | `POST /calibrate/extrinsics` | `{confirm, capture, u, v}` sweeps, fits, verifies, writes |
 | `GET /calibrate` | running state, progress, the last verdict, the current rig |
 | `GET /reach.json` | `K`, `dist`, plane/hover, the tag placement, and `T_base_cam` for the phone's reach overlay |
+| `POST /locate` | `{capture, mode}` -> the base-frame point for one marker |
+| `POST /sequence` | `{targets:[...]}` -> a multi-marker trajectory from the gateway's `/plan-sequence` |
 
 Three gates, because this moves the arm with nobody at the panel: `REBOT_EXECUTE=1`
 on the host, `--allow-execute` on the edge, and `"confirm": true` in the body.
@@ -409,36 +415,48 @@ Calibration is per camera, per resolution, **and per zoom**. The page reports
 or don't zoom. `calib.load()` rescales `K` between resolutions of the same aspect
 ratio and refuses to cross a crop.
 
-## Tap the object
+## Markers, then Move arm
 
-Tap the object in either viewport -- the phone page or the workstation's `/live`
-page. The tap is a complete transaction:
+On the phone a tap no longer plans. It captures that exact frame, locates the
+pixel in the base frame and pins a numbered marker on the preview. Up to ten;
+**Clear marker** removes the last one. **Move arm** is disabled until at least
+one marker is on screen. Odd markers are amber (the gripper will half-close);
+even markers are green (it will open).
+
+![Numbered markers on the phone](phone-markers.png)
 
 ```
-tap (u,v)
-  -> the page grabs that exact video frame to a JPEG     (/capture)
-  -> capture_server runs locate_target.py on it          (/plan)
-  -> arm gateway reads GET /pose, plans, writes           (planner:8000)
-  -> the panel shows target, waypoints, worst IK, peak tau
-  -> [Move the arm] -> two-step confirm -> gateway scp + rebot-edge --execute
+marker tap (u,v)
+  -> the page grabs that exact frame                    (/capture)
+  -> capture_server runs locate_target.py on it         (/locate)
+  -> the marker is numbered and its base point kept
+Move arm
+  -> all targets become one multi-marker pass           (/sequence -> /plan-sequence)
+  -> the arm visits them in order, holds at each
+  -> the trajectory runs                                (/execute -> POST /play)
 ```
 
-Nothing is typed and nothing is reordered by hand. The frame that was tapped is
-saved next to its `target.json` and its trajectory, so a bad move can be
-replayed and understood afterwards.
+The gripper starts fully open -- it opens before the arm leaves its first pose
+-- half-closes at odd-numbered markers and opens at even-numbered ones. The pass
+finishes back at the pose it started from, so odd/even on screen is the whole
+rule. Between markers the arm moves in joint space (checked against the table
+capsule), and the tool yaw follows each marker's direction from the base, which
+is the free-yaw envelope the reach band draws.
+
+The **execution gate is unchanged**: with `REBOT_EXECUTE=0` the Move arm call
+still plans and writes `out/<id>.json`, but does not move; the log says so. With
+execution enabled, Move arm is the one deliberate action that moves the arm (the
+two-step confirm that belongs to the single-tap panel is not part of this flow).
+The edge still re-checks limits and steps.
 
 - **One of two things supplies the extrinsics.** With `REBOT_EXTRINSICS` set, a
   fitted rig does, and nothing else has to be in frame. Without it, the tag must
-  be visible in the same frame as the object, on every tap.
-- **Execution is off by default.** `REBOT_EXECUTE=0` means taps produce plans in
-  `out/` and nothing moves. Set it to 1 in `.env` and start the edge with
-  `--allow-execute` to get the button; it still asks twice.
-- **Every plan is also a file.** `out/<id>.json` is the same trajectory the CLI
-  writes, so `rebot-edge --check` works on it without the browser.
-
-Two viewers, one module (`viewer.js`): the phone uses its own camera stream, the
-workstation uses the WebRTC stream from MediaMTX, and both post the frame they
-were looking at.
+  be visible in the same frame as the marker, on every marker tap.
+- **Every plan is also a file.** `out/<id>.json` is a normal trajectory, so
+  `rebot-edge --check` works on it without the browser.
+- **The workstation's `/live` page still taps once** and plans one point with
+  `viewer.js`; that panel is unchanged. The phone's `viewer.js` instance is
+  disabled and kept only for the **Rig** button.
 
 If you would rather drive it from a shell, the same three steps exist as
 commands:
@@ -532,9 +550,9 @@ Chrome a detection takes about 25-80 ms at 810x1440, and the page runs it about
 three times a second, so the band follows a moving phone without a tap. Against
 the twelve stored bench captures, ten recovered to **17-43 mm and 0.7-2.7 deg**;
 the two misses are marginal views where the tag is small or partly merged with
-the base. A missed frame keeps the last pose for 1.2 s, then the overlay falls
-back to the pose of the last plan; with neither, it says to point the camera at
-the tag.
+the base. A missed frame keeps the last pose for **3 s**; after that the band is
+cleared, and it reappears when the tag is found again. A fixed rig never needs
+the tag, so it never clears.
 
 The browser detector knows **4x4_50, id 0** only -- what `base-marker.pdf`
 prints. A different tag needs the fixed rig. A fitted rig is also more accurate
@@ -565,14 +583,15 @@ band stays registered in portrait and landscape.
   about the fixed RGB-D; use this for "wipe here", "pick that", not for
   sub-millimetre placement.
 - **IK is accepted by the pose it reached**, not by the solver's success flag: a
-  result within 2 mm and 0.5 deg is kept (`--ik-pos-tol`), which is well inside
-  the arm's own 23 mm repeatability. A miss beyond that is refused with the
-  distance it got to, usually because the target is near a reach limit from the
-  pose that was dumped.
+  single tap keeps a result within 2 mm and 0.5 deg (`--ik-pos-tol`), and a
+  marker sequence allows 10 mm because a marker can sit closer to the reach
+  boundary; both are well inside the arm's own 23 mm repeatability. A miss
+  beyond that is refused with the distance it got to.
 - **Nothing here is a safety function.** The arm still only moves on
   `--execute`, after `--check`, with the limits re-verified on the edge. The
-  gateway's own gate (`REBOT_EXECUTE=1`) and the two-step button are there to
-  make an accidental tap harmless, not to make the arm safe.
+  gateway's own gate (`REBOT_EXECUTE=1`), the `/live` two-step button, and the
+  phone's deliberate **Move arm** are there to make an accidental tap harmless,
+  not to make the arm safe.
 - **The frame is the one you saw**, decoded in the browser, not a fresh one from
   the server: a tap and its pixels cannot drift apart. The cost is that a tap
   taken while the phone is moving is a few hundred milliseconds old.
@@ -608,7 +627,7 @@ band stays registered in portrait and landscape.
 | tap: "cannot reach the edge" | the board is not running `rebot-edge serve`, or `REBOT_EDGE_URL` is wrong |
 | tap: the edge answers 401 | `REBOT_EDGE_TOKEN` does not match `--token` on the board |
 | tap: the edge answers 503 on /pose | `can0` is down on the board; see the edge README |
-| tap: no "Move the arm" button | `REBOT_EXECUTE=0`; set it to 1 and `docker compose up -d` |
+| `/live` tap: no "Move the arm" button | `REBOT_EXECUTE=0`; set it to 1 and `docker compose up -d` |
 
 ## Files
 
@@ -618,13 +637,14 @@ band stays registered in portrait and landscape.
 | `Dockerfile` | the capture server and every one-shot tool, in one image |
 | `.env.example` | `REBOT_HOST_IP`, `REBOT_TOKEN`, `REBOT_PORT`, `REBOT_EXTRINSICS` |
 | `healthcheck.py` | compose healthcheck for the capture service |
-| `phone.html` | the page on the phone: preview, tap-to-plan, calibration mode, WHIP |
-| `live.html` | workstation viewer: WHEP playback and the same tap-to-plan |
-| `viewer.js` | shared tap -> capture -> plan -> execute panel |
+| `phone.html` | the phone page: numbered markers, Move arm, reach overlay, calibration, WHIP |
+| `live.html` | workstation viewer: WHEP playback and single-tap planning |
+| `viewer.js` | the tap -> capture -> plan -> execute panel used by `/live` and the phone's Rig button |
+| `markers.js` | numbered markers on the phone: capture, locate, pin, clear, up to 10 |
 | `reach.js` | the phone's reachable-band canvas overlay (IK + projection, in the page) |
 | `aruco.js` | browser-side 4x4_50 detection and pose for the live handheld overlay |
-| `capture_server.py` | TLS endpoint, `/capture`, `/plan`, `/execute`, the calibration routes, WHIP/WHEP relay |
-| `planner_server.py` | the arm gateway: edge `/pose`, planning, gated execution |
+| `capture_server.py` | TLS endpoint, `/capture`, `/locate`, `/plan`, `/sequence`, `/execute`, calibration, WHIP/WHEP |
+| `planner_server.py` | the arm gateway: edge `/pose`, `/plan`, `/plan-sequence`, gated execution |
 | `make_cert.py` | local CA + leaf certificate for the phone |
 | `base_marker.py` | the printable marker sheet and its PnP (see `base-marker.md`) |
 | `calibrate_intrinsics.py` | checkerboard fit -> `calib/<device>.json` |
@@ -635,7 +655,7 @@ band stays registered in portrait and landscape.
 | `auto_calibrate.py` | drives the sweep, grabs the stills, finds the tip, verifies |
 | `camera.py` | where an automatic still comes from: RTSP, HTTP snapshot, device |
 | `locate_target.py` | capture -> `target.json` (rig or PnP, + table plane), annotated JPEG |
-| `plan_to_target.py` | the planner: target + pose -> trajectory JSON, CLI and gateway |
+| `plan_to_target.py` | the planner: target(s) + pose -> trajectory JSON, including the marker sequence |
 | `traj.py` | payload assembly + the player's schema checks, no Pinocchio |
 | `selftest.py` | offline proof of all of the above |
 | `browser_check.py` | drives the page in headless Chrome: tap, capture, check the file |

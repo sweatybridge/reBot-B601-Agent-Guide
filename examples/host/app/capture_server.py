@@ -165,6 +165,15 @@ async def handle_aruco_js(request: web.Request) -> web.StreamResponse:
                         headers={"Cache-Control": "no-store"})
 
 
+async def handle_markers_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "markers.js"
+    if not script.is_file():
+        return web.Response(text="markers.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
 async def _page(request: web.Request, name: str) -> web.StreamResponse:
     page = WEB_DIR / name
     if not page.is_file():
@@ -510,6 +519,95 @@ async def planner_call(app, path, body, timeout=120, method="POST"):
         return 502, {"ok": False,
                      "error": "cannot reach the arm gateway at %s (%s)" % (url, exc),
                      "unreachable": True}
+
+
+async def handle_locate(request: web.Request) -> web.Response:
+    """One capture -> one base-frame point, without asking the planner for a plan.
+
+    The marker UI needs the point as soon as the user taps, so it can number the
+    marker and show whether it is reachable. This is the same `locate_target.py`
+    the plan route runs; only the planner call is missing.
+    """
+    app = request.app
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
+
+    capture_id = str(body.get("capture") or "")
+    if not CAPTURE_ID.match(capture_id):
+        raise web.HTTPBadRequest(text="'capture' must be a capture id")
+    directory = app["captures"] / capture_id
+    if not (directory / "frame.jpg").is_file():
+        raise web.HTTPNotFound(text="no frame for %s" % capture_id)
+
+    calibration = resolve_calibration(app, body.get("calib"))
+    try:
+        options = locate_options(app, body)
+    except locator.LocateError as error:
+        return web.json_response({"ok": False, "stage": "locate", "capture": capture_id,
+                                  "error": str(error)}, status=422)
+    options.annotate = ""
+
+    try:
+        target = await asyncio.to_thread(locator.locate_capture, directory, calibration, options)
+    except locator.LocateError as error:
+        logging.info("locate %s: %s", capture_id, error)
+        return web.json_response({"ok": False, "stage": "locate", "capture": capture_id,
+                                  "error": str(error)}, status=422)
+    except Exception as error:  # noqa: BLE001 - a bad calibration must not kill the server
+        logging.exception("locate %s crashed", capture_id)
+        return web.json_response({"ok": False, "stage": "locate", "capture": capture_id,
+                                  "error": "%s: %s" % (type(error).__name__, error)}, status=500)
+    target.pop("_out", None)
+    return web.json_response({"ok": True, "capture": capture_id, "target": target})
+
+
+async def handle_sequence(request: web.Request) -> web.Response:
+    """Plan one hover pass through the markers the phone collected."""
+    app = request.app
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
+
+    targets = body.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise web.HTTPBadRequest(text="'targets' must be a non-empty list")
+    if len(targets) > 20:
+        raise web.HTTPBadRequest(text="a marker sequence is limited to 20 targets")
+    for index, target in enumerate(targets, start=1):
+        if not isinstance(target, dict) or target.get("format") != "rebot-target":
+            raise web.HTTPBadRequest(text="target %d is not a rebot-target" % index)
+        point = target.get("point")
+        if not isinstance(point, list) or len(point) != 3:
+            raise web.HTTPBadRequest(text="target %d has no [x, y, z] point" % index)
+
+    plan_options = {
+        "tool_axis": app["tool_axis"],
+        "yaw": float(body.get("yaw", app["yaw"])),
+        "hover": True,
+        "hover_m": float(body.get("hover_m", app["hover_m"])),
+        "tip_m": float(body.get("tip_m", app["tip_m"])),
+    }
+    plan_options.update(body.get("options") or {})
+
+    status, payload = await planner_call(app, "/plan-sequence",
+                                        {"targets": targets, "options": plan_options},
+                                        timeout=300)
+    if status != 200:
+        return web.json_response({"ok": False, "stage": "plan",
+                                  "error": payload.get("error", "sequence plan failed")},
+                                 status=status)
+
+    logging.info("sequence plan %s: %s markers", payload.get("id"),
+                 (payload.get("summary") or {}).get("markers"))
+    return web.json_response({
+        "ok": True,
+        "plan": payload,
+        # Both gates must agree: the host's --execute and the gateway's.
+        "execute": bool(app["execute"] and payload.get("execute", True)),
+    })
 
 
 async def handle_plan(request: web.Request) -> web.Response:
@@ -929,7 +1027,9 @@ def build_app(args) -> web.Application:
     app.router.add_get("/reach.json", handle_reach)
     app.router.add_get("/captures.json", handle_captures)
     app.router.add_post("/capture", handle_capture)
+    app.router.add_post("/locate", handle_locate)
     app.router.add_post("/plan", handle_plan)
+    app.router.add_post("/sequence", handle_sequence)
     app.router.add_post("/execute", handle_execute)
     app.router.add_get("/pose", handle_pose)
     app.router.add_post("/calibrate/extrinsics", handle_calibrate)
@@ -938,6 +1038,7 @@ def build_app(args) -> web.Application:
     app.router.add_get("/viewer.js", handle_viewer_js)
     app.router.add_get("/reach.js", handle_reach_js)
     app.router.add_get("/aruco.js", handle_aruco_js)
+    app.router.add_get("/markers.js", handle_markers_js)
     app.router.add_get("/captures/{id}/{name}", handle_file)
     app.router.add_get("/favicon.ico", handle_favicon)
     if not args.no_whip:

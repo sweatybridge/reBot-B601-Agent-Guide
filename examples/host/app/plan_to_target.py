@@ -50,10 +50,14 @@ from reBotArm_control_py.kinematics.robot_model import (
 from reBotArm_control_py.trajectory import IKParams
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sweep  # noqa: E402
 import traj  # noqa: E402
 
 MOTOR7_OPEN = 4.90
 MOTOR7_CLOSED = -0.015
+# Halfway between open and closed: the gesture the marker sequence makes on
+# odd-numbered markers.
+MOTOR7_HALF = (MOTOR7_OPEN + MOTOR7_CLOSED) / 2.0
 TOOL_AXES = {
     "x+": (0, 1.0), "x-": (0, -1.0),
     "y+": (1, 1.0), "y-": (1, -1.0),
@@ -430,6 +434,293 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         "unparked": unparked,
     }
     return payload, summary
+
+
+def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = print):
+    """Hover through a list of tapped points, in order, as one trajectory.
+
+    This is the multi-marker form of the hover plan: each target is visited at
+    `hover_m` above the table, the arm holds there while the gripper moves, and
+    the pass finishes back at the pose it started from. The gripper starts fully
+    open; it half-closes at odd-numbered markers and opens at even-numbered ones.
+    The motion is the same cosine-eased Cartesian leg the single-tap plan uses,
+    so the speeds and the edge's step checks are unchanged.
+    """
+    if not isinstance(targets, (list, tuple)) or not targets:
+        raise PlanError("a marker sequence needs at least one target")
+    if len(targets) > 20:
+        raise PlanError("a marker sequence is limited to 20 targets")
+
+    model = load_robot_model(options.urdf or None)
+    frame = get_end_effector_frame_id(model)
+    n_arm = get_arm_joint_count(model, frame)
+    if n_arm != 6:
+        raise PlanError("expected 6 arm joints, model has %d" % n_arm)
+
+    if options.payload > 0.0:
+        tip = model.frames[frame]
+        model.appendBodyToJoint(
+            tip.parentJoint,
+            pin.Inertia(options.payload, np.zeros(3), np.zeros((3, 3))),
+            tip.placement,
+        )
+
+    q_start, gripper_start = posture(dump)
+    lower = np.asarray(model.lowerPositionLimit[:n_arm], dtype=float)
+    upper = np.asarray(model.upperPositionLimit[:n_arm], dtype=float)
+    q_start = np.clip(q_start, lower, upper)
+    q = pad_q_for_model(model, q_start, n_arm)
+    _, R0, T0 = compute_fk(model, q)
+    p0 = T0[:3, 3].copy()
+    p_start = p0.copy()
+
+    # Validate everything before the first move: a bad marker halfway through a
+    # sequence must not leave the arm somewhere unexpected.
+    points = []
+    for index, target in enumerate(targets, start=1):
+        point = validate_target_meta(target)
+        radius = float(np.linalg.norm(point[:2]))
+        judged = point + np.array([0.0, 0.0, float(options.hover_m)])
+        if judged[2] < options.min_z:
+            raise PlanError("marker %d: target z %.4f is below --min-z %.4f"
+                            % (index, judged[2], options.min_z))
+        if judged[2] > options.max_z:
+            raise PlanError("marker %d: target z %.3f is above --max-z %.3f"
+                            % (index, judged[2], options.max_z))
+        if radius > options.max_reach:
+            raise PlanError("marker %d: target is %.3f m from the base axis, above "
+                            "--max-reach %.2f" % (index, radius, options.max_reach))
+        points.append(point)
+
+    # With `--tool-axis current` the single-tap plan holds the start
+    # orientation, including its yaw. A marker sequence can do better: the
+    # gripper yaw follows the marker's direction from the base, which is the
+    # free-yaw envelope the reach overlay draws. `z-` is the reference arm's
+    # down axis at the parked pose; an explicit axis is used as given.
+    sequence_axis = "z-" if options.tool_axis == "current" else options.tool_axis
+    ik_params = IKParams(max_iter=300, tolerance=1e-6, damping=1e-8, step_size=1.0)
+    worst = {"residual": 0.0, "where": ""}
+
+    def ik_to(place, rotation, seed, label):
+        result = solve_ik(model, model.createData(), frame,
+                          pos_rot_to_se3(place, rotation), seed, ik_params,
+                          controlled_joints=n_arm)
+        solution = pad_q_for_model(model, result.q, n_arm) if result.q is not None else None
+
+        position_error, angle_error = 1e9, 1e9
+        if solution is not None:
+            _, reached_rotation, reached = compute_fk(model, solution)
+            position_error = float(np.linalg.norm(reached[:3, 3] - place))
+            cosine = (np.trace(reached_rotation.T @ rotation) - 1.0) / 2.0
+            angle_error = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+
+        accepted = (solution is not None
+                    and (result.success
+                         or (position_error <= options.ik_pos_tol
+                             and angle_error <= options.ik_angle_tol)))
+        if not accepted:
+            raise PlanError(
+                "IK failed at [%.3f %.3f %.3f] m (%s): %s; reached %.4f m / %.2f deg off. "
+                "The marker is probably out of reach from this pose."
+                % (place[0], place[1], place[2], label,
+                   getattr(result, "message", "no solution") or "no solution",
+                   position_error, angle_error))
+
+        if position_error > worst["residual"]:
+            worst["residual"] = position_error
+            worst["where"] = label
+        for index in range(n_arm):
+            if solution[index] < lower[index] - traj.LIMIT_TOL or solution[index] > upper[index] + traj.LIMIT_TOL:
+                raise PlanError("IK returned joint %d = %.3f rad at %s, outside its limits [%.3f, %.3f]"
+                                % (index + 1, solution[index], label, lower[index], upper[index]))
+        return solution
+
+    period = 1.0 / options.hz
+    waypoints = []
+    state = {"t": 0.0}
+
+    def append(q_model, gripper):
+        gravity = compute_generalized_gravity(model=model, q=q_model)
+        waypoints.append(traj.waypoint(
+            state["t"], list(q_model[:n_arm]) + [float(gripper)],
+            [float(v) for v in gravity[:n_arm]] + [0.0]))
+
+    def hold(seconds, gripper):
+        count = max(1, int(round(seconds * options.hz)))
+        for _ in range(count):
+            state["t"] += period
+            append(pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float),
+                                   n_arm), gripper)
+
+    def gripper_leg(target, seconds):
+        count = max(1, int(round(seconds * options.hz)))
+        current = waypoints[-1]["q"][6]
+        for index in range(1, count + 1):
+            state["t"] += period
+            angle = current + (target - current) * ease(index / count)
+            waypoints.append(traj.waypoint(
+                state["t"], waypoints[-1]["q"][:6] + [angle], waypoints[-1]["tau"]))
+
+    def joint_leg(base_q, delta, seconds, label, gripper):
+        base = np.array(base_q[:n_arm], dtype=float)
+        count = max(1, int(round(seconds * options.hz)))
+        for index in range(1, count + 1):
+            state["t"] += period
+            fraction = ease(index / count)
+            target_q = base + np.array([delta.get(k, 0.0) for k in range(n_arm)]) * fraction
+            append(pad_q_for_model(model, target_q, n_arm), gripper)
+        if not options.quiet:
+            log("  %-11s: %d waypoints" % (label, count))
+        return pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float), n_arm)
+
+    def cartesian(start, end, rotation_from, rotation_to, seconds, blend_fraction, seed,
+                  label, gripper):
+        count = max(1, int(round(seconds * options.hz)))
+        for index in range(1, count + 1):
+            state["t"] += period
+            fraction = ease(index / count)
+            place = start + (end - start) * fraction
+            rotation = blend_rotation(rotation_from, rotation_to,
+                                      min(1.0, fraction / max(1e-6, blend_fraction)))
+            seed = ik_to(place, rotation, seed, "%s %d/%d" % (label, index, count))
+            append(seed, gripper)
+        return seed
+
+    # The edge starts from the arm's current gripper angle, so a closed gripper
+    # would jump open on the first waypoint. Hold still and ramp it open first.
+    gripper_start = float(gripper_start)
+    if abs(gripper_start - MOTOR7_OPEN) > 1e-6:
+        state["t"] += period
+        append(q.copy(), gripper_start)
+        gripper_leg(MOTOR7_OPEN, max(0.8, options.hold_s))
+    gripper = MOTOR7_OPEN
+
+    seed = q.copy()
+    unpark = {1: math.radians(options.unpark_j2), 2: math.radians(options.unpark_j3)}
+    unparked = any(abs(value) > 1e-9 for value in unpark.values())
+    if unparked:
+        seed = joint_leg(q.copy(), unpark, options.unpark_s, "unpark", gripper)
+        _, R0, T_unparked = compute_fk(model, seed)
+        p0 = T_unparked[:3, 3].copy()
+    start_seed = seed.copy()
+
+    current_place = p0.copy()
+    current_rotation = R0.copy()
+    yaw_degrees = []
+    for index, point in enumerate(points, start=1):
+        place = point + np.array([0.0, 0.0, float(options.hover_m) + float(options.tip_m)])
+        yaw_deg = math.degrees(math.atan2(float(point[1]), float(point[0])))
+        yaw_degrees.append(round(yaw_deg, 3))
+        R_marker = work_orientation(R0, sequence_axis, yaw_deg)
+        if index == 1:
+            # The first approach is the one the single-tap plan is known to
+            # handle: from the arm's pose to the first marker.
+            seed = cartesian(current_place, place, current_rotation, R_marker,
+                             options.approach_s, 0.4, seed, "marker 1", gripper)
+        else:
+            # Between markers, a straight Cartesian line can leave the annulus
+            # the arm can reach with the tool down. Solve the marker pose, then
+            # interpolate joint space; the capsule check still guards the table.
+            try:
+                target = ik_to(place, R_marker, seed, "marker %d" % index)
+            except PlanError:
+                target = ik_to(place, R_marker, start_seed, "marker %d" % index)
+            current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+            if not sweep.path_safe(current_q, target[:n_arm]):
+                raise PlanError(
+                    "the leg from marker %d to marker %d dips within a link radius "
+                    "of the worktop; space the markers further apart or move the arm "
+                    "clear" % (index - 1, index))
+            seed = joint_leg(
+                current_q,
+                {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
+                options.approach_s, "marker %d" % index, gripper)
+        hold(0.25, gripper)
+        next_gripper = MOTOR7_HALF if index % 2 == 1 else MOTOR7_OPEN
+        if abs(next_gripper - gripper) > 1e-6:
+            gripper_leg(next_gripper, max(0.8, options.hold_s))
+        gripper = next_gripper
+        hold(0.25, gripper)
+        current_place = place
+        current_rotation = R_marker
+
+    # Return in joint space. A Cartesian return to the parked pose is the one
+    # leg where IK can fail on the last millimetres (the parked pose sits on
+    # two stops), and a return is not a precision move. The capsule check still
+    # refuses a leg that would cross the worktop, exactly like /move does.
+    q_last = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+    q_home = np.array(q_start[:n_arm], dtype=float)
+    if not sweep.path_safe(q_last, q_home):
+        raise PlanError("the return from marker %d to the start pose dips within a "
+                        "link radius of the worktop; move the arm clear and retry"
+                        % len(points))
+    joint_leg(q_last, {index: q_home[index] - q_last[index] for index in range(n_arm)},
+              options.return_s, "return", gripper)
+
+    steps = ("%d markers: hover each in order; gripper open, half-close on odd "
+             "markers, open on even; return" % len(points))
+    provenance = {
+        "sequence": True,
+        "targets": [
+            {"point": [float(v) for v in point],
+             "capture": targets[index].get("capture"),
+             "source": targets[index].get("source"),
+             "tap": targets[index].get("tap")}
+            for index, point in enumerate(points)
+        ],
+        "tool_axis": sequence_axis,
+        "yaw_deg": options.yaw,
+        "marker_yaw_deg": yaw_degrees,
+        "gripper": {"open": MOTOR7_OPEN, "half": MOTOR7_HALF,
+                    "closed": MOTOR7_CLOSED},
+    }
+    payload = traj.build(
+        waypoints, options.hz,
+        [[float(lo), float(hi)] for lo, hi in zip(lower, upper)] + [[-0.1, 5.0]],
+        steps,
+        extra={
+            "capture": provenance,
+            "tool_axis": sequence_axis,
+            "yaw_deg": options.yaw,
+            "marker_yaw_deg": yaw_degrees,
+            "dynamics": {
+                "source": "reBotArm_control_py.compute_generalized_gravity (Pinocchio RNEA)",
+                "tau": "gravity torque of the planned pose, per waypoint",
+            },
+        },
+    )
+    stats = traj.validate(payload)
+    summary = {
+        "markers": len(points),
+        "targets": [[float(v) for v in point] for point in points],
+        "radii": [float(np.linalg.norm(point[:2])) for point in points],
+        "start_tcp": [float(v) for v in p_start],
+        "waypoints": stats["waypoints"],
+        "duration_s": stats["duration_s"],
+        "worst_ik_m": worst["residual"],
+        "worst_ik_at": worst["where"] or None,
+        "peak_tau": stats["peak_tau"],
+        "max_step_rad": stats["max_step_rad"],
+        "unparked": unparked,
+    }
+    return payload, summary
+
+
+def describe_sequence(summary):
+    lines = ["Marker sequence: %d markers, gripper open -> half/odd -> open/even"
+             % summary["markers"]]
+    for index, (point, radius) in enumerate(zip(summary["targets"], summary["radii"]),
+                                            start=1):
+        lines.append("  marker %2d : [%+.4f %+.4f %+.4f] m (%.3f m from the base axis)"
+                     % (index, point[0], point[1], point[2], radius))
+    lines += [
+        "  waypoints  : %d over %.2f s" % (summary["waypoints"], summary["duration_s"]),
+        "  worst IK   : %.4f m at %s" % (summary["worst_ik_m"],
+                                          summary["worst_ik_at"] or "-"),
+        "  peak |tau| : %.2f N.m" % summary["peak_tau"],
+        "  max step   : %.3f rad" % summary["max_step_rad"],
+    ]
+    return "\n".join(lines)
 
 
 def describe(summary):

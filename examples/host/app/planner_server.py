@@ -20,6 +20,7 @@ routes.
     GET  /health              what is configured, and whether the edge answers
     GET  /pose                proxy of the edge's pose
     POST /plan                {target, pose?, options?} -> /app/out/<id>.json
+    POST /plan-sequence       {targets, pose?, options?} -> one multi-marker pass
     POST /execute             {id, kp?, kd?} -> POST /play on the edge
     POST /move                {q, seconds?, gripper?} -> joint-space move, no IK
 
@@ -139,6 +140,51 @@ def plan_one(body):
 
     logging.info("plan %s: %d waypoints, %.2f s, %.2f s to compute",
                  plan_id, summary["waypoints"], summary["duration_s"], time.time() - started)
+    summary["compute_s"] = round(time.time() - started, 2)
+    return {"ok": True, "id": plan_id, "path": str(path), "bytes": path.stat().st_size,
+            "summary": summary, "execute": EXECUTE}
+
+
+def plan_sequence_one(body):
+    """Plan one hover pass through a list of marker targets."""
+    targets = body.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise GatewayError("'targets' must be a non-empty list of rebot-target objects")
+    if len(targets) > 20:
+        raise GatewayError("a marker sequence is limited to 20 targets")
+    pose = body.get("pose")
+    if pose is None:
+        pose = dump_pose()
+    elif not isinstance(pose, dict) or "ids" not in pose:
+        raise GatewayError("'pose' must be a rebot-edge dump when supplied")
+
+    options = planner.Options()
+    for name, value in (body.get("options") or {}).items():
+        if not hasattr(options, name):
+            raise GatewayError("unknown option %r" % name)
+        setattr(options, name, value)
+    # The marker sequence is a sequence of places, not a sequence of grasps.
+    options.hover = True
+    options.quiet = True
+    # A marker sequence may pass close to the reach boundary between two
+    # markers. The arm's repeatability is 23 mm; 10 mm at a hover waypoint is
+    # still inside that, and the marker itself is gated by --max-reach.
+    options.ik_pos_tol = max(float(options.ik_pos_tol), 0.010)
+
+    started = time.time()
+    try:
+        payload, summary = planner.plan_sequence(pose, targets, options)
+    except planner.PlanError as error:
+        raise GatewayError(str(error), 422) from error
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    plan_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
+    path = OUT_DIR / ("%s.json" % plan_id)
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+    logging.info("sequence %s: %d markers, %d waypoints, %.2f s, %.2f s to compute",
+                 plan_id, summary["markers"], summary["waypoints"],
+                 summary["duration_s"], time.time() - started)
     summary["compute_s"] = round(time.time() - started, 2)
     return {"ok": True, "id": plan_id, "path": str(path), "bytes": path.stat().st_size,
             "summary": summary, "execute": EXECUTE}
@@ -370,6 +416,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise GatewayError("missing or wrong X-Rebot-Token", 401)
             if self.path == "/plan":
                 self._send(200, plan_one(self._body()))
+            elif self.path == "/plan-sequence":
+                self._send(200, plan_sequence_one(self._body()))
             elif self.path == "/execute":
                 self._send(200, execute_one(self._body()))
             elif self.path == "/move":

@@ -239,21 +239,14 @@ async def drive_page(cdp, args) -> int:
     offset_y = box["y"] + (box["h"] - box["vh"] * scale) / 2
     u, v = 401.5, 303.5
     x, y = offset_x + u * scale, offset_y + v * scale
+    before = {p.name for p in Path(args.captures).glob("*") if p.is_dir()}
+    # A tap now adds a numbered marker: the page uploads the frame under the
+    # finger and locates it. The capture is the observable side effect here.
     for kind, pressed in (("mousePressed", 1), ("mouseReleased", 0)):
         await cdp.call("Input.dispatchMouseEvent", {
             "type": kind, "x": x, "y": y, "button": "left",
             "buttons": pressed, "clickCount": 1,
         }, page)
-    tap = await cdp.evaluate("state.tap", page)
-    check = ("[%s] tap maps to the image pixel" % (
-        "ok  " if tap and abs(tap["u"] - u) < 1.0 and abs(tap["v"] - v) < 1.0 else "FAIL"))
-    print("  %s (%.1f, %.1f) -> expected (%.1f, %.1f)"
-          % (check, tap["u"] if tap else -1, tap["v"] if tap else -1, u, v))
-    if not tap or abs(tap["u"] - u) > 1.0:
-        raise SystemExit("tap mapping is wrong")
-
-    before = {p.name for p in Path(args.captures).glob("*") if p.is_dir()}
-    await cdp.evaluate("document.getElementById('shot').click()", page)
 
     found = None
     for _ in range(100):
@@ -263,7 +256,7 @@ async def drive_page(cdp, args) -> int:
             found = fresh.pop()
             break
         await asyncio.sleep(0.1)
-    print("  [%s] capture landed as %s" % ("ok  " if found else "FAIL", found))
+    print("  [%s] marker capture landed as %s" % ("ok  " if found else "FAIL", found))
     if not found:
         logs = await cdp.evaluate(
             "Array.from(document.querySelectorAll('#log p')).map(p => p.textContent)", page)
@@ -276,14 +269,15 @@ async def drive_page(cdp, args) -> int:
         print("  screenshot: %s" % args.screenshot)
 
     meta = json.loads((Path(args.captures) / found / "meta.json").read_text(encoding="utf-8"))
-    same_tap = (meta.get("tap") or {}) and abs(meta["tap"]["u"] - u) < 1.0
-    print("  [%s] meta tap and image_size [%s]"
+    tap = meta.get("tap") or {}
+    same_tap = abs(tap.get("u", -1) - u) < 1.0 and abs(tap.get("v", -1) - v) < 1.0
+    print("  [%s] meta tap (%.1f, %.1f) and image_size [%s]"
           % ("ok  " if same_tap and meta.get("image_size") == [1280, 960] else "FAIL",
-             meta.get("image_size")))
+             tap.get("u", -1), tap.get("v", -1), meta.get("image_size")))
     if not same_tap or meta.get("image_size") != [1280, 960]:
         raise SystemExit("the stored metadata does not match what was tapped")
 
-    print("\npage, tap mapping and upload all work")
+    print("\npage, marker tap mapping and upload all work")
     return 0
 
 

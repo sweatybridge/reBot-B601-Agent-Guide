@@ -391,6 +391,7 @@ async def test_server(workdir: Path, geometry):
               (reach.get("marker") or {}).get("id") == 0
               and abs((reach.get("marker") or {}).get("size_m", 0) - 0.08) < 1e-9)
         check("serves the browser ArUco module", (await client.get("/aruco.js")).status == 200)
+        check("serves the marker module", (await client.get("/markers.js")).status == 200)
 
         form = FormData()
         form.add_field("meta", json.dumps({"purpose": "plan", "image_size": [image.shape[1], image.shape[0]],
@@ -417,6 +418,25 @@ async def test_server(workdir: Path, geometry):
         check("meta keeps the tap and gets a server block",
               abs(meta.get("tap", {}).get("u", 0) - geometry["pixel"][0]) < 0.01
               and meta.get("server", {}).get("bytes") == len(jpeg))
+
+        located = await client.post("/locate", json={"capture": body["id"], "mode": "handheld"},
+                                    headers={"X-Rebot-Token": "selftest-token"})
+        located_body = await located.json()
+        marker_target = located_body.get("target") or {}
+        marker_point = np.asarray(marker_target.get("point") or [0.0, 0.0, 0.0], dtype=float)
+        check("locate returns the marker point",
+              located.status == 200 and located_body.get("ok") is True
+              and float(np.linalg.norm(marker_point - geometry["point"])) < 0.003,
+              "%.2f mm" % (1000.0 * float(np.linalg.norm(marker_point - geometry["point"]))))
+        sequenced = await client.post("/sequence", json={"targets": [marker_target]},
+                                      headers={"X-Rebot-Token": "selftest-token"})
+        sequence_body = await sequenced.json()
+        check("sequence reaches the planner",
+              sequenced.status == 502 and sequence_body.get("stage") == "plan",
+              "status %s, %s" % (sequenced.status, str(sequence_body.get("error"))[:50]))
+        bad_sequence = await client.post("/sequence", json={"targets": [{"format": "nope"}]},
+                                         headers={"X-Rebot-Token": "selftest-token"})
+        check("sequence rejects a non-target", bad_sequence.status == 400)
 
         listing = await (await client.get("/captures.json")).json()
         check("captures.json lists it", len(listing["captures"]) == 1

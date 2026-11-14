@@ -69,6 +69,23 @@
     pointer-events: none; z-index: 5;
   }
   #reachCanvas.on { display: block; }
+  #markers {
+    position: absolute; inset: 0; pointer-events: none; z-index: 6;
+  }
+  #markers[hidden] { display: none; }
+  #markers.disabled { opacity: .5; }
+  .seq-pin {
+    position: absolute; width: 30px; height: 30px; margin: -15px 0 0 -15px;
+    border: 2px solid var(--good); border-radius: 50%;
+    background: rgba(11, 13, 16, .55); color: var(--good);
+    font-size: 14px; font-weight: 700; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, .6), 0 2px 8px rgba(0, 0, 0, .45);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, .9);
+  }
+  .seq-pin.half { border-color: var(--warn); color: var(--warn); }
+  .seq-pin.open { border-color: var(--good); color: var(--good); }
+  .seq-pin.far { outline: 2px solid var(--bad); outline-offset: 2px; }
   #hint {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     text-align: center; padding: 24px; color: var(--dim); font-size: 14px; pointer-events: none;
@@ -126,7 +143,8 @@
   <div id="stage">
     <video id="video" playsinline muted autoplay></video>
     <canvas id="reachCanvas" aria-hidden="true"></canvas>
-    <div id="hint">Tap <strong>Start camera</strong>, keep the base tag in frame, then tap the object you want the arm to reach.</div>
+    <div id="markers" aria-hidden="true"></div>
+    <div id="hint">Tap <strong>Start camera</strong>, keep the base tag in frame, then tap the table to place numbered markers.</div>
   </div>
   <div id="log" aria-live="polite"></div>
 </main>
@@ -134,7 +152,7 @@
 <footer>
   <div class="row">
     <button class="action primary" id="start">Start camera</button>
-    <button class="action" id="shot" disabled>Capture</button>
+    <button class="action" id="shot" disabled>Move arm</button>
   </div>
   <div class="row">
     <button class="chip" id="camera">Camera: handheld tag</button>
@@ -142,25 +160,27 @@
     <button class="chip" id="calib">Calibration mode: off</button>
     <button class="chip" id="live">Live preview: off</button>
     <button class="chip" id="lock">Lock focus: -</button>
-    <button class="chip" id="clear">Clear tap</button>
+    <button class="chip" id="clear">Clear marker</button>
   </div>
   <details>
     <summary>How to use</summary>
     <ol>
-      <li><b>Handheld (the default).</b> The tag is taped to the side of the base. Hold the phone
-          so that <em>the tag and the target are both in frame</em>, then tap the target: the host
-          solves the camera from the tag in that exact frame and sends the arm 10 cm above the
-          point.</li>
-      <li>Capture, check the crosshair, then <b>Move the arm</b>. There is no calibration step and
-          the phone can move between taps &mdash; the tag re-solves the camera every time.</li>
-      <li>If the tag is not in frame the plan is refused rather than guessed. Turn the phone
+      <li><b>Handheld (the default).</b> The tag is taped to the side of the base. Tap the table
+          to add a numbered marker, up to 10. Each tap is solved in the frame it was taken in, so
+          the phone can move between markers.</li>
+      <li><b>Move arm</b> plans and runs the markers in order. Amber odd markers half-close
+          the gripper; green even markers open it, starting fully open. The arm returns to where
+          it began. <b>Clear marker</b> removes the last one; Move arm is disabled with none.</li>
+      <li>If the tag is not in frame a marker is refused rather than guessed. Turn the phone
           until it is, or switch to a fixed camera.</li>
       <li><b>Fixed camera (optional).</b> Press <b>Camera</b> to switch, then <b>Rig</b> once:
           capture one pose, tap the tool tip in it, and let the arm sweep eight poses. After that
-          taps need no tag.</li>
-      <li><b>Reach</b> paints the band of table a tap can be planned in. With a fixed rig it is
+          markers need no tag.</li>
+      <li><b>Calibration mode</b> turns the Move arm button back into <b>Capture</b> for
+          checkerboard shots.</li>
+      <li><b>Reach</b> paints the band of table markers can be planned in. With a fixed rig it is
           exact; with the base tag in view the phone locates the tag itself and the band follows
-          the camera. If the tag is out of view, it falls back to the last tap.</li>
+          the camera. It clears after a few seconds without a detection.</li>
       <li>Printing the tag and giving the host its position: <code>docs/base-marker.md</code>.</li>
     </ol>
   </details>
@@ -169,6 +189,7 @@
 <script src="/viewer.js"></script>
 <script src="/aruco.js"></script>
 <script src="/reach.js"></script>
+<script src="/markers.js"></script>
 <script>
 "use strict";
 
@@ -186,6 +207,7 @@ const lockButton = $("#lock");
 const clearButton = $("#clear");
 const reachButton = $("#reach");
 const reachCanvas = $("#reachCanvas");
+const markersContainer = $("#markers");
 
 const state = {
   stream: null,
@@ -196,6 +218,7 @@ const state = {
   calib: false,
   locked: false,
   busy: false,
+  busyText: "",
   calibCount: 0,
   token: "",
   health: null,
@@ -339,6 +362,7 @@ async function startCamera() {
   startButton.textContent = "Starting...";
   try {
     if (state.stream) {
+      markersOverlay.clear();
       await stopPublish();
       state.stream.getTracks().forEach((track) => track.stop());
       state.stream = null;
@@ -351,7 +375,8 @@ async function startCamera() {
     video.srcObject = stream;
     await video.play();
     hint.hidden = true;
-    shotButton.disabled = false;
+    markersOverlay.setEnabled(true);
+    updateStartButton();
     startButton.textContent = "Restart camera";
     startButton.disabled = false;
     keepAwake();
@@ -361,6 +386,7 @@ async function startCamera() {
   } catch (error) {
     startButton.disabled = false;
     startButton.textContent = "Start camera";
+    updateStartButton();
     log(escapeHtml(explain(error)), "bad");
   }
 }
@@ -498,8 +524,7 @@ async function capture() {
     log("capture failed: " + escapeHtml(explain(error)), "bad");
   } finally {
     state.busy = false;
-    shotButton.disabled = false;
-    shotButton.textContent = "Capture";
+    updateStartButton();
   }
 }
 
@@ -587,8 +612,7 @@ async function togglePublish() {
 /* ----------------------------------------------------------------- wires */
 
 // The reach band is drawn here; the host only supplies K and, for a fixed
-// camera, T_base_cam. In handheld mode the camera pose is solved per tap, so
-// `onPose` anchors the overlay on the frame the last plan came from.
+// camera, T_base_cam. Handheld mode finds the base tag in the page.
 const reachOverlay = window.ReachOverlay.create({
   video: video,
   canvas: reachCanvas,
@@ -596,50 +620,145 @@ const reachOverlay = window.ReachOverlay.create({
   onStatus: (message, kind) => log(escapeHtml(message), kind),
 });
 
-// One tap = plan. The same module runs on the workstation viewer.
+// The old tap-to-plan module is kept only for the Rig button it creates; its
+// tap handling is off. Markers own the stage now.
 const planner = TapPlanner.create({
   video: video,
   stage: stage,
   token: () => state.token,
   source: "phone",
   onStatus: (message, kind) => log(escapeHtml(message), kind),
-  onPose: (pose, source) => reachOverlay.setPose(pose,
-    source === "tap+marker" ? "last tap" : "last plan"),
 });
-planner.enable();
+planner.disable();
 
-startButton.addEventListener("click", startCamera);
-shotButton.addEventListener("click", capture);
+const markersOverlay = MarkerSequence.create({
+  video: video,
+  stage: stage,
+  pins: markersContainer,
+  token: () => state.token,
+  onStatus: (message, kind) => log(escapeHtml(message), kind),
+  onChange: () => updateStartButton(),
+});
+
+function updateStartButton() {
+  if (state.calib) {
+    shotButton.textContent = state.busy ? "Sending..." : "Capture";
+    shotButton.disabled = state.busy || !state.track;
+    return;
+  }
+  shotButton.textContent = state.busy ? (state.busyText || "Planning...") : "Move arm";
+  shotButton.disabled = state.busy || !state.track || markersOverlay.busy
+    || markersOverlay.count === 0;
+}
+
+async function startSequence() {
+  if (state.busy || !state.track || markersOverlay.count === 0) return;
+  state.busy = true;
+  state.busyText = "Planning...";
+  clearButton.disabled = true;
+  markersOverlay.setEnabled(false);
+  updateStartButton();
+  try {
+    const response = await api("/sequence", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targets: markersOverlay.targets }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || ("sequence failed: " + response.status));
+    }
+    const plan = data.plan || {};
+    const summary = plan.summary || {};
+    log("planned " + (summary.markers || markersOverlay.count) + " markers · "
+      + (summary.waypoints || 0) + " waypoints · "
+      + Number(summary.duration_s || 0).toFixed(1) + " s", "good");
+    if (!data.execute) {
+      log("execution is off on the host; the trajectory is written to out/ only", "warn");
+      return;
+    }
+    state.busyText = "Moving...";
+    updateStartButton();
+    log("starting " + plan.id + " on the arm", "warn");
+    const answer = await api("/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: plan.id }),
+    });
+    const result = await answer.json().catch(() => ({}));
+    if (!answer.ok || result.ok === false) {
+      throw new Error(result.error || ("execute failed: " + answer.status));
+    }
+    log("arm finished: " + plan.id, "good");
+  } catch (error) {
+    log("sequence failed: " + escapeHtml(error.message), "bad");
+  } finally {
+    state.busy = false;
+    state.busyText = "";
+    markersOverlay.setEnabled(true);
+    clearButton.disabled = false;
+    updateStartButton();
+  }
+}
+
+startButton.addEventListener("click", () => {
+  if (state.busy) {
+    log("wait for the sequence to finish", "warn");
+    return;
+  }
+  startCamera();
+});
+shotButton.addEventListener("click", () => {
+  if (state.calib) capture();
+  else startSequence();
+});
 clearButton.addEventListener("click", () => {
-  planner.clear();
-  log("tap cleared", "warn");
+  if (markersOverlay.clearLast()) {
+    log("last marker cleared", "warn");
+  } else {
+    log(markersOverlay.busy ? "still locating a marker" : "no markers to clear", "warn");
+  }
+  updateStartButton();
 });
 // Which of the two ways in this phone uses. Handheld is the default: the tag on
-// the base sets the camera on every tap. "Fixed rig" uses the pose a sweep fitted.
+// the base sets the camera for each marker. "Fixed rig" uses the pose a sweep fitted.
 cameraButton.addEventListener("click", () => {
+  if (state.busy) {
+    log("wait for the sequence to finish", "warn");
+    return;
+  }
   const next = TapPlanner.getMode() === "fixed" ? "handheld" : "fixed";
   TapPlanner.setMode(next);
   cameraButton.textContent = "Camera: " + (next === "fixed" ? "fixed rig" : "handheld tag");
   cameraButton.classList.toggle("on", next === "fixed");
+  markersOverlay.clear();
   log(next === "fixed"
-    ? "fixed camera: taps use the rig (press Rig once if none is fitted)"
-    : "handheld: the base tag sets the camera on every tap", "warn");
+    ? "fixed camera: markers use the rig (press Rig once if none is fitted)"
+    : "handheld: the base tag sets the camera for each marker", "warn");
 });
 calibButton.addEventListener("click", () => {
+  if (state.busy) {
+    log("wait for the sequence to finish", "warn");
+    return;
+  }
   state.calib = !state.calib;
   calibButton.textContent = "Calibration mode: " + (state.calib ? "on" : "off");
   calibButton.classList.toggle("on", state.calib);
+  markersOverlay.setCalibrating(state.calib);
   if (state.calib) {
     state.calibCount = 0;
     log("calibration mode: fill the frame with the checkerboard, 15-20 poses", "warn");
+  } else {
+    log("calibration mode off: taps add markers again", "warn");
   }
+  updateStartButton();
   renderChips();
 });
 reachButton.addEventListener("click", () => {
   const on = reachOverlay.toggle();
   reachButton.textContent = "Reach: " + (on ? "on" : "off");
   reachButton.classList.toggle("on", on);
-  log(on ? "reach overlay on: the shaded band is where a tap can be planned"
+  log(on ? "reach overlay on: the shaded band is where a marker can be planned"
     : "reach overlay off", on ? "good" : "warn");
 });
 liveButton.addEventListener("click", togglePublish);
@@ -651,12 +770,15 @@ document.addEventListener("visibilitychange", () => {
     if (state.track && state.track.readyState === "ended") {
       log("the camera stopped while the page was hidden; tap Restart camera", "warn");
       startButton.textContent = "Restart camera";
-      shotButton.disabled = true;
+      state.track = null;
+      markersOverlay.setEnabled(false);
+      updateStartButton();
     }
   }
 });
 
 initToken();
+updateStartButton();
 renderChips();
 healthLoop();
 log("open https://<host>:8443 on the phone; the dot turns green when the host answers");

@@ -426,6 +426,7 @@
     let liveAt = 0;
     let detectTimer = null;
     let detectMisses = 0;
+    let lossLogged = false;
 
     function headers() {
       const value = typeof token === "function" ? token() : token;
@@ -621,6 +622,11 @@
       context.restore();
     }
 
+    function clearCanvas() {
+      const size = sizeCanvas();
+      context.clearRect(0, 0, size.width, size.height);
+    }
+
     function stopDetection() {
       if (detectTimer) {
         clearTimeout(detectTimer);
@@ -645,7 +651,19 @@
           planeZ: Number(config.plane_z),
         });
       }
-      if (detectTimer) return;
+      if (detectTimer) {
+        // The camera may have just produced its first frame after the overlay
+        // was switched on; restart the grace rather than clearing immediately.
+        if (!livePose) {
+          liveAt = Date.now();
+          detectMisses = 0;
+        }
+        return;
+      }
+      // The "few seconds" grace starts when the overlay starts looking, not at
+      // some stale timestamp from a previous toggle.
+      if (!livePose) liveAt = Date.now();
+      lossLogged = false;
 
       function tick() {
         detectTimer = null;
@@ -661,16 +679,21 @@
             livePose = found.T_base_cam;
             liveAt = Date.now();
             detectMisses = 0;
+            lossLogged = false;
             draw();
           } else {
             detectMisses += 1;
             // A single missed frame is normal (blur, a hand, a bad angle).
-            // Keep the last good pose for a moment, then fall back honestly.
-            if (detectMisses > 2 && Date.now() - liveAt > 1200) {
-              if (livePose) {
-                livePose = null;
-                draw();
+            // Keep the last good pose for three seconds, then clear -- a band
+            // left over from a camera that moved is worse than no band.
+            if (detectMisses > 2 && Date.now() - liveAt > 3000) {
+              livePose = null;
+              lastPose = null;
+              if (!lossLogged) {
+                lossLogged = true;
+                status("reach overlay: base tag not seen for 3 s; band hidden", "warn");
               }
+              clearCanvas();
             }
           }
         }
@@ -690,12 +713,12 @@
         return;
       }
       const fixed = Boolean(config.T_base_cam);
-      const live = !fixed && livePose && (Date.now() - liveAt) < 1500;
+      const live = !fixed && livePose && (Date.now() - liveAt) < 3000;
       const chosen = fixed ? config.T_base_cam : (live ? livePose : (lastPose || null));
       if (!chosen) {
         drawEmpty(config.marker
-          ? "point the camera at the base tag (or tap once)"
-          : "handheld: tap once to anchor the overlay, or fit the rig");
+          ? "point the camera at the base tag"
+          : "fit a fixed rig or configure the base tag");
         return;
       }
       const pose = matrixPose(chosen);
@@ -754,6 +777,11 @@
     }
 
     window.addEventListener("resize", () => { if (visible) draw(); });
+    if (window.ResizeObserver) {
+      // The log pane can grow and shrink the stage; the canvas backing store
+      // and the letterboxed content box change with it.
+      new ResizeObserver(() => { if (visible) draw(); }).observe(canvas);
+    }
     video.addEventListener("loadedmetadata", () => {
       if (!visible) return;
       draw();
