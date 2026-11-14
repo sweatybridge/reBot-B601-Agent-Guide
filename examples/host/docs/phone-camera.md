@@ -445,6 +445,14 @@ measured blocked opening instead of pressing further. Between markers the arm mo
 capsule), and the tool yaw follows each marker's direction from the base, which
 is the free-yaw envelope the reach band draws.
 
+The phone's **gyro is used while Reach is on**: the tag still supplies the
+absolute camera pose, and between tag frames the browser integrates
+`devicemotion.rotationRate` to keep the band turning with the phone. The tag
+position is held until the next detection; translation is not integrated from
+the accelerometer. On iOS the motion permission prompt appears when Reach is
+switched on. With no motion permission the band falls back to updating only when
+the tag is seen.
+
 The **execution gate is unchanged**: with `REBOT_EXECUTE=0` the Move arm call
 still plans and writes `out/<id>.json`, but does not move; the log says so. With
 execution enabled, Move arm is the one deliberate action that moves the arm (the

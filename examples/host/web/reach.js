@@ -14,8 +14,9 @@
  *
  * The server only supplies numbers it already has: the calibration (K, dist)
  * and, when a fixed-camera rig is fitted, `T_base_cam`. In handheld mode the
- * camera pose is solved per frame by the server on a tap, so the page uses the
- * pose of the most recent plan; `setPose()` is called by `viewer.js` for that.
+ * browser ArUco detector solves `T_base_cam`; between tag frames the phone gyro
+ * propagates the orientation while the tag position is held. `setPose()` stays
+ * for the workstation tap path.
  *
  * Why the reach band is computed rather than guessed: the interesting shape is
  * not a circle. The arm cannot fold its wrist close to its own base while
@@ -119,6 +120,22 @@
       (error[1][0] - error[0][1]) / (2 * Math.sin(angle)),
     ];
     return [axis[0] * angle, axis[1] * angle, axis[2] * angle];
+  }
+
+  function rotationFromPose(T) {
+    return [[T[0][0], T[0][1], T[0][2]],
+            [T[1][0], T[1][1], T[1][2]],
+            [T[2][0], T[2][1], T[2][2]]];
+  }
+
+  function blendOrientation(current, target, fraction) {
+    // Shortest-path correction toward the tag, so a noisy 3 Hz pose does not
+    // snap the band. `rotationError` is the axis-angle of target * current^T.
+    const error = rotationError(current, target);
+    const angle = Math.hypot(error[0], error[1], error[2]);
+    if (!(angle > 1e-9) || !Number.isFinite(angle)) return current;
+    const axis = [error[0] / angle, error[1] / angle, error[2] / angle];
+    return matMul(axisAngle(axis, angle * fraction), current);
   }
 
   function forward(q, withFrames) {
@@ -427,6 +444,15 @@
     let detectTimer = null;
     let detectMisses = 0;
     let lossLogged = false;
+    let baseCamera = null;          // R_base_cam propagated by the phone gyro
+    let motionStarted = false;
+    let motionSeen = false;
+    let motionPermission = "unknown";
+    let motionRequest = null;
+    let motionLogged = false;
+    let motionStatusLogged = false;
+    let lastMotionAt = 0;
+    let animationId = 0;
 
     function headers() {
       const value = typeof token === "function" ? token() : token;
@@ -627,11 +653,154 @@
       context.clearRect(0, 0, size.width, size.height);
     }
 
+    function noteMotion(message) {
+      if (motionStatusLogged) return;
+      motionStatusLogged = true;
+      status(message, "warn");
+    }
+
+    function requestMotionPermission() {
+      if (motionPermission !== "unknown") return;
+      if (motionRequest) return;
+      if (!window.DeviceMotionEvent) {
+        motionPermission = "unsupported";
+        noteMotion("reach overlay: no motion sensor; the band updates when the tag is seen");
+        return;
+      }
+      // iOS gates the gyro behind a permission prompt that must be requested
+      // from a user gesture. toggle() calls this before awaiting /reach.json.
+      if (typeof window.DeviceMotionEvent.requestPermission !== "function") {
+        motionPermission = "granted";
+        return;
+      }
+      try {
+        motionRequest = window.DeviceMotionEvent.requestPermission()
+          .then((result) => {
+            motionPermission = result === "granted" ? "granted" : "denied";
+            if (motionPermission === "granted") {
+              startMotion();
+            } else {
+              noteMotion("reach overlay: motion permission denied; the band updates when the tag is seen");
+            }
+          })
+          .catch(() => {
+            motionPermission = "denied";
+            noteMotion("reach overlay: motion permission denied; the band updates when the tag is seen");
+          });
+      } catch (error) {
+        motionPermission = "denied";
+        noteMotion("reach overlay: motion permission denied; the band updates when the tag is seen");
+      }
+    }
+
+    function startMotion() {
+      if (motionStarted || !visible || !config || config.T_base_cam) return;
+      if (motionPermission !== "granted") return;
+      window.addEventListener("devicemotion", onMotion);
+      motionStarted = true;
+      motionSeen = false;
+      lastMotionAt = 0;
+    }
+
+    function stopMotion() {
+      if (motionStarted) {
+        window.removeEventListener("devicemotion", onMotion);
+        motionStarted = false;
+      }
+      motionSeen = false;
+      lastMotionAt = 0;
+      baseCamera = null;
+    }
+
+    function onMotion(event) {
+      if (!visible || !motionStarted || !livePose || !baseCamera) return;
+      const rate = event.rotationRate;
+      if (!rate) return;
+      const alpha = Number(rate.alpha);
+      const beta = Number(rate.beta);
+      const gamma = Number(rate.gamma);
+      if (!Number.isFinite(alpha) || !Number.isFinite(beta) || !Number.isFinite(gamma)) {
+        return;
+      }
+      // performance.now() keeps the integration on one clock across Safari and
+      // Chrome; the event's own timeStamp origin differs between them.
+      const now = performance.now();
+      if (!motionSeen) {
+        motionSeen = true;
+        if (!motionLogged) {
+          motionLogged = true;
+          status("reach overlay: phone motion is smoothing the band", "good");
+        }
+        if (livePose) startAnimation();
+      }
+      if (!lastMotionAt) {
+        lastMotionAt = now;
+        return;
+      }
+      const dt = (now - lastMotionAt) / 1000;
+      lastMotionAt = now;
+      if (!(dt > 0 && dt < 0.2)) return;
+
+      // DeviceMotion: alpha is about z, beta about x, gamma about y. The rear
+      // camera has x_cam = x_device, y_cam = -y_device, z_cam = -z_device.
+      const omega = [beta, -gamma, -alpha].map((value) => value * Math.PI / 180);
+      const magnitude = Math.hypot(omega[0], omega[1], omega[2]);
+      if (magnitude < 1e-6) return;
+      const axis = [omega[0] / magnitude, omega[1] / magnitude, omega[2] / magnitude];
+      baseCamera = matMul(baseCamera, axisAngle(axis, magnitude * dt));
+    }
+
+    function applyTagOrientation(T) {
+      const target = rotationFromPose(T);
+      if (!baseCamera || !motionSeen) {
+        // No gyro samples: follow the tag directly, as the old overlay did.
+        baseCamera = target;
+      } else {
+        baseCamera = blendOrientation(baseCamera, target, 0.6);
+      }
+      lastMotionAt = performance.now();
+    }
+
+    function predictedPose() {
+      if (!livePose) return null;
+      if (!baseCamera) return livePose;
+      const R = baseCamera;
+      return [
+        [R[0][0], R[0][1], R[0][2], livePose[0][3]],
+        [R[1][0], R[1][1], R[1][2], livePose[1][3]],
+        [R[2][0], R[2][1], R[2][2], livePose[2][3]],
+        [0, 0, 0, 1],
+      ];
+    }
+
+    function stopAnimation() {
+      if (animationId) {
+        cancelAnimationFrame(animationId);
+        animationId = 0;
+      }
+    }
+
+    function animate() {
+      animationId = 0;
+      if (!visible || !config || config.T_base_cam) return;
+      if (livePose && Date.now() - liveAt < 3000) {
+        draw();
+        animationId = requestAnimationFrame(animate);
+      }
+    }
+
+    function startAnimation() {
+      if (animationId || !visible || !config || config.T_base_cam || !motionSeen) return;
+      animationId = requestAnimationFrame(animate);
+    }
+
     function stopDetection() {
       if (detectTimer) {
         clearTimeout(detectTimer);
         detectTimer = null;
       }
+      stopMotion();
+      stopAnimation();
     }
 
     function startDetection() {
@@ -651,6 +820,8 @@
           planeZ: Number(config.plane_z),
         });
       }
+      startMotion();
+      if (livePose) startAnimation();
       if (detectTimer) {
         // The camera may have just produced its first frame after the overlay
         // was switched on; restart the grace rather than clearing immediately.
@@ -676,10 +847,12 @@
             lastError = error.message;
           }
           if (found && found.T_base_cam) {
+            applyTagOrientation(found.T_base_cam);
             livePose = found.T_base_cam;
             liveAt = Date.now();
             detectMisses = 0;
             lossLogged = false;
+            startAnimation();
             draw();
           } else {
             detectMisses += 1;
@@ -693,6 +866,8 @@
                 lossLogged = true;
                 status("reach overlay: base tag not seen for 3 s; band hidden", "warn");
               }
+              stopAnimation();
+              baseCamera = null;
               clearCanvas();
             }
           }
@@ -714,7 +889,7 @@
       }
       const fixed = Boolean(config.T_base_cam);
       const live = !fixed && livePose && (Date.now() - liveAt) < 3000;
-      const chosen = fixed ? config.T_base_cam : (live ? livePose : (lastPose || null));
+      const chosen = fixed ? config.T_base_cam : (live ? predictedPose() : (lastPose || null));
       if (!chosen) {
         drawEmpty(config.marker
           ? "point the camera at the base tag"
@@ -731,7 +906,8 @@
         return;
       }
       const label = fixed ? "fixed rig"
-        : (live ? "base tag" : (lastPoseLabel || "last tap"));
+        : (live ? (motionSeen ? "base tag + gyro" : "base tag")
+          : (lastPoseLabel || "last tap"));
       drawBand(camera, pose, label);
     }
 
@@ -740,6 +916,8 @@
       if (loading) return;
       loading = true;
       stopDetection();
+      livePose = null;
+      baseCamera = null;
       try {
         await load();
         detector = null;
@@ -760,10 +938,13 @@
       canvas.classList.toggle("on", visible);
       canvas.hidden = !visible;
       if (visible) {
+        // Ask for the gyro while the toggle click is still a user gesture.
+        if (!config || !config.T_base_cam) requestMotionPermission();
         apply();
       } else {
         stopDetection();
         livePose = null;
+        baseCamera = null;
         context.clearRect(0, 0, canvas.width, canvas.height);
       }
       return visible;
@@ -792,6 +973,7 @@
       // The camera was stopped: do not leave the last band over a black stage.
       stopDetection();
       livePose = null;
+      baseCamera = null;
       if (visible) drawEmpty("start the camera first");
     });
     document.addEventListener("visibilitychange", () => {
@@ -807,6 +989,7 @@
       stopDetection();
       detector = null;
       livePose = null;
+      baseCamera = null;
       config = null;
       apply();
     });
