@@ -7,30 +7,31 @@ the Pi replays -- the same `rebot-joint-trajectory` file as
 
 The design is two planes, not one video pipe:
 
-| | preview (aiming) | capture (planning) |
+| | preview (aiming) | planning input |
 |---|---|---|
-| what | 640x360 - 1280x720, 15-30 fps | one full-resolution JPEG |
-| how | WebRTC (WHIP) through MediaMTX | `POST /capture` |
-| needs | best effort | calibration, a fitted rig (or a tag), a still arm |
-| kept | no | yes, next to the trajectory |
+| what | 640x360 - 1280x720, 15-30 fps | one full-resolution JPEG, or the phone's in-page solve |
+| how | WebRTC (WHIP) through MediaMTX | `POST /capture` for `/live`/calibration; phone markers solve in-page |
+| needs | best effort | calibration and a fitted rig (or a tag) |
+| kept | no | yes for `/live` captures; phone markers keep the tip target |
 
-Video is for the person holding the phone. The planner only ever sees an
-immutable frame whose intrinsics, extrinsics and arm pose are all known, which
-is what makes a plan reproducible and a failure debuggable.
+Video is for the person holding the phone. The phone's numbered-marker path
+solves the tap in the page: it already has the calibration, the camera pose and
+the table plane, so it sends the arm-space **tip** point straight to `/sequence`.
+`/live`, calibration and the CLI still upload an immutable frame, which is what
+makes those plans reproducible and a failure debuggable.
 
 ```
-phone page (tap) ─┐
-                  ├─ grab the frame under the tap ─► /capture
-/live page  (tap) ─┘                                      │
-                                                          ▼
-                                   capture server: locate_target.py
-                                   calib + rig (or ArUco PnP) + table plane
-                                                          │
-                                                          ▼
-                                   arm gateway (planner container)
-                                   edge /pose ─► Pinocchio ─► out/<id>.json
-                                                          │
-                             [Move the arm] ──────────────┴─► POST /play ─► rebot-edge
+phone page (tap) ─► browser: calib + pose (rig/tag) + table plane + height
+                              │
+                              ▼
+                    capture server: validate tip + min_z
+                              │
+                              ▼
+                    arm gateway /plan ─► Pinocchio ─► out/<id>.json
+                              │
+                    [Move arm] ┴─► /execute ─► POST /play ─► rebot-edge
+
+/live page (tap) ─► /capture ─► capture server: locate_target.py ─► /plan
 ```
 
 The geometry and the planner are shared; the UI on top differs. The phone
@@ -47,7 +48,7 @@ docker compose -f examples/host/compose.yaml --profile tools run --rm tools test
 python examples/host/tests/selftest.py
 ```
 
-152 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
+162 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
 tag recovers a known 3D point to a fraction of a millimetre, a camera pose is
 recovered from eight synthetic arm poses with a 30 px mis-click in the set, a
 capture round-trips through the real HTTP server, and the trajectory payload is
@@ -55,8 +56,9 @@ checked against the player's own rules. If this fails, the pipeline is wrong,
 not your measurement.
 
 The page is the one part that needs a browser. `browser_check.py` runs it in
-headless Chrome: it substitutes a canvas for the camera, taps a known pixel,
-captures once, and checks the stored tap and image size:
+headless Chrome: it substitutes a canvas for the camera, stubs the tag pose,
+taps a known pixel, checks the browser-located tip marker, then checks the
+height drag and the floor:
 
 ```bash
 # with the capture server already running
@@ -362,8 +364,15 @@ the arm. Nothing is typed and there is no second path.
 | `POST /calibrate/extrinsics` | `{confirm, capture, u, v}` sweeps, fits, verifies, writes |
 | `GET /calibrate` | running state, progress, the last verdict, the current rig |
 | `GET /reach.json` | `K`, `dist`, plane/hover, the tag placement, and `T_base_cam` for the phone's reach overlay |
-| `POST /locate` | `{capture, mode}` -> the base-frame point for one marker |
-| `POST /sequence` | `{targets:[...]}` -> a multi-marker trajectory from the gateway's `/plan-sequence` |
+| `POST /locate` | `{capture, mode}` -> base-frame point for `/live` and CLI taps |
+| `POST /sequence` | `{targets:[{tip:[x,y,z], pixel?}]}` -> validates `min_z`, adds `tip_offset_m`, posts `/plan` with `gripper:"alternate"` |
+
+The arm gateway has one planning route, `POST /plan`:
+`{targets:[{tip:[x,y,z]}], tip_offset_m, gripper, options}`. `gripper` is
+`"alternate"` for the marker sequence and `"none"` for `/live`'s one target.
+Hover mode is gone: `hover`, `hover_m` and `tip_m` options are refused, and the
+old `/plan-sequence` route answers `410`. The capture server is the adapter: it
+validates `min_z`, adds the host's `tip_offset_m`, and forwards only tip points.
 
 Three gates, because this moves the arm with nobody at the panel: `REBOT_EXECUTE=1`
 on the host, `--allow-execute` on the edge, and `"confirm": true` in the body.
@@ -417,28 +426,47 @@ ratio and refuses to cross a crop.
 
 ## Markers, then Move arm
 
-On the phone a tap no longer plans. It captures that exact frame, locates the
-pixel in the base frame and pins a numbered marker on the preview. Up to ten;
-**Clear marker** removes the last one. **Move arm** is disabled until at least
-one marker is on screen. Odd markers are amber (the gripper will half-close);
-even markers are green (it will open).
+On the phone a tap no longer plans. It grabs the exact frame under the finger,
+solves the camera pose and the tap ray in the page, computes the arm-space tip,
+and pins a numbered marker on the preview. Up to ten; **Clear marker** removes the
+last one. **Move arm** is disabled until at least one marker is on screen. Odd
+markers are amber (the gripper will half-close); even markers are green (it will
+open).
 
-A pin is drawn at the **projection of the target on the worktop plane**, not at
-the raw finger pixel. The capture stores its own projected pixel as a fallback;
-while Reach is on, the live camera pose (including the gyro prediction) reprojects
-the pin so it stays on the table as the phone moves.
+**Tap and drag to set the height.** A press that stays put adds a marker. Once
+the finger moves past the tap slop, the press becomes a height drag: moving up
+raises the plane the tap intersects, and moving down lowers it. The badge in the
+camera row (next to the zoom chip) shows the current value, and the reach band
+recomputes for it, so the shaded region is where the next marker can be planned
+at that height. The height is frozen into each marker when it is tapped: **Move
+arm** sends every marker with its own tip point, so changing the badge later only
+affects new markers and the live band. The capture server adds the host's
+`tip_offset_m`, validates the tip against `min_z`, and posts the tip point to the
+planner. The default is 10 cm. There is no hold delay: the drag starts as soon as
+the finger moves.
+
+The height is a **horizontal plane**, not a vertical lift: the browser intersects
+the tap ray with `plane_z + height`. At a slanted view, raising the height moves
+the tip along the ray, so its x/y shifts too (7 cm at a 54° view for 10 cm, less
+from steeper). The pin is drawn at that raised tip, under the tapped pixel.
+
+A pin is drawn at the **projection of the tip target**, not at the raw finger
+pixel. The target carries its tapped pixel as a fallback; while Reach is on, the
+live camera pose (including the gyro prediction) reprojects the pin as the phone
+moves, so a marker keeps the height it was tapped at.
 
 ![Numbered markers on the phone](phone-markers.png)
 
 ```
 marker tap (u,v)
-  -> the page grabs that exact frame                    (/capture)
-  -> capture_server runs locate_target.py on it         (/locate)
-  -> the marker is numbered and its base point kept
+  -> the page grabs that exact frame
+  -> aruco.js/rig pose + locate.js ray-plane
+  -> tip = ray ∩ plane(plane_z + tap height); the marker is numbered
 Move arm
-  -> all targets become one multi-marker pass           (/sequence -> /plan-sequence)
+  -> tip targets go to the capture server                (/sequence)
+  -> capture server validates min_z and forwards         (/plan, gripper alternate)
   -> the arm visits them in order, holds at each
-  -> the trajectory runs                                (/execute -> POST /play)
+  -> the trajectory runs                                 (/execute -> POST /play)
 ```
 
 The gripper starts fully open -- it opens before the arm leaves its first pose
@@ -545,9 +573,20 @@ closer, and the outer edge is where the planner's `--max-reach` stops.
 
 Three numbers shape the band:
 
-- **Hover height.** The planner aims the flange `hover_m + tip_m` above a tapped
-  point, so the band is the set of points whose *tip* can sit `hover_m` above the
-  table. `--plane-z` moves it up or down with the worktop.
+- **Height plane.** The browser intersects the tap ray with `plane_z + hover_m`;
+  the planner lifts the flange by `tip_m` for IK, so the band is the set of points
+  whose *tip* can sit `hover_m` above the table. `--plane-z` moves it up or down
+  with the worktop. Because the intersection is direct, x/y move along the ray as
+  the height changes. The phone's tap-and-drag gesture changes `hover_m` live
+  (10 cm default, up to 60 cm; the lower bound is the tip floor above); the band
+  is redrawn for the new height, which is why its inner edge moves as the badge
+  changes. A marker keeps the height it was tapped at, so the band describes the
+  next marker while older pins keep their own heights in the plan.
+- **The tip has a floor.** The planner refuses a tip point below `min_z`, which
+  defaults to `REBOT_HOVER_M` (10 cm). The capture server checks the same value
+  before calling the gateway. On a worktop at `z = 0` the height badge therefore
+  stops at exactly 10 cm, matching the default tap; `tip_m` is only the flange
+  offset and does not lower the badge.
 - **The inner edge is real.** At the table the wrist cannot fold the tool down
   closer than about 0.60 m from the base axis (0.48 m at the default 100 mm
   hover). A tap inside it is refused by IK, not by an arbitrary radius gate.
@@ -624,9 +663,10 @@ band stays registered in portrait and landscape.
   systemd unit) aborts when motor 7 has a >0.15 rad position error and is moving
   <0.08 rad/s for 0.3 s, holds the measured opening for the return ramp, then
   ramps home. That is a stall guard, not a grip-force limit.
-- **The frame is the one you saw**, decoded in the browser, not a fresh one from
-  the server: a tap and its pixels cannot drift apart. The cost is that a tap
-  taken while the phone is moving is a few hundred milliseconds old.
+- **The phone marker is solved on the frame it grabbed**, in the page: the
+  camera pose, the tap ray and the tip cannot drift apart. `/live` still uploads
+  an immutable frame to `locate_target.py`. A tap taken while the phone is moving
+  is a few hundred milliseconds old either way.
 
 ## Troubleshooting
 
@@ -672,12 +712,14 @@ band stays registered in portrait and landscape.
 | `phone.html` | the phone page: numbered markers, Move arm, reach overlay, calibration, WHIP |
 | `live.html` | workstation viewer: WHEP playback and single-tap planning |
 | `viewer.js` | the tap -> capture -> plan -> execute panel used by `/live` and the phone's Rig button |
-| `markers.js` | numbered markers on the phone: capture, locate, pin, clear, up to 10 |
+| `markers.js` | numbered markers on the phone: pin, clear, up to 10 |
+| `locate.js` | browser ray-plane solve: pixel + camera pose -> arm-space tip |
+| `height.js` | tap-and-drag height gesture and the camera-row badge |
 | `ekf.js` | optional 15-state camera pose/bias EKF, enabled with `?filter=ekf`; default is tag-only |
 | `reach.js` | the phone's reachable-band canvas overlay (IK + projection, in the page) |
 | `aruco.js` | browser-side 4x4_50 detection and pose for the live handheld overlay |
 | `capture_server.py` | TLS endpoint, `/capture`, `/locate`, `/plan`, `/sequence`, `/execute`, calibration, WHIP/WHEP |
-| `planner_server.py` | the arm gateway: edge `/pose`, `/plan`, `/plan-sequence`, gated execution |
+| `planner_server.py` | the arm gateway: edge `/pose`, one compact `/plan`, gated execution |
 | `make_cert.py` | local CA + leaf certificate for the phone |
 | `base_marker.py` | the printable marker sheet and its PnP (see `base-marker.md`) |
 | `calibrate_intrinsics.py` | checkerboard fit -> `calib/<device>.json` |
@@ -691,7 +733,7 @@ band stays registered in portrait and landscape.
 | `plan_to_target.py` | the planner: target(s) + pose -> trajectory JSON, including the marker sequence |
 | `traj.py` | payload assembly + the player's schema checks, no Pinocchio |
 | `selftest.py` | offline proof of all of the above |
-| `browser_check.py` | drives the page in headless Chrome: tap, capture, check the file |
+| `browser_check.py` | drives the page in headless Chrome: tap, browser tip locate, height drag |
 | `mediamtx.yml` | minimal WHIP/WHEP/RTSP config |
 
 `captures/`, `calib/`, `tls/`, `out/` and `work/` are local state; only the code

@@ -1,15 +1,16 @@
 /* Numbered markers on the phone preview, and nothing else.
  *
- * A tap captures the frame under the finger, locates that pixel in the arm's
- * base frame through `POST /capture` + `POST /locate`, and keeps the target for
- * the sequence planner. Each pin is drawn at the projection of its base-frame
- * target, not at the raw finger pixel: the capture's pixel is the fallback, and
- * the reach overlay's live pose reprojects the pins as the phone moves. The
- * pins are DOM elements so they stay crisp and can be numbered; the overlay
- * canvas below them is untouched.
+ * A tap asks `locate.js` for the tool-tip position in the arm base frame, using
+ * the camera pose the page already has (fixed rig or the base tag in that frame).
+ * No frame is uploaded per marker. Each pin is drawn at the projection of its
+ * base-frame tip target, not at the raw finger pixel; the reach overlay's live
+ * pose reprojects the pins as the phone moves. The pins are DOM elements so they
+ * stay crisp and can be numbered; the overlay canvas below them is untouched.
  *
  * The page owns what Start does. This module only answers: how many markers,
- * which targets, and is a locate still in flight?
+ * which targets, and is a locate still in flight? It also no longer listens for
+ * pointerdown itself: the page routes a tap here from the height control, so a
+ * tap and a tap-and-drag can be told apart.
  */
 (function () {
   "use strict";
@@ -21,9 +22,10 @@
     const stage = options.stage;
     const container = options.pins;
     const status = options.onStatus || function () {};
-    const token = options.token || (() => "");
     const onChange = options.onChange || function () {};
     const projectPoint = options.project || null;
+    const heightAt = options.height || null;
+    const locate = options.locate || null;
 
     const markers = [];
     let busy = false;
@@ -31,17 +33,6 @@
     let calibrating = false;
     let generation = 0;             // invalidates a locate that a clear overtook
     let projectionTimer = 0;
-
-    function headers() {
-      const value = typeof token === "function" ? token() : token;
-      return value ? { "X-Rebot-Token": value } : {};
-    }
-
-    async function api(path, request) {
-      const request_ = Object.assign({ cache: "no-store" }, request || {});
-      request_.headers = Object.assign({}, request_.headers || {}, headers());
-      return fetch(path, request_);
-    }
 
     function videoPoint(clientX, clientY) {
       const rect = video.getBoundingClientRect();
@@ -73,7 +64,7 @@
     function projectedPixel(marker) {
       if (projectPoint) {
         try {
-          const live = projectPoint(marker.target.point);
+          const live = projectPoint(marker.target.tip);
           if (live && Number.isFinite(live[0]) && Number.isFinite(live[1])) {
             return live;
           }
@@ -119,64 +110,39 @@
       scheduleProjection();
     }
 
-    async function grabFrame() {
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
-      const blob = await new Promise((resolve, reject) => {
-        canvas.toBlob((value) => (value ? resolve(value) : reject(new Error("JPEG encode failed"))),
-          "image/jpeg", 0.95);
-      });
-      return { blob: blob, width: canvas.width, height: canvas.height };
-    }
-
     async function addAt(clientX, clientY) {
       if (!enabled || calibrating || busy) return;
+      if (!locate) {
+        status("marker locate is not available in this page", "bad");
+        return;
+      }
       if (markers.length >= MAX_MARKERS) {
         status("10 markers is the limit; clear one first", "warn");
         return;
       }
       const tapped = videoPoint(clientX, clientY);
       if (!tapped) return;
+      // Freeze the badge height at the instant of the tap: the marker must
+      // remember the height it was tapped at, not wherever the badge is later.
+      const tapHeight = typeof heightAt === "function" ? Number(heightAt()) : NaN;
 
       const current = generation;
       busy = true;
       onChange();
       try {
-        const frame = await grabFrame();
-        const form = new FormData();
-        form.append("meta", JSON.stringify({
-          purpose: "plan",
-          capturedAt: new Date().toISOString(),
-          image_size: [frame.width, frame.height],
-          tap: tapped,
-          source: "phone-sequence",
-        }));
-        form.append("frame", frame.blob, "frame.jpg");
-
-        const upload = await api("/capture", { method: "POST", body: form });
-        const saved = await upload.json().catch(() => ({}));
-        if (!upload.ok) throw new Error(saved.error || ("upload failed: " + upload.status));
-
-        const mode = window.TapPlanner ? window.TapPlanner.getMode() : "handheld";
-        const response = await api("/locate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ capture: saved.id, mode: mode }),
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || !data.ok) {
-          throw new Error(data.error || ("locate failed: " + response.status));
-        }
-
+        const target = await locate(tapped, Number.isFinite(tapHeight) ? tapHeight : 0);
         if (current !== generation) return;
-        const target = data.target;
+        if (!target || !Array.isArray(target.tip) || target.tip.length !== 3) {
+          throw new Error("the locator returned no [x, y, z] tip point");
+        }
         const pixel = Array.isArray(target.pixel) ? target.pixel : [tapped.u, tapped.v];
+        const radius = Math.hypot(Number(target.tip[0]), Number(target.tip[1]));
         markers.push({ u: tapped.u, v: tapped.v, pixel: pixel, target: target,
-          radius: Number(target.radius || 0) });
-        const point = (target.point || []).map((value) => value.toFixed(3)).join(", ");
-        status("marker " + markers.length + " at [" + point + "] m" +
+          radius: radius });
+        const point = target.tip.map((value) => Number(value).toFixed(3)).join(", ");
+        const heightText = Number.isFinite(tapHeight)
+          ? " · " + Math.round(tapHeight * 1000) + " mm up" : "";
+        status("marker " + markers.length + " at tip [" + point + "] m" + heightText +
           (markers.length % 2 === 1 ? " · gripper will half-close" : " · gripper will open"),
           markers.length % 2 === 1 ? "warn" : "good");
         render();
@@ -189,11 +155,6 @@
         onChange();
       }
     }
-
-    stage.addEventListener("pointerdown", (event) => {
-      if (!enabled || calibrating || busy) return;
-      addAt(event.clientX, event.clientY);
-    });
 
     window.addEventListener("resize", render);
     video.addEventListener("loadedmetadata", render);

@@ -174,6 +174,24 @@ async def handle_markers_js(request: web.Request) -> web.StreamResponse:
                         headers={"Cache-Control": "no-store"})
 
 
+async def handle_height_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "height.js"
+    if not script.is_file():
+        return web.Response(text="height.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
+async def handle_locate_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "locate.js"
+    if not script.is_file():
+        return web.Response(text="locate.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
 async def handle_ekf_js(request: web.Request) -> web.StreamResponse:
     script = WEB_DIR / "ekf.js"
     if not script.is_file():
@@ -216,6 +234,9 @@ async def handle_health(request: web.Request) -> web.Response:
                 {"size_m": app["marker"]["size_m"], "at": list(app["marker"]["at"]),
                  "yaw_deg": math.degrees(app["marker"]["yaw"])}),
         "plane_z": app["plane_z"],
+        "hover_m": app["hover_m"],
+        "tip_m": app["tip_m"],
+        "min_z": app["min_z"],
     })
 
 
@@ -483,6 +504,31 @@ def locate_options(app, body):
     )
 
 
+def compact_target(tip, source=None):
+    """Build the small wire object the planner accepts: tip plus optional audit."""
+    result = {"tip": [float(tip[0]), float(tip[1]), float(tip[2])]}
+    if source:
+        for key in ("pixel", "tap", "capture"):
+            if source.get(key) is not None:
+                result[key] = source[key]
+    return result
+
+
+def target_tip(target, index):
+    """Validate one compact target and return its tip as floats."""
+    tip = target.get("tip") if isinstance(target, dict) else None
+    if not isinstance(tip, list) or len(tip) != 3:
+        raise web.HTTPBadRequest(text="target %d has no [x, y, z] tip" % index)
+    try:
+        point = [float(value) for value in tip]
+    except (TypeError, ValueError) as error:
+        raise web.HTTPBadRequest(
+            text="target %d has a non-numeric tip" % index) from error
+    if not all(math.isfinite(value) for value in point):
+        raise web.HTTPBadRequest(text="target %d has a non-finite tip" % index)
+    return point
+
+
 async def capture_pose(app):
     """`GET /pose` twice, 120 ms apart, so a moving arm is caught at upload time.
 
@@ -573,7 +619,12 @@ async def handle_locate(request: web.Request) -> web.Response:
 
 
 async def handle_sequence(request: web.Request) -> web.Response:
-    """Plan one hover pass through the markers the phone collected."""
+    """Plan one pass through the compact tip targets the phone collected.
+
+    Targets are `{"tip": [x, y, z], "pixel": [u, v]}` in the arm base frame.
+    The host supplies the physical tip offset and the safety floor; the planner
+    only sees tip points.
+    """
     app = request.app
     try:
         body = await request.json()
@@ -585,32 +636,43 @@ async def handle_sequence(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="'targets' must be a non-empty list")
     if len(targets) > 20:
         raise web.HTTPBadRequest(text="a marker sequence is limited to 20 targets")
-    for index, target in enumerate(targets, start=1):
-        if not isinstance(target, dict) or target.get("format") != "rebot-target":
-            raise web.HTTPBadRequest(text="target %d is not a rebot-target" % index)
-        point = target.get("point")
-        if not isinstance(point, list) or len(point) != 3:
-            raise web.HTTPBadRequest(text="target %d has no [x, y, z] point" % index)
+    if body.get("hover_m") is not None:
+        raise web.HTTPBadRequest(text="hover_m is deprecated; send tip points")
+
+    tips = [target_tip(target, index) for index, target in enumerate(targets, start=1)]
+    tap_heights = [tip[2] - float(app["plane_z"]) for tip in tips]
+    for index, tip in enumerate(tips, start=1):
+        if tip[2] < app["min_z"] - 1e-9:
+            return web.json_response({
+                "ok": False, "stage": "target",
+                "error": "marker %d: tip z %.3f m is below the minimum %.3f m"
+                         % (index, tip[2], app["min_z"]),
+            }, status=422)
 
     plan_options = {
         "tool_axis": app["tool_axis"],
         "yaw": float(body.get("yaw", app["yaw"])),
-        "hover": True,
-        "hover_m": float(body.get("hover_m", app["hover_m"])),
-        "tip_m": float(body.get("tip_m", app["tip_m"])),
+        "min_z": app["min_z"],
     }
     plan_options.update(body.get("options") or {})
+    plan_options["min_z"] = app["min_z"]
+    planner_targets = [compact_target(tip, target)
+                       for tip, target in zip(tips, targets)]
 
-    status, payload = await planner_call(app, "/plan-sequence",
-                                        {"targets": targets, "options": plan_options},
-                                        timeout=300)
+    status, payload = await planner_call(app, "/plan", {
+        "targets": planner_targets,
+        "tip_offset_m": float(app["tip_m"]),
+        "gripper": "alternate",
+        "options": plan_options,
+    }, timeout=300)
     if status != 200:
         return web.json_response({"ok": False, "stage": "plan",
                                   "error": payload.get("error", "sequence plan failed")},
                                  status=status)
 
-    logging.info("sequence plan %s: %s markers", payload.get("id"),
-                 (payload.get("summary") or {}).get("markers"))
+    logging.info("sequence plan %s: %s markers at [%s] mm tap height",
+                 payload.get("id"), (payload.get("summary") or {}).get("markers"),
+                 ", ".join("%.0f" % (height * 1000) for height in tap_heights))
     return web.json_response({
         "ok": True,
         "plan": payload,
@@ -638,7 +700,7 @@ async def handle_plan(request: web.Request) -> web.Response:
     if not (directory / "frame.jpg").is_file():
         raise web.HTTPNotFound(text="no frame for %s" % capture_id)
 
-    calibration = resolve_calibration(app, body.get("calib"))
+    calibration_path = resolve_calibration(app, body.get("calib"))
     try:
         options = locate_options(app, body)
     except locator.LocateError as error:
@@ -648,7 +710,8 @@ async def handle_plan(request: web.Request) -> web.Response:
 
     # locate_target.py is CPU work (aruco + PnP): keep it off the event loop.
     try:
-        target = await asyncio.to_thread(locator.locate_capture, directory, calibration, options)
+        target = await asyncio.to_thread(locator.locate_capture, directory, calibration_path,
+                                         options)
     except locator.LocateError as error:
         logging.info("locate %s: %s", capture_id, error)
         return web.json_response({"ok": False, "stage": "locate", "capture": capture_id,
@@ -660,18 +723,47 @@ async def handle_plan(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "stage": "locate", "capture": capture_id,
                                   "error": "%s: %s" % (type(error).__name__, error)}, status=500)
     target.pop("_out", None)
+    calibration = calib_mod.load(calibration_path,
+                                 image_size=tuple(target.get("image_size") or (0, 0)))
 
-    plan_options = {"tool_axis": app["tool_axis"], "yaw": float(body.get("yaw", app["yaw"])),
-                    # A tap marks a place: the arm visits it at the hover height. The
-                    # pick sequence is still available, but it is not what a tap means.
-                    "hover": bool(body.get("hover", app["hover"])),
-                    "hover_m": float(body.get("hover_m", app["hover_m"])),
-                    # The planner aims the flange; the tip is below it. A fitted rig
-                    # knows that distance exactly, a handheld profile has to be told.
-                    "tip_m": float(body.get("tip_m", app["tip_m"]))}
+    tap_height = float(body.get("hover_m", app["hover_m"]))
+    if tap_height < 0:
+        raise web.HTTPBadRequest(text="hover_m must be >= 0")
+    tap = target.get("tap") or {}
+    try:
+        tip, _distance, _grazing = extrinsics.ray_plane(
+            calibration.K, calibration.dist, np.asarray(target["T_base_cam"], dtype=float),
+            tap["u"], tap["v"], float(app["plane_z"]) + tap_height)
+    except (KeyError, TypeError, ValueError, extrinsics.ExtrinsicsError) as error:
+        return web.json_response({
+            "ok": False, "stage": "target", "capture": capture_id,
+            "error": "cannot intersect the raised plane: %s" % error,
+            "target": target,
+        }, status=422)
+    tip = [float(value) for value in tip]
+    if tip[2] < app["min_z"] - 1e-9:
+        return web.json_response({
+            "ok": False, "stage": "target", "capture": capture_id,
+            "error": "tip z %.3f m is below the minimum %.3f m"
+                     % (tip[2], app["min_z"]),
+            "target": target,
+        }, status=422)
+
+    plan_options = {
+        "tool_axis": app["tool_axis"],
+        "yaw": float(body.get("yaw", app["yaw"])),
+        "min_z": app["min_z"],
+    }
     plan_options.update(body.get("options") or {})
+    plan_options["min_z"] = app["min_z"]
 
-    status, payload = await planner_call(app, "/plan", {"target": target, "options": plan_options})
+    status, payload = await planner_call(app, "/plan", {
+        "targets": [compact_target(tip, {"pixel": target.get("pixel"),
+                                         "tap": tap, "capture": capture_id})],
+        "tip_offset_m": float(app["tip_m"]),
+        "gripper": "none",
+        "options": plan_options,
+    })
     if status != 200:
         # Return the target as well: the camera pose in it is still valid, and
         # the phone's reach overlay anchors on it even when the arm cannot go
@@ -680,9 +772,9 @@ async def handle_plan(request: web.Request) -> web.Response:
                                   "error": payload.get("error", "plan failed"),
                                   "target": target}, status=status)
 
-    logging.info("plan %s from tap at (%s, %s): %s", payload.get("id"),
-                 (target.get("tap") or {}).get("u"), (target.get("tap") or {}).get("v"),
-                 payload.get("summary", {}).get("target"))
+    logging.info("plan %s from tap at (%s, %s) at %.0f mm: tip [%.3f %.3f %.3f]",
+                 payload.get("id"), tap.get("u"), tap.get("v"), tap_height * 1000,
+                 tip[0], tip[1], tip[2])
     return web.json_response({
         "ok": True,
         "capture": capture_id,
@@ -1008,6 +1100,9 @@ def build_app(args) -> web.Application:
                          or os.environ.get("REBOT_TIP_MM", "35")) / 1000.0
     app["hover_m"] = float(getattr(args, "hover_m", 0.0)
                            or os.environ.get("REBOT_HOVER_M", "0.10"))
+    # The lowest tip z the planner will accept. It defaults to the default
+    # hover height, so a tap can never plan closer to the table than that.
+    app["min_z"] = app["hover_m"]
     app["calibrating"] = False
     app["last_calibration"] = None
     app["progress"] = None
@@ -1048,6 +1143,8 @@ def build_app(args) -> web.Application:
     app.router.add_get("/reach.js", handle_reach_js)
     app.router.add_get("/aruco.js", handle_aruco_js)
     app.router.add_get("/markers.js", handle_markers_js)
+    app.router.add_get("/height.js", handle_height_js)
+    app.router.add_get("/locate.js", handle_locate_js)
     app.router.add_get("/ekf.js", handle_ekf_js)
     app.router.add_get("/captures/{id}/{name}", handle_file)
     app.router.add_get("/favicon.ico", handle_favicon)
@@ -1097,7 +1194,8 @@ def main(argv=None):
                         help="fixed: rig from a sweep; handheld: the base marker on every tap")
     parser.add_argument("--hover-m", type=float,
                         default=float(os.environ.get("REBOT_HOVER_M", "0.10")),
-                        help="how far above the tapped point the arm ends, in metres")
+                        help="how far above the tapped point the arm ends, in metres; "
+                             "also the lowest tip z the planner accepts")
     parser.add_argument("--extrinsics", default=os.environ.get("REBOT_EXTRINSICS", ""),
                         help="fixed-camera rig JSON; then taps need no tag")
     parser.add_argument("--camera", default=os.environ.get("REBOT_CAMERA", ""),

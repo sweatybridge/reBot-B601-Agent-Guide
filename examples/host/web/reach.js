@@ -442,6 +442,8 @@
     let config = null;              // /reach.json
     let band = null;                // computed annulus, cached by flange height
     let bandKey = "";
+    let heightM = null;             // page override of hover_m, metres above the worktop
+    let heightTimer = 0;            // coalesces band recomputes during a height drag
     let lastPose = null;            // T_base_cam from the last plan (handheld)
     let lastPoseLabel = "";
     let lastError = "";
@@ -472,6 +474,24 @@
       return value ? { "X-Rebot-Token": value } : {};
     }
 
+    function effectiveHeight() {
+      if (heightM !== null) return heightM;
+      return Number(config && config.hover_m);
+    }
+
+    function recomputeBand() {
+      if (!config) return false;
+      const planeZ = Number(config.plane_z);
+      const hoverM = effectiveHeight();
+      const tipM = Number(config.tip_m);
+      const key = [planeZ, hoverM, tipM].join("|");
+      if (bandKey !== key || !band) {
+        band = computeReachBand(planeZ, hoverM, tipM);
+        bandKey = key;
+      }
+      return Boolean(band);
+    }
+
     async function load() {
       const response = await fetch("/reach.json", { headers: headers(), cache: "no-store" });
       const data = await response.json().catch(() => ({}));
@@ -479,13 +499,40 @@
         throw new Error(data.error || ("the host answered " + response.status));
       }
       config = data;
-      const key = [data.plane_z, data.hover_m, data.tip_m].join("|");
-      if (bandKey !== key || !band) {
-        band = computeReachBand(Number(data.plane_z), Number(data.hover_m), Number(data.tip_m));
-        bandKey = key;
-      }
-      if (!band) throw new Error("the arm model has no reachable band at this height");
+      if (!recomputeBand()) throw new Error("the arm model has no reachable band at this height");
       return data;
+    }
+
+    function clearHeightTimer() {
+      if (heightTimer) {
+        clearTimeout(heightTimer);
+        heightTimer = 0;
+      }
+    }
+
+    function applyHeight() {
+      heightTimer = 0;
+      if (!visible || !config) return;
+      if (!recomputeBand()) {
+        lastError = "the arm model has no reachable band at this height";
+        drawEmpty(lastError);
+        return;
+      }
+      lastError = "";
+      draw();
+    }
+
+    function setHeight(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return;
+      const next = Math.max(0, number);
+      if (heightM !== null && Math.abs(heightM - next) < 1e-9) return;
+      heightM = next;
+      if (!visible || !config) return;
+      // The band costs a radial IK scan. Coalesce a drag into one recompute per
+      // ~110 ms; the final value always gets drawn because the timer is trailing.
+      if (heightTimer) return;
+      heightTimer = window.setTimeout(applyHeight, 110);
     }
 
     function sizeCanvas() {
@@ -1020,6 +1067,10 @@
         drawEmpty(lastError || "reading the calibration…");
         return;
       }
+      if (!band) {
+        drawEmpty("the arm model has no reachable band at this height");
+        return;
+      }
       const fixed = Boolean(config.T_base_cam);
       const live = !fixed && livePose && (Date.now() - liveAt) < 3000;
       const chosen = fixed ? config.T_base_cam : (live ? predictedPose() : (lastPose || null));
@@ -1049,6 +1100,7 @@
       if (loading) return;
       loading = true;
       stopDetection();
+      clearHeightTimer();
       livePose = null;
       baseCamera = null;
       try {
@@ -1076,6 +1128,7 @@
         apply();
       } else {
         stopDetection();
+        clearHeightTimer();
         livePose = null;
         baseCamera = null;
         context.clearRect(0, 0, canvas.width, canvas.height);
@@ -1120,10 +1173,13 @@
     window.addEventListener("rebot:rig", () => {
       if (!visible) return;
       stopDetection();
+      clearHeightTimer();
       detector = null;
       livePose = null;
       baseCamera = null;
       config = null;
+      band = null;
+      bandKey = "";
       apply();
     });
 
@@ -1147,6 +1203,8 @@
       toggle: toggle,
       setPose: setPose,
       projectPoint: projectPoint,
+      setHeight: setHeight,
+      get height() { return heightM; },
       get visible() { return visible; },
     };
   }

@@ -55,9 +55,15 @@ Errors go into the tap point one for one: 5 mm off in `x` is 5 mm off at the
 finger, and a heading a half-turn wrong mirrors the point through the tag's plane
 instead — which is unmistakable on the first tap.
 
-Every tap then: uploads the frame, solves `T_cam_tag` with a PnP, places the tag
-with `T_base_tag` from those four numbers, composes `T_base_cam`, casts the tap's
-ray onto the table plane, and sends the arm to **10 cm above** the intersection.
+Every phone tap then: solves the tag in the page on the tapped frame, composes
+`T_base_cam` from those four numbers, and intersects the tap's ray with the
+plane at the selected height — **10 cm above the worktop** by default. The
+intersection moves along the ray as the height changes. (`/live` and the CLI
+still upload the frame and run the same PnP on the host; their hover is a
+vertical offset.) Tap and drag up or down on the preview to change that height;
+the badge next to the zoom chip shows the current value. Each marker keeps the
+height it was tapped at, so changing the badge later affects the next marker
+only; the plan carries each marker's own tip point.
 
 No calibration session, and the phone can be picked up and moved between taps.
 
@@ -70,14 +76,16 @@ The camera stays put; the tag is not needed.
    verification decides whether to write the rig.
 2. Choose **Fixed camera** with the switch.
 
-From then on each tap projects through that rig: ray → table plane → 10 cm above.
-Re-run the sweep if the bracket is bumped.
+From then on each tap projects through that rig: ray → plane at the selected
+height (10 cm above the worktop by default). Re-run the sweep if the bracket is
+bumped.
 
 ## What the two modes share
 
 The tap's metric meaning is the same in both: the pixel's ray meets the table
 plane (`REBOT_PLANE_Z`), and the arm goes to `REBOT_HOVER_M` above it — 10 cm by
-default. The difference is only where the camera's pose came from.
+default, adjustable per tap on the phone. The difference is only where the
+camera's pose came from.
 
 The board ends every move where it began, so the arm goes out to the point, holds,
 and comes back. That is the platform's semantics, not a choice made here.

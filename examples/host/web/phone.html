@@ -47,7 +47,7 @@
   .dot.ok { background: var(--good); box-shadow: 0 0 0 3px rgba(69, 201, 138, .12); }
   .dot.wait { background: var(--warn); box-shadow: 0 0 0 3px rgba(240, 180, 41, .12); }
   .server { color: var(--dim); font-size: 13px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; min-height: 24px; }
+  .chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; min-height: 24px; }
   .chip {
     font: inherit; font-size: 12px; color: var(--ink);
     background: #1b2027; border: 1px solid var(--line); border-radius: 999px;
@@ -57,12 +57,29 @@
   .chip.on { border-color: var(--accent); color: var(--accent); }
   .chip.warn { border-color: var(--warn); color: var(--warn); }
   .chip.plain { cursor: default; color: var(--dim); }
+  .chip-group { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+  .height-badge {
+    flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 650; font-variant-numeric: tabular-nums;
+    color: #04121f; background: var(--accent); border-radius: 999px;
+    padding: 5px 10px; white-space: nowrap;
+    user-select: none; -webkit-user-select: none;
+    transition: background .15s ease, transform .15s ease;
+  }
+  .height-badge::before { content: "⇕"; font-size: 13px; line-height: 1; opacity: .7; }
+  .height-badge.adjusting { background: var(--warn); transform: scale(1.06); }
+  @media (max-width: 430px) {
+    .brand small { display: none; }
+    .server { font-size: 12px; }
+  }
 
   main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   #stage {
     position: relative; flex: 1 1 auto; min-height: 0; background: #000;
-    overflow: hidden; touch-action: manipulation;
+    overflow: hidden; touch-action: none;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
   }
+  #stage.adjusting { cursor: ns-resize; }
   #video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
   #reachCanvas {
     position: absolute; inset: 0; width: 100%; height: 100%; display: none;
@@ -136,6 +153,7 @@
   </div>
   <div class="chips" id="chips">
     <span class="chip plain">camera off</span>
+    <span class="height-badge" id="heightBadge" title="Drag up or down in the preview to set the arm height">10 cm</span>
   </div>
 </header>
 
@@ -144,7 +162,7 @@
     <video id="video" playsinline muted autoplay></video>
     <canvas id="reachCanvas" aria-hidden="true"></canvas>
     <div id="markers" aria-hidden="true"></div>
-    <div id="hint">Tap <strong>Start camera</strong>, keep the base tag in frame, then tap the table to place numbered markers.</div>
+    <div id="hint">Tap <strong>Start camera</strong>, keep the base tag in frame, then tap the table to place numbered markers. Drag up or down on the preview to set the arm's height.</div>
   </div>
   <div id="log" aria-live="polite"></div>
 </main>
@@ -168,6 +186,12 @@
       <li><b>Handheld (the default).</b> The tag is taped to the side of the base. Tap the table
           to add a numbered marker, up to 10. Each tap is solved in the frame it was taken in, so
           the phone can move between markers.</li>
+      <li><b>Height.</b> Drag up or down anywhere in the preview: the badge next to the zoom
+          chip is how far above the worktop the arm ends. A tap still adds a marker; only a
+          drag changes the height. Each marker keeps the height it was tapped at, so moving
+          the badge later affects new markers and the Reach band, not markers already placed.
+          The arm refuses a tip below the default hover (10 cm by default), so the drag
+          stops at that floor. The default is 10 cm.</li>
       <li><b>Move arm</b> plans and runs the markers in order. Amber odd markers half-close
           the gripper; green even markers open it, starting fully open. The pins are projected
           onto the worktop and follow it while Reach is on. The arm returns to where it began.
@@ -179,11 +203,12 @@
           markers need no tag.</li>
       <li><b>Calibration mode</b> turns the Move arm button back into <b>Capture</b> for
           checkerboard shots.</li>
-      <li><b>Reach</b> paints the band of table markers can be planned in. With a fixed rig it is
-          exact; with the base tag in view the phone locates the tag itself, and the phone IMU
-          keeps the band turning and translating between tag frames. It clears after a few
-          seconds without a detection. By default Reach uses the tag pose alone; add
-          <code>&amp;filter=ekf</code> to the page URL to enable the 15-state IMU/EKF.</li>
+      <li><b>Reach</b> paints the band of table markers can be planned in, at the current
+          height. With a fixed rig it is exact; with the base tag in view the phone locates
+          the tag itself, and the phone IMU keeps the band turning and translating between tag
+          frames. It clears after a few seconds without a detection. By default Reach uses the
+          tag pose alone; add <code>&amp;filter=ekf</code> to the page URL to enable the
+          15-state IMU/EKF.</li>
       <li>Printing the tag and giving the host its position: <code>docs/base-marker.md</code>.</li>
     </ol>
   </details>
@@ -193,6 +218,8 @@
 <script src="/aruco.js"></script>
 <script src="/ekf.js"></script>
 <script src="/reach.js"></script>
+<script src="/locate.js"></script>
+<script src="/height.js"></script>
 <script src="/markers.js"></script>
 <script>
 "use strict";
@@ -212,6 +239,7 @@ const clearButton = $("#clear");
 const reachButton = $("#reach");
 const reachCanvas = $("#reachCanvas");
 const markersContainer = $("#markers");
+const heightBadge = $("#heightBadge");
 
 const state = {
   stream: null,
@@ -299,6 +327,15 @@ async function healthLoop() {
     const response = await api("/health");
     const data = await response.json();
     state.health = data;
+    if (heightControl) {
+      // point.z is the tip. The lowest accepted tip is min_z, so the lowest tap
+      // height is that minus the worktop only; the flange offset does not enter.
+      const minZ = Number(data.min_z ?? data.hover_m ?? 0.10);
+      const planeZ = Number(data.plane_z ?? 0);
+      heightControl.setRange(Math.max(0, minZ - planeZ),
+                             window.HeightControl.MAX);
+      heightControl.adoptHeight(data.hover_m);
+    }
     $("#serverDot").className = "dot ok";
     $("#serverText").textContent = "host ok" + (data.latest ? " / " + data.latest.slice(-6) : "");
     renderChips();
@@ -323,7 +360,14 @@ function renderChips() {
     if (settings.facingMode) chips.push('<span class="chip plain">' + settings.facingMode + "</span>");
     if (typeof settings.zoom === "number") {
       const zoomed = Math.abs(settings.zoom - 1) > 0.01;
-      chips.push('<span class="chip ' + (zoomed ? "warn" : "plain") + '">zoom ' + settings.zoom.toFixed(2) + "</span>");
+      // Zoom and the height badge are one flex item, so they stay on the same
+      // line even when the chip row wraps. The badge is moved into the slot
+      // because this list is rebuilt whenever the camera or health changes.
+      chips.push('<span class="chip-group">'
+        + '<span class="chip ' + (zoomed ? "warn" : "plain") + '">zoom '
+        + settings.zoom.toFixed(2) + "</span>"
+        + '<span data-height-slot></span>'
+        + "</span>");
     }
     if (state.calib) chips.push('<span class="chip on">calib ' + state.calibCount + "</span>");
   }
@@ -336,7 +380,11 @@ function renderChips() {
   } else if (!state.pc) {
     liveButton.disabled = false;
   }
-  $("#chips").innerHTML = chips.join("");
+  const chipsBox = $("#chips");
+  chipsBox.innerHTML = chips.join("");
+  const slot = chipsBox.querySelector("[data-height-slot]");
+  if (slot) slot.replaceWith(heightBadge);
+  else chipsBox.appendChild(heightBadge);
 }
 
 async function openStream() {
@@ -635,15 +683,37 @@ const planner = TapPlanner.create({
 });
 planner.disable();
 
+// The tap's tip point is solved in the page from the same camera pose the Reach
+// band uses; the capture server only enriches and forwards it.
+const browserLocate = window.BrowserLocate.create({
+  video: video,
+  token: () => state.token,
+  mode: () => (window.TapPlanner ? TapPlanner.getMode() : "handheld"),
+  onStatus: (message, kind) => log(escapeHtml(message), kind),
+});
+
 const markersOverlay = MarkerSequence.create({
   video: video,
   stage: stage,
   pins: markersContainer,
-  token: () => state.token,
   onStatus: (message, kind) => log(escapeHtml(message), kind),
   onChange: () => updateStartButton(),
   project: (point) => reachOverlay.projectPoint(point),
+  height: () => heightControl.height,
+  locate: (tap, height) => browserLocate.locate(tap, height),
 });
+
+// One owner for stage gestures: a tap adds a marker, a drag adjusts the arm's
+// height above the tapped point. The badge and the reach band follow it.
+const heightControl = window.HeightControl.create({
+  stage: stage,
+  badge: heightBadge,
+  initial: 0.10,
+  onTap: (x, y) => markersOverlay.addAt(x, y),
+  onChange: (height) => reachOverlay.setHeight(height),
+  onStatus: (message, kind) => log(escapeHtml(message), kind),
+});
+reachOverlay.setHeight(heightControl.height);
 
 function updateStartButton() {
   if (state.calib) {
@@ -662,6 +732,7 @@ async function startSequence() {
   state.busyText = "Planning...";
   clearButton.disabled = true;
   markersOverlay.setEnabled(false);
+  heightControl.setEnabled(false);
   updateStartButton();
   try {
     const response = await api("/sequence", {
@@ -701,6 +772,7 @@ async function startSequence() {
     state.busy = false;
     state.busyText = "";
     markersOverlay.setEnabled(true);
+    heightControl.setEnabled(true);
     clearButton.disabled = false;
     updateStartButton();
   }
@@ -750,6 +822,7 @@ calibButton.addEventListener("click", () => {
   calibButton.textContent = "Calibration mode: " + (state.calib ? "on" : "off");
   calibButton.classList.toggle("on", state.calib);
   markersOverlay.setCalibrating(state.calib);
+  heightControl.setEnabled(!state.calib);
   if (state.calib) {
     state.calibCount = 0;
     log("calibration mode: fill the frame with the checkerboard, 15-20 poses", "warn");

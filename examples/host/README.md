@@ -84,8 +84,8 @@ app/
   make_cert.py            local CA + leaf certificate for the phone
   healthcheck.py          compose healthcheck for the capture service
 
-web/                      phone.html, live.html, viewer.js (shared tap module)
-tests/                    selftest.py (43 checks) and browser_check.py (Chromium)
+web/                      phone.html, live.html, viewer.js (shared tap module), locate.js, height.js
+tests/                    selftest.py (162 checks) and browser_check.py (Chromium)
 deploy/                   mediamtx.yml, repeat_pino.ps1
 docs/                     phone-camera.md, arm_model.png
 state/                    captures, calib, tls, tags, out, work  (gitignored)

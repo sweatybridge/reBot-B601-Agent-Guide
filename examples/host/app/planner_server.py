@@ -19,10 +19,17 @@ routes.
 
     GET  /health              what is configured, and whether the edge answers
     GET  /pose                proxy of the edge's pose
-    POST /plan                {target, pose?, options?} -> /app/out/<id>.json
-    POST /plan-sequence       {targets, pose?, options?} -> one multi-marker pass
+    POST /plan                {targets, tip_offset_m, gripper, pose?, options?}
     POST /execute             {id, kp?, kd?} -> POST /play on the edge
     POST /move                {q, seconds?, gripper?} -> joint-space move, no IK
+
+The compact planner contract is tip-space only: `targets` is a list of
+`{tip: [x, y, z]}` objects (optional `pixel`/`tap`/`capture` provenance),
+`tip_offset_m` is the physical flange-to-tip distance for the whole request, and
+`gripper` is `"none"` (one target, no gripper motion) or `"alternate"`
+(half-close/open through a marker sequence). `hover`, `hover_m` and `tip_m` are
+deprecated; `min_z` defaults to the default hover height and the capture server
+sends its value with every request. The old `/plan-sequence` route answers 410.
 
 `/execute` refuses unless REBOT_EXECUTE=1. The file it sends was produced by the
 same `plan()` the CLI uses, and the edge re-checks limits and steps before any
@@ -33,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -110,70 +118,95 @@ def dump_pose():
     return payload
 
 
-def plan_one(body):
-    target = body.get("target")
-    if not isinstance(target, dict):
-        raise GatewayError("'target' must be the locate_target.py object")
-    pose = body.get("pose")
-    if pose is None:
-        pose = dump_pose()
-    elif not isinstance(pose, dict) or "ids" not in pose:
-        raise GatewayError("'pose' must be a rebot-edge dump when supplied")
-
-    options = planner.Options()
-    for name, value in (body.get("options") or {}).items():
-        if not hasattr(options, name):
-            raise GatewayError("unknown option %r" % name)
-        setattr(options, name, value)
-    options.quiet = True
-
-    started = time.time()
+def request_tip_offset(body):
+    value = body.get("tip_offset_m")
+    if value is None:
+        raise GatewayError("'tip_offset_m' is required (the flange-to-tip offset)")
     try:
-        payload, summary = planner.plan(pose, target, options)
-    except planner.PlanError as error:
-        raise GatewayError(str(error), 422) from error
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    plan_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
-    path = OUT_DIR / ("%s.json" % plan_id)
-    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-
-    logging.info("plan %s: %d waypoints, %.2f s, %.2f s to compute",
-                 plan_id, summary["waypoints"], summary["duration_s"], time.time() - started)
-    summary["compute_s"] = round(time.time() - started, 2)
-    return {"ok": True, "id": plan_id, "path": str(path), "bytes": path.stat().st_size,
-            "summary": summary, "execute": EXECUTE}
+        offset = float(value)
+    except (TypeError, ValueError) as error:
+        raise GatewayError("'tip_offset_m' must be a number in metres") from error
+    if not math.isfinite(offset) or offset < 0:
+        raise GatewayError("'tip_offset_m' must be finite and >= 0")
+    return offset
 
 
-def plan_sequence_one(body):
-    """Plan one hover pass through a list of marker targets."""
-    targets = body.get("targets")
-    if not isinstance(targets, list) or not targets:
-        raise GatewayError("'targets' must be a non-empty list of rebot-target objects")
-    if len(targets) > 20:
-        raise GatewayError("a marker sequence is limited to 20 targets")
-    pose = body.get("pose")
-    if pose is None:
-        pose = dump_pose()
-    elif not isinstance(pose, dict) or "ids" not in pose:
-        raise GatewayError("'pose' must be a rebot-edge dump when supplied")
-
+def request_options(body):
+    """Parse the small, tip-only option set; hover is gone."""
+    raw = body.get("options") or {}
+    for name in ("hover", "hover_m", "tip_m"):
+        if name in raw:
+            raise GatewayError(
+                "%s is deprecated in the planner API; send tip points and "
+                "'tip_offset_m' at the top level" % name)
     options = planner.Options()
-    for name, value in (body.get("options") or {}).items():
+    for name, value in raw.items():
         if not hasattr(options, name):
             raise GatewayError("unknown option %r" % name)
         setattr(options, name, value)
-    # The marker sequence is a sequence of places, not a sequence of grasps.
     options.hover = True
+    options.hover_m = 0.0
     options.quiet = True
-    # A marker sequence may pass close to the reach boundary between two
-    # markers. The arm's repeatability is 23 mm; 10 mm at a hover waypoint is
-    # still inside that, and the marker itself is gated by --max-reach.
-    options.ik_pos_tol = max(float(options.ik_pos_tol), 0.010)
+    return options
+
+
+def compact_targets(body):
+    """`targets: [{tip:[x,y,z], pixel?, tap?, capture?}]` -> internal targets."""
+    items = body.get("targets")
+    if not isinstance(items, list) or not items:
+        raise GatewayError("'targets' must be a non-empty list of tip targets")
+    if len(items) > 20:
+        raise GatewayError("a sequence is limited to 20 targets")
+    targets = []
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            raise GatewayError("target %d is not an object" % index)
+        tip = item.get("tip")
+        if not isinstance(tip, list) or len(tip) != 3:
+            raise GatewayError("target %d has no [x, y, z] tip" % index)
+        try:
+            point = [float(value) for value in tip]
+        except (TypeError, ValueError) as error:
+            raise GatewayError("target %d has a non-numeric tip" % index) from error
+        if not all(math.isfinite(value) for value in point):
+            raise GatewayError("target %d has a non-finite tip" % index)
+        target = {"format": "rebot-target", "version": 1,
+                  "point_frame": "tip", "point": point}
+        for key in ("pixel", "tap", "capture"):
+            if item.get(key) is not None:
+                target[key] = item[key]
+        targets.append(target)
+    gripper = body.get("gripper")
+    if gripper not in ("none", "alternate"):
+        raise GatewayError("'gripper' must be \"none\" or \"alternate\"")
+    return targets, gripper
+
+
+def plan_targets(body):
+    """One planning route for one or many tip points."""
+    targets, gripper = compact_targets(body)
+    pose = body.get("pose")
+    if pose is None:
+        pose = dump_pose()
+    elif not isinstance(pose, dict) or "ids" not in pose:
+        raise GatewayError("'pose' must be a rebot-edge dump when supplied")
+
+    options = request_options(body)
+    options.tip_m = request_tip_offset(body)
 
     started = time.time()
     try:
-        payload, summary = planner.plan_sequence(pose, targets, options)
+        if gripper == "none":
+            if len(targets) != 1:
+                raise GatewayError('gripper "none" takes exactly one target')
+            payload, summary = planner.plan(pose, targets[0], options)
+            label = "plan"
+        else:
+            # A sequence may pass close to the reach boundary between two
+            # markers; the arm's repeatability is 23 mm.
+            options.ik_pos_tol = max(float(options.ik_pos_tol), 0.010)
+            payload, summary = planner.plan_sequence(pose, targets, options)
+            label = "sequence"
     except planner.PlanError as error:
         raise GatewayError(str(error), 422) from error
 
@@ -182,9 +215,25 @@ def plan_sequence_one(body):
     path = OUT_DIR / ("%s.json" % plan_id)
     path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 
-    logging.info("sequence %s: %d markers, %d waypoints, %.2f s, %.2f s to compute",
-                 plan_id, summary["markers"], summary["waypoints"],
-                 summary["duration_s"], time.time() - started)
+    if label == "sequence":
+        tap_heights = summary.get("tap_heights_m") or []
+        if tap_heights and all(value is not None for value in tap_heights):
+            logging.info("sequence %s: %d markers, tap heights [%s] mm, %d waypoints, "
+                         "%.2f s, %.2f s to compute",
+                         plan_id, summary["markers"],
+                         ", ".join("%.0f" % (float(height) * 1000) for height in tap_heights),
+                         summary["waypoints"], summary["duration_s"],
+                         time.time() - started)
+        else:
+            logging.info("sequence %s: %d markers, %d waypoints, %.2f s, %.2f s to compute",
+                         plan_id, summary["markers"], summary["waypoints"],
+                         summary["duration_s"], time.time() - started)
+    else:
+        logging.info("plan %s: tip offset %.0f mm, %d waypoints, %.2f s, "
+                     "%.2f s to compute",
+                     plan_id, options.tip_m * 1000, summary["waypoints"],
+                     summary["duration_s"], time.time() - started)
+
     summary["compute_s"] = round(time.time() - started, 2)
     return {"ok": True, "id": plan_id, "path": str(path), "bytes": path.stat().st_size,
             "summary": summary, "execute": EXECUTE}
@@ -415,9 +464,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorised():
                 raise GatewayError("missing or wrong X-Rebot-Token", 401)
             if self.path == "/plan":
-                self._send(200, plan_one(self._body()))
+                self._send(200, plan_targets(self._body()))
             elif self.path == "/plan-sequence":
-                self._send(200, plan_sequence_one(self._body()))
+                raise GatewayError(
+                    "/plan-sequence is deprecated; POST /plan with targets and gripper", 410)
             elif self.path == "/execute":
                 self._send(200, execute_one(self._body()))
             elif self.path == "/move":

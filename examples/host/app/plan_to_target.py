@@ -20,6 +20,11 @@ the table (`--tool-axis`, see `--inspect`), then yawed by `--yaw`. Holding the
 start pose's orientation is the default because it is the one the arm is known
 to reach from; a top-down grasp needs `--tool-axis z-` or whichever local axis
 the URDF points out of the gripper.
+
+The gateway sends `target.point` as the **tool tip** in the base frame, with
+`hover_m` and `tip_m` zero and the physical offset in `target.tip_offset_m`. The
+CLI keeps the surface-point convenience: its target is the locator's worktop
+point, lifted by `hover_m` before the cartesian legs are built.
 """
 
 from __future__ import annotations
@@ -55,6 +60,9 @@ import traj  # noqa: E402
 
 MOTOR7_OPEN = 4.90
 MOTOR7_CLOSED = -0.015
+# The default minimum target z: the default hover height. It is also what the
+# capture server sends as min_z, so the two sides cannot drift.
+DEFAULT_MIN_Z = 0.10
 # Halfway between open and closed: the gesture the marker sequence makes on
 # odd-numbered markers.
 MOTOR7_HALF = (MOTOR7_OPEN + MOTOR7_CLOSED) / 2.0
@@ -95,7 +103,9 @@ class Options:
     tool_axis: str = "current"
     yaw: float = 0.0
     payload: float = 0.0
-    min_z: float = 0.002
+    # The lowest z the planner accepts for a target point. The default is the
+    # default hover height: the tip must not sit closer to the table than a tap.
+    min_z: float = DEFAULT_MIN_Z
     max_z: float = 0.95
     max_reach: float = 0.75
     no_return: bool = False
@@ -189,6 +199,34 @@ def validate_target_meta(target):
     return np.array([float(v) for v in point])
 
 
+def target_hover(target, default):
+    """The surface offset a CLI caller asked for; zero for a tip-point gateway target."""
+    value = target.get("hover_m")
+    if value is None:
+        value = default
+    try:
+        hover = float(value)
+    except (TypeError, ValueError) as error:
+        raise PlanError("target 'hover_m' must be a number in metres") from error
+    if not math.isfinite(hover) or hover < 0:
+        raise PlanError("target 'hover_m' must be finite and >= 0")
+    return hover
+
+
+def target_tip_offset(target, default):
+    """How far the flange sits above the tip, in metres."""
+    value = target.get("tip_offset_m")
+    if value is None:
+        value = default
+    try:
+        offset = float(value)
+    except (TypeError, ValueError) as error:
+        raise PlanError("target 'tip_offset_m' must be a number in metres") from error
+    if not math.isfinite(offset) or offset < 0:
+        raise PlanError("target 'tip_offset_m' must be finite and >= 0")
+    return offset
+
+
 def inspect_frame(R0, p0):
     print("end-effector at the dumped pose: [%+.4f %+.4f %+.4f] m" % tuple(p0))
     print("orientation, per local axis:")
@@ -230,13 +268,23 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
     p_start = p0.copy()
 
     point = validate_target_meta(target)
+    # A gateway target is already the tip in arm space; a CLI target is the
+    # surface point and asks for hover_m above it. Either way, the tip offset is
+    # what lifts the flange for IK.
+    hover_m = target_hover(target, options.hover_m)
+    tip_offset_m = target_tip_offset(target, options.tip_m)
+    is_tip = target.get("point_frame") == "tip"
+    lift_m = 0.0 if is_tip or not options.hover else hover_m
+    tip_point = point + np.array([0.0, 0.0, lift_m])
+    flange_point = tip_point + np.array([0.0, 0.0, tip_offset_m])
     radius = float(np.linalg.norm(point[:2]))
-    # With a hover the arm never descends to the table; judge the height it will
-    # actually reach, or every tap on the worktop would be refused as "into it".
-    judged = point + np.array([0.0, 0.0, float(options.hover_m) if options.hover else 0.0])
-    if judged[2] < options.min_z:
-        raise PlanError("target z %.4f is below --min-z %.4f: refusing to plan into the table"
-                        % (judged[2], options.min_z))
+    # Judge the tip: the min_z floor is a tip height. A pick plan has no hover,
+    # so it keeps the old table clearance rather than the tap floor.
+    judged = tip_point if options.hover else point
+    floor = options.min_z if options.hover else min(options.min_z, 0.002)
+    if judged[2] < floor - 1e-9:
+        raise PlanError("target z %.4f is below the minimum %.4f: refusing to plan into "
+                        "the table" % (judged[2], floor))
     if judged[2] > options.max_z:
         raise PlanError("target z %.3f is above --max-z %.3f" % (judged[2], options.max_z))
     if radius > options.max_reach:
@@ -355,7 +403,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
     if options.hover:
         # One leg out, a hold, and the way back. The tap meant "this place": the
         # arm visits it and stops, with no descend, grip or lift.
-        hover_point = point + np.array([0.0, 0.0, float(options.hover_m) + float(options.tip_m)])
+        hover_point = flange_point
         seed = cartesian(p0, hover_point, R0, R_work, options.approach_s, 0.4, seed, "hover")
         hold_start = state["t"]
         hold(options.hold_s)
@@ -384,6 +432,14 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         "frame": target.get("frame"),
         "target_source": target.get("source"),
         "target_point": [float(v) for v in point],
+        # The gateway sends tip points with the surface point and the tap height
+        # as provenance; the CLI sends a surface point directly.
+        "point_frame": target.get("point_frame"),
+        "tip_point": [float(v) for v in tip_point],
+        "flange_point": [float(v) for v in flange_point] if options.hover else None,
+        "surface_point": target.get("surface_point"),
+        "tap_height_m": target.get("tap_height_m"),
+        "tip_offset_m": tip_offset_m,
         "target_tag_reproj_px": (target.get("tag") or {}).get("reproj_px"),
         "calib_fingerprint": target.get("calib_fingerprint"),
         # A fixed camera: which rig, how good, and whether its mount still held
@@ -392,8 +448,18 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         "witness": target.get("witness"),
     }
     if options.hover:
+        provenance["hover_m"] = 0.0 if is_tip else hover_m
+        provenance["tip_m"] = tip_offset_m
+    if options.hover and is_tip:
+        tap_height = target.get("tap_height_m")
+        tap_text = "" if tap_height is None else " at %.0f mm tap height" % (
+            float(tap_height) * 1000)
+        steps = ("tap target: move tip to [%.3f %.3f %.3f]%s%s"
+                 % (point[0], point[1], point[2], tap_text,
+                    "" if options.no_return else ", then return"))
+    elif options.hover:
         steps = ("tap target: hover %.0f mm above [%.3f %.3f %.3f]%s"
-                 % (options.hover_m * 1000, point[0], point[1], point[2],
+                 % (hover_m * 1000, point[0], point[1], point[2],
                     "" if options.no_return else ", then return"))
     else:
         steps = ("tap target: approach %.0f mm above [%.3f %.3f %.3f], descend, grip %.2f rad, "
@@ -421,8 +487,13 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
     summary = {
         "start_tcp": [float(v) for v in p_start],
         "unpark_tcp": [float(v) for v in p0] if unparked else None,
-        "target": [float(v) for v in point],
+        "target": [float(v) for v in tip_point],
+        "flange_point": [float(v) for v in flange_point] if options.hover else None,
         "radius": radius,
+        "hover_m": None if (not options.hover or is_tip) else hover_m,
+        "tip_m": tip_offset_m if options.hover else None,
+        "tap_height_m": target.get("tap_height_m"),
+        "point_frame": target.get("point_frame"),
         "tool_axis": options.tool_axis,
         "yaw_deg": options.yaw,
         "waypoints": stats["waypoints"],
@@ -439,12 +510,15 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
 def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = print):
     """Hover through a list of tapped points, in order, as one trajectory.
 
-    This is the multi-marker form of the hover plan: each target is visited at
-    `hover_m` above the table, the arm holds there while the gripper moves, and
-    the pass finishes back at the pose it started from. The gripper starts fully
-    open; it half-closes at odd-numbered markers and opens at even-numbered ones.
-    The motion is the same cosine-eased Cartesian leg the single-tap plan uses,
-    so the speeds and the edge's step checks are unchanged.
+    This is the multi-marker form of the hover plan. The gateway sends already
+    converted tip points with `hover_m`/`tip_m` zero and the physical flange
+    offset in `tip_offset_m`, so `point` is the tip; the CLI may still pass a
+    surface point and let the options lift it. The arm holds at each point while
+    the gripper moves, and the pass finishes back at the pose it started from.
+    The gripper starts fully open; it half-closes at odd-numbered markers and
+    opens at even-numbered ones. The motion is the same cosine-eased Cartesian leg
+    the single-tap plan uses, so the speeds and the edge's step checks are
+    unchanged.
     """
     if not isinstance(targets, (list, tuple)) or not targets:
         raise PlanError("a marker sequence needs at least one target")
@@ -477,20 +551,30 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     # Validate everything before the first move: a bad marker halfway through a
     # sequence must not leave the arm somewhere unexpected.
     points = []
+    hovers = []
+    tip_offsets = []
+    flange_points = []
     for index, target in enumerate(targets, start=1):
         point = validate_target_meta(target)
+        hover_m = target_hover(target, options.hover_m)
+        tip_offset_m = target_tip_offset(target, options.tip_m)
+        is_tip = target.get("point_frame") == "tip"
+        tip_point = point if is_tip else point + np.array([0.0, 0.0, hover_m])
+        flange_point = tip_point + np.array([0.0, 0.0, tip_offset_m])
         radius = float(np.linalg.norm(point[:2]))
-        judged = point + np.array([0.0, 0.0, float(options.hover_m)])
-        if judged[2] < options.min_z:
-            raise PlanError("marker %d: target z %.4f is below --min-z %.4f"
-                            % (index, judged[2], options.min_z))
-        if judged[2] > options.max_z:
-            raise PlanError("marker %d: target z %.3f is above --max-z %.3f"
-                            % (index, judged[2], options.max_z))
+        if tip_point[2] < options.min_z - 1e-9:
+            raise PlanError("marker %d: tip z %.4f is below the minimum %.4f"
+                            % (index, tip_point[2], options.min_z))
+        if tip_point[2] > options.max_z:
+            raise PlanError("marker %d: tip z %.3f is above --max-z %.3f"
+                            % (index, tip_point[2], options.max_z))
         if radius > options.max_reach:
             raise PlanError("marker %d: target is %.3f m from the base axis, above "
                             "--max-reach %.2f" % (index, radius, options.max_reach))
-        points.append(point)
+        points.append(tip_point)
+        hovers.append(0.0 if is_tip else hover_m)
+        tip_offsets.append(tip_offset_m)
+        flange_points.append(flange_point)
 
     # With `--tool-axis current` the single-tap plan holds the start
     # orientation, including its yaw. A marker sequence can do better: the
@@ -608,7 +692,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     current_rotation = R0.copy()
     yaw_degrees = []
     for index, point in enumerate(points, start=1):
-        place = point + np.array([0.0, 0.0, float(options.hover_m) + float(options.tip_m)])
+        place = flange_points[index - 1]
         yaw_deg = math.degrees(math.atan2(float(point[1]), float(point[0])))
         yaw_degrees.append(round(yaw_deg, 3))
         R_marker = work_orientation(R0, sequence_axis, yaw_deg)
@@ -657,12 +741,21 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     joint_leg(q_last, {index: q_home[index] - q_last[index] for index in range(n_arm)},
               options.return_s, "return", gripper)
 
-    steps = ("%d markers: hover each in order; gripper open, half-close on odd "
-             "markers, open on even; return" % len(points))
+    steps = ("%d markers: move each tip to its arm-space point; gripper open, "
+             "half-close on odd, open on even; return" % len(points))
     provenance = {
         "sequence": True,
+        # Defaults for a CLI surface target; the gateway sends tip points with
+        # zero hover and a per-target tip offset.
+        "hover_m": float(options.hover_m),
+        "tip_m": float(options.tip_m),
         "targets": [
             {"point": [float(v) for v in point],
+             "flange_point": [float(v) for v in flange_points[index]],
+             "hover_m": float(hovers[index]),
+             "tip_offset_m": float(tip_offsets[index]),
+             "surface_point": targets[index].get("surface_point"),
+             "tap_height_m": targets[index].get("tap_height_m"),
              "capture": targets[index].get("capture"),
              "source": targets[index].get("source"),
              "tap": targets[index].get("tap")}
@@ -693,7 +786,15 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     summary = {
         "markers": len(points),
         "targets": [[float(v) for v in point] for point in points],
+        "flange_points": [[float(v) for v in point] for point in flange_points],
         "radii": [float(np.linalg.norm(point[:2])) for point in points],
+        "hover_m": float(options.hover_m),
+        "hovers_m": [float(value) for value in hovers],
+        "tap_heights_m": [target.get("tap_height_m") for target in targets],
+        "tip_offsets_m": [float(value) for value in tip_offsets],
+        "tip_m": (float(tip_offsets[0]) if tip_offsets
+                  and all(abs(value - tip_offsets[0]) < 1e-9 for value in tip_offsets)
+                  else None),
         "start_tcp": [float(v) for v in p_start],
         "waypoints": stats["waypoints"],
         "duration_s": stats["duration_s"],
@@ -711,8 +812,20 @@ def describe_sequence(summary):
              % summary["markers"]]
     for index, (point, radius) in enumerate(zip(summary["targets"], summary["radii"]),
                                             start=1):
-        lines.append("  marker %2d : [%+.4f %+.4f %+.4f] m (%.3f m from the base axis)"
-                     % (index, point[0], point[1], point[2], radius))
+        tap_heights = summary.get("tap_heights_m") or []
+        tap_height = tap_heights[index - 1] if index <= len(tap_heights) else None
+        tip_offsets = summary.get("tip_offsets_m") or []
+        tip_offset = tip_offsets[index - 1] if index <= len(tip_offsets) else None
+        if tap_height is not None:
+            height_text = "tap %.0f mm" % (float(tap_height) * 1000)
+        elif abs(float(summary["hovers_m"][index - 1])) > 1e-9:
+            height_text = "offset %.0f mm" % (summary["hovers_m"][index - 1] * 1000)
+        else:
+            height_text = ""
+        tip_text = "" if tip_offset is None else ", tip +%.0f mm" % (float(tip_offset) * 1000)
+        lines.append("  marker %2d : [%+.4f %+.4f %+.4f] m (%.3f m from the base axis), "
+                     "%s%s" % (index, point[0], point[1], point[2], radius,
+                               height_text, tip_text))
     lines += [
         "  waypoints  : %d over %.2f s" % (summary["waypoints"], summary["duration_s"]),
         "  worst IK   : %.4f m at %s" % (summary["worst_ik_m"],
@@ -739,6 +852,15 @@ def describe(summary):
         "  peak |tau|  : %.2f N.m" % summary["peak_tau"],
         "  max step    : %.3f rad" % summary["max_step_rad"],
     ]
+    if summary.get("flange_point") is not None:
+        lines.append("  flange      : [%+.4f %+.4f %+.4f] m (tip offset %.0f mm)"
+                     % (*summary["flange_point"], summary["tip_m"] * 1000))
+    if summary.get("hover_m") is not None:
+        lines.append("  hover       : %.0f mm above the target"
+                     % (summary["hover_m"] * 1000))
+    if summary.get("tap_height_m") is not None:
+        lines.append("  tap height  : %.0f mm above the worktop"
+                     % (summary["tap_height_m"] * 1000))
     return "\n".join(lines)
 
 
@@ -776,7 +898,8 @@ def add_arguments(parser):
     parser.add_argument("--ik-angle-tol", type=float, default=0.5,
                         help="and within this orientation error, deg")
     parser.add_argument("--payload", type=float, default=0.0, help="held mass at the tool frame, kg")
-    parser.add_argument("--min-z", type=float, default=0.002)
+    parser.add_argument("--min-z", type=float, default=None,
+                        help="minimum target z, m (default: %.2f)" % DEFAULT_MIN_Z)
     parser.add_argument("--max-z", type=float, default=0.95)
     parser.add_argument("--max-reach", type=float, default=0.75)
     parser.add_argument("--no-return", action="store_true")
@@ -785,12 +908,13 @@ def add_arguments(parser):
 
 
 def options_from_args(args) -> Options:
+    min_z = DEFAULT_MIN_Z if args.min_z is None else args.min_z
     return Options(
         hz=args.hz, approach=args.approach, approach_s=args.approach_s,
         descend_s=args.descend_s, grasp_q=args.grasp_q, open_q=args.open_q,
         grasp_s=args.grasp_s, hold_s=args.hold_s, lift=args.lift, lift_s=args.lift_s,
         return_s=args.return_s, tool_axis=args.tool_axis, yaw=args.yaw,
-        payload=args.payload, min_z=args.min_z, max_z=args.max_z, max_reach=args.max_reach,
+        payload=args.payload, min_z=min_z, max_z=args.max_z, max_reach=args.max_reach,
         no_return=args.no_return, unpark_j2=args.unpark_j2, unpark_j3=args.unpark_j3,
         unpark_s=args.unpark_s, ik_pos_tol=args.ik_pos_tol, ik_angle_tol=args.ik_angle_tol,
         urdf=args.urdf, quiet=args.quiet,

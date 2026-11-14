@@ -379,6 +379,13 @@ async def test_server(workdir: Path, geometry):
         check("health is ok", health.get("ok") is True and health.get("auth") is True)
         check("health reports the camera mode", health.get("mode") == "handheld"
               and health.get("rig") is None, str(health.get("mode")))
+        check("health reports the default hover height",
+              abs(float(health.get("hover_m", -1)) - 0.10) < 1e-9,
+              str(health.get("hover_m")))
+        check("health reports the flange minimum and tip offset",
+              abs(float(health.get("min_z", -1)) - 0.10) < 1e-9
+              and abs(float(health.get("tip_m", -1)) - 0.035) < 1e-9,
+              "min_z %s, tip_m %s" % (health.get("min_z"), health.get("tip_m")))
         check("serves the phone page", (await client.get("/")).status == 200)
 
         reach = await (await client.get("/reach.json")).json()
@@ -392,6 +399,8 @@ async def test_server(workdir: Path, geometry):
               and abs((reach.get("marker") or {}).get("size_m", 0) - 0.08) < 1e-9)
         check("serves the browser ArUco module", (await client.get("/aruco.js")).status == 200)
         check("serves the marker module", (await client.get("/markers.js")).status == 200)
+        check("serves the height control", (await client.get("/height.js")).status == 200)
+        check("serves the browser locator", (await client.get("/locate.js")).status == 200)
         check("serves the pose EKF", (await client.get("/ekf.js")).status == 200)
 
         form = FormData()
@@ -436,7 +445,12 @@ async def test_server(workdir: Path, geometry):
               "(%.2f, %.2f) vs (%.2f, %.2f)" % (
                   marker_pixel[0], marker_pixel[1],
                   geometry["pixel"][0], geometry["pixel"][1]))
-        sequenced = await client.post("/sequence", json={"targets": [marker_target]},
+        # Compact tip targets: no capture/locate, no rebot-target envelope.
+        compact = [
+            {"tip": [0.5, 0.0, 0.16], "pixel": [640, 480]},
+            {"tip": [0.55, 0.0, 0.25]},
+        ]
+        sequenced = await client.post("/sequence", json={"targets": compact},
                                       headers={"X-Rebot-Token": "selftest-token"})
         sequence_body = await sequenced.json()
         check("sequence reaches the planner",
@@ -444,7 +458,68 @@ async def test_server(workdir: Path, geometry):
               "status %s, %s" % (sequenced.status, str(sequence_body.get("error"))[:50]))
         bad_sequence = await client.post("/sequence", json={"targets": [{"format": "nope"}]},
                                          headers={"X-Rebot-Token": "selftest-token"})
-        check("sequence rejects a non-target", bad_sequence.status == 400)
+        check("sequence rejects a target without a tip", bad_sequence.status == 400)
+
+        # The phone's tip points are already arm-space; the host adds the one
+        # physical offset and the safety floor, then posts the compact request.
+        forwarded = []
+
+        async def fake_planner_call(app, path, body, timeout=120, method="POST"):
+            forwarded.append((path, body))
+            return 200, {"id": "fake-sequence",
+                         "summary": {"markers": len(body.get("targets") or [])},
+                         "execute": False}
+
+        real_planner_call = capture_server.planner_call
+        capture_server.planner_call = fake_planner_call
+        try:
+            forwarded_response = await client.post(
+                "/sequence", json={"targets": compact},
+                headers={"X-Rebot-Token": "selftest-token"})
+            forwarded_body = await forwarded_response.json()
+        finally:
+            capture_server.planner_call = real_planner_call
+        forwarded_ok = False
+        forwarded_note = "no planner call"
+        if forwarded:
+            path, request = forwarded[-1]
+            sent = request.get("targets") or []
+            options = request.get("options") or {}
+            first, second = (sent + [{}, {}])[:2]
+            first = first or {}
+            second = second or {}
+            first_ok = (first.get("tip") == [0.5, 0.0, 0.16]
+                        and first.get("pixel") == [640, 480]
+                        and "format" not in first and "point_frame" not in first)
+            second_ok = second.get("tip") == [0.55, 0.0, 0.25]
+            options_ok = (abs(float(options.get("min_z", -1)) - 0.10) < 1e-9
+                          and "hover_m" not in options and "tip_m" not in options)
+            forwarded_ok = (path == "/plan" and forwarded_response.status == 200
+                            and forwarded_body.get("ok") is True
+                            and request.get("gripper") == "alternate"
+                            and abs(float(request.get("tip_offset_m", -1)) - 0.035) < 1e-9
+                            and first_ok and second_ok and options_ok)
+            forwarded_note = ("path %s, gripper %s, offset %s, options %s"
+                              % (path, request.get("gripper"),
+                                 request.get("tip_offset_m"), options))
+        check("sequence forwards compact tip targets", forwarded_ok, forwarded_note)
+
+        deprecated_hover = await client.post(
+            "/sequence", json={"targets": compact, "hover_m": 0.1},
+            headers={"X-Rebot-Token": "selftest-token"})
+        check("sequence rejects the deprecated hover_m", deprecated_hover.status == 400)
+
+        bad_tip = await client.post(
+            "/sequence", json={"targets": [{"tip": [0.5, 0.0, "high"]}]},
+            headers={"X-Rebot-Token": "selftest-token"})
+        check("sequence rejects a non-numeric tip", bad_tip.status == 400)
+
+        rejected_low = await client.post(
+            "/sequence", json={"targets": [{"tip": [0.5, 0.0, 0.0]}]},
+            headers={"X-Rebot-Token": "selftest-token"})
+        check("sequence rejects a tip below the minimum",
+              rejected_low.status == 422,
+              str((await rejected_low.json()).get("error"))[:70])
 
         listing = await (await client.get("/captures.json")).json()
         check("captures.json lists it", len(listing["captures"]) == 1
@@ -482,6 +557,39 @@ async def test_server(workdir: Path, geometry):
               (captures / body["id"] / "target.json").is_file())
         check("locate annotated the frame",
               (captures / body["id"] / "annotated.jpg").is_file())
+
+        forwarded.clear()
+        capture_server.planner_call = fake_planner_call
+        try:
+            single = await client.post("/plan",
+                                       json={"capture": body["id"], "hover_m": 0.20},
+                                       headers={"X-Rebot-Token": "selftest-token"})
+            single_body = await single.json()
+        finally:
+            capture_server.planner_call = real_planner_call
+        single_ok = False
+        single_note = "no planner call"
+        if forwarded:
+            path, request = forwarded[-1]
+            sent = (request.get("targets") or [{}])[0] or {}
+            options = request.get("options") or {}
+            tip = sent.get("tip") or [0, 0, 0]
+            single_ok = (path == "/plan" and single.status == 200
+                         and single_body.get("ok") is True
+                         and request.get("gripper") == "none"
+                         and abs(float(request.get("tip_offset_m", -1)) - 0.035) < 1e-9
+                         and abs(float(tip[2]) - 0.20) < 1e-9
+                         and abs(float(options.get("min_z", -1)) - 0.10) < 1e-9
+                         and "hover_m" not in options and "tip_m" not in options)
+            single_note = "tip z %.3f, gripper %s, offset %s" % (
+                tip[2], request.get("gripper"), request.get("tip_offset_m"))
+        check("single tap becomes a one-target /plan", single_ok, single_note)
+
+        low_single = await client.post("/plan",
+                                       json={"capture": body["id"], "hover_m": 0.0},
+                                       headers={"X-Rebot-Token": "selftest-token"})
+        check("single tap rejects a tip below the minimum", low_single.status == 422)
+
         check("execution is off unless asked for",
               (await client.post("/execute", json={"id": "x"},
                                  headers={"X-Rebot-Token": "selftest-token"})).status == 403)
