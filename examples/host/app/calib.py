@@ -29,6 +29,61 @@ class CalibError(Exception):
     """Intrinsics are missing, malformed, or for a different aspect ratio."""
 
 
+def same_shape(a, b) -> bool:
+    """Do two image sizes describe the same rectangle, up to a quarter turn?"""
+    aw, ah = float(a[0]), float(a[1])
+    bw, bh = float(b[0]), float(b[1])
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return False
+    ratio = (aw / ah) / (bw / bh)
+    return abs(ratio - 1.0) <= 0.01
+
+
+def swapped_shape(a, b) -> bool:
+    """Is `b` the quarter-turn of `a` (dimensions exchanged)?"""
+    aw, ah = float(a[0]), float(a[1])
+    bw, bh = float(b[0]), float(b[1])
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return False
+    return same_shape((aw, ah), (bh, bw)) and abs(aw / ah - ah / aw) > 0.01
+
+
+def turns_for_shapes(calib_size, frame_size) -> int:
+    """Quarter turns (clockwise) the frame is rotated relative to the calibration.
+
+    Either 0 (same shape, maybe another resolution) or an odd number -- but from
+    dimensions alone a quarter turn has no sign: 90 and 270 both exchange the
+    sides. Callers that know the device orientation pass it in; this returns 1 as
+    the documented default and says so.
+    """
+    if swapped_shape(calib_size, frame_size):
+        return 1
+    if same_shape(calib_size, frame_size):
+        return 0
+    raise CalibError(
+        "the frame is %sx%s but the calibration is %sx%s; that is neither the same "
+        "aspect ratio nor a quarter turn of it"
+        % (int(frame_size[0]), int(frame_size[1]),
+           int(calib_size[0]), int(calib_size[1])))
+
+
+def map_pixel(u, v, size, turns):
+    """A pixel after `turns` clockwise quarter turns of an image of `size`.
+
+    `size` is the size of the image the pixel is measured in. One turn maps
+    (u, v) -> (h - v, u) and swaps the sides; the inverse is three turns, so a
+    caller never needs a second formula:
+
+        calibrated = map_pixel(u_frame, v_frame, frame_size, (4 - turns) % 4)
+        frame      = map_pixel(u_cal, v_cal, calib_size, turns)
+    """
+    width, height = float(size[0]), float(size[1])
+    for _ in range(int(turns) % 4):
+        u, v = height - v, u
+        width, height = height, width
+    return u, v
+
+
 def scale_K(K: np.ndarray, src_size, dst_size) -> np.ndarray:
     """Rescale a camera matrix between two image sizes of the same sensor crop.
 
@@ -89,7 +144,13 @@ class Calib:
 
 
 def load(path, image_size=None) -> Calib:
-    """Read a calibration JSON and rescale it to `image_size` if one is given."""
+    """Read a calibration JSON and rescale it to `image_size` if one is given.
+
+    `image_size` must be the same shape as the calibration, possibly at another
+    resolution. A frame that is a quarter turn of it is not a rescale: load it
+    without `image_size` and map the pixels with `map_pixel`, so `K` keeps
+    describing the grid it was measured on.
+    """
     path = Path(path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -106,6 +167,11 @@ def load(path, image_size=None) -> Calib:
         raise CalibError("%s: expected K, dist and image_size, got %s" % (path, exc)) from exc
 
     if image_size is not None and (int(image_size[0]), int(image_size[1])) != size:
+        if swapped_shape(size, image_size):
+            raise CalibError(
+                "the frame (%sx%s) is a quarter turn of the calibration (%sx%s): load "
+                "without image_size and map the pixels instead of rescaling"
+                % (int(image_size[0]), int(image_size[1]), int(size[0]), int(size[1])))
         K = scale_K(K, size, image_size)
         size = (int(image_size[0]), int(image_size[1]))
 

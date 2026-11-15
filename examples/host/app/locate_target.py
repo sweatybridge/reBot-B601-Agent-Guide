@@ -33,7 +33,7 @@ import json
 import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -76,6 +76,7 @@ class Options:
     extrinsics: object | None = None      # extrinsics.Rig; a fixed camera, no tag in frame
     witness: object | None = None         # witness.Reference; proves the mount has not moved
     witness_max_px: float = 2.0
+    rotation: int | None = None           # quarter turns clockwise, frame vs calibration
 
 
 def tag_object_points(tag_size):
@@ -349,10 +350,34 @@ def locate(image, meta, calibration, options: Options):
 
 
 def locate_capture(directory, calib_path, options: Options):
-    """The whole job for one capture directory: read, solve, annotate, write."""
+    """The whole job for one capture directory: read, solve, annotate, write.
+
+    A frame delivered in another orientation is turned back before anything is
+    measured: `K` and `dist` describe the grid they were fitted on, and `cv2`
+    solves the tag against exactly that grid. Turning the *frame* keeps both
+    exact, and costs one rotate of a few megapixels.
+    """
     image, meta, capture_dir, image_path = load_capture(directory)
-    calibration = calib_mod.load(calib_path, image_size=(image.shape[1], image.shape[0]))
-    payload = locate(image, meta, calibration, options)
+    delivered = (image.shape[1], image.shape[0])
+    calibration = calib_mod.load(calib_path)
+    turns = rotation_turns(meta, delivered, calibration, options.rotation)
+    if turns:
+        image = rotate_image(image, turns)
+        calibration = calib_mod.load(calib_path, image_size=(image.shape[1], image.shape[0]))
+
+    tap = options.tap if options.tap is not None else tap_from_meta(meta, delivered)
+    if tap is not None and turns:
+        tap = calib_mod.map_pixel(tap[0], tap[1], delivered, turns)
+    # The image is upright now, so the tap must be too; the meta's own tap would
+    # be measured against the delivered frame.
+    meta_upright = dict(meta)
+    meta_upright.pop("tap", None)
+    meta_upright["image_size"] = [int(image.shape[1]), int(image.shape[0])]
+    upright = replace(options, tap=tap, rotation=0)
+
+    payload = locate(image, meta_upright, calibration, upright)
+    payload["rotation"] = turns
+    payload["delivered_size"] = [int(delivered[0]), int(delivered[1])]
 
     corners = payload.pop("_corners")
     T_base_cam = payload.pop("_T_base_cam")
@@ -370,10 +395,45 @@ def locate_capture(directory, calib_path, options: Options):
     return payload
 
 
+def rotate_image(image, turns):
+    """Turn an image clockwise by `turns` quarter turns."""
+    turns = int(turns) % 4
+    if turns == 1:
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    if turns == 2:
+        return cv2.rotate(image, cv2.ROTATE_180)
+    if turns == 3:
+        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return image
+
+
+def rotation_turns(meta, frame_size, calibration, explicit=None):
+    """How far the delivered frame is turned from the calibration, clockwise.
+
+    Three sources, in order: the caller, the capture's own `rotation`, and the
+    two orientations (`orientation_deg` now and in the calibration). Dimensions
+    alone cannot tell 90 from 270 -- they only say "a quarter turn" -- so the
+    shape fallback assumes clockwise and the payload records what it used.
+    """
+    if explicit is not None:
+        return int(explicit) % 4
+    declared = meta.get("rotation")
+    if declared is not None:
+        return int(declared) % 4
+    frame_deg = meta.get("orientation_deg")
+    calib_deg = (calibration.raw or {}).get("orientation_deg")
+    if frame_deg is not None and calib_deg is not None:
+        return int(round((float(frame_deg) - float(calib_deg)) / 90.0)) % 4
+    return calib_mod.turns_for_shapes(calibration.image_size, frame_size)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Locate a tapped point in the arm base frame.")
     parser.add_argument("--capture", required=True, help="capture directory or image file")
     parser.add_argument("--calib", required=True, help="calib/<device>.json")
+    parser.add_argument("--rotation", type=int, default=None, choices=[0, 1, 2, 3],
+                        help="quarter turns clockwise the frame is turned from the calibration; "
+                             "default is the capture's own meta, then the shape")
     parser.add_argument("--out", default="", help="target.json (default: <capture>/target.json)")
     parser.add_argument("--dictionary", default="4x4_50", choices=sorted(ARUCO_DICTS))
     parser.add_argument("--tag-id", type=int, default=None, help="default: largest marker in view")
@@ -423,6 +483,7 @@ def main(argv=None):
         max_reproj=args.max_reproj, max_grazing=args.max_grazing, max_reach=args.max_reach,
         dictionary=args.dictionary, tag_id=args.tag_id, annotate=args.annotate,
         extrinsics=rig, witness=reference, witness_max_px=args.witness_max_px,
+        rotation=args.rotation,
     )
     if marker is not None:
         options.tag_size = float(marker["size_m"])

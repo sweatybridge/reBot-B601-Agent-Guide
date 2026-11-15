@@ -161,6 +161,42 @@
     };
   }
 
+  // A frame can arrive a quarter turn from the calibration (a phone held in
+  // landscape). That is not a rescale: turn the coordinates back and keep K on
+  // the grid it was fitted for. The Python side does the same in calib.py.
+  function turnsForShapes(calibrationSize, frameSize) {
+    if (!calibrationSize || !frameSize) return 0;
+    const cw = calibrationSize[0];
+    const ch = calibrationSize[1];
+    const fw = frameSize[0];
+    const fh = frameSize[1];
+    if (!(cw > 0 && ch > 0 && fw > 0 && fh > 0)) return -1;
+    const same = Math.abs((cw / ch) / (fw / fh) - 1) <= 0.01;
+    const swapped = Math.abs((cw / ch) / (fh / fw) - 1) <= 0.01
+      && Math.abs(cw / ch - ch / cw) > 0.01;
+    if (swapped) return 1;      // the sign needs the device; clockwise is the default
+    if (same) return 0;
+    return -1;                  // neither a rescale nor a quarter turn
+  }
+
+  function mapPixel(u, v, size, turns) {
+    let width = size[0];
+    let height = size[1];
+    let x = u;
+    let y = v;
+    let steps = ((Math.round(turns) % 4) + 4) % 4;
+    while (steps > 0) {
+      const next = [height - y, x];
+      x = next[0];
+      y = next[1];
+      const size2 = [height, width];
+      width = size2[0];
+      height = size2[1];
+      steps -= 1;
+    }
+    return [x, y];
+  }
+
   function undistort(u, v, camera) {
     const xd = (u - camera.cx) / camera.fx;
     const yd = (v - camera.cy) / camera.fy;
@@ -216,6 +252,7 @@
       blendOrientation: blendOrientation,
       makeCamera: makeCamera, project: project, matrixPose: matrixPose,
       scaleCalibration: scaleCalibration, undistort: undistort, rayPlane: rayPlane,
+      turnsForShapes: turnsForShapes, mapPixel: mapPixel,
     };
   }
   if (typeof module !== "undefined" && module.exports) {
@@ -226,6 +263,7 @@
       blendOrientation: blendOrientation,
       makeCamera: makeCamera, project: project, matrixPose: matrixPose,
       scaleCalibration: scaleCalibration, undistort: undistort, rayPlane: rayPlane,
+      turnsForShapes: turnsForShapes, mapPixel: mapPixel,
     };
   }
 })();

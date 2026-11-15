@@ -260,6 +260,7 @@ const state = {
   calibCount: 0,
   token: "",
   health: null,
+  pinned: null,             // the frame size and screen angle the session started at
   modeInitialized: false,
   rigFingerprint: null,
 };
@@ -387,7 +388,8 @@ function renderChips() {
     chips.push('<span class="chip plain">camera off</span>');
   } else {
     const settings = state.track.getSettings ? state.track.getSettings() : {};
-    const size = (video.videoWidth || settings.width || 0) + "x" + (video.videoHeight || settings.height || 0);
+    const size = geometryText()
+      || ((settings.width || 0) + "x" + (settings.height || 0));
     chips.push('<span class="chip plain">' + size + "</span>");
     if (settings.frameRate) chips.push('<span class="chip plain">' + Math.round(settings.frameRate) + " fps</span>");
     if (settings.facingMode) chips.push('<span class="chip plain">' + settings.facingMode + "</span>");
@@ -459,6 +461,7 @@ async function startCamera() {
     state.track = stream.getVideoTracks()[0];
     video.srcObject = stream;
     await video.play();
+    pinGeometry();
     hint.hidden = true;
     markersOverlay.setEnabled(true);
     updateStartButton();
@@ -466,7 +469,12 @@ async function startCamera() {
     startButton.disabled = false;
     keepAwake();
     renderChips();
-    log("camera ready: " + video.videoWidth + "x" + video.videoHeight, "good");
+    log("camera ready: " + geometryText(), "good");
+    if (state.pinned) {
+      log("geometry pinned at " + state.pinned.width + "x" + state.pinned.height
+        + ", screen " + state.pinned.angle + " deg; it stays there until you restart",
+        "");
+    }
     applyPreferredFocus();
   } catch (error) {
     startButton.disabled = false;
@@ -474,6 +482,82 @@ async function startCamera() {
     updateStartButton();
     log(escapeHtml(explain(error)), "bad");
   }
+}
+
+/* ------------------------------------------------------- pinned geometry
+ *
+ * A tile on the sensor is not a tile in the frame: the browser may turn the
+ * stream by a quarter turn when the phone is held differently, and a `K` fitted
+ * on one grid does not describe the turned one. So the geometry -- frame size
+ * and the screen angle it arrived at -- is taken once, when the camera starts or
+ * restarts, and the session keeps it. A rotation mid-stream leaves the viewport
+ * alone and changes nothing the solver uses; if the browser really does re-cut
+ * the stream, taps and captures are refused with a line in the log instead of
+ * quietly solving against a grid the calibration never saw.
+ */
+
+function pinGeometry() {
+  const width = Number(video.videoWidth) || 0;
+  const height = Number(video.videoHeight) || 0;
+  state.pinned = width && height
+    ? { width: width, height: height, angle: screenAngle() }
+    : null;
+  geometryWarned = "";
+  angleNoticed = false;
+}
+
+function geometryMismatch() {
+  if (!state.pinned) return "";
+  const width = Number(video.videoWidth) || 0;
+  const height = Number(video.videoHeight) || 0;
+  if (!width || !height) return "the camera has no frame";
+  if (width === state.pinned.width && height === state.pinned.height) return "";
+  return "the frame changed from " + state.pinned.width + "x" + state.pinned.height
+    + " to " + width + "x" + height + " since the camera started; restart the camera "
+    + "to refit, or turn the phone back";
+}
+
+function geometryText() {
+  return (state.pinned ? state.pinned.width : video.videoWidth) + "x"
+    + (state.pinned ? state.pinned.height : video.videoHeight);
+}
+
+// One line when the viewport stops matching the pinned frame, one when it comes
+// back, and one when only the *screen* turned: a different angle with the same
+// frame size means the browser kept the stream geometry, so the calibration
+// still applies and nothing is re-fitted.
+let geometryWarned = "";
+let angleNoticed = false;
+function checkGeometry() {
+  const problem = geometryMismatch();
+  if (problem) {
+    if (problem !== geometryWarned) {
+      geometryWarned = problem;
+      log(escapeHtml(problem), "warn");
+    }
+    return problem;
+  }
+  if (geometryWarned) {
+    geometryWarned = "";
+    log("the frame matches the pinned geometry again", "good");
+  }
+  const angle = screenAngle();
+  if (state.pinned && angle !== null && angle !== state.pinned.angle) {
+    if (!angleNoticed) {
+      angleNoticed = true;
+      log("the screen turned; the frame geometry did not change, so the calibration "
+        + "still applies", "");
+    }
+  } else {
+    angleNoticed = false;
+  }
+  return "";
+}
+
+window.addEventListener("orientationchange", checkGeometry);
+window.addEventListener("resize", checkGeometry);
+if (window.screen && window.screen.orientation && window.screen.orientation.addEventListener) {
+  window.screen.orientation.addEventListener("change", checkGeometry);
 }
 
 async function applyPreferredFocus() {
@@ -557,8 +641,22 @@ function buildMeta(width, height) {
       platform: navigator.platform || "",
       dpr: window.devicePixelRatio || 1,
     },
+    // The screen's angle the *stream* was pinned at, not the angle now: a frame
+    // taken after a mid-stream turn would not match this geometry anyway, and
+    // such a capture is refused before it gets here.
+    orientation_deg: state.pinned ? state.pinned.angle : screenAngle(),
     locked: state.locked,
   };
+}
+
+// screen.orientation is the modern API; window.orientation is the iOS fallback.
+// null means "this browser will not say", and the host falls back to the shape.
+function screenAngle() {
+  const modern = window.screen && window.screen.orientation
+    ? window.screen.orientation.angle : undefined;
+  const value = Number(modern !== undefined ? modern : window.orientation);
+  if (!Number.isFinite(value)) return null;
+  return ((Math.round(value) % 360) + 360) % 360;
 }
 
 function captureLink(id) {
@@ -570,6 +668,11 @@ async function capture() {
   if (state.busy || !state.track) return;
   if (!video.videoWidth) {
     log("no frame yet; wait a moment and try again", "warn");
+    return;
+  }
+  const wrongFrame = checkGeometry();
+  if (wrongFrame) {
+    log("not capturing: " + escapeHtml(wrongFrame), "bad");
     return;
   }
   state.busy = true;
@@ -740,7 +843,14 @@ const heightControl = window.HeightControl.create({
   stage: stage,
   badge: heightBadge,
   initial: 0.10,
-  onTap: (x, y) => markersOverlay.addAt(x, y),
+  onTap: (x, y) => {
+    const wrongFrame = checkGeometry();
+    if (wrongFrame) {
+      log("not marking: " + escapeHtml(wrongFrame), "warn");
+      return;
+    }
+    markersOverlay.addAt(x, y);
+  },
   onChange: (height) => reachOverlay.setHeight(height),
   onStatus: (message, kind) => log(escapeHtml(message), kind),
 });

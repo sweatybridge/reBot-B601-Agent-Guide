@@ -98,7 +98,7 @@ app/
   healthcheck.py          compose healthcheck for the capture service
 
 web/                      phone page, shared api/video/geometry modules, reach, locate
-tests/                    selftest.py (174 checks), browser_check.py (Chromium),
+tests/                    selftest.py (the whole pipeline, no hardware), browser_check.py (Chromium),
                           agent_eval.py (chat trajectories against the model)
 deploy/                   mediamtx.yml, repeat_pino.ps1
 docs/                     phone-camera.md, arm_model.png

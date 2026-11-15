@@ -22,14 +22,23 @@
   function tipTarget(calibration, T, u, v, planeZ, tapHeight, videoWidth, videoHeight) {
     const width = videoWidth || calibration.image_size[0];
     const heightPx = videoHeight || calibration.image_size[1];
-    const camera = makeCamera(calibration, width, heightPx);
     const height = Number(tapHeight);
     if (!Number.isFinite(height)) throw new Error("the tap height is not a number");
+
+    // A landscape frame is a quarter turn of the calibration: map the tap into
+    // the calibrated grid and use K there, rather than rescaling a K that no
+    // longer describes the frame. `turnsForShapes` returns -1 for a genuine crop
+    // mismatch, which `makeCamera` below still refuses.
+    const turns = Math.max(0, G.turnsForShapes(calibration.image_size, [width, heightPx]));
+    const source = turns ? calibration.image_size : [width, heightPx];
+    const at = turns ? G.mapPixel(u, v, [width, heightPx], 4 - turns) : [u, v];
+    const camera = makeCamera(calibration, source[0], source[1]);
+
     // Direct intersection with the raised plane: the tip is the point under the
     // tapped pixel at that height, so its x/y move along the ray as the height
     // changes. This is not the same as lifting the worktop point vertically.
-    const tip = rayPlane(camera, T, u, v, Number(planeZ) + height).point;
-    return { tip: tip, pixel: [u, v], tap: { u: u, v: v } };
+    const tip = rayPlane(camera, T, at[0], at[1], Number(planeZ) + height).point;
+    return { tip: tip, pixel: [u, v], tap: { u: u, v: v }, rotation: turns };
   }
 
   function solveTag(pixels, width, height, calibration, marker, planeZ) {

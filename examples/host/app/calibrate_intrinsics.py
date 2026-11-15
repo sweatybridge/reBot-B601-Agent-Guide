@@ -218,14 +218,21 @@ def main(argv=None):
                          % (rms, args.max_rms))
 
     # Name the file after the device the page reported, so a second phone or the
-    # front camera does not overwrite the first calibration.
+    # front camera does not overwrite the first calibration. The orientation the
+    # board was shot in is recorded too, so a later landscape frame can be turned
+    # back instead of needing a second calibration.
     device = args.device
+    meta = {}
+    meta_path = views[0][0] / "meta.json"
+    if meta_path.is_file():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
     if not device:
-        meta_path = views[0][0] / "meta.json"
-        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
         settings = meta.get("settings") or {}
         label = settings.get("deviceId") or (meta.get("device") or {}).get("ua", "")
         device = calib_mod.slug(str(label)[-40:], "camera")
+    orientation_deg = None
+    if meta.get("orientation_deg") is not None:
+        orientation_deg = int(round(float(meta["orientation_deg"]))) % 360
 
     payload = {
         "format": "rebot-camera-calib",
@@ -241,6 +248,8 @@ def main(argv=None):
         "source_captures": [directory.name for directory, _ in views],
         "notes": "pinhole + radial/tangential; rescale with calib.scale_K for other sizes",
     }
+    if orientation_deg is not None:
+        payload["orientation_deg"] = orientation_deg
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / ("%s.json" % device)

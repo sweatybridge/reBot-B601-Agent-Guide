@@ -171,6 +171,9 @@
         calibrating = Boolean(value);
         render();
       },
+      // A caller that adds a marker without a gesture (the chat sidebar) can ask
+      // for the pins to be laid out again once its own state has settled.
+      redraw: function () { render(); },
       get count() { return markers.length; },
       get targets() { return markers.map((marker) => marker.target); },
       get busy() { return busy; },

@@ -53,12 +53,13 @@ docker compose -f examples/host/compose.yaml --profile tools run --rm tools test
 python examples/host/tests/selftest.py
 ```
 
-174 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
-tag recovers a known 3D point to a fraction of a millimetre, a camera pose is
-recovered from eight synthetic arm poses with a 30 px mis-click in the set, a
-capture round-trips through the real HTTP server, and the trajectory payload is
-checked against the player's own rules. If this fails, the pipeline is wrong,
-not your measurement.
+The suite needs no phone and no arm: a synthetic camera calibrates itself, a
+rendered tag recovers a known 3D point to a fraction of a millimetre, a camera
+pose is recovered from eight synthetic arm poses with a 30 px mis-click in the
+set, a landscape frame is turned back and lands within 1.5 mm, a capture
+round-trips through the real HTTP server, and the trajectory payload is checked
+against the player's own rules. It prints how many checks it ran. If this fails,
+the pipeline is wrong, not your measurement.
 
 The page is the one part that needs a browser. `browser_check.py` runs it in
 headless Chrome: it substitutes a canvas for the camera, stubs the tag pose,
@@ -451,6 +452,74 @@ Calibration is per camera, per resolution, **and per zoom**. The page reports
 or don't zoom. `calib.load()` rescales `K` between resolutions of the same aspect
 ratio and refuses to cross a crop.
 
+### When the phone is in landscape
+
+A frame delivered a quarter turn round is **not** a rescale: `K` and `dist`
+describe the pixel grid they were fitted on, and the tag solve runs against that
+grid. Rotating `K` by hand is the wrong instinct for this pipeline -- it is only
+exact for a pure pinhole, because the tangential terms are tied to the image
+axes, and `cv2` would then solve the tag against a grid that does not exist.
+
+So the capture is **turned back first**, then solved with the original `K`:
+
+```
+delivered 1200x1600, calibrated 1600x1200
+  turns = 3 (the delivered frame is a quarter turn the other way)
+  image  = rotate(delivered, 3)            -> 1600x1200, upright
+  tap    = map_pixel(tap, delivered, 3)    -> the same point, upright
+  solve  = the portrait K, the portrait dist, exactly as before
+```
+
+Where the quarter turn comes from, in order:
+
+| source | what it is |
+|---|---|
+| the caller | `--rotation 0..3` on `locate_target.py`, or `Options(rotation=...)` |
+| the capture | `meta.rotation`, written by whoever took the frame |
+| the two angles | `meta.orientation_deg` minus the calibration's own `orientation_deg`, in 90s |
+| the shape | the frame is a quarter turn of the calibration, so **assume clockwise** |
+
+The phone records `orientation_deg` from `screen.orientation.angle` on every
+capture, and `calibrate_intrinsics.py` stores the angle the board was shot at, so
+the third row is exact whenever both exist. The last row is the fallback: two
+dimensions cannot tell 90 from 270, and the payload says `rotation` and
+`delivered_size` so a wrong guess is visible in one tap rather than silent. A
+frame that is neither the same aspect ratio nor a quarter turn is still refused,
+with the message telling you which it is.
+
+`/live` is a separate case: it decodes a stream whose geometry the *publisher*
+chose, so the page reuses `K` as long as the phone publishes one orientation. If
+the phone is rotated while publishing, the stream geometry changes underneath it
+and the page needs the same orientation signal; that is not wired yet.
+
+### The geometry is pinned when the camera starts
+
+Turning a frame back needs to know **how far it turned**, and mid-stream that is
+exactly what is hard to know. So the frame size and the screen angle are read
+once, when the camera starts or restarts, and the session keeps them:
+
+- A later rotation changes nothing the pipeline uses. The viewport is the stage's
+  box, not the frame's, so it does not move; the chip keeps showing the pinned
+  size; `K` still describes the pinned grid.
+- If only the *screen* turned and the frame size stayed the same, the browser kept
+  the stream geometry: the log says so once, and the calibration still applies.
+- If the browser really re-cuts the stream (the frame size changed), taps,
+  markers and captures are refused with `the frame changed from 720x1280 to
+  1280x720 since the camera started; restart the camera to refit, or turn the
+  phone back`. Nothing is solved against a grid the calibration never saw.
+- **Restart** is the one action that is allowed to change the geometry: it stops
+  the track, opens a new one and re-pins to whatever comes back, which is also
+  how a landscape session is fitted for good.
+
+Captures carry `orientation_deg` from the pinned angle, not the angle at the
+moment of the shot: a shot taken after a mid-stream re-cut would not match that
+geometry anyway, and is refused before it is encoded.
+
+`/live` does the same per connection: the WHEP stream's size is pinned in
+`loadedmetadata`; a publisher that re-cuts the stream mid-session gets a warning
+in the chat, and the pixel tools, marker adds and plan taps refuse until the page
+is disconnected and connected again.
+
 ## Markers, then Move arm
 
 On the phone a tap no longer plans. It grabs the exact frame under the finger,
@@ -754,9 +823,17 @@ Linux). Running `capture_server.py` directly, `localhost` is already right.
   as it was when the chat started.
 - The conversation keeps at most **4 frames**; older ones are replaced with
   "(older frame dropped)" so a long chat does not become megabytes of base64.
-- The page stops a runaway at **8 model turns** and says so in the log.
+- The page stops a runaway at **12 model turns** and says so in the log.
 - Tool calls and their outcomes are printed in the log as they happen, so the
   transcript shows what was attempted even when the model's prose is vague.
+- Everything the model says is shown, including the line it writes *between* two
+  tool calls, and every line carries a timestamp.
+- The send button is the stop button while the agent works: an up arrow sends, a
+  square aborts the model call in flight and frees the box for the next message. A
+  tool call already running finishes; nothing queued behind it starts.
+- A marker the agent queues is pinned on the preview exactly like a tapped one
+  (`add_marker` switches the page to markers, so **Move arm** is available), and
+  the transcript says which pixel it landed on.
 - `/agent` is a POST, so it needs the same `X-Rebot-Token` as everything else.
 
 ### Where it is weak
@@ -941,7 +1018,11 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | capture works, `locate_target.py` says "no ArUco marker" | tag out of frame, or too small/blurred at that distance |
 | "tag reprojection 4 px is above --max-reproj" | phone moved during the exposure, or `--tag-size` is the sheet size, not the black square |
 | live preview never connects | phone and host on different VLANs / AP isolation; UDP 8189 blocked |
-| "aspect ratio changed" | calibrated at 4:3, captured 16:9; recalibrate at the capture size |
+| "aspect ratio changed" | calibrated at 4:3, captured 16:9; recalibrate at the capture size. A 90°/270° frame is not this: it is turned back, see *When the phone is in landscape* |
+| "the frame is a quarter turn of the calibration" | the frame is rotated and the caller asked `calib.load` to *rescale* it; load without `image_size` and map the pixels (the capture path already does) |
+| a landscape marker lands mirrored | the quarter-turn direction was guessed; put `rotation` in the capture meta, or pass `--rotation`, and check the angle the calibration was shot at |
+| taps and markers stop after turning the phone | the browser re-cut the frame mid-stream, so the pinned geometry no longer matches; restart the camera (or reconnect on `/live`), or turn the phone back |
+| `the screen turned; the frame geometry did not change` in the log | harmless: the stream kept its size, so the same intrinsics still apply and nothing was re-fitted |
 | live preview works, `/live` does not | MediaMTX up but the path has no publisher yet |
 | IK failed at the target | target outside the arm's reach, or too close to the base; loosen `--max-reach`, move the phone view |
 | compose: page loads but the camera is blocked | no certificate yet (`make_cert.py`), or the CA is not installed on the phone |
@@ -993,7 +1074,7 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | `locate.js` | browser ray-plane solve: pixel + camera pose -> arm-space tip (also the tip step `/live` reuses) |
 | `height.js` | tap-and-drag height gesture and the camera-row badge |
 | `ekf.js` | optional 15-state camera pose/bias EKF, enabled with `?filter=ekf`; default is tag-only |
-| `geometry.js` | shared matrices, camera model, projection, undistortion, ray/plane |
+| `geometry.js` | shared matrices, camera model, projection, undistortion, ray/plane, quarter-turn mapping |
 | `arm-model.js` | the six-joint chain, FK/IK, and the reach-band search |
 | `api.js` | token-aware GET/POST helpers with JSON/plain-text error parsing |
 | `video.js` | letterboxed client <-> camera pixels and frame capture |

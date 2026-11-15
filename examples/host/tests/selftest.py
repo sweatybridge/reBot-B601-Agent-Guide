@@ -724,6 +724,80 @@ def test_locate_cli(workdir: Path, geometry):
 
 
 # --------------------------------------------------------------------------- #
+# 5b. Landscape: the same intrinsics, turned back instead of recalibrated
+# --------------------------------------------------------------------------- #
+
+def test_rotation(workdir: Path, geometry):
+    """A frame delivered a quarter turn round must still solve with one K."""
+    print("\nlandscape: the same intrinsics, turned back")
+    K, dist = geometry["K"], geometry["dist"]
+    upright = geometry["image"]
+    truth = geometry["point"]
+    size = (upright.shape[1], upright.shape[0])          # 1600x1200
+    turned_size = (size[1], size[0])                     # 1200x1600
+
+    calib_path = workdir / "rotation-calib.json"
+    calib_path.write_text(json.dumps({
+        "format": "rebot-camera-calib", "version": 1, "device": "synthetic",
+        "image_size": list(size), "K": K.tolist(), "dist": dist.tolist(), "rms": 0.2,
+        "orientation_deg": 0,
+    }), encoding="utf-8")
+
+    rotated = cv2.rotate(upright, cv2.ROTATE_90_CLOCKWISE)
+    tap = calib_mod.map_pixel(geometry["pixel"][0], geometry["pixel"][1], size, 1)
+    capture = workdir / "captures" / "20260101T120001Z-rot123"
+    capture.mkdir(parents=True)
+    cv2.imwrite(str(capture / "frame.jpg"), rotated, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    (capture / "meta.json").write_text(json.dumps({
+        "purpose": "plan",
+        "image_size": list(turned_size),
+        "tap": {"u": tap[0], "v": tap[1]},
+        "settings": {"deviceId": "synthetic"},
+    }), encoding="utf-8")
+
+    options = locate.Options(tag_size=0.080, tag_x=0.36, tag_y=-0.10, tag_z=0.12,
+                             tag_yaw=180.0, plane_z=0.0)
+    target = locate.locate_capture(capture, calib_path, options)
+    point = np.array(target["point"])
+    error = float(np.linalg.norm(point - truth))
+    check("a landscape frame is recognised as a quarter turn",
+          target.get("rotation") == 1, "rotation %s" % target.get("rotation"))
+    check("it is solved with the portrait K, not rescaled",
+          list(target.get("image_size") or []) == list(size),
+          str(target.get("image_size")))
+    check("the turned tap lands within 3 mm of the truth", error < 0.003,
+          "%.2f mm" % (error * 1000))
+
+    # The mapping has to be its own inverse across the size swap; a real K is
+    # asymmetric, so getting the *direction* wrong does not cancel out, which is
+    # why the payload records the rotation it used.
+    back = calib_mod.map_pixel(tap[0], tap[1], turned_size, 3)
+    check("turning the tap back recovers it",
+          abs(back[0] - geometry["pixel"][0]) < 1e-9
+          and abs(back[1] - geometry["pixel"][1]) < 1e-9,
+          "(%.1f, %.1f) vs (%.1f, %.1f)"
+          % (back[0], back[1], geometry["pixel"][0], geometry["pixel"][1]))
+    check("the payload says which turn it used",
+          target.get("delivered_size") == list(turned_size)
+          and target.get("rotation") == 1,
+          "%s, rotation %s" % (target.get("delivered_size"), target.get("rotation")))
+
+    # A frame of another aspect ratio that is not a quarter turn is still refused.
+    awkward = workdir / "captures" / "20260101T120002Z-bad001"
+    awkward.mkdir(parents=True)
+    cv2.imwrite(str(awkward / "frame.jpg"), cv2.resize(upright, (800, 900)))
+    (awkward / "meta.json").write_text(json.dumps({
+        "purpose": "plan", "image_size": [800, 900], "tap": {"u": 10, "v": 10},
+    }), encoding="utf-8")
+    try:
+        locate.locate_capture(awkward, calib_path, options)
+        check("an unrelated aspect ratio is refused", False, "it solved anyway")
+    except calib_mod.CalibError as error:
+        check("an unrelated aspect ratio is refused", "quarter turn" in str(error),
+              str(error)[:70])
+
+
+# --------------------------------------------------------------------------- #
 # 6. The fixed camera: a rig fitted from the arm, and the witness that guards it
 # --------------------------------------------------------------------------- #
 
@@ -2002,6 +2076,7 @@ def main(argv=None):
         asyncio.run(test_server(workdir, geometry))
     if calibration:
         test_locate_cli(workdir, geometry)
+    test_rotation(workdir, geometry)
     test_fixed_rig(workdir)
     test_base_marker()
     test_auto_sweep(workdir)

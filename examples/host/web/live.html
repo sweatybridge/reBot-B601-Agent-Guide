@@ -84,8 +84,11 @@
     display: flex; flex-direction: column; gap: 8px; font-size: 13px; line-height: 1.45; }
   #chatLog:empty::before { content: "Ask the agent to place markers or move the arm.";
     color: #626d7d; font-size: 12.5px; }
-  .msg { padding: 7px 10px; border-radius: 10px; white-space: pre-wrap;
-    word-break: break-word; }
+  .msg { display: flex; gap: 6px; align-items: baseline; padding: 7px 10px;
+    border-radius: 10px; word-break: break-word; }
+  .msg .text { min-width: 0; white-space: pre-wrap; }
+  .msg time { flex: 0 0 auto; color: #5f6a78; font-size: 10.5px;
+    font-variant-numeric: tabular-nums; }
   .msg.user { align-self: flex-end; max-width: 92%; background: #1b2b3f;
     border: 1px solid #2b4a6b; }
   .msg.agent { align-self: flex-start; max-width: 100%; background: #171c23;
@@ -102,10 +105,13 @@
     line-height: 1.4; padding: 8px 10px; border-radius: 10px; border: 1px solid #262c34;
     background: #0d1116; color: #e8eaed; }
   #chatText:disabled { opacity: .5; }
-  #chatSend { font: inherit; font-weight: 600; font-size: 13px; padding: 8px 14px;
-    border-radius: 10px; border: 1px solid #4ea1ff; background: #4ea1ff; color: #04121f;
-    cursor: pointer; }
-  #chatSend:disabled { opacity: .45; cursor: default; border-color: #262c34;
+  /* One button, two jobs: an up arrow sends, a stop square interrupts. */
+  #chatSend { flex: 0 0 auto; width: 36px; height: 36px; padding: 0; display: inline-flex;
+    align-items: center; justify-content: center; border-radius: 50%;
+    border: 1px solid #4ea1ff; background: #4ea1ff; color: #04121f; cursor: pointer; }
+  #chatSend svg { display: block; }
+  #chatSend.stop { background: #1b2027; border-color: #7a3b3b; color: #ff6b6b; }
+  #chatSend:disabled { opacity: .4; cursor: default; border-color: #262c34;
     background: #1b2027; color: #9aa4b2; }
   @media (max-width: 980px) {
     body { flex-direction: column; }
@@ -156,7 +162,7 @@
   <div class="chat-input">
     <textarea id="chatText" rows="2" placeholder="Move the soft toy next to the water bottle"
               aria-label="Message the agent"></textarea>
-    <button id="chatSend" type="button">Send</button>
+    <button id="chatSend" type="button" aria-label="Send" title="Send"></button>
   </div>
 </aside>
 <script src="/api.js"></script>
@@ -337,6 +343,11 @@ const heightControl = window.HeightControl.create({
   badge: heightBadge,
   initial: 0.10,
   onTap: (x, y) => {
+    const wrongFrame = checkStream();
+    if (wrongFrame) {
+      status("not planning: " + wrongFrame, "bad");
+      return;
+    }
     if (state.tapMode === "markers") {
       markersOverlay.addAt(x, y);
       return;
@@ -368,6 +379,8 @@ const markersOverlay = window.MarkerSequence.create({
 // the capture path -- a plan-mode tap still gets it, a marker does not (neither
 // does a marker on the phone).
 async function locateHere(tap, height) {
+  const wrongFrame = checkStream();
+  if (wrongFrame) throw new Error(wrongFrame);
   const config = await window.RebotConfig.load(() => state.token);
   if (!Array.isArray(config.T_base_cam)) {
     throw new Error("no fixed rig fitted: press Rig, or run calibrate_extrinsics.py --auto");
@@ -581,6 +594,7 @@ const CHAT = {
   history: [],        // OpenAI messages, frames included
   busy: false,
   ready: false,       // the host has a model configured
+  abort: null,        // the controller behind the stop square
   maxTurns: 12,       // tool round trips before the page stops a runaway: a
                       // refusal plus one fix-and-retry fits inside this
   maxFrames: 4,       // older frames are dropped so a turn stays small
@@ -606,19 +620,55 @@ function trimHistory(limit) {
   return dropped;
 }
 
+// The one button is two controls: an up arrow that sends, a square that stops
+// the model and lets the next message through.
+const ICON_SEND = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" '
+  + 'stroke="currentColor" stroke-width="2.2" stroke-linecap="round" '
+  + 'stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/>'
+  + '<path d="M6 11l6-6 6 6"/></svg>';
+const ICON_STOP = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" '
+  + 'aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+
 function pushChat(kind, text) {
   const line = document.createElement("div");
   line.className = "msg " + kind;
-  line.textContent = text;
+  const when = document.createElement("time");
+  const now = new Date();
+  when.dateTime = now.toISOString();
+  when.textContent = now.toLocaleTimeString([], { hour12: false });
+  const body = document.createElement("span");
+  body.className = "text";
+  body.textContent = text;
+  line.append(when, body);
   chatLog.appendChild(line);
   chatLog.scrollTop = chatLog.scrollHeight;
   return line;
 }
 
+// A tool line is rewritten in place when its result arrives, so the timestamp
+// has to survive: only the text changes.
+function setChatText(line, text) {
+  const body = line && line.querySelector(".text");
+  if (body) body.textContent = text;
+  else if (line) line.textContent = text;
+  if (chatLog.scrollTop + chatLog.clientHeight >= chatLog.scrollHeight - 40) {
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+}
+
+function updateSendButton() {
+  const busy = CHAT.busy;
+  chatSend.classList.toggle("stop", busy);
+  chatSend.innerHTML = busy ? ICON_STOP : ICON_SEND;
+  chatSend.title = busy ? "Stop the agent" : "Send";
+  chatSend.setAttribute("aria-label", chatSend.title);
+  chatSend.disabled = busy ? !CHAT.ready : (!CHAT.ready || !chatText.value.trim());
+  chatText.disabled = !CHAT.ready;
+}
+
 function setChatBusy(busy) {
-  chatSend.disabled = busy || !CHAT.ready;
-  chatText.disabled = busy || !CHAT.ready;
-  chatSend.textContent = busy ? "Working..." : "Send";
+  CHAT.busy = Boolean(busy);
+  updateSendButton();
 }
 
 // The host owns whether there is a model at all; all this page shows is its name.
@@ -783,6 +833,8 @@ async function toolRig() {
 }
 
 async function toolPixelToArm(args) {
+  const wrongFrame = checkStream();
+  if (wrongFrame) throw new Error(wrongFrame);
   const config = await loadRigConfig();
   const u = Number(args.u);
   const v = Number(args.v);
@@ -824,6 +876,11 @@ async function toolAddMarker(args) {
   const report = tipReport(config, placed.marker.target.tip, height, { u: u, v: v });
   report.index = placed.index;
   report.count = markersOverlay.count;
+  // Lay the pins out again now that the marker list and the mode have settled,
+  // and say so in the transcript: the pin is the only visible proof it landed.
+  markersOverlay.redraw();
+  pushChat("meta", "marker " + placed.index + " pinned at ("
+    + round3(u) + ", " + round3(v) + ")");
   return report;
 }
 
@@ -894,11 +951,12 @@ function summariseResult(result) {
   return "ok";
 }
 
-async function postAgent() {
+async function postAgent(signal) {
   const dropped = trimHistory(CHAT.maxMessages);
   if (dropped) pushChat("meta", "dropped " + dropped + " older messages to fit the context");
   const response = await api("/agent", {
     method: "POST",
+    signal: signal,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       messages: [{ role: "system", content: systemPrompt() }].concat(CHAT.history),
@@ -912,14 +970,32 @@ async function postAgent() {
   return data;
 }
 
+function isAbort(error) {
+  return Boolean(error) && (error.name === "AbortError"
+    || /abort/i.test(String(error.message || "")));
+}
+
+// The stop square: cut the request the model is answering, and let the loop
+// notice on its next step. A tool call already in flight finishes; nothing
+// queued behind it starts.
+function stopAgent() {
+  if (!CHAT.busy || !CHAT.abort) return;
+  CHAT.abort.abort();
+  pushChat("meta", "stopping the agent…");
+}
+
 async function runAgent() {
-  CHAT.busy = true;
+  CHAT.abort = new AbortController();
+  const signal = CHAT.abort.signal;
   setChatBusy(true);
   try {
     for (let step = 0; step < CHAT.maxTurns; step += 1) {
-      const data = await postAgent();
+      if (signal.aborted) break;
+      const data = await postAgent(signal);
       const message = data.message || {};
       const rawCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      // Every thing the model says is shown, including the line it writes
+      // between two tool calls.
       if (message.content) pushChat("agent", message.content);
       const assistant = { role: "assistant", content: message.content || "" };
       if (rawCalls.length) {
@@ -943,6 +1019,7 @@ async function runAgent() {
 
       let wantsFrame = false;
       for (const call of assistant.tool_calls) {
+        if (signal.aborted) break;
         let args = {};
         let argsError = "";
         try {
@@ -959,11 +1036,13 @@ async function runAgent() {
         } catch (error) {
           result = { ok: false, error: (error && error.message) || String(error) };
         }
-        line.textContent = summariseCall(call.function.name, args) + " → " + summariseResult(result);
+        setChatText(line, summariseCall(call.function.name, args)
+          + " → " + summariseResult(result));
         line.classList.toggle("bad", result.ok === false);
         CHAT.history.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
         if (call.function.name === "capture_view" && result.ok) wantsFrame = true;
       }
+      if (signal.aborted) break;
       if (wantsFrame) {
         const frame = grabFrame();
         if (frame) {
@@ -978,13 +1057,16 @@ async function runAgent() {
         }
       }
     }
-    pushChat("meta", "stopped after " + CHAT.maxTurns + " model turns");
+    if (signal.aborted) pushChat("meta", "stopped");
+    else pushChat("meta", "stopped after " + CHAT.maxTurns + " model turns");
   } catch (error) {
-    pushChat("error", String((error && error.message) || error));
+    if (isAbort(error)) pushChat("meta", "stopped");
+    else pushChat("error", String((error && error.message) || error));
   } finally {
-    CHAT.busy = false;
+    CHAT.abort = null;
     setChatBusy(false);
     pruneFrames();
+    chatText.focus();
   }
 }
 
@@ -992,6 +1074,7 @@ async function sendChat() {
   const text = chatText.value.trim();
   if (!text || CHAT.busy || !CHAT.ready) return;
   chatText.value = "";
+  updateSendButton();
   pushChat("user", text);
   const content = [{ type: "text", text: text }];
   const frame = grabFrame();
@@ -1000,7 +1083,11 @@ async function sendChat() {
   await runAgent();
 }
 
-chatSend.addEventListener("click", sendChat);
+chatSend.addEventListener("click", () => {
+  if (CHAT.busy) stopAgent();
+  else sendChat();
+});
+chatText.addEventListener("input", updateSendButton);
 chatText.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
@@ -1026,6 +1113,46 @@ function waitForIce(connection, milliseconds) {
   });
 }
 
+// The stream geometry this connection was made with. A `K` describes one grid,
+// so it is taken once per connection: a stream that re-cuts itself mid-session
+// (the phone turned while publishing) leaves the viewport alone and refuses the
+// solves rather than quietly using the wrong intrinsics. Reconnect to refit.
+let streamPin = null;
+
+function pinStream() {
+  const width = Number(video.videoWidth) || 0;
+  const height = Number(video.videoHeight) || 0;
+  streamPin = width && height ? { width: width, height: height } : null;
+}
+
+function streamMismatch() {
+  if (!streamPin) return "";
+  const width = Number(video.videoWidth) || 0;
+  const height = Number(video.videoHeight) || 0;
+  if (!width || !height) return "the preview has no frame";
+  if (width === streamPin.width && height === streamPin.height) return "";
+  return "the stream changed from " + streamPin.width + "x" + streamPin.height
+    + " to " + width + "x" + height + " since it connected; disconnect and connect "
+    + "again to refit the intrinsics";
+}
+
+let streamWarned = "";
+function checkStream() {
+  const problem = streamMismatch();
+  if (problem && problem !== streamWarned) {
+    streamWarned = problem;
+    status(problem, "warn");
+    pushChat("error", problem);
+  } else if (!problem && streamWarned) {
+    streamWarned = "";
+    status("the stream matches the geometry it connected with again", "good");
+  }
+  return problem;
+}
+
+video.addEventListener("resize", checkStream);
+window.addEventListener("orientationchange", checkStream);
+
 async function connect() {
   if (pc) return;
   connectButton.disabled = true;
@@ -1046,6 +1173,8 @@ async function connect() {
   };
   video.addEventListener("loadedmetadata", () => {
     setState(video.videoWidth + "x" + video.videoHeight, "ok");
+    pinStream();          // this connection's geometry, for the rest of its life
+    streamWarned = "";
   }, { once: true });
 
   try {
@@ -1079,6 +1208,8 @@ async function disconnect() {
   pc = null;
   sessionUrl = null;
   video.srcObject = null;
+  streamPin = null;           // the next connect pins its own geometry
+  streamWarned = "";
   if (connection) {
     try { connection.close(); } catch (error) { /* already closed */ }
   }
