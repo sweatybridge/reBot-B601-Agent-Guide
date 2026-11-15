@@ -392,7 +392,7 @@ and **Run the sweep from this tap** starts the arm.
 | `GET /calibrate` | running state, progress, the last verdict, the current rig |
 | `GET /reach.json` | `K`, `dist`, plane/hover, the tag placement, and `T_base_cam` for the reach overlay |
 | `POST /sequence` | `{targets:[{tip:[x,y,z], pixel?}]}` -> validates `min_z`, adds `tip_offset_m`, posts `/plan` with `gripper:"alternate"` |
-| `POST /agent` | one model turn for the sidebar: forwards `messages` and `tools` to `REBOT_LLM_URL` and returns the assistant message |
+| `POST /agent` | one model turn for the sidebar: forwards `messages` and `tools` to `REBOT_LLM_URL`; `stream: true` answers as SSE (`reasoning`, `content`, `done`, `error`) |
 
 The arm gateway has one planning route, `POST /plan`:
 `{targets:[{tip:[x,y,z]}], tip_offset_m, gripper, options}`. `gripper` is
@@ -882,6 +882,12 @@ Linux). Running `capture_server.py` directly, `localhost` is already right.
   transcript shows what was attempted even when the model's prose is vague.
 - Everything the model says is shown, including the line it writes *between* two
   tool calls, and every line carries a timestamp.
+- If the endpoint returns a separate chain of thought (`reasoning_content` or
+  `reasoning`), each turn appears as a collapsed **Reasoning** block above the
+  answer. `/agent` forwards it; a model that does not expose its reasoning, or an
+  endpoint whose chat template has thinking disabled, has nothing to display.
+  The live route does not force `enable_thinking` — that is the endpoint's chat
+  template — so no block can appear if the model is answering without one.
 - The send button is the stop button while the agent works: an up arrow sends, a
   square aborts the model call in flight and frees the box for the next message. A
   tool call already running finishes; nothing queued behind it starts.
@@ -889,6 +895,31 @@ Linux). Running `capture_server.py` directly, `localhost` is already right.
   (`add_marker` switches the page to markers, so **Move arm** is available), and
   the transcript says which pixel it landed on.
 - `/agent` is a POST, so it needs the same `X-Rebot-Token` as everything else.
+
+### Streaming
+
+The page asks `/agent` for `stream: true`, so a turn is visible while it is being
+written instead of after it finishes. The capture server parses the endpoint's
+SSE and normalizes it to four events:
+
+```
+event: reasoning   data: {"text": "…"}     chain of thought, if the endpoint sends one
+event: content     data: {"text": "…"}     answer text
+event: done        data: {"message": …, "finish_reason": …, "usage": …}
+event: error       data: {"error": "…"}    after the headers, so the page can show it
+```
+
+Tool calls are **assembled** from their deltas on the server and only appear in
+`done`, complete; the page executes them after the turn, as before. The
+`Reasoning` block grows live and the answer bubble streams underneath it. Until
+the first token arrives, a pulsing **Agent is thinking…** bubble holds the log;
+the first reasoning or content delta replaces it, so a slow model is visible
+without pretending it has answered.
+
+The page falls back to the old JSON response if `/agent` answers with JSON (an
+older server, or a proxy that ignored the stream). `X-Accel-Buffering: no` is on
+the response so a reverse proxy does not hold the chunks until the end. Aborting
+the request cancels the upstream connection too.
 
 ### Where it is weak
 
@@ -1112,6 +1143,7 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | `/live` sidebar: "no model: set REBOT_LLM_URL" | the host has no chat endpoint configured; set it (and `REBOT_LLM_MODEL`) and restart the capture service |
 | `/live` sidebar: "cannot reach the model" | the endpoint is down or on the wrong address: inside compose it is `host.docker.internal`, not `localhost` |
 | `/live` sidebar: "the model refused (404)" | the base URL is a host, not the full path: it must end in `/v1/chat/completions` |
+| `add_marker() → error: arguments are not JSON` or the model refuses 500 with "Failed to parse tool call arguments" | a streamed tool call was cut off or malformed. The page now refuses that turn before it enters `CHAT.history`, so it cannot become a 500 loop; raise `REBOT_LLM_MAX_TOKENS`, reduce reasoning, or ask for one short tool call and retry. |
 | `/live` sidebar: the model chats but never calls a tool | it is not a tool-calling build, or the name is wrong; `Qwen3.8-27B` is the supported one |
 | the agent marks the bottle instead of the toy | a pixel guess: ask it to plan only and look at the pins before moving, or point it at the object in words |
 
@@ -1133,6 +1165,7 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | `geometry.js` | shared matrices, camera model, projection, undistortion, ray/plane, quarter-turn mapping |
 | `arm-model.js` | the six-joint chain, FK/IK, and the reach-band search |
 | `api.js` | token-aware GET/POST helpers with JSON/plain-text error parsing |
+| `stream.js` | SSE frame parser for the agent's streamed reasoning/content/tool turn |
 | `video.js` | letterboxed client <-> camera pixels and frame capture |
 | `reach-config.js` | one cached `/reach.json` shared by the overlay and locator |
 | `reach.js` | the reachable-band canvas and camera-pose orchestration, on both pages |

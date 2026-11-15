@@ -407,6 +407,7 @@ async def test_server(workdir: Path, geometry):
         check("serves the height control", (await client.get("/height.js")).status == 200)
         check("serves the browser locator", (await client.get("/locate.js")).status == 200)
         check("serves the pose EKF", (await client.get("/ekf.js")).status == 200)
+        check("serves the agent stream parser", (await client.get("/stream.js")).status == 200)
 
         form = FormData()
         form.add_field("meta", json.dumps({"purpose": "plan", "image_size": [image.shape[1], image.shape[0]],
@@ -591,12 +592,39 @@ async def test_server(workdir: Path, geometry):
         seen = []
 
         async def fake_chat(request):
-            seen.append({"body": await request.json(),
+            payload = await request.json()
+            seen.append({"body": payload,
                          "auth": request.headers.get("Authorization")})
+            truncated = any(
+                isinstance(message, dict) and message.get("content") == "truncated"
+                for message in (payload.get("messages") or []))
+            if payload.get("stream"):
+                response = aiohttp_web.StreamResponse(
+                    status=200, headers={"Content-Type": "text/event-stream"})
+                await response.prepare(request)
+                chunks = [
+                    {"choices": [{"delta": {"reasoning_content": "checking "}}]},
+                    {"choices": [{"delta": {"content": "looking "}}]},
+                    {"choices": [{"delta": {
+                        "tool_calls": [{
+                            "index": 0, "id": "call_7", "type": "function",
+                            "function": {"name": "rig",
+                                         "arguments": '{"u":620' if truncated else "{}"},
+                        }],
+                    }}]},
+                    {"choices": [{"finish_reason": "length" if truncated else "tool_calls",
+                                  "delta": {}}]},
+                ]
+                for chunk in chunks:
+                    await response.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+                await response.write(b"data: [DONE]\n\n")
+                await response.write_eof()
+                return response
             return aiohttp_web.json_response({
                 "model": "stub-model",
                 "choices": [{"message": {
                     "role": "assistant", "content": "looking now",
+                    "reasoning_content": "checking the pixels first",
                     "tool_calls": [{"function": {"name": "rig", "arguments": "{}"}}],
                 }}],
                 "usage": {"total_tokens": 7},
@@ -637,6 +665,9 @@ async def test_server(workdir: Path, geometry):
                   and message.get("content") == "looking now"
                   and len(message.get("tool_calls") or []) == 1,
                   "status %s, %s" % (turn.status, str(turn_body.get("error"))[:60]))
+            check("agent forwards the model's reasoning separately",
+                  message.get("reasoning") == "checking the pixels first",
+                  str(message.get("reasoning"))[:60])
             sent = (seen[-1]["body"] if seen else {})
             check("agent sends the configured model, not the page's",
                   sent.get("model") == "Qwen3.8-27B"
@@ -649,6 +680,41 @@ async def test_server(workdir: Path, geometry):
                   and sent.get("tool_choice") == "auto")
             check("agent sends the host's key, which the page never sees",
                   (seen[-1]["auth"] if seen else "") == "Bearer stub-key")
+
+            streamed = await client.post("/agent",
+                                         json={"messages": [{"role": "user", "content": "hi"}],
+                                               "tools": tools, "stream": True},
+                                         headers={"X-Rebot-Token": "selftest-token"})
+            stream_text = await streamed.text()
+            check("agent streams SSE when asked",
+                  streamed.status == 200
+                  and "text/event-stream" in (streamed.headers.get("Content-Type") or "")
+                  and "event: reasoning" in stream_text
+                  and "event: content" in stream_text
+                  and "event: done" in stream_text,
+                  "status %s" % streamed.status)
+            data_lines = [line[6:] for line in stream_text.splitlines()
+                          if line.startswith("data: ")]
+            done = json.loads(data_lines[-1]) if data_lines else {}
+            check("agent assembles the streamed turn and its tool call",
+                  (done.get("message") or {}).get("reasoning") == "checking "
+                  and (done.get("message") or {}).get("content") == "looking "
+                  and ((done.get("message") or {}).get("tool_calls") or [{}])[0]
+                      .get("function", {}).get("name") == "rig"
+                  and done.get("finish_reason") == "tool_calls",
+                  str(done)[:120])
+            truncated = await client.post(
+                "/agent",
+                json={"messages": [{"role": "user", "content": "truncated"}],
+                      "tools": tools, "stream": True},
+                headers={"X-Rebot-Token": "selftest-token"})
+            truncated_text = await truncated.text()
+            check("agent refuses a truncated streamed tool call",
+                  truncated.status == 200
+                  and "event: error" in truncated_text
+                  and "event: done" not in truncated_text
+                  and "cut off by the token limit" in truncated_text,
+                  truncated_text[-160:])
 
             no_token = await client.post("/agent", json={"messages": [{"role": "user", "content": "hi"}]})
             check("agent still needs the page token", no_token.status == 401)

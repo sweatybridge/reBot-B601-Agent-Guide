@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import hashlib
 import hmac
 import json
@@ -244,6 +245,15 @@ async def handle_ekf_js(request: web.Request) -> web.StreamResponse:
     script = WEB_DIR / "ekf.js"
     if not script.is_file():
         return web.Response(text="ekf.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
+async def handle_stream_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "stream.js"
+    if not script.is_file():
+        return web.Response(text="stream.js is missing next to capture_server.py", status=500)
     return web.Response(text=script.read_text(encoding="utf-8"),
                         content_type="text/javascript",
                         headers={"Cache-Control": "no-store"})
@@ -876,7 +886,265 @@ async def handle_plan(request: web.Request) -> web.Response:
     })
 
 
-async def handle_agent(request: web.Request) -> web.Response:
+def _agent_text(value):
+    """A message field as text: some servers send content parts, not a string."""
+    if isinstance(value, list):
+        return "".join(part.get("text", "") for part in value if isinstance(part, dict))
+    return str(value or "")
+
+
+def _agent_reasoning(message):
+    """The chain of thought under any of the names OpenAI-compatible servers use."""
+    return _agent_text(message.get("reasoning_content") or message.get("reasoning")
+                       or message.get("thinking") or "")
+
+
+def _agent_tool_calls(raw):
+    """Normalize tool calls to the shape the page already assembles."""
+    calls = []
+    for index, call in enumerate(raw or []):
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments or {}, ensure_ascii=False)
+        calls.append({
+            "id": call.get("id") or "",
+            "type": call.get("type") or "function",
+            "function": {
+                "name": str(function.get("name") or ""),
+                "arguments": arguments,
+            },
+        })
+    return calls
+
+
+def _agent_message(data):
+    """The assistant message and usage from a non-streamed completion."""
+    choices = data.get("choices") or [{}]
+    message = (choices[0] or {}).get("message") or {}
+    return {
+        "role": "assistant",
+        "content": _agent_text(message.get("content")),
+        "tool_calls": _agent_tool_calls(message.get("tool_calls") or []),
+        "reasoning": _agent_reasoning(message),
+    }, data.get("usage") or {}
+
+
+def _agent_tool_error(message, finish_reason=""):
+    """Why this turn's tool calls must not be executed, or '' when they are sane.
+
+    A cut-off tool call is worse than a failed one: the malformed assistant
+    message cannot be sent back on the next turn (the model server rejects it),
+    and a complete-looking but truncated argument object can move the arm to the
+    wrong pixel. Refuse the turn instead.
+    """
+    calls = message.get("tool_calls") or []
+    if not calls:
+        return ""
+    if str(finish_reason) == "length":
+        return ("the model's tool call was cut off by the token limit; nothing was run. "
+                "Raise REBOT_LLM_MAX_TOKENS or ask for one short tool call.")
+    for call in calls:
+        arguments = (call.get("function") or {}).get("arguments")
+        if arguments is None or arguments == "":
+            continue
+        try:
+            value = json.loads(arguments)
+        except (TypeError, ValueError):
+            return ("the model produced a tool call whose arguments are not valid JSON "
+                    "(%s); nothing was run. Retry, or raise REBOT_LLM_MAX_TOKENS."
+                    % str(arguments)[:80])
+        if not isinstance(value, dict):
+            return ("the model produced a tool call whose arguments are not a JSON object "
+                    "(%s); nothing was run." % str(arguments)[:80])
+    return ""
+
+
+def _sse(event, data):
+    """One Server-Sent Event frame, as bytes."""
+    return ("event: %s\ndata: %s\n\n"
+            % (event, json.dumps(data, ensure_ascii=False))).encode("utf-8")
+
+
+def _merge_tool_delta(calls, parts):
+    """Accumulate streamed tool-call fragments by index.
+
+    OpenAI sends `function.arguments` in pieces; a tool must not run until the
+    stream has finished and those pieces form valid JSON.
+    """
+    for part in parts or []:
+        if not isinstance(part, dict):
+            continue
+        try:
+            index = int(part.get("index", 0))
+        except (TypeError, ValueError):
+            index = 0
+        slot = calls.setdefault(index, {
+            "id": "", "type": "function",
+            "function": {"name": "", "arguments": ""},
+        })
+        if part.get("id"):
+            slot["id"] = str(part["id"])
+        if part.get("type"):
+            slot["type"] = str(part["type"])
+        function = part.get("function") or {}
+        name = function.get("name")
+        if name and not slot["function"]["name"]:
+            slot["function"]["name"] = str(name)
+        arguments = function.get("arguments")
+        if isinstance(arguments, dict):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        if arguments:
+            slot["function"]["arguments"] += str(arguments)
+
+
+def _sse_payload(frame):
+    """The `data:` payload of one SSE frame, or None for comments/keepalives."""
+    lines = []
+    for line in frame.split("\n"):
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            lines.append(line[5:].lstrip(" "))
+    return "\n".join(lines) if lines else None
+
+
+async def _relay_sse(request, upstream):
+    """Relay one model turn as normalized SSE events.
+
+    The browser sees `reasoning` and `content` deltas as they arrive, then one
+    `done` with the complete assistant message. Tool-call fragments are assembled
+    here so the page never parses a half-written argument string.
+    """
+    response = web.StreamResponse(status=200, headers={
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    })
+    try:
+        response.enable_compression(False)
+    except AttributeError:
+        pass
+    await response.prepare(request)
+
+    async def send(event, data):
+        await response.write(_sse(event, data))
+
+    content_parts = []
+    reasoning_parts = []
+    tool_calls = {}
+    finish_reason = ""
+    usage = {}
+    finished = False
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    buffer = ""
+
+    try:
+        async for chunk in upstream.content.iter_any():
+            buffer += decoder.decode(chunk)
+            buffer = buffer.replace("\r\n", "\n")
+            frames = buffer.split("\n\n")
+            buffer = frames.pop()
+            for frame in frames:
+                payload = _sse_payload(frame)
+                if payload is None:
+                    continue
+                if payload.strip() == "[DONE]":
+                    finished = True
+                    buffer = ""
+                    break
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("error"):
+                    raise RuntimeError(str(data["error"]))
+                if data.get("usage"):
+                    usage = data["usage"]
+                for choice in data.get("choices") or []:
+                    if not isinstance(choice, dict):
+                        continue
+                    if choice.get("finish_reason"):
+                        finish_reason = str(choice["finish_reason"])
+                    delta = choice.get("delta") or choice.get("message") or {}
+                    reasoning = _agent_reasoning(delta)
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
+                        await send("reasoning", {"text": reasoning})
+                    content = _agent_text(delta.get("content"))
+                    if content:
+                        content_parts.append(content)
+                        await send("content", {"text": content})
+                    _merge_tool_delta(tool_calls, delta.get("tool_calls"))
+            if finished:
+                break
+        # A stream that closes without its final blank line: parse what is left.
+        if buffer.strip():
+            payload = _sse_payload(buffer)
+            if payload and payload.strip() != "[DONE]":
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    data = None
+                if data:
+                    if data.get("usage"):
+                        usage = data["usage"]
+                    for choice in data.get("choices") or []:
+                        if not isinstance(choice, dict):
+                            continue
+                        if choice.get("finish_reason"):
+                            finish_reason = str(choice["finish_reason"])
+                        delta = choice.get("delta") or choice.get("message") or {}
+                        reasoning = _agent_reasoning(delta)
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
+                            await send("reasoning", {"text": reasoning})
+                        content = _agent_text(delta.get("content"))
+                        if content:
+                            content_parts.append(content)
+                            await send("content", {"text": content})
+                        _merge_tool_delta(tool_calls, delta.get("tool_calls"))
+
+        message = {
+            "role": "assistant",
+            "content": "".join(content_parts),
+            "reasoning": "".join(reasoning_parts),
+            "tool_calls": [tool_calls[index] for index in sorted(tool_calls)],
+        }
+        tool_error = _agent_tool_error(message, finish_reason)
+        if tool_error:
+            await send("error", {"error": tool_error})
+        elif not message["content"] and not message["tool_calls"]:
+            await send("error", {"error": "the model returned neither text nor tool calls"})
+        else:
+            logging.info("agent stream: %d chars, %d tool call(s), %d reasoning chars",
+                         len(message["content"]), len(message["tool_calls"]),
+                         len(message["reasoning"]))
+            await send("done", {"message": message, "finish_reason": finish_reason,
+                                "usage": usage})
+    except asyncio.CancelledError:
+        raise
+    except (ConnectionResetError, ConnectionAbortedError):
+        # The page went away; the upstream is closed by the caller's context.
+        pass
+    except Exception as exc:  # noqa: BLE001 - a stream may fail after headers
+        logging.warning("agent stream failed: %s", exc)
+        try:
+            await send("error", {"error": str(exc)})
+        except (ConnectionResetError, ConnectionAbortedError):
+            pass
+    finally:
+        try:
+            await response.write_eof()
+        except (ConnectionResetError, ConnectionAbortedError):
+            pass
+    return response
+
+
+async def handle_agent(request: web.Request) -> web.StreamResponse:
     """One model turn for the page's chat sidebar.
 
     The page owns the conversation and the tool loop, because every tool either
@@ -884,6 +1152,10 @@ async def handle_agent(request: web.Request) -> web.Response:
     (`/sequence`, `/execute`). What lives here is the transport and its
     configuration: the endpoint, the model name and any key stay on the host, so
     the browser never holds them and no page setting can change them.
+
+    `stream: true` asks for SSE. The upstream deltas are normalized here into
+    `reasoning`, `content`, `done` and `error` events, so the page never has to
+    know which provider produced them or how its tool-call deltas are shaped.
     """
     app = request.app
     if not app["llm_url"]:
@@ -907,10 +1179,11 @@ async def handle_agent(request: web.Request) -> web.Response:
     if tools is not None and not isinstance(tools, list):
         raise web.HTTPBadRequest(text="'tools' must be a list of tool schemas")
 
+    stream = bool(body.get("stream"))
     payload = {
         "model": app["llm_model"],
         "messages": messages,
-        "stream": False,
+        "stream": stream,
         "temperature": app["llm_temperature"],
     }
     if app["llm_max_tokens"] > 0:
@@ -919,12 +1192,27 @@ async def handle_agent(request: web.Request) -> web.Response:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
     headers = {"Content-Type": "application/json"}
+    if stream:
+        headers["Accept"] = "text/event-stream"
     if app["llm_token"]:
         headers["Authorization"] = "Bearer " + app["llm_token"]
 
     try:
         async with app["client"].post(app["llm_url"], json=payload, headers=headers,
                                       timeout=ClientTimeout(total=app["llm_timeout"])) as answer:
+            if answer.status != 200:
+                text = await answer.text()
+                logging.warning("agent %s answered %d: %s", app["llm_url"],
+                                answer.status, text[:200])
+                return web.json_response({
+                    "ok": False,
+                    "error": "the model refused (%d): %s" % (answer.status, text[:300]),
+                }, status=502)
+            content_type = answer.headers.get("Content-Type") or ""
+            if stream and "text/event-stream" in content_type:
+                return await _relay_sse(request, answer)
+            # A server that ignores `stream`, or the ordinary non-streamed
+            # request: read the one JSON body and answer in kind.
             text = await answer.text()
     except Exception as exc:  # noqa: BLE001 - surfaced to the chat
         logging.warning("agent %s failed: %s", app["llm_url"], exc)
@@ -933,13 +1221,6 @@ async def handle_agent(request: web.Request) -> web.Response:
             "error": "cannot reach the model at %s (%s)" % (app["llm_url"], exc),
         }, status=502)
 
-    if answer.status != 200:
-        logging.warning("agent %s answered %d: %s", app["llm_url"], answer.status,
-                        text[:200])
-        return web.json_response({
-            "ok": False,
-            "error": "the model refused (%d): %s" % (answer.status, text[:300]),
-        }, status=502)
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -948,29 +1229,24 @@ async def handle_agent(request: web.Request) -> web.Response:
             "error": "the model answered something that is not JSON: %s" % text[:200],
         }, status=502)
 
-    choices = data.get("choices") or [{}]
-    message = (choices[0] or {}).get("message") or {}
-    content = message.get("content")
-    if isinstance(content, list):
-        # Vision replies occasionally arrive as content parts; flatten the text.
-        content = "".join(part.get("text", "") for part in content
-                          if isinstance(part, dict))
-    tool_calls = message.get("tool_calls") or []
-    if content is None and not tool_calls:
+    message, usage = _agent_message(data)
+    finish_reason = (((data.get("choices") or [{}])[0] or {}).get("finish_reason") or "")
+    tool_error = _agent_tool_error(message, finish_reason)
+    if tool_error:
+        return web.json_response({"ok": False, "error": tool_error}, status=502)
+    if not message["content"] and not message["tool_calls"]:
         return web.json_response({
             "ok": False,
             "error": "the model returned neither text nor tool calls",
         }, status=502)
-    logging.info("agent: %d chars, %d tool call(s)", len(content or ""), len(tool_calls))
+    logging.info("agent: %d chars, %d tool call(s), %d reasoning chars",
+                 len(message["content"]), len(message["tool_calls"]),
+                 len(message["reasoning"]))
     return web.json_response({
         "ok": True,
         "model": data.get("model") or app["llm_model"],
-        "message": {
-            "role": "assistant",
-            "content": content or "",
-            "tool_calls": tool_calls,
-        },
-        "usage": data.get("usage") or {},
+        "message": message,
+        "usage": usage,
     })
 
 
@@ -1601,6 +1877,7 @@ def build_app(args) -> web.Application:
     app.router.add_get("/height.js", handle_height_js)
     app.router.add_get("/locate.js", handle_locate_js)
     app.router.add_get("/ekf.js", handle_ekf_js)
+    app.router.add_get("/stream.js", handle_stream_js)
     app.router.add_get("/captures/{id}/{name}", handle_file)
     app.router.add_get("/favicon.ico", handle_favicon)
     if not args.no_whip:

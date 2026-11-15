@@ -93,6 +93,14 @@
     border: 1px solid #2b4a6b; }
   .msg.agent { align-self: flex-start; max-width: 100%; background: #171c23;
     border: 1px solid #262c34; }
+  .msg.reasoning { display: block; align-self: stretch; background: #12171e;
+    border: 1px solid #232b35; color: #8f9aa8; font-size: 11.8px; }
+  .msg.reasoning summary { cursor: pointer; color: #9fb0c4; }
+  .msg.reasoning .text { margin-top: 6px; white-space: pre-wrap; }
+  .msg.thinking { align-self: flex-start; background: #151a21; border: 1px dashed #2b3644;
+    color: #8f9aa8; font-style: italic; animation: thinking-pulse 1.4s ease-in-out infinite; }
+  @keyframes thinking-pulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .msg.thinking { animation: none; } }
   .msg.tool { align-self: stretch; background: transparent; border: 1px dashed #2b323c;
     color: #9aa4b2; font-size: 11.5px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
   .msg.tool.bad { color: #ff9b9b; border-color: #6b2b2b; }
@@ -166,6 +174,7 @@
   </div>
 </aside>
 <script src="/api.js"></script>
+<script src="/stream.js"></script>
 <script src="/video.js"></script>
 <script src="/viewer.js"></script>
 <script src="/geometry.js"></script>
@@ -670,6 +679,41 @@ function pushChat(kind, text) {
   return line;
 }
 
+// The model's chain of thought is kept out of the answer bubble and collapsed
+// by default: it is useful when a tool call looks wrong, but it is not what the
+// arm does. The endpoint has to return `reasoning_content`/`reasoning` for this
+// to have anything to show.
+function pushReasoning(text, turn) {
+  const line = document.createElement("div");
+  line.className = "msg reasoning";
+  const details = document.createElement("details");
+  details.open = true;
+  const summary = document.createElement("summary");
+  const body = document.createElement("div");
+  body.className = "text";
+  details.append(summary, body);
+  line.appendChild(details);
+  chatLog.appendChild(line);
+  updateReasoning(line, text, turn);
+  return line;
+}
+
+// The block grows while the model is thinking; the summary carries the size so
+// the transcript stays readable after it is collapsed.
+function updateReasoning(line, text, turn) {
+  if (!line) return;
+  const summary = line.querySelector("summary");
+  const body = line.querySelector(".text");
+  if (summary) {
+    summary.textContent = "Reasoning · turn " + turn + " · " + String(text || "").length
+      + " chars";
+  }
+  if (body) body.textContent = String(text || "");
+  if (chatLog.scrollTop + chatLog.clientHeight >= chatLog.scrollHeight - 40) {
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+}
+
 // A tool line is rewritten in place when its result arrives, so the timestamp
 // has to survive: only the text changes.
 function setChatText(line, text) {
@@ -976,7 +1020,7 @@ function summariseResult(result) {
   return "ok";
 }
 
-async function postAgent(signal) {
+async function postAgent(signal, onEvent) {
   const dropped = trimHistory(CHAT.maxMessages);
   if (dropped) pushChat("meta", "dropped " + dropped + " older messages to fit the context");
   const response = await api("/agent", {
@@ -986,13 +1030,51 @@ async function postAgent(signal) {
     body: JSON.stringify({
       messages: [{ role: "system", content: systemPrompt() }].concat(CHAT.history),
       tools: AGENT_TOOLS,
+      stream: true,
     }),
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || !data.ok) {
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
     throw new Error((data && data.error) || ("the agent failed: " + response.status));
   }
-  return data;
+
+  // A server that does not stream (or a proxy that buffered the response) is
+  // still usable: the JSON path carries the same message, just all at once.
+  const contentType = response.headers.get("Content-Type") || "";
+  if (!contentType.includes("text/event-stream") || !response.body) {
+    const data = await response.json().catch(() => ({}));
+    if (!data.ok) throw new Error(data.error || "the agent answered without JSON");
+    return data.message || {};
+  }
+  if (!window.RebotStream) throw new Error("the stream parser is not loaded");
+
+  const parser = window.RebotStream.create();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let final = null;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      for (const event of parser.feed(decoder.decode(value, { stream: true }))) {
+        if (event.event === "reasoning" && event.data && event.data.text) {
+          onEvent("reasoning", event.data.text);
+        } else if (event.event === "content" && event.data && event.data.text) {
+          onEvent("content", event.data.text);
+        } else if (event.event === "done" && event.data && event.data.message) {
+          final = event.data.message;
+        } else if (event.event === "error") {
+          throw new Error((event.data && event.data.error) || "the model stream failed");
+        }
+      }
+    }
+  } finally {
+    if (reader.releaseLock) {
+      try { reader.releaseLock(); } catch (error) { /* already cancelled */ }
+    }
+  }
+  if (!final) throw new Error("the model stream ended without a final message");
+  return final;
 }
 
 function isAbort(error) {
@@ -1013,16 +1095,62 @@ async function runAgent() {
   CHAT.abort = new AbortController();
   const signal = CHAT.abort.signal;
   setChatBusy(true);
+  let thinkingLine = null;
   try {
     for (let step = 0; step < CHAT.maxTurns; step += 1) {
       if (signal.aborted) break;
-      const data = await postAgent(signal);
-      const message = data.message || {};
+      const draft = { reasoning: "", content: "", reasoningLine: null, contentLine: null };
+      // Until the first token arrives there is nothing else in the log: make
+      // the wait visible, and remove it the moment reasoning or content starts.
+      thinkingLine = pushChat("thinking", "Agent is thinking…");
+      const message = await postAgent(signal, (kind, text) => {
+        if (thinkingLine) {
+          thinkingLine.remove();
+          thinkingLine = null;
+        }
+        if (kind === "reasoning") {
+          draft.reasoning += text;
+          if (!draft.reasoningLine) draft.reasoningLine = pushReasoning("", step + 1);
+          updateReasoning(draft.reasoningLine, draft.reasoning, step + 1);
+        } else if (kind === "content") {
+          draft.content += text;
+          if (!draft.contentLine) draft.contentLine = pushChat("agent", "");
+          setChatText(draft.contentLine, draft.content);
+        }
+      });
+      if (thinkingLine) {
+        // A non-streamed fallback, or a turn that only returned tool calls.
+        thinkingLine.remove();
+        thinkingLine = null;
+      }
+      const finalReasoning = message.reasoning || "";
+      const finalContent = message.content || "";
+      // A provider that sends everything only in `done`, or a non-streamed
+      // fallback, still gets a block; a streamed turn already rendered it.
+      if (finalReasoning && finalReasoning !== draft.reasoning) {
+        if (!draft.reasoningLine) draft.reasoningLine = pushReasoning("", step + 1);
+        updateReasoning(draft.reasoningLine, finalReasoning, step + 1);
+      }
+      if (finalContent && finalContent !== draft.content) {
+        if (!draft.contentLine) draft.contentLine = pushChat("agent", "");
+        setChatText(draft.contentLine, finalContent);
+      }
       const rawCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-      // Every thing the model says is shown, including the line it writes
-      // between two tool calls.
-      if (message.content) pushChat("agent", message.content);
-      const assistant = { role: "assistant", content: message.content || "" };
+      // A truncated tool call must never reach CHAT.history: the model server
+      // rejects malformed assistant arguments on the next turn, which turns one
+      // bad call into a 500 loop. Server-side validation catches this too; this
+      // is the guard for an older server or a buffered/non-streamed reply.
+      for (const call of rawCalls) {
+        try {
+          parseToolArgs(call.function && call.function.arguments);
+        } catch (error) {
+          pushChat("error", "the model's tool call was incomplete (" + error.message
+            + "); nothing was run. Retry, or raise REBOT_LLM_MAX_TOKENS.");
+          return;
+        }
+      }
+      const contentText = finalContent || draft.content;
+      const assistant = { role: "assistant", content: contentText };
       if (rawCalls.length) {
         // Some backends (Ollama among them) omit the call id; a tool result
         // without one breaks stricter servers on the next turn.
@@ -1085,9 +1213,14 @@ async function runAgent() {
     if (signal.aborted) pushChat("meta", "stopped");
     else pushChat("meta", "stopped after " + CHAT.maxTurns + " model turns");
   } catch (error) {
+    if (thinkingLine) {
+      thinkingLine.remove();
+      thinkingLine = null;
+    }
     if (isAbort(error)) pushChat("meta", "stopped");
     else pushChat("error", String((error && error.message) || error));
   } finally {
+    if (thinkingLine) thinkingLine.remove();
     CHAT.abort = null;
     setChatBusy(false);
     pruneFrames();

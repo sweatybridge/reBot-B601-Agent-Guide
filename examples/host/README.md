@@ -97,7 +97,7 @@ app/
   make_cert.py            local CA + leaf certificate for the phone
   healthcheck.py          compose healthcheck for the capture service
 
-web/                      phone page, shared api/video/geometry modules, reach, locate
+web/                      phone page, shared api/stream/video/geometry modules, reach, locate
 tests/                    selftest.py (the whole pipeline, no hardware), browser_check.py (Chromium),
                           agent_eval.py (chat trajectories against the model)
 deploy/                   mediamtx.yml, repeat_pino.ps1
