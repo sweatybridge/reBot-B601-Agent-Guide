@@ -360,14 +360,15 @@ def locate_capture(directory, calib_path, options: Options):
     image, meta, capture_dir, image_path = load_capture(directory)
     delivered = (image.shape[1], image.shape[0])
     calibration = calib_mod.load(calib_path)
-    turns = rotation_turns(meta, delivered, calibration, options.rotation)
-    if turns:
-        image = rotate_image(image, turns)
-        calibration = calib_mod.load(calib_path, image_size=(image.shape[1], image.shape[0]))
-
+    turned = rotation_turns(meta, delivered, calibration, options.rotation)
+    applied = 0
+    if turned:
+        image, calibration, applied = upright_frame(calib_path, image, turned)
     tap = options.tap if options.tap is not None else tap_from_meta(meta, delivered)
-    if tap is not None and turns:
-        tap = calib_mod.map_pixel(tap[0], tap[1], delivered, turns)
+    if tap is not None and applied:
+        # The tap is measured in the delivered frame; move it into the grid the
+        # image was turned into before anything is solved.
+        tap = calib_mod.map_pixel(tap[0], tap[1], delivered, applied)
     # The image is upright now, so the tap must be too; the meta's own tap would
     # be measured against the delivered frame.
     meta_upright = dict(meta)
@@ -376,7 +377,8 @@ def locate_capture(directory, calib_path, options: Options):
     upright = replace(options, tap=tap, rotation=0)
 
     payload = locate(image, meta_upright, calibration, upright)
-    payload["rotation"] = turns
+    payload["rotation"] = turned          # how the frame arrived ...
+    payload["turned_back"] = applied      # ... and what was applied to undo it
     payload["delivered_size"] = [int(delivered[0]), int(delivered[1])]
 
     corners = payload.pop("_corners")
@@ -410,6 +412,13 @@ def rotate_image(image, turns):
 def rotation_turns(meta, frame_size, calibration, explicit=None):
     """How far the delivered frame is turned from the calibration, clockwise.
 
+    This is a *measurement of the frame*, not the correction: a frame that came
+    out of a landscape phone while the board was shot in portrait is one turn
+    clockwise (`k = 1`), and turning it back takes `4 - k = 3` turns. Keeping the
+    two apart matters -- applying `k` as if it were the correction leaves the
+    image 180 degrees out, which still looks like "a rotated picture" but puts
+    every projected point in the wrong place.
+
     Three sources, in order: the caller, the capture's own `rotation`, and the
     two orientations (`orientation_deg` now and in the calibration). Dimensions
     alone cannot tell 90 from 270 -- they only say "a quarter turn" -- so the
@@ -425,6 +434,31 @@ def rotation_turns(meta, frame_size, calibration, explicit=None):
     if frame_deg is not None and calib_deg is not None:
         return int(round((float(frame_deg) - float(calib_deg)) / 90.0)) % 4
     return calib_mod.turns_for_shapes(calibration.image_size, frame_size)
+
+
+def upright_frame(calib_path, frame, rotation=None):
+    """A delivered frame turned back to the calibration's orientation.
+
+    This is the one entry point for anything that measures a frame with `K`:
+    the tap locator, the tag-seeded rig and the sweep all call it, so none of
+    them can silently use intrinsics for a grid the image is not on.
+
+    `rotation` is how far the delivered frame is turned clockwise from the
+    calibration (`k`). `None` asks the shape, which can only tell odd from even --
+    a mount is one or the other for good, so an explicit value settles it.
+
+    Returns `(frame, calibration, applied)`, where `applied` is the turn that was
+    actually applied, `4 - k`: rotate by that to undo and map frame pixels by it
+    to reach the calibrated grid.
+    """
+    calibration = calib_mod.load(calib_path)
+    turned = rotation_turns({}, (frame.shape[1], frame.shape[0]), calibration, rotation)
+    applied = (4 - turned) % 4
+    if applied:
+        frame = rotate_image(frame, applied)
+        calibration = calib_mod.load(calib_path,
+                                     image_size=(frame.shape[1], frame.shape[0]))
+    return frame, calibration, applied
 
 
 def main(argv=None):

@@ -460,37 +460,78 @@ grid. Rotating `K` by hand is the wrong instinct for this pipeline -- it is only
 exact for a pure pinhole, because the tangential terms are tied to the image
 axes, and `cv2` would then solve the tag against a grid that does not exist.
 
-So the capture is **turned back first**, then solved with the original `K`:
+So the capture is **turned back first**, then solved with the original `K`. The
+two numbers must not be confused: `k` is how the frame *arrived* (clockwise), and
+`4 - k` is what is *applied* to undo it.
 
 ```
-delivered 1200x1600, calibrated 1600x1200
-  turns = 3 (the delivered frame is a quarter turn the other way)
-  image  = rotate(delivered, 3)            -> 1600x1200, upright
-  tap    = map_pixel(tap, delivered, 3)    -> the same point, upright
-  solve  = the portrait K, the portrait dist, exactly as before
+delivered 1920x1080, calibrated 1080x1920
+  k       = 3   (the frame arrived three quarter turns clockwise)
+  applied = 1   (so one clockwise turn puts it back)
+  image   = rotate(delivered, 1)             -> 1080x1920, upright
+  tap     = map_pixel(tap, delivered, 1)     -> the same point, upright
+  solve   = the portrait K, the portrait dist, exactly as before
 ```
 
-Where the quarter turn comes from, in order:
+Applying `k` instead of `4 - k` is the bug this section exists to prevent: the
+frame is still the right *size*, so nothing raises, and every projected point is
+180 degrees out -- a reach band drawn off the table, taps landing on the wrong
+side. The payload records both (`rotation` = `k`, `turned_back` = applied).
+
+Where the frame's turn comes from, in order:
 
 | source | what it is |
 |---|---|
-| the caller | `--rotation 0..3` on `locate_target.py`, or `Options(rotation=...)` |
-| the capture | `meta.rotation`, written by whoever took the frame |
-| the two angles | `meta.orientation_deg` minus the calibration's own `orientation_deg`, in 90s |
+| the tag, measured | the host projects the base tag with the rig and compares with where it is detected: only the real turn matches. See below |
+| the caller | `--rotation 0..3` on `locate_target.py`, or `Options(rotation=...)` -- how the frame arrived |
+| the capture | `meta.rotation`, written by whoever took the frame -- also how it arrived |
+| the two angles | the calibration's own angle minus the phone's published stream angle, in 90s. `screen.orientation.angle` grows as the viewport turns while the camera's pixels stay put, so the frame turns the other way; the tag measurement below is preferred anyway |
 | the shape | the frame is a quarter turn of the calibration, so **assume clockwise** |
 
 The phone records `orientation_deg` from `screen.orientation.angle` on every
 capture, and `calibrate_intrinsics.py` stores the angle the board was shot at, so
-the third row is exact whenever both exist. The last row is the fallback: two
-dimensions cannot tell 90 from 270, and the payload says `rotation` and
-`delivered_size` so a wrong guess is visible in one tap rather than silent. A
+the fourth row is exact whenever both exist. The last row is the fallback: two
+dimensions cannot tell 90 from 270, and the payload says `rotation`, `turned_back`
+and `delivered_size` so a wrong guess is visible in one tap rather than silent. A
 frame that is neither the same aspect ratio nor a quarter turn is still refused,
 with the message telling you which it is.
 
-`/live` is a separate case: it decodes a stream whose geometry the *publisher*
-chose, so the page reuses `K` as long as the phone publishes one orientation. If
-the phone is rotated while publishing, the stream geometry changes underneath it
-and the page needs the same orientation signal; that is not wired yet.
+The **Rig modal and the sweep** go through the same turn-back: a still from a
+camera mounted a quarter turn from the calibration is rotated before the tag is
+solved, and during a sweep every frame the recorder hands over is rotated the
+same way (otherwise the tip pixels and the tag would be measured on one grid and
+fitted on another).
+
+### The direction is measured, not assumed
+
+The base tag is a known point in the base frame. Project it with the fitted rig,
+detect it in the frame, and compare: for the wrong turn the prediction is
+hundreds of pixels away, for the right one it is a pixel or two. That is
+`measure_stream_rotation` in the capture server, and it is what settles the sign
+without a setting, a guess, or a convention:
+
+```json
+// /reach.json and /health
+"stream_rotation": {"turns": 3, "source": "measured"}
+```
+
+`source` says who decided -- `measured` from the tag, `phone` from the angle the
+page publishes at camera start, or `shape` when neither could. The measurement is
+cached for 30 seconds and only runs when nothing else knows, so it costs one
+still grab per session at most. On the bench used to write this it reported
+`turns: 3` with a tag error of 1.2 px, against 590 px for the other direction --
+and drawing the band with that value puts it on the table, where the shape's
+default guess of "clockwise" does not.
+
+When the phone *does* publish, `/health` carries it as `stream_orientation`:
+
+```
+POST /orientation   {"angle": 90, "size": [1920, 1080]}
+```
+
+`/live` prefers `stream_rotation.turns` from `/reach.json` for its own
+projections (the band, marker pins, plan taps, the agent's pixel tools), so a
+wrong direction cannot come from the frame size alone.
 
 ### The geometry is pinned when the camera starts
 
@@ -1020,7 +1061,7 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | live preview never connects | phone and host on different VLANs / AP isolation; UDP 8189 blocked |
 | "aspect ratio changed" | calibrated at 4:3, captured 16:9; recalibrate at the capture size. A 90°/270° frame is not this: it is turned back, see *When the phone is in landscape* |
 | "the frame is a quarter turn of the calibration" | the frame is rotated and the caller asked `calib.load` to *rescale* it; load without `image_size` and map the pixels (the capture path already does) |
-| a landscape marker lands mirrored | the quarter-turn direction was guessed; put `rotation` in the capture meta, or pass `--rotation`, and check the angle the calibration was shot at |
+| a landscape marker lands mirrored, or the reach band sits off the table | a turn applied as `k` instead of `4 - k`, or guessed from the shape; read `stream_rotation` in `/reach.json` -- `source: "shape"` means nothing measured it, `source: "measured"` is the tag's answer, `source: "phone"` is the published angle |
 | taps and markers stop after turning the phone | the browser re-cut the frame mid-stream, so the pinned geometry no longer matches; restart the camera (or reconnect on `/live`), or turn the phone back |
 | `the screen turned; the frame geometry did not change` in the log | harmless: the stream kept its size, so the same intrinsics still apply and nothing was re-fitted |
 | live preview works, `/live` does not | MediaMTX up but the path has no publisher yet |
@@ -1047,6 +1088,8 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | tap: the edge answers 503 on /pose | `can0` is down on the board; see the edge README |
 | `/live` tap: no "Move the arm" button | `REBOT_EXECUTE=0`; set it to 1 and `docker compose up -d` |
 | `/live` header: "host unreachable" | no token (open `/live?token=...` once) or the capture service is down; the dot is the `/health` poll |
+| Rig modal: "the tag needs intrinsics at this size: ... quarter turn ..." | the still is a quarter turn from the calibration and no direction was published; start the camera on the phone so it posts `POST /orientation`, or fit with the phone held the way it will be mounted |
+| a rig fitted in landscape is rolled | the published angle and the calibration's disagree; check `stream_orientation` in `/health` against the calibration's `orientation_deg`, and re-run the camera start so the page republishes, then fit again |
 | `/live` header: "no fixed rig: fit one with Rig" | `/live` plans through a rig only: **Capture one pose** with the base tag in view (no arm motion), or run the sweep (`Rig`, or `calibrate_extrinsics.py --auto`); the rig is written to `state/calib/extrinsics-fixed.json` and loaded on the next start |
 | Rig: "Capture one pose" writes no rig | the tag was not in the still, is under 16 px across, is more than 75 deg edge-on, or its corners reproject worse than 2 px; the card shows which. Retake with the tag in view, or tap the tool tip and sweep |
 | `/live` tap: "fixed mode needs a rig" | same thing from the server's side; nothing on that page can plan without a fitted rig |
@@ -1081,7 +1124,7 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | `reach-config.js` | one cached `/reach.json` shared by the overlay and locator |
 | `reach.js` | the reachable-band canvas and camera-pose orchestration, on both pages |
 | `aruco.js` | browser-side 4x4_50 detection and pose for the live handheld overlay |
-| `capture_server.py` | TLS endpoint, `/capture`, `/plan`, `/sequence`, `/execute`, `/agent`, calibration, WHIP/WHEP |
+| `capture_server.py` | TLS endpoint, `/capture`, `/orientation`, `/plan`, `/sequence`, `/execute`, `/agent`, calibration, WHIP/WHEP |
 | `planner_server.py` | the arm gateway: edge `/pose`, one compact `/plan`, gated execution |
 | `make_cert.py` | local CA + leaf certificate for the phone |
 | `base_marker.py` | the printable marker sheet and its PnP (see `base-marker.md`) |

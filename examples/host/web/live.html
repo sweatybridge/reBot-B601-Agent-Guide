@@ -316,6 +316,9 @@ const reachOverlay = window.ReachOverlay.create({
   // Fixed rigs only: the band comes from `T_base_cam` in /reach.json, and there
   // is no detector here to invent a pose when one is missing.
   poseHint: "no fixed rig fitted: press Rig, or run calibrate_extrinsics.py --auto",
+  // The stream can be a quarter turn from the calibration; the phone published
+  // its screen angle, and every pixel the band draws has to be mapped into it.
+  rotation: () => streamTurns(),
 });
 
 // The workstation has no camera pose of its own, so every tap goes through the
@@ -330,6 +333,8 @@ const planner = TapPlanner.create({
   token: () => state.token,
   source: "live",
   height: () => heightControl.height,
+  // The stream's quarter turn, so the captured frame describes itself to the host.
+  rotation: () => streamTurns(),
   onStatus: status,
 });
 // One owner for the stage: the height control tells a tap from a drag and routes
@@ -378,6 +383,32 @@ const markersOverlay = window.MarkerSequence.create({
 // from `T_base_cam` in /reach.json. The trade is the witness check, which lives on
 // the capture path -- a plan-mode tap still gets it, a marker does not (neither
 // does a marker on the phone).
+// Quarter turns the decoded stream is turned from the calibration, clockwise.
+// The host measures it from the base tag when it can (`stream_rotation.turns`),
+// falls back to the angle the phone published, and to the frame shape last --
+// which knows "a quarter turn" but not which way. `source` says which won.
+function streamTurns() {
+  const config = window.RebotConfig ? window.RebotConfig.get() : null;
+  const width = Number(video.videoWidth) || 0;
+  const height = Number(video.videoHeight) || 0;
+  if (!config || !width || !height) return 0;
+  const known = config.stream_rotation;
+  if (known && Number.isFinite(Number(known.turns))) {
+    return (((Math.round(Number(known.turns)) % 4) + 4) % 4);
+  }
+  const orientation = state.health && state.health.stream_orientation;
+  const streamAngle = orientation ? Number(orientation.angle) : NaN;
+  const boardAngle = Number((config.calibration || {}).orientation_deg);
+  if (Number.isFinite(streamAngle) && Number.isFinite(boardAngle)) {
+    // The viewport turns clockwise as the device does; the camera's pixels stay
+    // put, so the frame is turned the other way round from the reported angle.
+    return (((Math.round((boardAngle - streamAngle) / 90) % 4) + 4) % 4);
+  }
+  const shape = window.ReachGeometry.turnsForShapes(config.calibration.image_size,
+    [width, height]);
+  return shape > 0 ? shape : 0;
+}
+
 async function locateHere(tap, height) {
   const wrongFrame = checkStream();
   if (wrongFrame) throw new Error(wrongFrame);
@@ -386,7 +417,8 @@ async function locateHere(tap, height) {
     throw new Error("no fixed rig fitted: press Rig, or run calibrate_extrinsics.py --auto");
   }
   const tip = window.BrowserLocate.tipTarget(config.calibration, config.T_base_cam,
-    tap.u, tap.v, config.plane_z, height, video.videoWidth, video.videoHeight);
+    tap.u, tap.v, config.plane_z, height, video.videoWidth, video.videoHeight,
+    streamTurns());
   return { tip: tip.tip, pixel: tip.pixel, tap: tip.tap };
 }
 
@@ -843,7 +875,7 @@ async function toolPixelToArm(args) {
   const width = video.videoWidth || config.calibration.image_size[0];
   const tall = video.videoHeight || config.calibration.image_size[1];
   const tip = window.BrowserLocate.tipTarget(config.calibration, config.T_base_cam,
-    u, v, config.plane_z, height, width, tall);
+    u, v, config.plane_z, height, width, tall, streamTurns());
   return tipReport(config, tip.tip, height, { u: u, v: v });
 }
 

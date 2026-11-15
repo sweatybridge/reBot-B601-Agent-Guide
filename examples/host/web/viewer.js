@@ -679,12 +679,16 @@
         const frame = await RebotVideo.grabBlob(video);
 
         const form = new FormData();
+        const turns = options.rotation ? Number(options.rotation()) : NaN;
         form.append("meta", JSON.stringify({
           purpose: "plan",
           capturedAt: new Date().toISOString(),
           image_size: [frame.width, frame.height],
           tap: tapped,
           source: options.source || "tap",
+          // The stream can be a quarter turn from the calibration; the page
+          // knows which way and the host has to turn the frame back.
+          rotation: Number.isFinite(turns) ? (((Math.round(turns) % 4) + 4) % 4) : 0,
           settings: video.videoWidth ? {
             width: video.videoWidth, height: video.videoHeight,
           } : {},

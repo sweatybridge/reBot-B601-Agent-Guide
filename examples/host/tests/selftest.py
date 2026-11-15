@@ -677,6 +677,31 @@ async def test_server(workdir: Path, geometry):
             app.update(saved_llm)
             await runner.cleanup()
 
+        # The phone publishes which way up its stream is: the frame size cannot
+        # say it, and the rig paths and /live need the sign.
+        posted = await client.post("/orientation", json={"angle": 90, "size": [1920, 1080]},
+                                   headers={"X-Rebot-Token": "selftest-token"})
+        posted_body = await posted.json()
+        health = await (await client.get("/health")).json()
+        check("the phone can publish its stream orientation",
+              posted.status == 200
+              and (posted_body.get("stream_orientation") or {}).get("angle") == 90
+              and (health.get("stream_orientation") or {}).get("angle") == 90,
+              str(health.get("stream_orientation")))
+        check("the published size comes back with it",
+              (health.get("stream_orientation") or {}).get("width") == 1920
+              and (health.get("stream_orientation") or {}).get("height") == 1080)
+        reach_now = await (await client.get("/reach.json")).json()
+        check("reach.json carries the calibration's own angle for the pairing",
+              "orientation_deg" in (reach_now.get("calibration") or {}),
+              str(sorted((reach_now.get("calibration") or {}).keys())))
+
+        bad_angle = await client.post("/orientation", json={"angle": 45},
+                                      headers={"X-Rebot-Token": "selftest-token"})
+        check("a non-quarter-turn angle is refused", bad_angle.status == 400)
+        no_orientation_token = await client.post("/orientation", json={"angle": 90})
+        check("orientation still needs the page token", no_orientation_token.status == 401)
+
 
 # --------------------------------------------------------------------------- #
 # 5. locate_target.py as the host actually runs it
@@ -768,19 +793,60 @@ def test_rotation(workdir: Path, geometry):
     check("the turned tap lands within 3 mm of the truth", error < 0.003,
           "%.2f mm" % (error * 1000))
 
-    # The mapping has to be its own inverse across the size swap; a real K is
-    # asymmetric, so getting the *direction* wrong does not cancel out, which is
-    # why the payload records the rotation it used.
+    # The mapping has to be its own inverse across the size swap: the frame
+    # arrived one quarter turn clockwise, so turning it back takes three.
     back = calib_mod.map_pixel(tap[0], tap[1], turned_size, 3)
     check("turning the tap back recovers it",
           abs(back[0] - geometry["pixel"][0]) < 1e-9
           and abs(back[1] - geometry["pixel"][1]) < 1e-9,
           "(%.1f, %.1f) vs (%.1f, %.1f)"
           % (back[0], back[1], geometry["pixel"][0], geometry["pixel"][1]))
-    check("the payload says which turn it used",
+    check("the payload says how it arrived and what was applied",
           target.get("delivered_size") == list(turned_size)
-          and target.get("rotation") == 1,
-          "%s, rotation %s" % (target.get("delivered_size"), target.get("rotation")))
+          and target.get("rotation") == 1 and target.get("turned_back") == 3,
+          "%s, rotation %s, turned back %s"
+          % (target.get("delivered_size"), target.get("rotation"), target.get("turned_back")))
+
+    # The Rig modal's one-pose path: the still is landscape, and the tag must
+    # still seed the rig. Loading K at the delivered size is what used to fail.
+    try:
+        calib_mod.load(calib_path, image_size=turned_size)
+        check("K is not rescaled onto a turned frame", False, "it scaled anyway")
+    except calib_mod.CalibError as error:
+        check("K is not rescaled onto a turned frame",
+              "quarter turn" in str(error), str(error)[:60])
+
+    upright, turned_calib, applied = locate.upright_frame(calib_path, rotated)
+    # Pixel-exact: turning the wrong way round would give a size-correct frame
+    # that is 180 degrees out, which the pose tests above cannot see with a
+    # symmetric camera. This can.
+    check("the still is turned back to the calibration's grid",
+          applied == 3 and turned_calib.image_size == size
+          and np.array_equal(upright, geometry["image"]),
+          "applied %s, size %s, identical %s"
+          % (applied, turned_calib.image_size, np.array_equal(upright, geometry["image"])))
+    marker = base_marker.parse_spec("%g,%g,%g,%g" % (0.36, -0.10, 0.12, 180.0), 0.080)
+    marker["id"] = 3            # the id the synthetic tag was rendered with
+    run = auto_calibrate.solve_marker(upright, turned_calib, marker, plane_z=0.0)
+    position = float(np.linalg.norm(
+        np.asarray(run.rig.T_base_cam)[:3, 3] - geometry["T_base_cam"][:3, 3]))
+    check("a landscape still still seeds the rig", position < 0.006,
+          "%.2f mm" % (position * 1000))
+
+    # The direction must not be guessed: the host measures it from the tag, and
+    # this frame arrived one quarter turn clockwise, so the answer is 1 -- the
+    # shape's default guess, but now with evidence, and 3 would be hundreds of
+    # pixels out.
+    still = workdir / "rotation-still.jpg"
+    cv2.imwrite(str(still), rotated, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    import capture_server  # imported here: the server tests import it on demand too
+    app = {"camera": str(still), "marker": marker, "rig": run.rig}
+    measured = capture_server.measure_stream_rotation(app, turned_calib, frame=rotated)
+    check("the host measures which way the stream is turned",
+          measured is not None and measured["turns"] == 1
+          and measured["error_px"] < 5.0,
+          None if measured is None else
+          "turns %s, tag error %.1f px" % (measured["turns"], measured["error_px"]))
 
     # A frame of another aspect ratio that is not a quarter turn is still refused.
     awkward = workdir / "captures" / "20260101T120002Z-bad001"

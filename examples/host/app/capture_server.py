@@ -285,6 +285,17 @@ async def handle_health(request: web.Request) -> web.Response:
         "hover_m": app["hover_m"],
         "tip_m": app["tip_m"],
         "min_z": app["min_z"],
+        # What the phone last published about its stream. A quarter turn has no
+        # sign in the frame size, so this is the only way to know which way the
+        # camera is turned, and every consumer of `K` reads it here.
+        "stream_orientation": app["stream_orientation"],
+        # ... and the turn the host last worked out, with who decided. /reach.json
+        # carries the same pair for the page's own projections.
+        "stream_rotation": ({"turns": int(app["measured_rotation"]["turns"]),
+                             "source": "measured", "error_px":
+                             round(float(app["measured_rotation"]["error_px"]), 2),
+                             "size": app["measured_rotation"]["size"]}
+                            if app.get("measured_rotation") else None),
         # The chat sidebar is configured from the host's environment, never from
         # the page; all the page needs to know is whether it is there and what
         # it is talking to.
@@ -309,6 +320,26 @@ async def handle_reach(request: web.Request) -> web.Response:
     calibration = calib_mod.load(resolve_calibration(app, request.query.get("calib")))
     rig = app["rig"]
     marker = app.get("marker")
+    # Which way round the stream is. The tag is the ground truth -- project it
+    # with the rig, see where it actually is -- so measure whenever the rig can
+    # see it, and only fall back to the phone's published angle (or the shape)
+    # when it cannot. The measurement is cached for 30 s, so this is at most one
+    # still grab per half minute.
+    measured = None
+    if rig is not None and marker is not None:
+        # Off the event loop: grabbing a still from RTSP blocks, and this server
+        # is also relaying the phone's media.
+        measured = await asyncio.get_running_loop().run_in_executor(
+            None, measure_stream_rotation, app, calibration)
+    rotation = stream_rotation(app, calibration)
+    if rotation is None:
+        turns, source = None, "shape"
+    else:
+        turns = int(rotation)
+        if app.get("measured_rotation"):
+            source = "measured"
+        else:
+            source = "phone"
     return web.json_response({
         "ok": True,
         "mode": effective_mode(app),
@@ -331,11 +362,51 @@ async def handle_reach(request: web.Request) -> web.Response:
             "image_size": [int(v) for v in calibration.image_size],
             "fingerprint": calibration.fingerprint,
             "rms": calibration.rms,
+            # The screen angle the board was shot at, when the phone told us: the
+            # page pairs it with the published stream angle to work out the turn.
+            "orientation_deg": (calibration.raw or {}).get("orientation_deg"),
         },
+        "stream_orientation": app["stream_orientation"],
+        # The turn the page must apply to its own projections: `turns` quarter
+        # turns clockwise, from whichever source could settle it.
+        "stream_rotation": {"turns": turns, "source": source},
         "T_base_cam": (None if rig is None
                        else np.asarray(rig.T_base_cam, dtype=float).tolist()),
         "rig": None if rig is None else rig.provenance(),
     }, headers={"Cache-Control": "no-store"})
+
+
+async def handle_orientation(request: web.Request) -> web.Response:
+    """`POST /orientation` -- the phone says which way up its stream is.
+
+    The browser is the only thing that knows: a quarter turn has no sign in the
+    frame size, so the publisher states it once when the camera starts and again
+    when it restarts. The rig paths (`/capture/pose`, the sweep) and `/live` read
+    it back from `/health`, so nothing has to guess a direction or be configured
+    by hand.
+    """
+    app = request.app
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
+    try:
+        angle = int(round(float(body.get("angle")))) % 360
+    except (TypeError, ValueError) as exc:
+        raise web.HTTPBadRequest(text="'angle' must be a number of degrees") from exc
+    if angle not in (0, 90, 180, 270):
+        raise web.HTTPBadRequest(text="'angle' must be 0, 90, 180 or 270")
+    width = height = None
+    size = body.get("size")
+    if isinstance(size, (list, tuple)) and len(size) == 2:
+        try:
+            width, height = int(size[0]), int(size[1])
+        except (TypeError, ValueError) as exc:
+            raise web.HTTPBadRequest(text="'size' must be [width, height]") from exc
+    app["stream_orientation"] = {"angle": angle, "width": width, "height": height,
+                                 "at": utc_now()}
+    logging.info("stream orientation: %d deg (%sx%s)", angle, width, height)
+    return web.json_response({"ok": True, "stream_orientation": app["stream_orientation"]})
 
 
 async def handle_captures(request: web.Request) -> web.Response:
@@ -973,8 +1044,16 @@ def run_sweep(app, camera_url, calibration_path, body):
     eye = camera_mod.open_source(camera_url, latency=0.0)
     try:
         probe = eye.read()
-        size = (probe.shape[1], probe.shape[0])
-        calibration = calib_mod.load(calibration_path, image_size=size)
+        base = calib_mod.load(calibration_path)
+        turned = stream_rotation(app, base)
+        probe, calibration, applied = locator.upright_frame(
+            calibration_path, probe, turned)
+        if applied:
+            # Every frame the sweep reads has to be in the same orientation as
+            # the probe, or the tip pixels and the tag would be measured against
+            # one grid and fitted with another.
+            eye = UprightEye(eye, applied)
+            logging.info("sweep: frames turned back by %d quarter turn(s)", applied)
         options = auto_calibrate.Options(
             plane_z=float(body.get("plane_z", app["plane_z"])),
             settle_s=float(body.get("settle", 0.5)),
@@ -1105,20 +1184,120 @@ async def handle_calibrate_status(request: web.Request) -> web.Response:
     })
 
 
+def measure_stream_rotation(app, calibration, frame=None):
+    """Which way the live stream is turned, measured against the base tag.
+
+    The frame size says "a quarter turn" but never which way, and a wrong guess
+    leaves the reach band, every tap and the rig fit 180 degrees out -- which
+    looks like "a rotated picture" rather than an error, so nothing complains.
+    The base tag is a known point in the base frame: project it with the fitted
+    rig, then compare that prediction with where the tag is actually detected
+    for each candidate turn. Only the real one matches.
+
+    `frame` is the delivered frame when the caller already has one (the sweep's
+    probe); otherwise one is grabbed from the configured camera.
+
+    Returns `{"turns", "error_px", "size"}` or `None` when there is no rig, no
+    marker, no visible tag, or the frame is not turned at all.
+    """
+    marker = app.get("marker")
+    rig = app.get("rig")
+    if marker is None or rig is None:
+        return None
+    import cv2  # noqa: F401  (the camera sources need it, and so does the detector)
+
+    if frame is None:
+        cache = app.get("measured_rotation")
+        if cache and (time.time() - cache.get("at", 0.0)) < 30.0:
+            return cache
+        try:
+            eye = camera_mod.open_source(app["camera"])
+            try:
+                frame = eye.read()
+            finally:
+                eye.close()
+        except Exception as error:  # a hint must never break the caller
+            logging.info("stream rotation not measured: %s", error)
+            return None
+    size = (int(frame.shape[1]), int(frame.shape[0]))
+    if calib_mod.turns_for_shapes(calibration.image_size, size) == 0:
+        measured = {"turns": 0, "error_px": 0.0, "size": list(size), "at": time.time()}
+        app["measured_rotation"] = measured
+        return measured
+    try:
+        # The id is optional in the spec and stored as None when it was not given.
+        marker_id = marker.get("id")
+        marker_id = base_marker.MARKER_ID if marker_id is None else int(marker_id)
+        corners = base_marker.detect(frame, marker_id)
+        centre = np.asarray(corners, dtype=float).reshape(-1, 2).mean(axis=0)
+        predicted = np.asarray(locator.project(calibration.K, rig.T_base_cam,
+                                               np.asarray(marker["at"], dtype=float)),
+                               dtype=float)
+    except Exception as error:
+        logging.info("stream rotation not measured: %s", error)
+        return None
+    best = None
+    for turns in (1, 3):
+        mapped = np.asarray(calib_mod.map_pixel(predicted[0], predicted[1],
+                                                calibration.image_size, turns),
+                            dtype=float)
+        error = float(np.linalg.norm(mapped - centre))
+        if best is None or error < best["error_px"]:
+            best = {"turns": turns, "error_px": error}
+    best["size"] = list(size)
+    best["at"] = time.time()
+    app["measured_rotation"] = best
+    logging.info("stream rotation measured: %d quarter turn(s), tag error %.1f px",
+                 best["turns"], best["error_px"])
+    return best
+
+
+def stream_rotation(app, calibration):
+    """Quarter turns the stream is turned from the calibration (clockwise), if known.
+
+    Order: what the tag measurement saw, then what the phone published, then
+    `None` -- which lets the caller fall back to the frame shape, that knows "a
+    quarter turn" but not which way.
+
+    The phone branch is `calibration_angle - stream_angle`, not the other way
+    round: `screen.orientation.angle` grows as the *viewport* turns clockwise,
+    while the camera's pixels stay put, so the frame ends up turned the opposite
+    way. On the B601 bench a phone reporting 90 against a portrait calibration is
+    a frame three quarter turns clockwise -- the tag measures 1.2 px for 3 and
+    590 px for 1, which is why the measurement is preferred.
+    """
+    measured = app.get("measured_rotation")
+    if measured and measured.get("turns") is not None:
+        return int(measured["turns"]) % 4
+    orientation = app.get("stream_orientation") or {}
+    angle = orientation.get("angle")
+    calib_deg = (calibration.raw or {}).get("orientation_deg")
+    if angle is None or calib_deg is None:
+        return None
+    return int(round((float(calib_deg) - float(angle)) / 90.0)) % 4
+
+
 def marker_from_still(app, frame, q=None):
     """Solve the fixed camera from the base tag in one still, and write the rig.
 
     This is the short path: the tag is a PnP, so a still that sees it needs no
     sweep and moves no arm. The sweep stays for a camera that cannot see the tag;
     a missing tag is a normal answer here, not an error on the capture.
+
+    The frame is first turned back to the calibration's orientation: `K` belongs
+    to the grid the checkerboard was shot on, and a landscape frame is a quarter
+    turn of a portrait calibration. The direction comes from the orientation the
+    phone published (`POST /orientation`); without it the shape decides.
     """
     if app.get("calibrating"):
         return {"marker": {"detected": None,
                            "error": "a calibration sweep is running; the tag was not read"}}
     try:
-        calibration = calib_mod.load(
-            resolve_calibration(app),
-            image_size=(frame.shape[1], frame.shape[0]))
+        calibration_path = resolve_calibration(app)
+        base = calib_mod.load(calibration_path)
+        turned = stream_rotation(app, base)
+        frame, calibration, applied = locator.upright_frame(
+            calibration_path, frame, turned)
     except (calib_mod.CalibError, web.HTTPException) as error:
         return {"marker": {
             "detected": None,
@@ -1135,7 +1314,33 @@ def marker_from_still(app, frame, q=None):
     rig_path = app["calib"] / ("extrinsics-%s.json" % run.rig.mount)
     _rig, _verdict, written = auto_calibrate.commit_marker(
         run, calibration, rig_path, frame=frame, q=q)
-    return auto_calibrate.marker_report(run, written)
+    report = auto_calibrate.marker_report(run, written)
+    report["rotation"] = turned          # how the still arrived (measured or published)
+    report["turned_back"] = applied      # what was applied before the solve
+    if applied:
+        report["note"] = ("the still arrived %d quarter turn(s) from the calibration "
+                          "and was turned back before the solve" % turned)
+    return report
+
+
+class UprightEye:
+    """A camera source whose frames are turned back to the calibration's grid.
+
+    The sweep reads many frames and measures tip pixels and the tag in all of
+    them; if the stream is a quarter turn from the calibration, they all have to
+    be turned the same way, or the fit mixes two grids.
+    """
+
+    def __init__(self, eye, turns):
+        self.eye = eye
+        self.turns = int(turns) % 4
+
+    def read(self, *args, **kwargs):
+        frame = self.eye.read(*args, **kwargs)
+        return locator.rotate_image(frame, self.turns) if self.turns else frame
+
+    def close(self):
+        self.eye.close()
 
 
 def grab_one(app, camera_url):
@@ -1292,6 +1497,10 @@ def build_app(args) -> web.Application:
     app["calib_file"] = args.calib
     app["extrinsics_path"] = ""
     app["witness_max_px"] = float(args.witness_max_px)
+    # What the phone last said about its stream: the angle its screen had when
+    # the camera started, and the frame size it published. The browser is the
+    # only place that knows the sign of a quarter turn.
+    app["stream_orientation"] = None
     app["camera"] = args.camera
     app["mediamtx_api"] = (getattr(args, "mediamtx_api", "")
                            or os.environ.get("REBOT_MEDIAMTX_API", "http://127.0.0.1:9997")).rstrip("/")
@@ -1374,6 +1583,7 @@ def build_app(args) -> web.Application:
     app.router.add_get("/reach.json", handle_reach)
     app.router.add_get("/captures.json", handle_captures)
     app.router.add_post("/capture", handle_capture)
+    app.router.add_post("/orientation", handle_orientation)
     app.router.add_post("/plan", handle_plan)
     app.router.add_post("/sequence", handle_sequence)
     app.router.add_post("/execute", handle_execute)

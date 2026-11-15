@@ -238,8 +238,35 @@
       return point ? { u: box.left + point.u * box.scale, v: box.top + point.v * box.scale } : null;
     }
 
+    // The stream can be a quarter turn from the calibration (a phone held in
+    // landscape). The page knows the turn -- the phone publishes its screen
+    // angle -- and every pixel this module draws has to be mapped into the
+    // frame the video is actually displaying.
+    function frameTurns() {
+      const value = typeof options.rotation === "function" ? Number(options.rotation()) : NaN;
+      return Number.isFinite(value) ? ((Math.round(value) % 4) + 4) % 4 : 0;
+    }
+
+    function frameCamera() {
+      if (frameTurns() % 2) {
+        // A quarter turn: the calibrated grid is the frame's grid turned back.
+        return makeCamera(config.calibration, config.calibration.image_size[0],
+          config.calibration.image_size[1]);
+      }
+      return makeCamera(config.calibration, video.videoWidth, video.videoHeight);
+    }
+
+    function projectToFrame(camera, pose, point) {
+      const pixel = project(camera, pose, point);
+      if (!pixel) return null;
+      const turns = frameTurns();
+      if (!turns) return pixel;
+      const at = G.mapPixel(pixel.u, pixel.v, config.calibration.image_size, turns);
+      return { u: at[0], v: at[1] };
+    }
+
     function ringPoint(camera, pose, radius, angle, box) {
-      return toCanvas(project(camera, pose,
+      return toCanvas(projectToFrame(camera, pose,
         [radius * Math.cos(angle), radius * Math.sin(angle), band.tipHeight]), box);
     }
 
@@ -295,7 +322,7 @@
       context.setLineDash([]);
 
       // The base, so the band has an obvious centre even when it is off-screen.
-      const base = toCanvas(project(camera, pose, [0, 0, band.tipHeight]), box);
+      const base = toCanvas(projectToFrame(camera, pose, [0, 0, band.tipHeight]), box);
       if (base) {
         context.beginPath();
         context.arc(base.u, base.v, 4, 0, Math.PI * 2);
@@ -709,7 +736,7 @@
       const pose = matrixPose(chosen);
       let camera;
       try {
-        camera = makeCamera(config.calibration, video.videoWidth, video.videoHeight);
+        camera = frameCamera();
       } catch (error) {
         lastError = error.message;
         drawEmpty(error.message);
@@ -818,8 +845,8 @@
       const chosen = fixed ? config.T_base_cam : (live ? predictedPose() : null);
       if (!chosen) return null;
       try {
-        const camera = makeCamera(config.calibration, video.videoWidth, video.videoHeight);
-        const pixel = project(camera, matrixPose(chosen), point);
+        const camera = frameCamera();
+        const pixel = projectToFrame(camera, matrixPose(chosen), point);
         return pixel ? [pixel.u, pixel.v] : null;
       } catch (error) {
         return null;

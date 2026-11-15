@@ -462,6 +462,7 @@ async function startCamera() {
     video.srcObject = stream;
     await video.play();
     pinGeometry();
+    await publishOrientation();
     hint.hidden = true;
     markersOverlay.setEnabled(true);
     updateStartButton();
@@ -659,6 +660,60 @@ function screenAngle() {
   return ((Math.round(value) % 360) + 360) % 360;
 }
 
+// Quarter turns clockwise the pinned frame is turned from the calibration,
+// worked out from the two screen angles: the one the camera started at and the
+// one the board was shot at. Undefined (not 0) when the config or the angles are
+// not known yet, so the caller falls back to the frame shape instead of being
+// told "no turn" by accident.
+function cameraTurns() {
+  const config = window.RebotConfig ? window.RebotConfig.get() : null;
+  if (!config || !state.pinned) return undefined;
+  const known = config.stream_rotation;
+  if (known && Number.isFinite(Number(known.turns))) {
+    return (((Math.round(Number(known.turns)) % 4) + 4) % 4);
+  }
+  const calibration = config.calibration || {};
+  const boardAngle = Number(calibration.orientation_deg);
+  if (state.pinned.angle !== null && Number.isFinite(boardAngle)) {
+    // The screen angle grows as the viewport turns clockwise while the camera's
+    // pixels stay put, so the frame is turned the other way from the reported
+    // angle; the host's tag measurement is preferred over this when it can see
+    // the base tag.
+    return (((Math.round((boardAngle - state.pinned.angle) / 90) % 4) + 4) % 4);
+  }
+  const shape = window.ReachGeometry.turnsForShapes(calibration.image_size,
+    [state.pinned.width, state.pinned.height]);
+  return shape > 0 ? shape : 0;
+}
+
+// The host cannot know which way a quarter turn goes, and the shape cannot tell
+// it: the phone says, once per camera start, and the rig paths and /live read it
+// back from /health.
+async function publishOrientation() {
+  if (!state.pinned || state.pinned.angle === null) return;
+  try {
+    const response = await api("/orientation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        angle: state.pinned.angle,
+        size: [state.pinned.width, state.pinned.height],
+      }),
+    });
+    if (!response.ok) {
+      // A host running an older build has no such route yet: say so instead of
+      // claiming the orientation was published.
+      log("the host did not take the orientation (" + response.status
+        + "); restart the capture service", "warn");
+      return;
+    }
+    log("orientation published: " + state.pinned.angle + " deg, "
+      + state.pinned.width + "x" + state.pinned.height, "");
+  } catch (error) {
+    log("could not publish the orientation: " + escapeHtml(explain(error)), "warn");
+  }
+}
+
 function captureLink(id) {
   const safe = encodeURIComponent(id);
   return '<a target="_blank" rel="noreferrer" href="/captures/' + safe + '/frame.jpg">' + escapeHtml(id) + "</a>";
@@ -810,6 +865,9 @@ const reachOverlay = window.ReachOverlay.create({
   // The Camera chip is the truth for this page: fixed uses the rig, handheld
   // solves the tag. A fitted rig does not force the band into fixed mode.
   mode: () => (window.TapPlanner ? TapPlanner.getMode() : "handheld"),
+  // The frame is what the camera started at; if that is a quarter turn from the
+  // calibration, every pixel drawn has to be mapped into it.
+  rotation: () => cameraTurns(),
   onStatus: (message, kind) => log(escapeHtml(message), kind),
 });
 
@@ -823,6 +881,7 @@ const browserLocate = window.BrowserLocate.create({
   video: video,
   token: () => state.token,
   mode: () => (window.TapPlanner ? TapPlanner.getMode() : "handheld"),
+  turns: () => cameraTurns(),
   onStatus: (message, kind) => log(escapeHtml(message), kind),
 });
 
