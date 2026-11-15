@@ -1138,10 +1138,11 @@ function waitForIce(connection, milliseconds) {
   });
 }
 
-// The stream geometry this connection was made with. A `K` describes one grid,
-// so it is taken once per connection: a stream that re-cuts itself mid-session
-// (the phone turned while publishing) leaves the viewport alone and refuses the
-// solves rather than quietly using the wrong intrinsics. Reconnect to refit.
+// The stream geometry this connection was made with. A proportional resize is
+// safe -- K is scaled with the frame, and `tipTarget` uses the current video
+// size -- but a different aspect (a quarter turn or a crop) is not: that leaves
+// the viewport alone and refuses the solves rather than quietly using the wrong
+// intrinsics. Reconnect to refit.
 let streamPin = null;
 
 function pinStream() {
@@ -1156,9 +1157,21 @@ function streamMismatch() {
   const height = Number(video.videoHeight) || 0;
   if (!width || !height) return "the preview has no frame";
   if (width === streamPin.width && height === streamPin.height) return "";
+  // A proportional resize is safe: the browser scales K by the same factor the
+  // stream did, and `tipTarget` feeds it the current video size. Re-pin so a
+  // later resize is judged against the size actually in use. A quarter turn or
+  // a crop changes the geometry, and still has to be reconnected.
+  const shape = window.ReachGeometry
+    ? window.ReachGeometry.shapeTurn([streamPin.width, streamPin.height], [width, height])
+    : -1;
+  if (shape === 0) {
+    streamPin = { width: width, height: height };
+    return "";
+  }
   return "the stream changed from " + streamPin.width + "x" + streamPin.height
-    + " to " + width + "x" + height + " since it connected; disconnect and connect "
-    + "again to refit the intrinsics";
+    + " to " + width + "x" + height + " since it connected, and that is not a "
+    + "proportional resize; disconnect and connect again, and refit the intrinsics "
+    + "if the field of view changed";
 }
 
 let streamWarned = "";
@@ -1170,7 +1183,7 @@ function checkStream() {
     pushChat("error", problem);
   } else if (!problem && streamWarned) {
     streamWarned = "";
-    status("the stream matches the geometry it connected with again", "good");
+    status("the stream geometry is usable again", "good");
   }
   return problem;
 }

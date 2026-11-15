@@ -262,9 +262,22 @@
       if (!pixel) return null;
       const turn = frameTurn();
       if (!turn) return pixel;
-      // Calibration -> frame is the inverse of what `turn` does.
-      const at = G.mapPixel(pixel.u, pixel.v, config.calibration.image_size,
-        (4 - turn) % 4);
+      const calibration = config.calibration.image_size;
+      if (turn % 2) {
+        // An odd turn projects on the calibration grid, so the mapped pixel is
+        // in the *turned calibration* size. The canvas is sized to the
+        // delivered frame; scale that grid onto the frame, or a stream that
+        // arrives at a different resolution moves the band.
+        const at = G.mapPixel(pixel.u, pixel.v, calibration, (4 - turn) % 4);
+        return {
+          u: at[0] * (video.videoWidth / calibration[1]),
+          v: at[1] * (video.videoHeight / calibration[0]),
+        };
+      }
+      // An even turn projects on the delivered frame already; rotate in that
+      // same pixel grid rather than the calibration's.
+      const at = G.mapPixel(pixel.u, pixel.v, [video.videoWidth, video.videoHeight],
+                            (4 - turn) % 4);
       return { u: at[0], v: at[1] };
     }
 

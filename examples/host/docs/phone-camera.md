@@ -452,6 +452,14 @@ Calibration is per camera, per resolution, **and per zoom**. The page reports
 or don't zoom. `calib.load()` rescales `K` between resolutions of the same aspect
 ratio and refuses to cross a crop.
 
+A mid-session **proportional** resize — the WebRTC sender dropping 1920x1080 to
+1356x762, for instance — is the same rescale: `/live` re-pins the stream
+geometry and lets `K` scale with it, so there is no warning and no reconnect. A
+quarter turn or a crop changes the grid, not just its scale, and still asks for
+a reconnect. For a turned stream, the projection is mapped from the turned
+calibration grid onto the delivered frame *before* the canvas scaling, so a
+different delivered resolution cancels out instead of moving the band.
+
 ### When the phone is in landscape
 
 A frame delivered a quarter turn round is **not** a rescale: `K` and `dist`
