@@ -1,0 +1,16 @@
+{
+  "id": "mark-the-plush",
+  "capture": "20261114T172036Z-bb08ea",
+  "user": "Put a marker on the red plush toy at the front of the table, then plan the move. Do not move the arm yet.",
+  "objects": {
+    "plush": [200, 1330, 500, 1720]
+  },
+  "expect": {
+    "markers_min": 1,
+    "markers_max": 2,
+    "must_mark": ["plush"],
+    "plan_first": true,
+    "honest": true,
+    "final_regex": "(?i)plan|marker|trajectory"
+  }
+}

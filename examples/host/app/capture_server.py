@@ -62,6 +62,9 @@ CAPTURE_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 PURPOSES = {"plan", "calib", "extrinsics", "debug"}
 RESERVED_META = {"id", "frame", "server"}
+# A chat turn carries the frames the model has been shown, and every frame is a
+# base64 JPEG. Past this many messages the page must drop old frames.
+AGENT_MAX_MESSAGES = 80
 
 
 def utc_now() -> str:
@@ -282,6 +285,14 @@ async def handle_health(request: web.Request) -> web.Response:
         "hover_m": app["hover_m"],
         "tip_m": app["tip_m"],
         "min_z": app["min_z"],
+        # The chat sidebar is configured from the host's environment, never from
+        # the page; all the page needs to know is whether it is there and what
+        # it is talking to.
+        "agent": {
+            "configured": bool(app["llm_url"]),
+            "model": app["llm_model"] if app["llm_url"] else "",
+            "auth": bool(app["llm_token"]),
+        },
     })
 
 
@@ -788,6 +799,104 @@ async def handle_plan(request: web.Request) -> web.Response:
     })
 
 
+async def handle_agent(request: web.Request) -> web.Response:
+    """One model turn for the page's chat sidebar.
+
+    The page owns the conversation and the tool loop, because every tool either
+    touches the page (markers, a fresh frame) or a route this server already has
+    (`/sequence`, `/execute`). What lives here is the transport and its
+    configuration: the endpoint, the model name and any key stay on the host, so
+    the browser never holds them and no page setting can change them.
+    """
+    app = request.app
+    if not app["llm_url"]:
+        return web.json_response({
+            "ok": False,
+            "error": "the agent is not configured: set REBOT_LLM_URL (and REBOT_LLM_MODEL)",
+        }, status=503)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
+
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise web.HTTPBadRequest(text="'messages' must be a non-empty list")
+    if len(messages) > AGENT_MAX_MESSAGES:
+        raise web.HTTPBadRequest(
+            text="a chat turn is limited to %d messages; drop the old frames"
+                 % AGENT_MAX_MESSAGES)
+    tools = body.get("tools")
+    if tools is not None and not isinstance(tools, list):
+        raise web.HTTPBadRequest(text="'tools' must be a list of tool schemas")
+
+    payload = {
+        "model": app["llm_model"],
+        "messages": messages,
+        "stream": False,
+        "temperature": app["llm_temperature"],
+    }
+    if app["llm_max_tokens"] > 0:
+        payload["max_tokens"] = app["llm_max_tokens"]
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    headers = {"Content-Type": "application/json"}
+    if app["llm_token"]:
+        headers["Authorization"] = "Bearer " + app["llm_token"]
+
+    try:
+        async with app["client"].post(app["llm_url"], json=payload, headers=headers,
+                                      timeout=ClientTimeout(total=app["llm_timeout"])) as answer:
+            text = await answer.text()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the chat
+        logging.warning("agent %s failed: %s", app["llm_url"], exc)
+        return web.json_response({
+            "ok": False,
+            "error": "cannot reach the model at %s (%s)" % (app["llm_url"], exc),
+        }, status=502)
+
+    if answer.status != 200:
+        logging.warning("agent %s answered %d: %s", app["llm_url"], answer.status,
+                        text[:200])
+        return web.json_response({
+            "ok": False,
+            "error": "the model refused (%d): %s" % (answer.status, text[:300]),
+        }, status=502)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return web.json_response({
+            "ok": False,
+            "error": "the model answered something that is not JSON: %s" % text[:200],
+        }, status=502)
+
+    choices = data.get("choices") or [{}]
+    message = (choices[0] or {}).get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        # Vision replies occasionally arrive as content parts; flatten the text.
+        content = "".join(part.get("text", "") for part in content
+                          if isinstance(part, dict))
+    tool_calls = message.get("tool_calls") or []
+    if content is None and not tool_calls:
+        return web.json_response({
+            "ok": False,
+            "error": "the model returned neither text nor tool calls",
+        }, status=502)
+    logging.info("agent: %d chars, %d tool call(s)", len(content or ""), len(tool_calls))
+    return web.json_response({
+        "ok": True,
+        "model": data.get("model") or app["llm_model"],
+        "message": {
+            "role": "assistant",
+            "content": content or "",
+            "tool_calls": tool_calls,
+        },
+        "usage": data.get("usage") or {},
+    })
+
+
 async def handle_execute(request: web.Request) -> web.Response:
     app = request.app
     if not app["execute"]:
@@ -1125,6 +1234,25 @@ def build_app(args) -> web.Application:
     app["plane_z"] = args.plane_z
     app["tool_axis"] = args.tool_axis
     app["yaw"] = args.yaw
+    # The chat sidebar's model: an OpenAI-compatible endpoint and the one model
+    # that can see. Empty URL turns the sidebar off. These are deliberately not
+    # settable from a page -- only from the host's environment or flags. Each
+    # value falls back to the environment when the flag was not given, and 0 is
+    # a meaningful temperature, so neither `or` is safe here.
+    app["llm_url"] = str(getattr(args, "llm_url", "") or os.environ.get("REBOT_LLM_URL", "")).strip()
+    app["llm_model"] = str(getattr(args, "llm_model", "")
+                           or os.environ.get("REBOT_LLM_MODEL", "Qwen3.8-27B")).strip()
+    app["llm_token"] = str(getattr(args, "llm_token", "")
+                           or os.environ.get("REBOT_LLM_TOKEN", "")).strip()
+    temperature = getattr(args, "llm_temperature", None)
+    app["llm_temperature"] = float(temperature if temperature is not None
+                                   else os.environ.get("REBOT_LLM_TEMPERATURE", "0.2"))
+    max_tokens = getattr(args, "llm_max_tokens", None)
+    app["llm_max_tokens"] = int(max_tokens if max_tokens is not None
+                                else os.environ.get("REBOT_LLM_MAX_TOKENS", "1024"))
+    timeout = getattr(args, "llm_timeout", None)
+    app["llm_timeout"] = float(timeout if timeout is not None
+                               else os.environ.get("REBOT_LLM_TIMEOUT", "300"))
     app["captures"].mkdir(parents=True, exist_ok=True)
     app["calib"].mkdir(parents=True, exist_ok=True)
 
@@ -1137,6 +1265,7 @@ def build_app(args) -> web.Application:
     app.router.add_post("/plan", handle_plan)
     app.router.add_post("/sequence", handle_sequence)
     app.router.add_post("/execute", handle_execute)
+    app.router.add_post("/agent", handle_agent)
     app.router.add_get("/pose", handle_pose)
     app.router.add_post("/calibrate/extrinsics", handle_calibrate)
     app.router.add_get("/calibrate", handle_calibrate_status)
@@ -1219,6 +1348,25 @@ def main(argv=None):
     parser.add_argument("--plane-z", type=float, default=float(os.environ.get("REBOT_PLANE_Z", "0.0")))
     parser.add_argument("--tool-axis", default=os.environ.get("REBOT_TOOL_AXIS", "current"))
     parser.add_argument("--yaw", type=float, default=float(os.environ.get("REBOT_YAW", "0")))
+    # The chat sidebar on /live. An OpenAI-compatible endpoint; set it empty to
+    # disable the sidebar. The model has to be able to see, and this is the only
+    # place it is named -- the page cannot change it. The default is the host's
+    # own Ollama; compose overrides it with the container's view of the host.
+    parser.add_argument("--llm-url",
+                        default=os.environ.get("REBOT_LLM_URL",
+                                               "http://localhost:11434/v1/chat/completions"),
+                        help="OpenAI-compatible chat endpoint for the /live agent sidebar")
+    parser.add_argument("--llm-model", default=os.environ.get("REBOT_LLM_MODEL", "Qwen3.8-27B"),
+                        help="model name that endpoint expects; it must accept images")
+    parser.add_argument("--llm-token", default=os.environ.get("REBOT_LLM_TOKEN", ""),
+                        help="bearer token for that endpoint, if it needs one")
+    parser.add_argument("--llm-temperature", type=float,
+                        default=float(os.environ.get("REBOT_LLM_TEMPERATURE", "0.2")))
+    parser.add_argument("--llm-max-tokens", type=int,
+                        default=int(os.environ.get("REBOT_LLM_MAX_TOKENS", "1024")))
+    parser.add_argument("--llm-timeout", type=float,
+                        default=float(os.environ.get("REBOT_LLM_TIMEOUT", "300")),
+                        help="seconds to wait for one model turn")
     parser.add_argument("--max-mb", type=int, default=25, help="largest accepted frame, MB")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
@@ -1271,6 +1419,9 @@ def main(argv=None):
           % (app["mode"] or "auto", app["hover_m"] * 1000, app["tip_m"] * 1000))
     if app["camera"]:
         print("  sweep    : %s (POST /calibrate/extrinsics)" % app["camera"])
+    print("  agent    : %s" % ("%s at %s" % (app["llm_model"], app["llm_url"])
+                                if app["llm_url"] else
+                                "off (set REBOT_LLM_URL to enable the /live chat sidebar)"))
     print("  auth     : %s" % ("token required on writes" if args.token else "open on the LAN"))
     web.run_app(app, host=args.host, port=args.port, ssl_context=ssl_context,
                 print=None, shutdown_timeout=2.0)

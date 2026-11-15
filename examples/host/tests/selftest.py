@@ -583,6 +583,100 @@ async def test_server(workdir: Path, geometry):
               (await client.post("/execute", json={"id": "x"},
                                  headers={"X-Rebot-Token": "selftest-token"})).status == 403)
 
+        # The agent sidebar: /agent is only a transport. The endpoint, the model
+        # and the key are the host's, so no page can change them -- and a page
+        # that asks for tools gets exactly the tools it asked for, no more.
+        from aiohttp import web as aiohttp_web
+
+        seen = []
+
+        async def fake_chat(request):
+            seen.append({"body": await request.json(),
+                         "auth": request.headers.get("Authorization")})
+            return aiohttp_web.json_response({
+                "model": "stub-model",
+                "choices": [{"message": {
+                    "role": "assistant", "content": "looking now",
+                    "tool_calls": [{"function": {"name": "rig", "arguments": "{}"}}],
+                }}],
+                "usage": {"total_tokens": 7},
+            })
+
+        fake_llm = aiohttp_web.Application()
+        fake_llm.router.add_post("/v1/chat/completions", fake_chat)
+        runner = aiohttp_web.AppRunner(fake_llm)
+        await runner.setup()
+        site = aiohttp_web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        llm_port = site._server.sockets[0].getsockname()[1]
+        saved_llm = {key: app[key] for key in
+                     ("llm_url", "llm_model", "llm_token", "llm_temperature",
+                      "llm_max_tokens", "llm_timeout")}
+        app["llm_url"] = "http://127.0.0.1:%d/v1/chat/completions" % llm_port
+        app["llm_model"] = "Qwen3.8-27B"
+        app["llm_token"] = "stub-key"
+        app["llm_temperature"] = 0.0
+        app["llm_max_tokens"] = 64
+        try:
+            agent_health = await (await client.get("/health")).json()
+            check("health names the agent model and says it is on",
+                  (agent_health.get("agent") or {}).get("configured") is True
+                  and (agent_health.get("agent") or {}).get("model") == "Qwen3.8-27B",
+                  str(agent_health.get("agent")))
+
+            tools = [{"type": "function", "function": {"name": "rig",
+                                                       "parameters": {"type": "object"}}}]
+            turn = await client.post("/agent",
+                                     json={"messages": [{"role": "user", "content": "hi"}],
+                                           "tools": tools},
+                                     headers={"X-Rebot-Token": "selftest-token"})
+            turn_body = await turn.json()
+            message = turn_body.get("message") or {}
+            check("agent forwards a turn and returns the reply",
+                  turn.status == 200 and turn_body.get("ok") is True
+                  and message.get("content") == "looking now"
+                  and len(message.get("tool_calls") or []) == 1,
+                  "status %s, %s" % (turn.status, str(turn_body.get("error"))[:60]))
+            sent = (seen[-1]["body"] if seen else {})
+            check("agent sends the configured model, not the page's",
+                  sent.get("model") == "Qwen3.8-27B"
+                  and sent.get("stream") is False
+                  and sent.get("temperature") == 0.0
+                  and sent.get("max_tokens") == 64,
+                  str({k: sent.get(k) for k in ("model", "stream", "temperature", "max_tokens")}))
+            check("agent passes the page's tools through, with tool_choice",
+                  (sent.get("tools") or [{}])[0].get("function", {}).get("name") == "rig"
+                  and sent.get("tool_choice") == "auto")
+            check("agent sends the host's key, which the page never sees",
+                  (seen[-1]["auth"] if seen else "") == "Bearer stub-key")
+
+            no_token = await client.post("/agent", json={"messages": [{"role": "user", "content": "hi"}]})
+            check("agent still needs the page token", no_token.status == 401)
+
+            empty = await client.post("/agent", json={"messages": []},
+                                      headers={"X-Rebot-Token": "selftest-token"})
+            check("agent refuses an empty conversation", empty.status == 400)
+
+            app["llm_url"] = "http://127.0.0.1:9/v1/chat/completions"
+            unreachable = await client.post(
+                "/agent", json={"messages": [{"role": "user", "content": "hi"}]},
+                headers={"X-Rebot-Token": "selftest-token"})
+            unreachable_body = await unreachable.json()
+            check("agent reports an unreachable model as a gateway error",
+                  unreachable.status == 502
+                  and "cannot reach the model" in (unreachable_body.get("error") or ""),
+                  "%s %s" % (unreachable.status, str(unreachable_body.get("error"))[:50]))
+
+            app["llm_url"] = ""
+            off = await client.post("/agent", json={"messages": [{"role": "user", "content": "hi"}]},
+                                    headers={"X-Rebot-Token": "selftest-token"})
+            check("agent is off when the host has no model configured",
+                  off.status == 503,
+                  str((await off.json()).get("error"))[:60])
+        finally:
+            app.update(saved_llm)
+            await runner.cleanup()
+
 
 # --------------------------------------------------------------------------- #
 # 5. locate_target.py as the host actually runs it

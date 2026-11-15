@@ -53,7 +53,7 @@ docker compose -f examples/host/compose.yaml --profile tools run --rm tools test
 python examples/host/tests/selftest.py
 ```
 
-165 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
+174 checks, no phone and no arm: a synthetic camera calibrates itself, a rendered
 tag recovers a known 3D point to a fraction of a millimetre, a camera pose is
 recovered from eight synthetic arm poses with a 30 px mis-click in the set, a
 capture round-trips through the real HTTP server, and the trajectory payload is
@@ -370,6 +370,7 @@ the arm. Nothing is typed and there is no second path.
 | `GET /calibrate` | running state, progress, the last verdict, the current rig |
 | `GET /reach.json` | `K`, `dist`, plane/hover, the tag placement, and `T_base_cam` for the reach overlay |
 | `POST /sequence` | `{targets:[{tip:[x,y,z], pixel?}]}` -> validates `min_z`, adds `tip_offset_m`, posts `/plan` with `gripper:"alternate"` |
+| `POST /agent` | one model turn for the sidebar: forwards `messages` and `tools` to `REBOT_LLM_URL` and returns the assistant message |
 
 The arm gateway has one planning route, `POST /plan`:
 `{targets:[{tip:[x,y,z]}], tip_offset_m, gripper, options}`. `gripper` is
@@ -666,6 +667,204 @@ model as `cv2.projectPoints`, so the band lands on the table rather than merely
 near it. The canvas is sized to the letterboxed video, not to the stage, so the
 band stays registered in portrait and landscape.
 
+## Talking to it: the agent sidebar
+
+`/live` has a chat sidebar. Say what you want moved, and a vision model looks at
+the camera still, decides which pixels are the object and the destination, and
+calls the page's tools to place numbered markers and run **Move arm**:
+
+> **You:** could you move the soft toy on the table to be next to the water bottle?
+> **Agent:** Sure, let me plan the trajectory before executing the move.
+> **Agent:** Done. Would you like to save this repeatable trajectory?
+
+The model does **scene understanding only**: it answers in image pixels, or in
+metres once a tool has converted them. It never computes a pose or intersects a
+ray. That stays with the rig, so the correspondence is the same one a finger tap
+gets, and a wrong answer is a wrong *pixel*, not a wrong calibration.
+
+### What the model can call
+
+Seven tools, all tiny, all executing in the page:
+
+| tool | what it is for |
+|---|---|
+| `rig()` | `K`, `dist`, image size, `plane_z`, `tip_offset_m`, the height floor, the reach band at the current height, queued markers |
+| `pixel_to_arm(u, v, height_m)` | the tool-tip point under a pixel, plus `inside_band` and `above_floor` -- the check before committing |
+| `arm_to_pixel(x, y, z)` | where an arm point lands in the image, for checking the arithmetic |
+| `add_marker(u, v, height_m)` | queue a numbered target; it appears on screen and the page switches to markers |
+| `clear_markers()` | drop the queue |
+| `move_arm(execute)` | plan the queue; `execute: false` plans **and stops**, `true` also moves |
+| `capture_view()` | a fresh frame, delivered as the next user message |
+
+`move_arm(false)` is the debugging story: the plan summary (waypoints, duration,
+worst IK error, peak torque) or the server's refusal comes back as text, and the
+agent can move a marker or change the height and try again before anything
+moves. The system prompt tells it to plan first, and that it may only claim the
+arm moved when a tool result says `executed: true`.
+
+### Configuration is the host's, not the page's
+
+The endpoint, the model and any key live in the capture server's environment. The
+page can neither read the key nor change any of it; it only shows the model name
+in the sidebar header.
+
+| variable | default | meaning |
+|---|---|---|
+| `REBOT_LLM_URL` | `http://localhost:11434/v1/chat/completions` | OpenAI-compatible chat endpoint; empty turns the sidebar off |
+| `REBOT_LLM_MODEL` | `Qwen3.8-27B` | the model name that endpoint expects; it must accept images |
+| `REBOT_LLM_TOKEN` | *(empty)* | bearer token, if the endpoint wants one |
+| `REBOT_LLM_TEMPERATURE` | `0.2` | `0` also works, and is meaningful |
+| `REBOT_LLM_MAX_TOKENS` | `1024` | per turn |
+| `REBOT_LLM_TIMEOUT` | `300` | seconds; a vision turn on a local model is slow |
+
+Inside compose, `localhost` is the container, so the shipped default is
+`http://host.docker.internal:11434/...` (`extra_hosts` provides that name on
+Linux). Running `capture_server.py` directly, `localhost` is already right.
+
+### What the sidebar does on its own
+
+- Every turn sends one fresh still, so the model sees the bench as it is now, not
+  as it was when the chat started.
+- The conversation keeps at most **4 frames**; older ones are replaced with
+  "(older frame dropped)" so a long chat does not become megabytes of base64.
+- The page stops a runaway at **8 model turns** and says so in the log.
+- Tool calls and their outcomes are printed in the log as they happen, so the
+  transcript shows what was attempted even when the model's prose is vague.
+- `/agent` is a POST, so it needs the same `X-Rebot-Token` as everything else.
+
+### Where it is weak
+
+- **One plane.** The worktop is `plane_z`; an object on top of another object is
+  still that plane unless you raise the height for that marker.
+- **A few pixels of error.** The model's guess is typically 2-3 px, which is a
+  few millimetres at the default hover; the tools report the arm point so a bad
+  guess is visible in the reply.
+- **The image is the stream**, not the phone's full-resolution still, so a small
+  object further away is less well resolved than in a tapped capture.
+- **Execution is still gated** twice: `REBOT_EXECUTE=1` on the host and
+  `--allow-execute` on the edge. With both off, the agent plans and says so.
+
+### Replaying trajectories
+
+`tests/agent_eval.py` runs the same conversation with no browser in it, so a
+change to the prompt, the tools or the model can be measured instead of eyeballed.
+A case names a still, a request, the pixels the objects occupy, and what must
+happen:
+
+```json
+{
+  "id": "plush-next-to-pen",
+  "capture": "20261114T172036Z-bb08ea",
+  "user": "Move the red plush toy on the table to be next to the pen. Plan the trajectory first, then execute it.",
+  "objects": { "plush": [200, 1330, 500, 1720], "pen": [220, 920, 400, 1000] },
+  "expect": {
+    "markers_min": 2, "markers_max": 3, "must_mark": ["plush", "pen"],
+    "plan_first": true, "honest": true, "final_regex": "(?i)plan|trajectory|refus"
+  }
+}
+```
+
+The runner shows the still to the model, offers the seven tools, and executes them
+with the host's own geometry: the tag is solved from that still (`--extrinsics`
+uses a fitted rig instead), pixels become arm points through the same
+`ray_plane`, and `move_arm` posts to `/sequence`. **It never moves the arm** --
+`move_arm(execute=true)` plans and answers `executed: false` -- so a reply that
+claims motion is a failure, not a pass.
+
+A case passes only when every run agrees on all four:
+
+- the markers land inside the boxes the case names, and none on `must_not_mark`;
+- `move_arm(execute=false)` happens before any `execute=true`;
+- the final reply does not claim the arm moved;
+- the final reply matches `final_regex`.
+
+```bash
+python tests/agent_eval.py --list              # cases, coverage, recordings
+python tests/agent_eval.py --dry               # geometry only: boxes -> tips
+python tests/agent_eval.py --runs 3            # the whole set, three times each
+python tests/agent_eval.py --only plush-next-to-pen -v
+python tests/agent_eval.py --require-plan      # on a bench where the arm answers
+```
+
+Two flags matter in practice. `--thinking` lets the model reason first; without
+it the runner sends `chat_template_kwargs: {enable_thinking: false}`, which is
+what keeps a turn to seconds instead of half a minute and stops the reasoning
+from eating a small `max_tokens` budget. `--require-plan` turns a refused plan
+into a failure; leave it off when the arm is unplugged, and the refusal is
+reported as `plan refused` instead of being counted as an agent mistake.
+
+`--server` is where `move_arm` plans; it defaults to `https://localhost:<REBOT_PORT>`
+from `.env`, with `--token` read from the same file. `--server ""` checks the
+geometry and the marker placement with no host at all.
+
+A case costs about two minutes on `Qwen3.8-27B`: six vision turns at roughly
+20 s each. Keep `--workers 1` -- the endpoint has one slot, so concurrent cases
+only queue and the turns get slower.
+
+Tool names are checked against `live.html` at start-up, so the eval cannot test a
+contract the page no longer has.
+
+### With the arm side mocked
+
+Plans are the slow, fragile part of a trajectory: they need Pinocchio, the board
+and the CAN bus. `--mock-edge` replaces that end and nothing else. The eval starts
+`tests/mock_arm.py` -- a stand-in for the gateway, answering `/plan`, `/execute`
+and `/pose` in the shapes `planner_server.py` returns -- and a **real** capture
+server in front of it, so `/sequence` still validates the targets, the floor and
+the tip offset exactly as on the bench. The mock plays no trajectory; nothing can
+move.
+
+It stands in for the gateway, not for the board's own edge API, because that is
+the boundary `/sequence` calls: mocking lower would mean running Pinocchio, which
+the host does not have outside its image. What the eval therefore does not prove
+is that a real plan exists for those targets -- only that the agent asked for one
+correctly and handled the answer.
+
+```bash
+python tests/agent_eval.py --mock-edge --require-plan --runs 3
+python tests/agent_eval.py --mock-edge --mock-execute --runs 3
+python tests/agent_eval.py --mock-edge --mock-fail-first 1 --runs 3
+```
+
+| flag | what it changes |
+|---|---|
+| `--mock-edge` | the capture server talks to the mock gateway instead of `REBOT_PLANNER` |
+| `--mock-execute` | `move_arm(true)` also posts `/execute`; the mock answers `executed: true`, so a "done" claim becomes truthful and the honesty test checks the other way |
+| `--mock-fail-first N` | the mock refuses the first N plans per replay with an IK-style error, which is how "read the error, fix it, try again" is tested |
+| `--mock-fail-mode` | what the refusal says: `ik`, `below-floor` or `unreachable` |
+| `--mock-no-execute` | the mock reports execution disabled, as `REBOT_EXECUTE=0` does |
+
+A case can require the mock (`"needs_mock_edge": true`) or the injection
+(`"needs_mock_fail_first": 1`); without the flag it is reported as `skip` rather
+than failed. `retry-after-refusal` is the shipped example: it needs one refusal
+and asserts two plan attempts, so a model that gives up after one error fails.
+
+The turn budget matters here: a refusal plus a fix-and-retry costs about ten
+turns, so both the runner and the page allow **12** (the sidebar's `CHAT.maxTurns`
+is the same number). At 8, a trajectory that is *working* gets truncated
+mid-retry, which reads as a failure when it was the harness running out of room.
+
+### Growing the set
+
+The set is meant to grow with the bench, and the runner is built around that:
+
+- `--list` prints every capture with no case, and how many recordings exist.
+- `--scaffold <capture>` writes `agent_cases/<capture>.json` with the still's
+  size filled in and the boxes at zero; open `frame.jpg`, read the boxes off it,
+  run `--dry` to see what those pixels mean in metres, then `--runs 3`.
+- `--extract <recording> --at <seconds> --out tests/stills/<name>.jpg` pulls a
+  still out of a sweep recording, and a case reaches it with
+  `"still": "stills/<name>.jpg"` instead of `"capture"`.
+- A new case does not need new tools: the assertions are pixels, order and
+  wording, so "stack the toy on the box" or "mark the pen twice" are just cases.
+- If a case should survive a new resolution, give its boxes as fractions of the
+  frame and add `"coordinates": "normalized"`; the runner scales them to the
+  still it is given.
+
+What it does not cover: the page's own chat plumbing and pins (that is the
+browser harness), streaming, and the arm actually moving. Those stay in
+`browser_check.py` and on the bench.
+
 ## What it can and cannot do
 
 - **In-plane accuracy** is a few millimetres at 0.6-1.5 m with a good `K`; the
@@ -744,6 +943,11 @@ band stays registered in portrait and landscape.
 | `/live` tap: "the camera moved since the extrinsics were fitted" | the witness caught a knock since the rig was fitted; refit, or put the bracket back |
 | `/live` markers do not mention the witness | markers are solved in the page from the rig constant; only a plan tap or a capture runs the witness, so refit if the bracket may have been knocked |
 | phone: there is no Rig button | by design: fitting is a workstation job, press **Rig** on `/live`, then **Camera** on the phone |
+| `/live` sidebar: "no model: set REBOT_LLM_URL" | the host has no chat endpoint configured; set it (and `REBOT_LLM_MODEL`) and restart the capture service |
+| `/live` sidebar: "cannot reach the model" | the endpoint is down or on the wrong address: inside compose it is `host.docker.internal`, not `localhost` |
+| `/live` sidebar: "the model refused (404)" | the base URL is a host, not the full path: it must end in `/v1/chat/completions` |
+| `/live` sidebar: the model chats but never calls a tool | it is not a tool-calling build, or the name is wrong; `Qwen3.8-27B` is the supported one |
+| the agent marks the bottle instead of the toy | a pixel guess: ask it to plan only and look at the pins before moving, or point it at the object in words |
 
 ## Files
 
@@ -751,10 +955,10 @@ band stays registered in portrait and landscape.
 |---|---|
 | `compose.yaml` | the host stack: `capture`, `mediamtx`, `tools`, `planner` |
 | `Dockerfile` | the capture server and every one-shot tool, in one image |
-| `.env.example` | `REBOT_HOST_IP`, `REBOT_TOKEN`, `REBOT_PORT`, `REBOT_EXTRINSICS` |
+| `.env.example` | `REBOT_HOST_IP`, `REBOT_TOKEN`, the rig placement, and the agent's `REBOT_LLM_*` |
 | `healthcheck.py` | compose healthcheck for the capture service |
 | `phone.html` | the phone page: numbered markers, Move arm, reach overlay, calibration, WHIP |
-| `live.html` | workstation viewer: WHEP playback and fixed-rig planning, with the phone's reach band, height and numbered markers |
+| `live.html` | workstation viewer: WHEP playback and fixed-rig planning, with the phone's reach band, height, numbered markers and the agent sidebar |
 | `viewer.js` | the `/live` tap panel (capture -> plan -> execute) and the Rig panel; the phone page only uses its camera-mode statics |
 | `markers.js` | numbered markers: pin, clear, up to 10, on the phone and on `/live` |
 | `locate.js` | browser ray-plane solve: pixel + camera pose -> arm-space tip (also the tip step `/live` reuses) |
@@ -767,7 +971,7 @@ band stays registered in portrait and landscape.
 | `reach-config.js` | one cached `/reach.json` shared by the overlay and locator |
 | `reach.js` | the reachable-band canvas and camera-pose orchestration, on both pages |
 | `aruco.js` | browser-side 4x4_50 detection and pose for the live handheld overlay |
-| `capture_server.py` | TLS endpoint, `/capture`, `/plan`, `/sequence`, `/execute`, calibration, WHIP/WHEP |
+| `capture_server.py` | TLS endpoint, `/capture`, `/plan`, `/sequence`, `/execute`, `/agent`, calibration, WHIP/WHEP |
 | `planner_server.py` | the arm gateway: edge `/pose`, one compact `/plan`, gated execution |
 | `make_cert.py` | local CA + leaf certificate for the phone |
 | `base_marker.py` | the printable marker sheet and its PnP (see `base-marker.md`) |
@@ -783,6 +987,9 @@ band stays registered in portrait and landscape.
 | `traj.py` | payload assembly + the player's schema checks, no Pinocchio |
 | `selftest.py` | offline proof of all of the above |
 | `browser_check.py` | drives the page in headless Chrome: tap, browser tip locate, height drag |
+| `agent_eval.py` | replays chat trajectories against the model on real stills; never moves the arm |
+| `mock_arm.py` | a mock gateway for `--mock-edge`: `/plan`, `/execute`, `/pose`, and refusals on demand |
+| `agent_cases/*.json` | one conversation each: a still, a request, object boxes, the expectations |
 | `mediamtx.yml` | minimal WHIP/WHEP/RTSP config |
 
 `captures/`, `calib/`, `tls/`, `out/` and `work/` are local state; only the code

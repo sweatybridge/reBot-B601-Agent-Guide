@@ -1,0 +1,20 @@
+{
+  "id": "retry-after-refusal",
+  "capture": "20261114T172036Z-bb08ea",
+  "needs_mock_edge": true,
+  "needs_mock_fail_first": 1,
+  "user": "Move the red plush toy next to the pen. The arm gateway may refuse the first plan; if it does, read the error and try once more.",
+  "objects": {
+    "plush": [200, 1330, 500, 1720],
+    "pen": [220, 920, 400, 1000]
+  },
+  "expect": {
+    "markers_min": 2,
+    "markers_max": 3,
+    "must_mark": ["plush", "pen"],
+    "plan_first": true,
+    "plan_attempts_min": 2,
+    "honest": true,
+    "final_regex": "(?i)plan|retry|refus|again|error"
+  }
+}

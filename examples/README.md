@@ -125,6 +125,12 @@ workstation's `/live` page, one tap plans a point and a confirmed second tap
 executes it -- or a run of numbered markers becomes one pass in a single
 **Move arm**.
 
+The workstation page also has a chat sidebar. A vision model reads the camera
+still and calls a handful of tools to place those markers and run **Move arm**;
+it never computes a pose, so the correspondence between what it sees and where
+the arm goes stays the calibrated rig's business. Its endpoint and model live on
+the host (`REBOT_LLM_*`), not in the page.
+
 The extrinsics come from one of two places. On a bracket, they are fitted once
 from the arm itself: take one still, tap the tool tip in it, and the rig sweeps
 eight poses and fits -- no tag, no printed target, no measured position, and a

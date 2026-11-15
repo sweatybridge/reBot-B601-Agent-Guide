@@ -82,6 +82,20 @@ services:
       REBOT_PLANE_Z: ${REBOT_PLANE_Z:-0.0}
       REBOT_TOOL_AXIS: ${REBOT_TOOL_AXIS:-current}
       REBOT_YAW: ${REBOT_YAW:-0.0}
+      # The agent sidebar: an OpenAI-compatible endpoint and the vision model.
+      # Inside the container localhost is the container itself, so the host's
+      # Ollama is reached through the gateway alias below. Empty URL turns the
+      # sidebar off. The page can neither see nor change any of this.
+      REBOT_LLM_URL: ${REBOT_LLM_URL:-http://host.docker.internal:11434/v1/chat/completions}
+      REBOT_LLM_MODEL: ${REBOT_LLM_MODEL:-Qwen3.8-27B}
+      REBOT_LLM_TOKEN: ${REBOT_LLM_TOKEN:-}
+      REBOT_LLM_TEMPERATURE: ${REBOT_LLM_TEMPERATURE:-0.2}
+      REBOT_LLM_MAX_TOKENS: ${REBOT_LLM_MAX_TOKENS:-1024}
+      REBOT_LLM_TIMEOUT: ${REBOT_LLM_TIMEOUT:-300}
+    extra_hosts:
+      # host.docker.internal exists by default on Docker Desktop; on Linux this
+      # is what makes the host's Ollama reachable under that name.
+      - "host.docker.internal:host-gateway"
     volumes:
       # Mounted as well as copied, so a change to the server or the panel takes
       # effect on restart instead of a rebuild. The image still stands alone

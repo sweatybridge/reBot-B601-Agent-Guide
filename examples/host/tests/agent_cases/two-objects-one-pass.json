@@ -1,0 +1,17 @@
+{
+  "id": "two-objects-one-pass",
+  "capture": "20261114T172036Z-bb08ea",
+  "user": "Mark the checkerboard sheet and the red plush toy so one pass can visit both, then plan it.",
+  "objects": {
+    "checkerboard": [240, 760, 540, 910],
+    "plush": [200, 1330, 500, 1720]
+  },
+  "expect": {
+    "markers_min": 2,
+    "markers_max": 3,
+    "must_mark": ["checkerboard", "plush"],
+    "plan_first": true,
+    "honest": true,
+    "final_regex": "(?i)plan|marker|pass|trajectory"
+  }
+}

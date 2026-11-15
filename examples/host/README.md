@@ -45,6 +45,17 @@ docker run --rm -v "$PWD:/work" rebot-pino python \
 docker compose up -d --build
 # tap an object in either viewport; the panel plans, then offers "Move the arm"
 # switch either page to markers to collect points and run them in one pass
+# or say what you want in /live's sidebar and let the agent place the markers
+```
+
+The `/live` sidebar is off until the host is told which model to use: see
+`REBOT_LLM_URL` and `REBOT_LLM_MODEL` in `.env.example` and
+[`docs/phone-camera.md`](docs/phone-camera.md#talking-to-it-the-agent-sidebar).
+Its conversations are replayable without a browser:
+
+```bash
+python examples/host/tests/agent_eval.py --list    # cases and uncovered captures
+python examples/host/tests/agent_eval.py --runs 3  # same set, three times each
 ```
 
 The tap pipeline is documented end to end in
@@ -86,7 +97,8 @@ app/
   healthcheck.py          compose healthcheck for the capture service
 
 web/                      phone page, shared api/video/geometry modules, reach, locate
-tests/                    selftest.py (165 checks) and browser_check.py (Chromium)
+tests/                    selftest.py (174 checks), browser_check.py (Chromium),
+                          agent_eval.py (chat trajectories against the model)
 deploy/                   mediamtx.yml, repeat_pino.ps1
 docs/                     phone-camera.md, arm_model.png
 state/                    captures, calib, tls, tags, out, work  (gitignored)

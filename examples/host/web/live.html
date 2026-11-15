@@ -5,11 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>B601 live preview</title>
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; --chat-width: 340px; --head-height: 50px; }
   html, body { height: 100%; margin: 0; background: #0b0d10; color: #e8eaed;
     font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-  body { display: flex; flex-direction: column; -webkit-tap-highlight-color: transparent; }
+  body { display: flex; flex-direction: row; -webkit-tap-highlight-color: transparent; }
   header { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    min-height: var(--head-height); box-sizing: border-box;
     border-bottom: 1px solid #262c34; background: #14181d; }
   #dot { width: 9px; height: 9px; border-radius: 50%; background: #ff6b6b; flex: 0 0 auto; }
   #dot.ok { background: #45c98a; }
@@ -52,6 +53,7 @@
   #hint { position: absolute; inset: 0; display: flex; align-items: center;
     justify-content: center; color: #9aa4b2; text-align: center; padding: 24px;
     pointer-events: none; }
+  #hint > span { max-width: 620px; }
   #hint[hidden] { display: none; }
   #tapStatus { min-height: 18px; padding: 0 14px; color: #9aa4b2; font-size: 12.5px; }
   footer { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid #262c34;
@@ -60,9 +62,61 @@
     border: 1px solid #262c34; background: #1b2027; color: #e8eaed; cursor: pointer; }
   footer button.primary { background: #4ea1ff; border-color: #4ea1ff; color: #04121f; }
   footer button:disabled { opacity: .45; cursor: default; }
+
+  /* The chat is the right-hand column of the window, so it runs the full
+     height; the header, video and footer stack beside it in #left. The video
+     pane still owns its own box, so video.js's letterboxing maths is unchanged,
+     and the Rig button is nudged left of the sidebar. */
+  #left { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex;
+    flex-direction: column; }
+  #viewer { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex;
+    flex-direction: column; }
+  body .rp-open { right: calc(var(--chat-width) + 14px); }
+  #chat { flex: 0 0 var(--chat-width); min-height: 0; display: flex;
+    flex-direction: column; background: #10141a; border-left: 1px solid #262c34; }
+  .chat-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px;
+    min-height: var(--head-height); box-sizing: border-box;
+    border-bottom: 1px solid #262c34; }
+  .chat-head strong { font-size: 13px; letter-spacing: .01em; }
+  .chat-head span { color: #9aa4b2; font-size: 11.5px; margin-left: auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #chatLog { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 8px; font-size: 13px; line-height: 1.45; }
+  #chatLog:empty::before { content: "Ask the agent to place markers or move the arm.";
+    color: #626d7d; font-size: 12.5px; }
+  .msg { padding: 7px 10px; border-radius: 10px; white-space: pre-wrap;
+    word-break: break-word; }
+  .msg.user { align-self: flex-end; max-width: 92%; background: #1b2b3f;
+    border: 1px solid #2b4a6b; }
+  .msg.agent { align-self: flex-start; max-width: 100%; background: #171c23;
+    border: 1px solid #262c34; }
+  .msg.tool { align-self: stretch; background: transparent; border: 1px dashed #2b323c;
+    color: #9aa4b2; font-size: 11.5px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  .msg.tool.bad { color: #ff9b9b; border-color: #6b2b2b; }
+  .msg.meta { align-self: center; color: #626d7d; font-size: 11.5px; }
+  .msg.error { align-self: stretch; background: #2a1416; border: 1px solid #6b2b2b;
+    color: #ffb3b3; }
+  .chat-input { display: flex; gap: 8px; align-items: flex-end; padding: 10px 12px;
+    border-top: 1px solid #262c34; }
+  #chatText { flex: 1 1 auto; min-width: 0; resize: none; font: inherit; font-size: 13px;
+    line-height: 1.4; padding: 8px 10px; border-radius: 10px; border: 1px solid #262c34;
+    background: #0d1116; color: #e8eaed; }
+  #chatText:disabled { opacity: .5; }
+  #chatSend { font: inherit; font-weight: 600; font-size: 13px; padding: 8px 14px;
+    border-radius: 10px; border: 1px solid #4ea1ff; background: #4ea1ff; color: #04121f;
+    cursor: pointer; }
+  #chatSend:disabled { opacity: .45; cursor: default; border-color: #262c34;
+    background: #1b2027; color: #9aa4b2; }
+  @media (max-width: 980px) {
+    body { flex-direction: column; }
+    #chat { flex: 0 0 45%; border-left: 0; border-top: 1px solid #262c34; }
+    /* The sidebar is under the video here, so Rig moves above it. */
+    body .rp-open { right: 14px; bottom: calc(45% + 14px); }
+  }
 </style>
 </head>
 <body>
+<div id="left">
 <header>
   <span id="dot"></span>
   <strong>Phone preview</strong>
@@ -75,21 +129,36 @@
   </span>
   <span id="state">idle</span>
 </header>
-<main id="stage">
-  <video id="video" autoplay muted playsinline></video>
-  <canvas id="reachCanvas" aria-hidden="true"></canvas>
-  <div id="markers" aria-hidden="true"></div>
-  <div id="hint">Start the camera and "Live preview" on the phone, then connect. This
-    page plans through the fitted rig: tap the image to plan one point, or switch to
-    <b>Tap: markers</b> to collect several and run them in one pass. Drag up or down to
-    set the arm's height.</div>
-</main>
-<div id="tapStatus" aria-live="polite"></div>
+  <div id="viewer">
+    <main id="stage">
+      <video id="video" autoplay muted playsinline></video>
+      <canvas id="reachCanvas" aria-hidden="true"></canvas>
+      <div id="markers" aria-hidden="true"></div>
+      <div id="hint"><span>Start the camera and "Live preview" on the phone, then connect.
+        This page plans through the fitted rig: tap the image to plan one point, or switch to
+        <b>Tap: markers</b> to collect several and run them in one pass. Drag up or down to
+        set the arm's height, or ask the agent in the chat.</span></div>
+    </main>
+    <div id="tapStatus" aria-live="polite"></div>
+  </div>
 <footer>
   <button class="primary" id="connect" type="button">Connect</button>
   <button id="disconnect" type="button" disabled>Disconnect</button>
   <button id="move" type="button" hidden>Move arm</button>
 </footer>
+</div>
+<aside id="chat" aria-label="Agent chat">
+  <div class="chat-head">
+    <strong>Agent</strong>
+    <span id="chatModel">checking the host…</span>
+  </div>
+  <div id="chatLog" role="log" aria-live="polite"></div>
+  <div class="chat-input">
+    <textarea id="chatText" rows="2" placeholder="Move the soft toy next to the water bottle"
+              aria-label="Message the agent"></textarea>
+    <button id="chatSend" type="button">Send</button>
+  </div>
+</aside>
 <script src="/api.js"></script>
 <script src="/video.js"></script>
 <script src="/viewer.js"></script>
@@ -118,6 +187,10 @@ const clearButton = $("#clear");
 const reachCanvas = $("#reachCanvas");
 const markersContainer = $("#markers");
 const heightBadge = $("#heightBadge");
+const chatLog = $("#chatLog");
+const chatText = $("#chatText");
+const chatSend = $("#chatSend");
+const chatModel = $("#chatModel");
 
 // What the hint says when nothing is wrong. The health loop swaps it for the
 // disabled message and back, so a host restarted with --no-whip (or without it)
@@ -190,6 +263,7 @@ async function healthLoop() {
     state.health = null;
   }
   renderHost();
+  renderAgent();
   setTimeout(healthLoop, 5000);
 }
 
@@ -326,8 +400,16 @@ function applyTapMode() {
   renderAction();
 }
 
-async function startSequence() {
-  if (state.busy || markersOverlay.count === 0) return;
+// `execute: false` plans and reports without moving anything: that is how the
+// agent checks its own trajectory before committing to it. Returns a result
+// object rather than only logging, so both the button and the chat can read it.
+async function runSequence(execute) {
+  const willExecute = execute !== false;
+  const result = { ok: false, markers: markersOverlay.count };
+  if (state.busy) return { ok: false, error: "the arm is busy", markers: markersOverlay.count };
+  if (markersOverlay.count === 0) {
+    return { ok: false, error: "no markers yet: add at least one", markers: 0 };
+  }
   state.busy = true;
   state.busyText = "Planning...";
   markersOverlay.setEnabled(false);
@@ -345,12 +427,24 @@ async function startSequence() {
     }
     const plan = data.plan || {};
     const summary = plan.summary || {};
+    result.plan = plan;
+    result.planId = plan.id;
+    result.summary = summary;
     status("planned " + (summary.markers || markersOverlay.count) + " markers · "
       + (summary.waypoints || 0) + " waypoints · "
       + Number(summary.duration_s || 0).toFixed(1) + " s", "good");
+    if (!willExecute) {
+      result.ok = true;
+      result.executed = false;
+      result.note = "planned only; nothing moved";
+      return result;
+    }
     if (!data.execute) {
       status("execution is off on the host; the trajectory is written to out/ only", "warn");
-      return;
+      result.ok = true;
+      result.executed = false;
+      result.note = "execution is off on the host (REBOT_EXECUTE=0); the trajectory was written to out/";
+      return result;
     }
     state.busyText = "Moving...";
     renderAction();
@@ -360,13 +454,18 @@ async function startSequence() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: plan.id }),
     });
-    const result = await answer.json().catch(() => ({}));
-    if (!answer.ok || result.ok === false) {
-      throw new Error(result.error || ("execute failed: " + answer.status));
+    const body = await answer.json().catch(() => ({}));
+    if (!answer.ok || body.ok === false) {
+      throw new Error(body.error || ("execute failed: " + answer.status));
     }
     status("arm finished: " + plan.id, "good");
+    result.ok = true;
+    result.executed = true;
+    return result;
   } catch (error) {
     status("sequence failed: " + error.message, "bad");
+    result.error = error.message;
+    return result;
   } finally {
     state.busy = false;
     state.busyText = "";
@@ -375,6 +474,538 @@ async function startSequence() {
     renderAction();
   }
 }
+
+/* ---------------------------------------------------------------- agent */
+
+// The chat drives the same two paths a person does: markers on the stage, then a
+// sequence. The model does the scene understanding -- it looks at one still and
+// answers in pixels -- and these tools are its only way to turn that into arm
+// coordinates. The rig, not the model, decides where a point is: every tool that
+// converts runs the same ray-to-plane step as a finger tap.
+//
+// Everything that talks to the model goes through /agent, which holds the
+// endpoint, the model name and any key from the host's environment
+// (REBOT_LLM_*). Nothing here can change them, and the page never sees a key.
+
+const AGENT_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "rig",
+      description: "The fitted camera and the arm's limits: intrinsic matrix K, image size, worktop plane z, tip offset, the height floor, the reach band at the current height, and how many markers are queued. Call it once before converting anything.",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pixel_to_arm",
+      description: "Convert an image pixel to the arm-base tool-tip point at an approach height. Reports whether the point is inside the reach band and above the height floor. Use it to check a target before adding a marker.",
+      parameters: {
+        type: "object",
+        properties: {
+          u: { type: "number", description: "image column in pixels" },
+          v: { type: "number", description: "image row in pixels" },
+          height_m: { type: "number", description: "approach height above the worktop, metres; omit for the page's badge height" },
+        },
+        required: ["u", "v"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "arm_to_pixel",
+      description: "Where an arm-base point appears in the camera image. Use it to check that a computed point lands where you meant.",
+      parameters: {
+        type: "object",
+        properties: {
+          x: { type: "number", description: "metres, base frame" },
+          y: { type: "number", description: "metres, base frame" },
+          z: { type: "number", description: "metres above the robot base" },
+        },
+        required: ["x", "y", "z"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "add_marker",
+      description: "Queue a numbered target at an image pixel; it appears on the screen. The arm visits queued markers in order, alternating the gripper. Returns the tip point and whether it is reachable.",
+      parameters: {
+        type: "object",
+        properties: {
+          u: { type: "number", description: "image column in pixels" },
+          v: { type: "number", description: "image row in pixels" },
+          height_m: { type: "number", description: "approach height above the worktop, metres; omit for the page's badge height" },
+        },
+        required: ["u", "v"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "clear_markers",
+      description: "Drop every queued marker.",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "move_arm",
+      description: "Plan the queued markers into one trajectory. execute=false plans only and returns the summary -- do that first. execute=true also moves the arm when the host allows it.",
+      parameters: {
+        type: "object",
+        properties: {
+          execute: { type: "boolean", description: "false to plan without moving" },
+        },
+        required: ["execute"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "capture_view",
+      description: "Ask for a fresh camera frame; it arrives as the next user message. Use it after the arm moves, or when the view may have changed.",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    },
+  },
+];
+
+const CHAT = {
+  history: [],        // OpenAI messages, frames included
+  busy: false,
+  ready: false,       // the host has a model configured
+  maxTurns: 12,       // tool round trips before the page stops a runaway: a
+                      // refusal plus one fix-and-retry fits inside this
+  maxFrames: 4,       // older frames are dropped so a turn stays small
+  maxMessages: 48,    // older turns are dropped to stay under the host's cap
+};
+
+// Drop whole turns from the front. A tool result without its assistant message
+// is invalid for a strict server, so an assistant message always takes the tool
+// results that follow it.
+function trimHistory(limit) {
+  let dropped = 0;
+  while (CHAT.history.length > limit) {
+    const first = CHAT.history.shift();
+    if (!first) break;
+    dropped += 1;
+    if (first.role === "assistant" && Array.isArray(first.tool_calls)) {
+      while (CHAT.history.length && CHAT.history[0].role === "tool") {
+        CHAT.history.shift();
+        dropped += 1;
+      }
+    }
+  }
+  return dropped;
+}
+
+function pushChat(kind, text) {
+  const line = document.createElement("div");
+  line.className = "msg " + kind;
+  line.textContent = text;
+  chatLog.appendChild(line);
+  chatLog.scrollTop = chatLog.scrollHeight;
+  return line;
+}
+
+function setChatBusy(busy) {
+  chatSend.disabled = busy || !CHAT.ready;
+  chatText.disabled = busy || !CHAT.ready;
+  chatSend.textContent = busy ? "Working..." : "Send";
+}
+
+// The host owns whether there is a model at all; all this page shows is its name.
+function renderAgent() {
+  const agent = state.health && state.health.agent;
+  CHAT.ready = Boolean(agent && agent.configured);
+  chatModel.textContent = CHAT.ready
+    ? String(agent.model || "model")
+    : "no model: set REBOT_LLM_URL";
+  setChatBusy(CHAT.busy);
+}
+
+function systemPrompt() {
+  const width = video.videoWidth;
+  const height = video.videoHeight;
+  const size = width && height ? width + "x" + height + " pixels"
+    : "the size rig() reports";
+  return [
+    "You operate a B601 arm through a workstation page; the engineer watches the same view.",
+    "You are shown a still from the fixed camera looking down at the workbench (" + size + ").",
+    "Image coordinates are pixels: u grows right, v grows down, origin at the top-left.",
+    "Arm coordinates are metres in the robot base frame: x and y on the worktop, z up.",
+    "",
+    "Tools:",
+    "- rig(): camera matrix, worktop plane, height floor, reach band, queued markers.",
+    "- pixel_to_arm(u, v, height_m): the tool-tip point for a pixel, and whether it is reachable.",
+    "- arm_to_pixel(x, y, z): where an arm point lands in the image; use it to check yourself.",
+    "- add_marker(u, v, height_m): queue a numbered target; markers are visited in order.",
+    "- clear_markers(): drop the queued targets.",
+    "- move_arm(execute): plan the markers; execute=false plans without moving.",
+    "- capture_view(): get a fresh frame, delivered in the next user message.",
+    "",
+    "Work in this order: look at the image, check a pixel with pixel_to_arm, add the markers,",
+    "plan with move_arm(false) and read the summary, then move with move_arm(true).",
+    "If a plan or a move fails, read the error, change the marker or the height, and try once more.",
+    "Never say the arm moved unless a tool result says executed: true.",
+    "Heights are metres above the worktop, clamped to the floor; the badge height is the default.",
+    "Keep replies to a few sentences: the engineer is watching the arm, not reading an essay.",
+  ].join("\n");
+}
+
+function grabFrame() {
+  const width = video.videoWidth;
+  const height = video.videoHeight;
+  if (!width || !height) return null;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  canvas.getContext("2d").drawImage(video, 0, 0, width, height);
+  return { url: canvas.toDataURL("image/jpeg", 0.82), width: width, height: height };
+}
+
+// Keep the newest frames and replace older ones with a note, so a long
+// conversation does not turn into megabytes of base64 on every turn.
+function pruneFrames() {
+  const frames = [];
+  CHAT.history.forEach((message, index) => {
+    if (!Array.isArray(message.content)) return;
+    message.content.forEach((part, at) => {
+      if (part && part.type === "image_url") frames.push({ index: index, at: at });
+    });
+  });
+  while (frames.length > CHAT.maxFrames) {
+    const old = frames.shift();
+    CHAT.history[old.index].content[old.at] = { type: "text", text: "(older frame dropped)" };
+  }
+}
+
+function parseToolArgs(raw) {
+  if (raw === undefined || raw === null || raw === "") return {};
+  if (typeof raw === "object") return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (error) {
+    throw new Error("arguments are not JSON: " + String(raw).slice(0, 120));
+  }
+}
+
+function oneLine(value, limit) {
+  const text = String(value);
+  return text.length > limit ? text.slice(0, limit - 3) + "..." : text;
+}
+
+function round3(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.round(number * 1000) / 1000 : null;
+}
+
+async function loadRigConfig() {
+  const config = await window.RebotConfig.load(() => state.token);
+  if (!Array.isArray(config.T_base_cam)) {
+    throw new Error("no fixed rig is fitted: press Rig on this page, or run calibrate_extrinsics.py --auto");
+  }
+  return config;
+}
+
+function reachBandFor(config, height) {
+  try {
+    const band = window.ReachArm.computeReachBand(Number(config.plane_z), Number(height),
+      Number(config.tip_m));
+    return {
+      inner_m: round3(band.inner),
+      outer_m: round3(band.outer),
+      sector_deg: Math.round(band.sector * 180 / Math.PI),
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+// The floor is min_z minus the worktop, exactly the badge's lower stop.
+function heightFloor(config) {
+  const planeZ = Number(config.plane_z) || 0;
+  const health = state.health || {};
+  const minZ = Number(health.min_z ?? (planeZ + Number(config.hover_m)));
+  return Math.max(0, minZ - planeZ);
+}
+
+// An explicit height moves the badge, so what the model plans is what the page
+// shows; otherwise the badge's current height is the default.
+function heightFrom(args) {
+  const asked = Number(args && args.height_m);
+  if (Number.isFinite(asked)) heightControl.setHeight(asked);
+  return heightControl.height;
+}
+
+function tipReport(config, tip, height, pixel) {
+  const radius = Math.hypot(Number(tip[0]), Number(tip[1]));
+  const band = reachBandFor(config, height);
+  const floor = heightFloor(config);
+  const z = Number(tip[2]);
+  return {
+    ok: true,
+    tip_m: [round3(tip[0]), round3(tip[1]), round3(z)],
+    height_m: round3(height),
+    pixel: pixel ? [round3(pixel.u), round3(pixel.v)] : null,
+    radius_m: round3(radius),
+    reach_band_m: band,
+    inside_band: band ? radius >= band.inner_m - 1e-6 && radius <= band.outer_m + 1e-6 : null,
+    above_floor: z >= Number(config.plane_z) + floor - 1e-6,
+  };
+}
+
+async function toolRig() {
+  const config = await loadRigConfig();
+  const height = heightControl.height;
+  return {
+    ok: true,
+    mode: "fixed",
+    image_size: config.calibration.image_size,
+    K: config.calibration.K,
+    dist: config.calibration.dist,
+    plane_z: round3(config.plane_z),
+    tip_offset_m: round3(config.tip_m),
+    default_height_m: round3(config.hover_m),
+    height_floor_m: round3(heightFloor(config)),
+    badge_height_m: round3(height),
+    reach_band_m: reachBandFor(config, height),
+    markers: markersOverlay.count,
+  };
+}
+
+async function toolPixelToArm(args) {
+  const config = await loadRigConfig();
+  const u = Number(args.u);
+  const v = Number(args.v);
+  if (!Number.isFinite(u) || !Number.isFinite(v)) throw new Error("u and v must be image pixels");
+  const height = heightFrom(args);
+  const width = video.videoWidth || config.calibration.image_size[0];
+  const tall = video.videoHeight || config.calibration.image_size[1];
+  const tip = window.BrowserLocate.tipTarget(config.calibration, config.T_base_cam,
+    u, v, config.plane_z, height, width, tall);
+  return tipReport(config, tip.tip, height, { u: u, v: v });
+}
+
+function toolArmToPixel(args) {
+  const point = [Number(args.x), Number(args.y), Number(args.z)];
+  if (!point.every((value) => Number.isFinite(value))) throw new Error("x, y and z must be metres");
+  const pixel = reachOverlay.projectPoint(point);
+  if (!pixel) throw new Error("that point does not project: is a fixed rig fitted?");
+  return { ok: true, u: round3(pixel[0]), v: round3(pixel[1]) };
+}
+
+async function toolAddMarker(args) {
+  const config = await loadRigConfig();
+  const u = Number(args.u);
+  const v = Number(args.v);
+  if (!Number.isFinite(u) || !Number.isFinite(v)) throw new Error("u and v must be image pixels");
+  const limit = window.MarkerSequence.MAX_MARKERS;
+  if (markersOverlay.count >= limit) {
+    return { ok: false, error: "at most " + limit + " markers; clear them first" };
+  }
+  const height = heightFrom(args);
+  ensureMarkersMode();
+  const at = RebotVideo.viewportPoint(video, u, v);
+  if (!at) throw new Error("that pixel is outside the video frame");
+  const placed = await markersOverlay.addAt(at.x, at.y);
+  if (!placed || !placed.ok) {
+    return { ok: false, error: (placed && placed.error) || "the marker was refused",
+      count: markersOverlay.count };
+  }
+  const report = tipReport(config, placed.marker.target.tip, height, { u: u, v: v });
+  report.index = placed.index;
+  report.count = markersOverlay.count;
+  return report;
+}
+
+async function toolMoveArm(args) {
+  const execute = !(args && args.execute === false);
+  const result = await runSequence(execute);
+  if (!result.ok) {
+    return { ok: false, error: result.error || "the plan failed", markers: result.markers };
+  }
+  const summary = result.summary || {};
+  return {
+    ok: true,
+    executed: Boolean(result.executed),
+    plan_id: result.planId || null,
+    markers: result.markers,
+    summary: {
+      target_m: summary.target || null,
+      waypoints: summary.waypoints || 0,
+      duration_s: Number(summary.duration_s || 0),
+      worst_ik_m: summary.worst_ik_m === undefined ? null : Number(summary.worst_ik_m),
+      peak_tau_nm: summary.peak_tau === undefined ? null : Number(summary.peak_tau),
+    },
+    note: result.note || "",
+  };
+}
+
+async function runTool(name, args) {
+  switch (name) {
+    case "rig": return toolRig();
+    case "pixel_to_arm": return toolPixelToArm(args);
+    case "arm_to_pixel": return toolArmToPixel(args);
+    case "add_marker": return toolAddMarker(args);
+    case "clear_markers":
+      markersOverlay.clear();
+      return { ok: true, count: 0 };
+    case "move_arm": return toolMoveArm(args);
+    case "capture_view":
+      return { ok: true, note: "a fresh frame arrives in the next user message" };
+    default:
+      return { ok: false, error: "no such tool: " + name };
+  }
+}
+
+function ensureMarkersMode() {
+  if (state.tapMode === "markers") return;
+  state.tapMode = "markers";
+  applyTapMode();
+  status("agent: switched the page to markers", "warn");
+}
+
+function summariseCall(name, args) {
+  const keys = Object.keys(args || {}).slice(0, 4);
+  const parts = keys.map((key) => {
+    const value = args[key];
+    return key + "=" + (typeof value === "number" ? round3(value) : oneLine(JSON.stringify(value), 24));
+  });
+  return name + "(" + parts.join(", ") + ")";
+}
+
+function summariseResult(result) {
+  if (!result) return "no result";
+  if (result.ok === false) return "error: " + oneLine(result.error || "failed", 160);
+  if (result.executed === true) return "done, the arm moved";
+  if (Array.isArray(result.tip_m)) return "tip [" + result.tip_m.join(", ") + "] m"
+    + (result.inside_band === false ? ", outside the band" : "");
+  if (result.count !== undefined) return result.count + " queued";
+  if (result.note) return oneLine(result.note, 100);
+  return "ok";
+}
+
+async function postAgent() {
+  const dropped = trimHistory(CHAT.maxMessages);
+  if (dropped) pushChat("meta", "dropped " + dropped + " older messages to fit the context");
+  const response = await api("/agent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      messages: [{ role: "system", content: systemPrompt() }].concat(CHAT.history),
+      tools: AGENT_TOOLS,
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok) {
+    throw new Error((data && data.error) || ("the agent failed: " + response.status));
+  }
+  return data;
+}
+
+async function runAgent() {
+  CHAT.busy = true;
+  setChatBusy(true);
+  try {
+    for (let step = 0; step < CHAT.maxTurns; step += 1) {
+      const data = await postAgent();
+      const message = data.message || {};
+      const rawCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      if (message.content) pushChat("agent", message.content);
+      const assistant = { role: "assistant", content: message.content || "" };
+      if (rawCalls.length) {
+        // Some backends (Ollama among them) omit the call id; a tool result
+        // without one breaks stricter servers on the next turn.
+        assistant.tool_calls = rawCalls.map((call, index) => {
+          const fn = call.function || {};
+          return {
+            id: call.id || ("call_" + step + "_" + index),
+            type: "function",
+            function: {
+              name: String(fn.name || ""),
+              arguments: typeof fn.arguments === "string"
+                ? fn.arguments : JSON.stringify(fn.arguments || {}),
+            },
+          };
+        });
+      }
+      CHAT.history.push(assistant);
+      if (!rawCalls.length) return;
+
+      let wantsFrame = false;
+      for (const call of assistant.tool_calls) {
+        let args = {};
+        let argsError = "";
+        try {
+          args = parseToolArgs(call.function.arguments);
+        } catch (error) {
+          argsError = error.message;
+        }
+        const line = pushChat("tool", summariseCall(call.function.name, args) + " ...");
+        let result;
+        try {
+          result = argsError
+            ? { ok: false, error: argsError }
+            : await runTool(call.function.name, args);
+        } catch (error) {
+          result = { ok: false, error: (error && error.message) || String(error) };
+        }
+        line.textContent = summariseCall(call.function.name, args) + " → " + summariseResult(result);
+        line.classList.toggle("bad", result.ok === false);
+        CHAT.history.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+        if (call.function.name === "capture_view" && result.ok) wantsFrame = true;
+      }
+      if (wantsFrame) {
+        const frame = grabFrame();
+        if (frame) {
+          CHAT.history.push({
+            role: "user",
+            content: [
+              { type: "text", text: "A fresh camera frame, taken just now." },
+              { type: "image_url", image_url: { url: frame.url } },
+            ],
+          });
+          pushChat("meta", "sent a fresh frame to the model");
+        }
+      }
+    }
+    pushChat("meta", "stopped after " + CHAT.maxTurns + " model turns");
+  } catch (error) {
+    pushChat("error", String((error && error.message) || error));
+  } finally {
+    CHAT.busy = false;
+    setChatBusy(false);
+    pruneFrames();
+  }
+}
+
+async function sendChat() {
+  const text = chatText.value.trim();
+  if (!text || CHAT.busy || !CHAT.ready) return;
+  chatText.value = "";
+  pushChat("user", text);
+  const content = [{ type: "text", text: text }];
+  const frame = grabFrame();
+  if (frame) content.push({ type: "image_url", image_url: { url: frame.url } });
+  CHAT.history.push({ role: "user", content: content });
+  await runAgent();
+}
+
+chatSend.addEventListener("click", sendChat);
+chatText.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    sendChat();
+  }
+});
 
 /* ----------------------------------------------------------------- live */
 
@@ -466,7 +1097,7 @@ async function disconnect() {
 
 connectButton.addEventListener("click", connect);
 disconnectButton.addEventListener("click", disconnect);
-moveButton.addEventListener("click", startSequence);
+moveButton.addEventListener("click", () => { runSequence(true); });
 reachButton.addEventListener("click", () => {
   const on = reachOverlay.toggle();
   reachButton.textContent = "Reach: " + (on ? "on" : "off");
@@ -503,6 +1134,7 @@ clearButton.addEventListener("click", () => {
 
 initToken();
 applyTapMode();
+renderAgent();
 healthLoop();
 </script>
 </body>

@@ -1,0 +1,17 @@
+{
+  "id": "plush-next-to-pen",
+  "capture": "20261114T172036Z-bb08ea",
+  "user": "Move the red plush toy on the table to be next to the pen. Plan the trajectory first, then execute it.",
+  "objects": {
+    "plush": [200, 1330, 500, 1720],
+    "pen": [220, 920, 400, 1000]
+  },
+  "expect": {
+    "markers_min": 2,
+    "markers_max": 3,
+    "must_mark": ["plush", "pen"],
+    "plan_first": true,
+    "honest": true,
+    "final_regex": "(?i)plan|trajectory|refus|error|arm"
+  }
+}

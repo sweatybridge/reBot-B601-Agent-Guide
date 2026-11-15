@@ -85,17 +85,21 @@
     }
 
     async function addAt(clientX, clientY) {
-      if (!enabled || calibrating || busy) return;
+      // Returns {ok, error?, index?, marker?} so a caller that is not a finger
+      // -- the chat sidebar -- can tell the model why a marker was refused.
+      if (!enabled) return { ok: false, error: "markers are off: switch the page to markers" };
+      if (calibrating) return { ok: false, error: "calibration mode is on" };
+      if (busy) return { ok: false, error: "a marker is still being located" };
       if (!locate) {
         status("marker locate is not available in this page", "bad");
-        return;
+        return { ok: false, error: "this page has no locator" };
       }
       if (markers.length >= MAX_MARKERS) {
         status("10 markers is the limit; clear one first", "warn");
-        return;
+        return { ok: false, error: MAX_MARKERS + " markers is the limit" };
       }
       const tapped = videoTools.videoPoint(video, clientX, clientY);
-      if (!tapped) return;
+      if (!tapped) return { ok: false, error: "that point is outside the video frame" };
       // Freeze the badge height at the instant of the tap: the marker must
       // remember the height it was tapped at, not wherever the badge is later.
       const tapHeight = typeof heightAt === "function" ? Number(heightAt()) : NaN;
@@ -105,7 +109,7 @@
       onChange();
       try {
         const target = await locate(tapped, Number.isFinite(tapHeight) ? tapHeight : 0);
-        if (current !== generation) return;
+        if (current !== generation) return { ok: false, error: "the markers were cleared" };
         if (!target || !Array.isArray(target.tip) || target.tip.length !== 3) {
           throw new Error("the locator returned no [x, y, z] tip point");
         }
@@ -121,8 +125,10 @@
           markers.length % 2 === 1 ? "warn" : "good");
         render();
         onChange();
+        return { ok: true, index: markers.length, marker: markers[markers.length - 1] };
       } catch (error) {
         status("marker not added: " + error.message, "bad");
+        return { ok: false, error: error.message };
       } finally {
         busy = false;
         render();
