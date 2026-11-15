@@ -460,41 +460,46 @@ grid. Rotating `K` by hand is the wrong instinct for this pipeline -- it is only
 exact for a pure pinhole, because the tangential terms are tied to the image
 axes, and `cv2` would then solve the tag against a grid that does not exist.
 
-So the capture is **turned back first**, then solved with the original `K`. The
-two numbers must not be confused: `k` is how the frame *arrived* (clockwise), and
-`4 - k` is what is *applied* to undo it.
+So the capture is **turned back first**, then solved with the original `K`. One
+number says how far: `turns`, the quarter turns to apply to the delivered frame to
+put it onto the calibration grid. It is always the *correction*, never the
+measurement, so nothing in the pipeline has to remember which of two numbers it is
+holding.
 
 ```
 delivered 1920x1080, calibrated 1080x1920
-  k       = 3   (the frame arrived three quarter turns clockwise)
-  applied = 1   (so one clockwise turn puts it back)
-  image   = rotate(delivered, 1)             -> 1080x1920, upright
-  tap     = map_pixel(tap, delivered, 1)     -> the same point, upright
-  solve   = the portrait K, the portrait dist, exactly as before
+  turns = 1                                   (one clockwise turn puts it back)
+  image = rotate(delivered, 1)                -> 1080x1920, upright
+  tap   = map_pixel(tap, delivered, 1)        -> the same point, upright
+  solve = the portrait K, the portrait dist, exactly as before
 ```
 
-Applying `k` instead of `4 - k` is the bug this section exists to prevent: the
-frame is still the right *size*, so nothing raises, and every projected point is
-180 degrees out -- a reach band drawn off the table, taps landing on the wrong
-side. The payload records both (`rotation` = `k`, `turned_back` = applied).
+`turns` is what the payload reports, what `--turns` sets, and what the pages read
+from `/reach.json`. The only place the complement appears is a projection that
+goes the *other* way — calibration pixels into the delivered frame — because that
+is the inverse of the correction; `reach.js` and the tag measurement each write
+`4 - turns` once, at that step, and nowhere else.
 
-Where the frame's turn comes from, in order:
+Where `turns` comes from, in order:
 
 | source | what it is |
 |---|---|
-| the tag, measured | the host projects the base tag with the rig and compares with where it is detected: only the real turn matches. See below |
-| the caller | `--rotation 0..3` on `locate_target.py`, or `Options(rotation=...)` -- how the frame arrived |
-| the capture | `meta.rotation`, written by whoever took the frame -- also how it arrived |
-| the two angles | the calibration's own angle minus the phone's published stream angle, in 90s. `screen.orientation.angle` grows as the viewport turns while the camera's pixels stay put, so the frame turns the other way; the tag measurement below is preferred anyway |
-| the shape | the frame is a quarter turn of the calibration, so **assume clockwise** |
+| the tag, measured | the host projects the base tag with the rig and compares with where it is detected: only the real turn lands on it. See below |
+| the caller | `--turns 0..3` on `locate_target.py`, or `Options(turn=...)` |
+| the capture | `meta.turns`, written by whoever took the frame |
+| the two angles | the phone's published stream angle minus the calibration's own angle, in 90s |
+| the shape | the frame is a quarter turn of the calibration, so assume one clockwise: `3`. A guess, and marked as one |
 
 The phone records `orientation_deg` from `screen.orientation.angle` on every
 capture, and `calibrate_intrinsics.py` stores the angle the board was shot at, so
-the fourth row is exact whenever both exist. The last row is the fallback: two
-dimensions cannot tell 90 from 270, and the payload says `rotation`, `turned_back`
-and `delivered_size` so a wrong guess is visible in one tap rather than silent. A
-frame that is neither the same aspect ratio nor a quarter turn is still refused,
-with the message telling you which it is.
+the fourth row is exact whenever both exist. On the B601 bench the phone reports
+`90` against a portrait calibration and the correction is `1`: the device was
+turned counter-clockwise, the camera looks *down* at the bench, so the scene turns
+counter-clockwise in the frame — one clockwise turn puts it back. The last row is
+the fallback: two dimensions cannot tell 90 from 270, and the payload carries
+`turns` and `delivered_size` so a wrong guess is visible in one tap rather than
+silent. A frame that is neither the same aspect ratio nor a quarter turn is still
+refused, with the message telling you which it is.
 
 The **Rig modal and the sweep** go through the same turn-back: a still from a
 camera mounted a quarter turn from the calibration is rotated before the tag is
@@ -502,26 +507,26 @@ solved, and during a sweep every frame the recorder hands over is rotated the
 same way (otherwise the tip pixels and the tag would be measured on one grid and
 fitted on another).
 
-### The direction is measured, not assumed
+### The turn is measured, not assumed
 
 The base tag is a known point in the base frame. Project it with the fitted rig,
 detect it in the frame, and compare: for the wrong turn the prediction is
 hundreds of pixels away, for the right one it is a pixel or two. That is
-`measure_stream_rotation` in the capture server, and it is what settles the sign
+`measure_stream_turn` in the capture server, and it is what settles the sign
 without a setting, a guess, or a convention:
 
 ```json
 // /reach.json and /health
-"stream_rotation": {"turns": 3, "source": "measured"}
+"stream_turn": {"turns": 1, "source": "measured"}
 ```
 
-`source` says who decided -- `measured` from the tag, `phone` from the angle the
+`source` says who decided — `measured` from the tag, `phone` from the angle the
 page publishes at camera start, or `shape` when neither could. The measurement is
-cached for 30 seconds and only runs when nothing else knows, so it costs one
-still grab per session at most. On the bench used to write this it reported
-`turns: 3` with a tag error of 1.2 px, against 590 px for the other direction --
-and drawing the band with that value puts it on the table, where the shape's
-default guess of "clockwise" does not.
+cached for 30 seconds, runs only when a rig and marker are configured, and is
+skipped entirely when the frame is not turned, so it costs one still grab per
+session at most. On the bench used to write this it reported `turns: 1` with a tag
+error of 1.5 px, against 590 px for the other direction — and drawing the band
+with that value puts it on the table, where the shape's guess does not.
 
 When the phone *does* publish, `/health` carries it as `stream_orientation`:
 
@@ -529,8 +534,8 @@ When the phone *does* publish, `/health` carries it as `stream_orientation`:
 POST /orientation   {"angle": 90, "size": [1920, 1080]}
 ```
 
-`/live` prefers `stream_rotation.turns` from `/reach.json` for its own
-projections (the band, marker pins, plan taps, the agent's pixel tools), so a
+`/live` and the phone page read `stream_turn.turns` from `/reach.json` for their
+own projections (the band, marker pins, plan taps, the agent's pixel tools), so a
 wrong direction cannot come from the frame size alone.
 
 ### The geometry is pinned when the camera starts
@@ -1061,7 +1066,7 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | live preview never connects | phone and host on different VLANs / AP isolation; UDP 8189 blocked |
 | "aspect ratio changed" | calibrated at 4:3, captured 16:9; recalibrate at the capture size. A 90°/270° frame is not this: it is turned back, see *When the phone is in landscape* |
 | "the frame is a quarter turn of the calibration" | the frame is rotated and the caller asked `calib.load` to *rescale* it; load without `image_size` and map the pixels (the capture path already does) |
-| a landscape marker lands mirrored, or the reach band sits off the table | a turn applied as `k` instead of `4 - k`, or guessed from the shape; read `stream_rotation` in `/reach.json` -- `source: "shape"` means nothing measured it, `source: "measured"` is the tag's answer, `source: "phone"` is the published angle |
+| a landscape marker lands mirrored, or the reach band sits off the table | the turn was guessed instead of measured; read `stream_turn` in `/reach.json` — `source: "shape"` means nothing measured it, `source: "measured"` is the tag's answer, `source: "phone"` is the published angle. If `turns` is right and the band is still out, the rig is stale: refit it |
 | taps and markers stop after turning the phone | the browser re-cut the frame mid-stream, so the pinned geometry no longer matches; restart the camera (or reconnect on `/live`), or turn the phone back |
 | `the screen turned; the frame geometry did not change` in the log | harmless: the stream kept its size, so the same intrinsics still apply and nothing was re-fitted |
 | live preview works, `/live` does not | MediaMTX up but the path has no publisher yet |

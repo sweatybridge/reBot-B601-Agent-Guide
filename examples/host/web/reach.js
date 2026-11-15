@@ -238,17 +238,18 @@
       return point ? { u: box.left + point.u * box.scale, v: box.top + point.v * box.scale } : null;
     }
 
-    // The stream can be a quarter turn from the calibration (a phone held in
-    // landscape). The page knows the turn -- the phone publishes its screen
-    // angle -- and every pixel this module draws has to be mapped into the
-    // frame the video is actually displaying.
-    function frameTurns() {
-      const value = typeof options.rotation === "function" ? Number(options.rotation()) : NaN;
+    // The stream can be a quarter turn from the calibration. `options.turn` is
+    // the correction -- the same number the host measures and the tap solve uses
+    // (`/reach.json`'s `stream_turn.turns`) -- so the only place this module has
+    // to reverse it is when it goes the other way, from the calibration grid
+    // into the frame the video is displaying.
+    function frameTurn() {
+      const value = typeof options.turn === "function" ? Number(options.turn()) : NaN;
       return Number.isFinite(value) ? ((Math.round(value) % 4) + 4) % 4 : 0;
     }
 
     function frameCamera() {
-      if (frameTurns() % 2) {
+      if (frameTurn() % 2) {
         // A quarter turn: the calibrated grid is the frame's grid turned back.
         return makeCamera(config.calibration, config.calibration.image_size[0],
           config.calibration.image_size[1]);
@@ -259,9 +260,11 @@
     function projectToFrame(camera, pose, point) {
       const pixel = project(camera, pose, point);
       if (!pixel) return null;
-      const turns = frameTurns();
-      if (!turns) return pixel;
-      const at = G.mapPixel(pixel.u, pixel.v, config.calibration.image_size, turns);
+      const turn = frameTurn();
+      if (!turn) return pixel;
+      // Calibration -> frame is the inverse of what `turn` does.
+      const at = G.mapPixel(pixel.u, pixel.v, config.calibration.image_size,
+        (4 - turn) % 4);
       return { u: at[0], v: at[1] };
     }
 

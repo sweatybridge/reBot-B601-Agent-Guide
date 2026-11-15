@@ -162,9 +162,12 @@
   }
 
   // A frame can arrive a quarter turn from the calibration (a phone held in
-  // landscape). That is not a rescale: turn the coordinates back and keep K on
-  // the grid it was fitted for. The Python side does the same in calib.py.
-  function turnsForShapes(calibrationSize, frameSize) {
+  // landscape). That is not a rescale: turn the frame and the coordinates back,
+  // and keep K on the grid it was fitted for. `shapeTurn` answers the same
+  // question as the Python `turn_back` -- the correction, not the measurement --
+  // and, like it, it can only guess the sign, so 3 (assume the frame arrived
+  // clockwise) is that guess. `-1` means "not a quarter turn at all".
+  function shapeTurn(calibrationSize, frameSize) {
     if (!calibrationSize || !frameSize) return 0;
     const cw = calibrationSize[0];
     const ch = calibrationSize[1];
@@ -174,7 +177,7 @@
     const same = Math.abs((cw / ch) / (fw / fh) - 1) <= 0.01;
     const swapped = Math.abs((cw / ch) / (fh / fw) - 1) <= 0.01
       && Math.abs(cw / ch - ch / cw) > 0.01;
-    if (swapped) return 1;      // the sign needs the device; clockwise is the default
+    if (swapped) return 3;      // the sign needs the device, so this is a guess
     if (same) return 0;
     return -1;                  // neither a rescale nor a quarter turn
   }
@@ -252,7 +255,7 @@
       blendOrientation: blendOrientation,
       makeCamera: makeCamera, project: project, matrixPose: matrixPose,
       scaleCalibration: scaleCalibration, undistort: undistort, rayPlane: rayPlane,
-      turnsForShapes: turnsForShapes, mapPixel: mapPixel,
+      shapeTurn: shapeTurn, mapPixel: mapPixel,
     };
   }
   if (typeof module !== "undefined" && module.exports) {
@@ -263,7 +266,8 @@
       blendOrientation: blendOrientation,
       makeCamera: makeCamera, project: project, matrixPose: matrixPose,
       scaleCalibration: scaleCalibration, undistort: undistort, rayPlane: rayPlane,
-      turnsForShapes: turnsForShapes, mapPixel: mapPixel,
+      shapeTurn: shapeTurn, mapPixel: mapPixel,
     };
   }
 })();
+

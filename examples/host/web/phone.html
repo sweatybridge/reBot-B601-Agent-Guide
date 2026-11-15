@@ -660,28 +660,24 @@ function screenAngle() {
   return ((Math.round(value) % 360) + 360) % 360;
 }
 
-// Quarter turns clockwise the pinned frame is turned from the calibration,
-// worked out from the two screen angles: the one the camera started at and the
-// one the board was shot at. Undefined (not 0) when the config or the angles are
-// not known yet, so the caller falls back to the frame shape instead of being
-// told "no turn" by accident.
-function cameraTurns() {
+// Quarter turns to apply to the pinned frame to bring it onto the calibration
+// grid. The host's answer wins (`stream_turn.turns`); the fallback is the two
+// screen angles -- the one the camera started at and the one the board was shot
+// at -- and, last, the frame shape. Undefined (not 0) when nothing is known, so
+// the caller falls back instead of being told "no turn" by accident.
+function cameraTurn() {
   const config = window.RebotConfig ? window.RebotConfig.get() : null;
   if (!config || !state.pinned) return undefined;
-  const known = config.stream_rotation;
+  const known = config.stream_turn;
   if (known && Number.isFinite(Number(known.turns))) {
     return (((Math.round(Number(known.turns)) % 4) + 4) % 4);
   }
   const calibration = config.calibration || {};
   const boardAngle = Number(calibration.orientation_deg);
   if (state.pinned.angle !== null && Number.isFinite(boardAngle)) {
-    // The screen angle grows as the viewport turns clockwise while the camera's
-    // pixels stay put, so the frame is turned the other way from the reported
-    // angle; the host's tag measurement is preferred over this when it can see
-    // the base tag.
-    return (((Math.round((boardAngle - state.pinned.angle) / 90) % 4) + 4) % 4);
+    return (((Math.round((state.pinned.angle - boardAngle) / 90) % 4) + 4) % 4);
   }
-  const shape = window.ReachGeometry.turnsForShapes(calibration.image_size,
+  const shape = window.ReachGeometry.shapeTurn(calibration.image_size,
     [state.pinned.width, state.pinned.height]);
   return shape > 0 ? shape : 0;
 }
@@ -867,7 +863,7 @@ const reachOverlay = window.ReachOverlay.create({
   mode: () => (window.TapPlanner ? TapPlanner.getMode() : "handheld"),
   // The frame is what the camera started at; if that is a quarter turn from the
   // calibration, every pixel drawn has to be mapped into it.
-  rotation: () => cameraTurns(),
+  turn: () => cameraTurn(),
   onStatus: (message, kind) => log(escapeHtml(message), kind),
 });
 
@@ -881,7 +877,7 @@ const browserLocate = window.BrowserLocate.create({
   video: video,
   token: () => state.token,
   mode: () => (window.TapPlanner ? TapPlanner.getMode() : "handheld"),
-  turns: () => cameraTurns(),
+  turn: () => cameraTurn(),
   onStatus: (message, kind) => log(escapeHtml(message), kind),
 });
 
@@ -1058,3 +1054,4 @@ log("open https://<host>:8443 on the phone; the dot turns green when the host an
 </script>
 </body>
 </html>
+

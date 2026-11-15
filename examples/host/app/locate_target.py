@@ -76,7 +76,7 @@ class Options:
     extrinsics: object | None = None      # extrinsics.Rig; a fixed camera, no tag in frame
     witness: object | None = None         # witness.Reference; proves the mount has not moved
     witness_max_px: float = 2.0
-    rotation: int | None = None           # quarter turns clockwise, frame vs calibration
+    turn: int | None = None               # quarter turns to apply to the frame, 0..3
 
 
 def tag_object_points(tag_size):
@@ -360,25 +360,23 @@ def locate_capture(directory, calib_path, options: Options):
     image, meta, capture_dir, image_path = load_capture(directory)
     delivered = (image.shape[1], image.shape[0])
     calibration = calib_mod.load(calib_path)
-    turned = rotation_turns(meta, delivered, calibration, options.rotation)
-    applied = 0
-    if turned:
-        image, calibration, applied = upright_frame(calib_path, image, turned)
+    turn = turn_back(meta, delivered, calibration, options.turn)
+    if turn:
+        image, calibration, _turn = upright_frame(calib_path, image, turn)
     tap = options.tap if options.tap is not None else tap_from_meta(meta, delivered)
-    if tap is not None and applied:
+    if tap is not None and turn:
         # The tap is measured in the delivered frame; move it into the grid the
         # image was turned into before anything is solved.
-        tap = calib_mod.map_pixel(tap[0], tap[1], delivered, applied)
+        tap = calib_mod.map_pixel(tap[0], tap[1], delivered, turn)
     # The image is upright now, so the tap must be too; the meta's own tap would
     # be measured against the delivered frame.
     meta_upright = dict(meta)
     meta_upright.pop("tap", None)
     meta_upright["image_size"] = [int(image.shape[1]), int(image.shape[0])]
-    upright = replace(options, tap=tap, rotation=0)
+    upright = replace(options, tap=tap, turn=0)
 
     payload = locate(image, meta_upright, calibration, upright)
-    payload["rotation"] = turned          # how the frame arrived ...
-    payload["turned_back"] = applied      # ... and what was applied to undo it
+    payload["turns"] = turn               # what had to be undone, 0..3
     payload["delivered_size"] = [int(delivered[0]), int(delivered[1])]
 
     corners = payload.pop("_corners")
@@ -409,65 +407,62 @@ def rotate_image(image, turns):
     return image
 
 
-def rotation_turns(meta, frame_size, calibration, explicit=None):
-    """How far the delivered frame is turned from the calibration, clockwise.
+def turn_back(meta, frame_size, calibration, explicit=None):
+    """Quarter turns to apply to the delivered frame to reach the calibration grid.
 
-    This is a *measurement of the frame*, not the correction: a frame that came
-    out of a landscape phone while the board was shot in portrait is one turn
-    clockwise (`k = 1`), and turning it back takes `4 - k = 3` turns. Keeping the
-    two apart matters -- applying `k` as if it were the correction leaves the
-    image 180 degrees out, which still looks like "a rotated picture" but puts
-    every projected point in the wrong place.
+    One number, one meaning: *the correction*, never the measurement. A frame out
+    of a landscape phone while the board was shot in portrait needs one clockwise
+    turn to put it back, so this answers `1`; whoever wants "how did it arrive"
+    can write `4 - turn_back(...)` at the point where that question is actually
+    being asked.
 
-    Three sources, in order: the caller, the capture's own `rotation`, and the
-    two orientations (`orientation_deg` now and in the calibration). Dimensions
-    alone cannot tell 90 from 270 -- they only say "a quarter turn" -- so the
-    shape fallback assumes clockwise and the payload records what it used.
+    Sources, in order: the caller, the capture's own `turns`, and the two
+    orientations (`orientation_deg` now and in the calibration). Dimensions alone
+    cannot tell 90 from 270 -- only that it is *a* quarter turn -- so the shape
+    fallback is a guess and the payload records what it used.
     """
     if explicit is not None:
         return int(explicit) % 4
-    declared = meta.get("rotation")
+    declared = meta.get("turns")
     if declared is not None:
         return int(declared) % 4
     frame_deg = meta.get("orientation_deg")
     calib_deg = (calibration.raw or {}).get("orientation_deg")
     if frame_deg is not None and calib_deg is not None:
         return int(round((float(frame_deg) - float(calib_deg)) / 90.0)) % 4
-    return calib_mod.turns_for_shapes(calibration.image_size, frame_size)
+    # The shape says "a quarter turn" and nothing else: assume the frame arrived
+    # clockwise, which three clockwise turns undo.
+    return 0 if calib_mod.turns_for_shapes(calibration.image_size, frame_size) == 0 else 3
 
 
-def upright_frame(calib_path, frame, rotation=None):
-    """A delivered frame turned back to the calibration's orientation.
+def upright_frame(calib_path, frame, turn=None):
+    """A delivered frame turned back onto the calibration's grid.
 
     This is the one entry point for anything that measures a frame with `K`:
     the tap locator, the tag-seeded rig and the sweep all call it, so none of
     them can silently use intrinsics for a grid the image is not on.
 
-    `rotation` is how far the delivered frame is turned clockwise from the
-    calibration (`k`). `None` asks the shape, which can only tell odd from even --
-    a mount is one or the other for good, so an explicit value settles it.
-
-    Returns `(frame, calibration, applied)`, where `applied` is the turn that was
-    actually applied, `4 - k`: rotate by that to undo and map frame pixels by it
-    to reach the calibrated grid.
+    `turn` is the correction in quarter turns (`turn_back(...)`); `None` derives
+    it. Returns `(frame, calibration, turn)`, and the frame, the calibration and
+    any pixel moved by `map_pixel(..., turn)` are then all on the same grid.
     """
     calibration = calib_mod.load(calib_path)
-    turned = rotation_turns({}, (frame.shape[1], frame.shape[0]), calibration, rotation)
-    applied = (4 - turned) % 4
-    if applied:
-        frame = rotate_image(frame, applied)
+    turn = turn_back({}, (frame.shape[1], frame.shape[0]), calibration, turn)
+    if turn:
+        frame = rotate_image(frame, turn)
         calibration = calib_mod.load(calib_path,
                                      image_size=(frame.shape[1], frame.shape[0]))
-    return frame, calibration, applied
+    return frame, calibration, turn
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Locate a tapped point in the arm base frame.")
     parser.add_argument("--capture", required=True, help="capture directory or image file")
     parser.add_argument("--calib", required=True, help="calib/<device>.json")
-    parser.add_argument("--rotation", type=int, default=None, choices=[0, 1, 2, 3],
-                        help="quarter turns clockwise the frame is turned from the calibration; "
-                             "default is the capture's own meta, then the shape")
+    parser.add_argument("--turns", type=int, default=None, choices=[0, 1, 2, 3],
+                        help="quarter turns to apply to the frame to bring it onto the "
+                             "calibration grid; default is the capture's own meta, then "
+                             "the two orientations, then the frame shape")
     parser.add_argument("--out", default="", help="target.json (default: <capture>/target.json)")
     parser.add_argument("--dictionary", default="4x4_50", choices=sorted(ARUCO_DICTS))
     parser.add_argument("--tag-id", type=int, default=None, help="default: largest marker in view")
@@ -517,7 +512,7 @@ def main(argv=None):
         max_reproj=args.max_reproj, max_grazing=args.max_grazing, max_reach=args.max_reach,
         dictionary=args.dictionary, tag_id=args.tag_id, annotate=args.annotate,
         extrinsics=rig, witness=reference, witness_max_px=args.witness_max_px,
-        rotation=args.rotation,
+        turn=args.turns,
     )
     if marker is not None:
         options.tag_size = float(marker["size_m"])
@@ -569,3 +564,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+

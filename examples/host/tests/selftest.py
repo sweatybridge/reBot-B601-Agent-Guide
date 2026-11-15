@@ -785,27 +785,38 @@ def test_rotation(workdir: Path, geometry):
     target = locate.locate_capture(capture, calib_path, options)
     point = np.array(target["point"])
     error = float(np.linalg.norm(point - truth))
-    check("a landscape frame is recognised as a quarter turn",
-          target.get("rotation") == 1, "rotation %s" % target.get("rotation"))
+    check("a frame that arrived one turn clockwise needs three to go back",
+          target.get("turns") == 3, "turns %s" % target.get("turns"))
     check("it is solved with the portrait K, not rescaled",
           list(target.get("image_size") or []) == list(size),
           str(target.get("image_size")))
     check("the turned tap lands within 3 mm of the truth", error < 0.003,
           "%.2f mm" % (error * 1000))
 
-    # The mapping has to be its own inverse across the size swap: the frame
-    # arrived one quarter turn clockwise, so turning it back takes three.
+    # One number, one meaning: `turns` is the correction, and applying it to the
+    # tap recovers the upright pixel. Its composition with 4 - turns is identity
+    # for every turn, which is the algebra the whole pipeline rests on.
     back = calib_mod.map_pixel(tap[0], tap[1], turned_size, 3)
     check("turning the tap back recovers it",
           abs(back[0] - geometry["pixel"][0]) < 1e-9
           and abs(back[1] - geometry["pixel"][1]) < 1e-9,
           "(%.1f, %.1f) vs (%.1f, %.1f)"
           % (back[0], back[1], geometry["pixel"][0], geometry["pixel"][1]))
-    check("the payload says how it arrived and what was applied",
+    check("the payload reports the correction, not the measurement",
           target.get("delivered_size") == list(turned_size)
-          and target.get("rotation") == 1 and target.get("turned_back") == 3,
-          "%s, rotation %s, turned back %s"
-          % (target.get("delivered_size"), target.get("rotation"), target.get("turned_back")))
+          and target.get("turns") == 3 and "rotation" not in target,
+          "%s, turns %s" % (target.get("delivered_size"), target.get("turns")))
+
+    # t and 4 - t are inverses, in pixels and in pixels-on-disk.
+    identity = True
+    for turn in range(4):
+        there = calib_mod.map_pixel(10.0, 20.0, (640, 480), turn)
+        there_size = (480, 640) if turn % 2 else (640, 480)
+        again = calib_mod.map_pixel(there[0], there[1], there_size, (4 - turn) % 4)
+        identity = identity and abs(again[0] - 10.0) < 1e-9 and abs(again[1] - 20.0) < 1e-9
+        back_image = locate.rotate_image(locate.rotate_image(rotated, turn), (4 - turn) % 4)
+        identity = identity and np.array_equal(back_image, rotated)
+    check("t and 4 - t are inverses for every turn", identity)
 
     # The Rig modal's one-pose path: the still is landscape, and the tag must
     # still seed the rig. Loading K at the delivered size is what used to fail.
@@ -816,15 +827,15 @@ def test_rotation(workdir: Path, geometry):
         check("K is not rescaled onto a turned frame",
               "quarter turn" in str(error), str(error)[:60])
 
-    upright, turned_calib, applied = locate.upright_frame(calib_path, rotated)
+    upright, turned_calib, turn = locate.upright_frame(calib_path, rotated)
     # Pixel-exact: turning the wrong way round would give a size-correct frame
     # that is 180 degrees out, which the pose tests above cannot see with a
     # symmetric camera. This can.
     check("the still is turned back to the calibration's grid",
-          applied == 3 and turned_calib.image_size == size
+          turn == 3 and turned_calib.image_size == size
           and np.array_equal(upright, geometry["image"]),
-          "applied %s, size %s, identical %s"
-          % (applied, turned_calib.image_size, np.array_equal(upright, geometry["image"])))
+          "turns %s, size %s, identical %s"
+          % (turn, turned_calib.image_size, np.array_equal(upright, geometry["image"])))
     marker = base_marker.parse_spec("%g,%g,%g,%g" % (0.36, -0.10, 0.12, 180.0), 0.080)
     marker["id"] = 3            # the id the synthetic tag was rendered with
     run = auto_calibrate.solve_marker(upright, turned_calib, marker, plane_z=0.0)
@@ -834,16 +845,15 @@ def test_rotation(workdir: Path, geometry):
           "%.2f mm" % (position * 1000))
 
     # The direction must not be guessed: the host measures it from the tag, and
-    # this frame arrived one quarter turn clockwise, so the answer is 1 -- the
-    # shape's default guess, but now with evidence, and 3 would be hundreds of
-    # pixels out.
+    # this frame arrived one turn clockwise, so the correction is 3 -- hundreds
+    # of pixels separate it from the shape's guess of 1.
     still = workdir / "rotation-still.jpg"
     cv2.imwrite(str(still), rotated, [cv2.IMWRITE_JPEG_QUALITY, 95])
     import capture_server  # imported here: the server tests import it on demand too
     app = {"camera": str(still), "marker": marker, "rig": run.rig}
-    measured = capture_server.measure_stream_rotation(app, turned_calib, frame=rotated)
-    check("the host measures which way the stream is turned",
-          measured is not None and measured["turns"] == 1
+    measured = capture_server.measure_stream_turn(app, turned_calib, frame=rotated)
+    check("the host measures the turn from the tag",
+          measured is not None and measured["turns"] == 3
           and measured["error_px"] < 5.0,
           None if measured is None else
           "turns %s, tag error %.1f px" % (measured["turns"], measured["error_px"]))

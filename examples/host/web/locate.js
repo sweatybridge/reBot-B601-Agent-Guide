@@ -19,27 +19,27 @@
   const configStore = (typeof window !== "undefined" && window.RebotConfig) || null;
   const videoTools = (typeof window !== "undefined" && window.RebotVideo) || null;
 
-  function tipTarget(calibration, T, u, v, planeZ, tapHeight, videoWidth, videoHeight, turns) {
+  // `turn` is the correction (see geometry.js's shapeTurn / the host's
+  // /reach.json `stream_turn`): the quarter turns to apply to the delivered
+  // frame to reach the calibration grid. The tap is moved by the same number.
+  function tipTarget(calibration, T, u, v, planeZ, tapHeight, videoWidth, videoHeight, turn) {
     const width = videoWidth || calibration.image_size[0];
     const heightPx = videoHeight || calibration.image_size[1];
     const height = Number(tapHeight);
     if (!Number.isFinite(height)) throw new Error("the tap height is not a number");
 
-    // A frame can be a quarter turn from the calibration. `turns` is that turn
-    // when the page knows it (the phone publishes its screen angle); otherwise
-    // the shape gives an odd/even answer, and clockwise is assumed.
-    const rotation = Number.isFinite(Number(turns))
-      ? ((Math.round(Number(turns)) % 4) + 4) % 4
-      : Math.max(0, G.turnsForShapes(calibration.image_size, [width, heightPx]));
-    const source = rotation ? calibration.image_size : [width, heightPx];
-    const at = rotation ? G.mapPixel(u, v, [width, heightPx], 4 - rotation) : [u, v];
+    const applied = Number.isFinite(Number(turn))
+      ? ((Math.round(Number(turn)) % 4) + 4) % 4
+      : Math.max(0, G.shapeTurn(calibration.image_size, [width, heightPx]));
+    const source = applied ? calibration.image_size : [width, heightPx];
+    const at = applied ? G.mapPixel(u, v, [width, heightPx], applied) : [u, v];
     const camera = makeCamera(calibration, source[0], source[1]);
 
     // Direct intersection with the raised plane: the tip is the point under the
     // tapped pixel at that height, so its x/y move along the ray as the height
     // changes. This is not the same as lifting the worktop point vertically.
     const tip = rayPlane(camera, T, at[0], at[1], Number(planeZ) + height).point;
-    return { tip: tip, pixel: [u, v], tap: { u: u, v: v }, rotation: rotation };
+    return { tip: tip, pixel: [u, v], tap: { u: u, v: v }, turn: applied };
   }
 
   function solveTag(pixels, width, height, calibration, marker, planeZ) {
@@ -60,9 +60,9 @@
     const video = options.video;
     const token = options.token || (() => "");
     const mode = options.mode || (() => "handheld");
-    // The page knows the turn (the phone publishes its screen angle); a page
-    // that does not leaves this out and the shape decides.
-    const turns = options.turns || (() => undefined);
+    // The correction this page must apply: /reach.json's `stream_turn.turns`.
+    // Left out, the frame shape decides.
+    const turn = options.turn || (() => undefined);
     const status = options.onStatus || function () {};
 
     async function locate(tap, tapHeight) {
@@ -83,7 +83,7 @@
           data.calibration, data.marker, data.plane_z);
       }
       return tipTarget(data.calibration, T, tap.u, tap.v, data.plane_z, tapHeight,
-        video.videoWidth, video.videoHeight, turns());
+        video.videoWidth, video.videoHeight, turn());
     }
 
     return { locate: locate, get config() { return configStore ? configStore.get() : null; } };
@@ -109,3 +109,4 @@
     };
   }
 })();
+
