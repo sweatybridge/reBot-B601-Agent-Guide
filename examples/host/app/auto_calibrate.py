@@ -60,6 +60,13 @@ class AutoError(Exception):
 # something is often a shadow or a highlight, so it is not evidence.
 CLOSE_PX = 40.0
 
+# The marker short path writes a rig from one still, so the only evidence it can
+# offer is the tag itself. A 4 cm tag at a metre is ~40 px across; these limits
+# accept that and refuse the two ways a PnP lies: a tiny tag and an edge-on one.
+MARKER_MAX_RMS_PX = 2.0
+MARKER_MIN_SIDE_PX = 16.0
+MARKER_MAX_GRAZING_DEG = 75.0
+
 # The arm's lime covers in HSV, and how much of them has to be in frame before
 # the colour detector is worth believing (a parked arm can be mostly hidden).
 GREEN_LOW = (30, 70, 45)
@@ -185,9 +192,11 @@ class Options:
     # sweep searches the family of poses that tap allows and lets its own
     # detections pick one.
     click: dict | None = None
-    # A printed marker flat on the base plate: {"at": [x, y, z], "yaw": rad,
-    # "size_m": m, "id": int}. When present it *replaces* the tap: the PnP gives
-    # the camera pose outright, so the seed is exact and the sweep only verifies.
+    # A printed marker on the base: {"at": [x, y, z], "yaw": rad, "size_m": m,
+    # "id": int}. When present it *replaces* the tap: the PnP gives the camera
+    # pose outright, so the seed is exact and the sweep only verifies. The tag
+    # is the upright one on the side of the column, the same placement the
+    # hand-held mode uses.
     marker: dict | None = None
 
 
@@ -915,7 +924,10 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
                 yaw=float(options.marker.get("yaw", 0.0)),
                 size_m=float(options.marker.get("size_m", base_marker.SIZE_M)),
                 marker_id=(int(options.marker["id"]) if options.marker.get("id") is not None
-                           else base_marker.MARKER_ID))
+                           else base_marker.MARKER_ID),
+                # The standard tag stands on the side of the column; composing
+                # it as if it lay flat would rotate the camera 90 degrees.
+                mode="vertical")
         except base_marker.MarkerError as error:
             if not options.click:
                 raise AutoError(
@@ -1032,6 +1044,155 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
     return RunResult(observations=observations, captures=captures, detections=refined,
                      bootstrap=T_guess, fit=final, seconds=time.time() - started,
                      first_frame=frames[0], first_pose=poses[0], warnings=warnings)
+
+
+# --------------------------------------------------------------------------- #
+# The marker short path: one still, no arm motion
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class MarkerRun:
+    """One solved still: the rig it implies, the verdict, and the tag evidence."""
+
+    rig: "ex.Rig"
+    verdict: dict
+    evidence: dict
+    seconds: float
+    warnings: list = field(default_factory=list)
+
+
+def verify_marker(evidence):
+    """Is this tag solve good enough to become a rig? The caller decides.
+
+    The sweep can cross-check the camera against the arm; a tag solve cannot, so
+    the gate is the tag's own geometry: a PnP that does not reproject, a tag too
+    small to localise, or one seen edge-on is refused rather than written.
+    """
+    rms = float(evidence.get("rms_px", float("inf")))
+    side = float(evidence.get("side_px", 0.0))
+    grazing = float(evidence.get("grazing_deg", 180.0))
+    reasons = []
+    if rms > MARKER_MAX_RMS_PX:
+        reasons.append("the tag's corners reproject %.1f px off the solve (limit %.0f)"
+                       % (rms, MARKER_MAX_RMS_PX))
+    if side < MARKER_MIN_SIDE_PX:
+        reasons.append("the tag is only %.0f px across in this still (limit %.0f): move the "
+                       "camera closer or print a larger tag" % (side, MARKER_MIN_SIDE_PX))
+    if grazing > MARKER_MAX_GRAZING_DEG:
+        reasons.append("the tag is seen at %.0f deg (limit %.0f): it is nearly edge-on"
+                       % (grazing, MARKER_MAX_GRAZING_DEG))
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "method": "base-marker",
+        "rms_px": round(rms, 2),
+        "worst_px": None,
+        "leave_one_out_px": None,
+        "predicted_mm": {},
+        "weakest": {},
+        "marker": {
+            "id": evidence.get("id"),
+            "side_px": round(side, 1),
+            "grazing_deg": round(grazing, 1),
+        },
+    }
+
+
+def solve_marker(frame, calibration, marker, plane_z=0.0, mount="fixed"):
+    """`T_base_cam` from one still of the tag, with the evidence for it.
+
+    This is the whole fixed-rig calibration when the tag is visible: no sweep, no
+    tap, no arm motion. The rig's `method` records that, so an audit can tell it
+    apart from a tip sweep.
+    """
+    if not isinstance(marker, dict) or marker.get("at") is None:
+        raise AutoError("the base marker has no placement: set REBOT_MARKER_AT to its centre "
+                        "and heading (see docs/base-marker.md)")
+    started = time.time()
+    matrix, evidence = base_marker.camera_solve(
+        frame, calibration.K, calibration.dist,
+        at=marker["at"],
+        yaw=float(marker.get("yaw", 0.0)),
+        size_m=float(marker.get("size_m", base_marker.SIZE_M)),
+        marker_id=(int(marker["id"]) if marker.get("id") is not None
+                   else base_marker.MARKER_ID),
+        # The standard placement is upright on the side of the column.
+        mode="vertical")
+    verdict = verify_marker(evidence)
+    size = (int(frame.shape[1]), int(frame.shape[0]))
+    rig = ex.Rig(
+        T_base_cam=matrix,
+        calib_fingerprint=calibration.fingerprint,
+        image_size=size,
+        plane_z=float(plane_z),
+        tip_offset=np.zeros(3),
+        rms_px=float(evidence["rms_px"]),
+        rms_mm=0.0,
+        max_px=float(evidence["rms_px"]),
+        observations=[],
+        sigma={},
+        weakest={},
+        predicted={},
+        device=calibration.device,
+        mount=mount,
+        method="base-marker",
+        fitted=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        iterations=0,
+        converged=True,
+    )
+    return MarkerRun(rig=rig, verdict=verdict, evidence=evidence,
+                     seconds=time.time() - started)
+
+
+def commit_marker(run, calibration, rig_path, frame=None, q=None):
+    """Write the marker rig only if its verdict passes. No rig, no side effects."""
+    rig = run.rig
+    verdict = run.verdict
+    if not verdict["ok"]:
+        return rig, verdict, None
+
+    rig_path = Path(rig_path)
+    rig_path.parent.mkdir(parents=True, exist_ok=True)
+    # The tag proves where the camera is at this instant, not that the bracket
+    # stayed there. The witness is the same background check the sweep writes.
+    if frame is not None and q is None:
+        run.warnings.append("the rig has no mount witness: the arm pose was not read")
+    if frame is not None and q is not None:
+        try:
+            # The gateway may report seven motor positions; the arm model has six.
+            q6 = np.asarray(q, dtype=float).reshape(-1)[:6]
+            reference = witness.build(frame, rig=rig, q=q6,
+                                      K=calibration.K, dist=calibration.dist)
+            name = "witness-%s.jpg" % rig.mount
+            witness.save(reference, rig_path.parent / name)
+            rig.witness = dict(reference.to_dict(), image=name)
+        except witness.WitnessError as error:
+            run.warnings.append("the rig has no mount witness (%s)" % error)
+    ex.save_rig(rig, rig_path)
+    return rig, verdict, rig_path
+
+
+def marker_report(run, written=None):
+    """What the capture route returns for a marker solve: no sweep, no tip."""
+    evidence = run.evidence
+    return {
+        "method": "base-marker",
+        "poses": 0,
+        "seconds": round(run.seconds, 1),
+        "camera": run.rig.describe().splitlines()[0],
+        "tip_mm": None,
+        "rig": run.rig.provenance(),
+        "verification": run.verdict,
+        "marker": {
+            "detected": True,
+            "id": evidence.get("id"),
+            "rms_px": round(float(evidence.get("rms_px", 0.0)), 2),
+            "side_px": round(float(evidence.get("side_px", 0.0)), 1),
+            "grazing_deg": round(float(evidence.get("grazing_deg", 0.0)), 1),
+        },
+        "warnings": run.warnings,
+        "written": str(written) if written else None,
+    }
 
 
 def verify(rig, observations, calibration, options: Options, converged=True):

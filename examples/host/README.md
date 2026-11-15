@@ -60,12 +60,13 @@ python examples/host/tests/agent_eval.py --runs 3  # same set, three times each
 
 The tap pipeline is documented end to end in
 [`docs/phone-camera.md`](docs/phone-camera.md); the board side is
-[`../edge-rust/README.md`](../edge-rust/README.md#http-server). With
-`REBOT_EXTRINSICS` set to a rig from `calibrate_extrinsics.py --auto`, the
-camera is fixed and no tag is placed anywhere; without it, the handheld phone
-path uses the ArUco tag. The rig comes from one tap: `POST /calibrate/extrinsics`
-drives the arm through eight poses, takes the stills, and writes the rig or
-refuses with the reason.
+[`../edge-rust/README.md`](../edge-rust/README.md#http-server). Once a rig has
+been fitted, `state/calib/extrinsics-fixed.json` is picked up at startup: the
+camera is fixed and no tag is placed anywhere. Until then, the handheld phone
+path uses the ArUco tag. The rig comes either from one still that sees the base
+tag (`POST /capture/pose` — no arm motion) or from one tap:
+`POST /calibrate/extrinsics` drives the arm through eight poses, takes the
+stills, and writes the rig or refuses with the reason.
 
 ## Layout
 
@@ -74,7 +75,7 @@ compose.yaml              the host stack
 Dockerfile                host image: aiohttp + opencv  (capture, tools, tests)
 Dockerfile.pinocchio      planner image: Pinocchio + reBotArm_control_py
 requirements.txt          the host image only; the planner installs its own
-.env.example              REBOT_HOST_IP, REBOT_EDGE_URL, camera rig, gates
+.env.example              REBOT_HOST_IP, REBOT_EDGE_URL, camera, tag, gates
 
 app/
   capture_server.py       HTTPS endpoint, /capture, /plan, /execute, WHIP relay
@@ -82,7 +83,7 @@ app/
   locate_target.py        capture -> base-frame point (rig or tag PnP + plane)
   calib.py                intrinsics: load, rescale, fingerprint
   calibrate_intrinsics.py checkerboard fit -> state/calib/<device>.json
-  calibrate_extrinsics.py tool-tip sweep -> state/calib/extrinsics-<mount>.json
+  calibrate_extrinsics.py capture -> base-tag rig or tool-tip sweep -> extrinsics-<mount>.json
   extrinsics.py           the rig: DLT + LM, covariance, predicted click error
   witness.py              did the camera move? background patches, arm masked
   sweep.py                the fixed eight-pose calibration sweep + clearance check

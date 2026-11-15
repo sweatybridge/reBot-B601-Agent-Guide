@@ -274,7 +274,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "execute": app["execute"],
         "calib": sorted(p.name for p in app["calib"].glob("*.json")
                         if not p.name.startswith(("extrinsics-", "witness-"))),
-        "mode": "fixed" if app["rig"] is not None else "handheld",
+        "mode": effective_mode(app),
         "rig": (None if app["rig"] is None else
                 dict(app["rig"].provenance(), path=str(app["extrinsics_path"]),
                      witness=bool(app["witness"]))),
@@ -311,7 +311,7 @@ async def handle_reach(request: web.Request) -> web.Response:
     marker = app.get("marker")
     return web.json_response({
         "ok": True,
-        "mode": "fixed" if rig is not None else "handheld",
+        "mode": effective_mode(app),
         "plane_z": app["plane_z"],
         "hover_m": app["hover_m"],
         "tip_m": app["tip_m"],
@@ -516,6 +516,16 @@ def resolve_calibration(app, requested=None) -> Path:
     return options[-1]
 
 
+def effective_mode(app):
+    """The mode a request that does not name one gets.
+
+    There is no host-wide switch to keep in sync: a fitted rig makes fixed the
+    default, and a client that wants the tag sends `"mode": "handheld"` (the
+    phone's Camera chip does exactly that).
+    """
+    return "fixed" if app.get("rig") is not None else "handheld"
+
+
 def locate_options(app, body):
     """The locator's options: a rig for a fixed camera, the base marker for a handheld one.
 
@@ -524,9 +534,7 @@ def locate_options(app, body):
     can actually do (a rig if one was fitted, otherwise the marker).
     """
     explicit = str(body.get("mode") or "").strip().lower()
-    mode = explicit or str(app.get("mode") or "").strip().lower()
-    if not mode:
-        mode = "fixed" if app.get("rig") is not None else "handheld"
+    mode = explicit or effective_mode(app)
     plane_z = float(body.get("plane_z", app["plane_z"]))
     if mode.startswith("hand"):
         marker = app.get("marker")
@@ -1062,12 +1070,18 @@ async def handle_calibrate(request: web.Request) -> web.Response:
     if payload["ok"] and payload.get("written"):
         # Use it now, not after a restart: the next tap should be on the new rig.
         try:
-            app["rig"] = extrinsics.load_rig(payload["written"])
-            app["extrinsics_path"] = payload["written"]
-            app["witness"] = witness.load_for(app["rig"], Path(payload["written"]).parent)
-        except (extrinsics.ExtrinsicsError, witness.WitnessError) as error:
+            rig = extrinsics.load_rig(payload["written"])
+        except extrinsics.ExtrinsicsError as error:
             logging.warning("calibration wrote %s but it could not be loaded: %s",
                             payload["written"], error)
+        else:
+            app["rig"] = rig
+            app["extrinsics_path"] = payload["written"]
+            try:
+                app["witness"] = witness.load_for(rig, Path(payload["written"]).parent)
+            except witness.WitnessError as error:
+                logging.warning("the new rig has no usable witness: %s", error)
+                app["witness"] = None
         logging.info("calibration wrote %s", payload.get("written"))
     return web.json_response(payload, status=200 if payload["ok"] else 422)
 
@@ -1084,15 +1098,54 @@ async def handle_calibrate_status(request: web.Request) -> web.Response:
         "sweep": {"poses": len(sweep.POSES), "home": list(sweep.HOME),
                   "seconds": round(sweep.sweep_seconds())},
         "last": app["last_calibration"],
-        # The base marker, when one is configured: the panel can then start a
-        # sweep without asking for a tap.
+        # The base marker, when one is configured: a capture can then solve the
+        # rig from the tag, and a sweep can start without asking for a tap.
         "marker": app["marker"],
         "rig": (None if app["rig"] is None else app["rig"].provenance()),
     })
 
 
+def marker_from_still(app, frame, q=None):
+    """Solve the fixed camera from the base tag in one still, and write the rig.
+
+    This is the short path: the tag is a PnP, so a still that sees it needs no
+    sweep and moves no arm. The sweep stays for a camera that cannot see the tag;
+    a missing tag is a normal answer here, not an error on the capture.
+    """
+    if app.get("calibrating"):
+        return {"marker": {"detected": None,
+                           "error": "a calibration sweep is running; the tag was not read"}}
+    try:
+        calibration = calib_mod.load(
+            resolve_calibration(app),
+            image_size=(frame.shape[1], frame.shape[0]))
+    except (calib_mod.CalibError, web.HTTPException) as error:
+        return {"marker": {
+            "detected": None,
+            "error": "the tag needs intrinsics at this size: %s"
+                     % (getattr(error, "text", None) or error)}}
+    try:
+        run = auto_calibrate.solve_marker(
+            frame, calibration, app["marker"], plane_z=float(app["plane_z"]))
+    except base_marker.MarkerError as error:
+        return {"marker": {"detected": False, "error": str(error)}}
+    except auto_calibrate.AutoError as error:
+        return {"marker": {"detected": None, "error": str(error)}}
+
+    rig_path = app["calib"] / ("extrinsics-%s.json" % run.rig.mount)
+    _rig, _verdict, written = auto_calibrate.commit_marker(
+        run, calibration, rig_path, frame=frame, q=q)
+    return auto_calibrate.marker_report(run, written)
+
+
 def grab_one(app, camera_url):
-    """One still from the fixed camera, with the pose the arm actually had."""
+    """One still from the fixed camera, plus the pose the click path needs.
+
+    The base tag is solved before the arm is touched: a PnP needs no motor read,
+    so a CAN fault must not stop a tag calibration. The two `/pose` reads -- and
+    the "arm held still" check they enable -- only happen when the still is
+    actually going to seed a tap.
+    """
     import cv2
 
     eye = camera_mod.open_source(camera_url)
@@ -1100,7 +1153,38 @@ def grab_one(app, camera_url):
         frame = eye.read()
     finally:
         eye.close()
+    size = [int(frame.shape[1]), int(frame.shape[0])]
 
+    def save_capture(pose):
+        capture_id = new_capture_id()
+        directory = Path(app["captures"]) / capture_id
+        directory.mkdir(parents=True, exist_ok=False)
+        cv2.imwrite(str(directory / "frame.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        record = {"id": capture_id, "pose": pose, "captured_at": utc_now(),
+                  "source": "capture-pose"}
+        if pose is None:
+            record["pose_note"] = "not read: the base tag solved the camera"
+        (directory / "meta.json").write_text(json.dumps({
+            "purpose": "extrinsics",
+            "image_size": size,
+            "server": record,
+        }, indent=2) + "\n", encoding="utf-8")
+        return capture_id
+
+    marker_payload = None
+    if app.get("marker"):
+        # The tag path first: no arm pose, no motor read, no sweep.
+        marker_payload = marker_from_still(app, frame, q=None)
+        if marker_payload.get("written"):
+            capture_id = save_capture(None)
+            payload = {"ok": True, "id": capture_id,
+                       "image_url": "/captures/%s/frame.jpg" % capture_id,
+                       "image_size": size, "pose": None}
+            payload.update(marker_payload)
+            payload["ok"] = True
+            return payload
+
+    # The tap path: record where the arm actually was, and that it held still.
     arm = auto_calibrate.ArmGateway(app["planner"], app["planner_token"])
     first = arm.pose()
     time.sleep(0.2)
@@ -1111,24 +1195,20 @@ def grab_one(app, camera_url):
             "the arm moved while the frame was taken (%.0f mrad): hold it still and capture "
             "again" % (1000.0 * moved))
 
-    capture_id = new_capture_id()
-    directory = Path(app["captures"]) / capture_id
-    directory.mkdir(parents=True, exist_ok=False)
-    cv2.imwrite(str(directory / "frame.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    (directory / "meta.json").write_text(json.dumps({
-        "purpose": "extrinsics",
-        "image_size": [int(frame.shape[1]), int(frame.shape[0])],
-        "server": {"id": capture_id, "pose": first, "captured_at": utc_now(),
-                   "source": "capture-pose"},
-    }, indent=2) + "\n", encoding="utf-8")
-    return {"ok": True, "id": capture_id,
-            "image_url": "/captures/%s/frame.jpg" % capture_id,
-            "image_size": [int(frame.shape[1]), int(frame.shape[0])],
-            "pose": first}
+    capture_id = save_capture(first)
+    payload = {"ok": True, "id": capture_id,
+               "image_url": "/captures/%s/frame.jpg" % capture_id,
+               "image_size": size, "pose": first}
+    if marker_payload is not None:
+        # The tag was configured but did not solve: say why, and keep the still
+        # for the tap fallback.
+        payload.update(marker_payload)
+        payload["ok"] = True
+    return payload
 
 
 async def handle_capture_pose(request: web.Request) -> web.Response:
-    """`POST /capture/pose` -- one still + pose, for the click path."""
+    """`POST /capture/pose` -- one still; the tag solve first, the pose if needed."""
     app = request.app
     try:
         body = await request.json()
@@ -1141,6 +1221,30 @@ async def handle_capture_pose(request: web.Request) -> web.Response:
         payload = await asyncio.to_thread(grab_one, app, camera_url)
     except (auto_calibrate.AutoError, camera_mod.CameraError) as error:
         return web.json_response({"ok": False, "error": str(error)}, status=422)
+
+    written = payload.get("written")
+    if written:
+        # Use it now, not after a restart: the next tap should be on the new rig.
+        try:
+            rig = extrinsics.load_rig(written)
+        except extrinsics.ExtrinsicsError as error:
+            logging.warning("the tag wrote %s but it could not be loaded: %s", written, error)
+        else:
+            app["rig"] = rig
+            app["extrinsics_path"] = written
+            try:
+                app["witness"] = witness.load_for(rig, Path(written).parent)
+            except witness.WitnessError as error:
+                logging.warning("the tag rig has no usable witness: %s", error)
+                app["witness"] = None
+        app["last_calibration"] = {"state": "ok", "at": utc_now(),
+                                   "method": "base-marker",
+                                   "verification": payload.get("verification")}
+        logging.info("the base tag solved the rig: %s", written)
+    elif (payload.get("marker") or {}).get("detected"):
+        app["last_calibration"] = {"state": "refused", "at": utc_now(),
+                                   "method": "base-marker",
+                                   "verification": payload.get("verification")}
     return web.json_response(payload)
 
 
@@ -1186,24 +1290,20 @@ def build_app(args) -> web.Application:
     app["execute"] = bool(args.execute)
     app["calib"] = Path(args.calib_dir).resolve()
     app["calib_file"] = args.calib
-    app["extrinsics_path"] = args.extrinsics
+    app["extrinsics_path"] = ""
     app["witness_max_px"] = float(args.witness_max_px)
     app["camera"] = args.camera
     app["mediamtx_api"] = (getattr(args, "mediamtx_api", "")
                            or os.environ.get("REBOT_MEDIAMTX_API", "http://127.0.0.1:9997")).rstrip("/")
     app["recordings"] = Path(getattr(args, "recordings", "")
                              or os.environ.get("REBOT_RECORDINGS", str(STATE / "recordings"))).resolve()
-    # "x,y,z,yaw" in metres and radians: where the 5 cm tag sits on the base plate
-    # in the robot's own frame. With this set, a sweep needs no tap at all.
+    # "x,y,z,yaw" in metres and degrees: where the tag sits on the base, in the
+    # robot's own frame. A capture that sees it writes the rig with no arm
+    # motion; a sweep can also use it instead of a tap.
     app["marker"] = base_marker.parse_spec(getattr(args, "marker_at", "")
                                 or os.environ.get("REBOT_MARKER_AT", ""),
                                 getattr(args, "marker_size", 0.0)
                                 or float(os.environ.get("REBOT_MARKER_SIZE", "0.04")))
-    # How a tap becomes a point: "fixed" projects through the rig a sweep fitted,
-    # "handheld" solves the camera from the base marker on every tap. Empty means
-    # "whatever this profile can do". The page may switch per tap either way.
-    app["mode"] = (getattr(args, "mode", "")
-                   or os.environ.get("REBOT_MODE", "")).strip().lower()
     app["hover"] = (getattr(args, "hover", "")
                     or os.environ.get("REBOT_HOVER", "1")) != "0"
     # The tool tip below the flange: fixed mode can take it from the rig, but a
@@ -1221,16 +1321,28 @@ def build_app(args) -> web.Application:
     app["calibration_started"] = None
     app["rig"] = None
     app["witness"] = None
+    # A fitted rig is picked up from the standard path at startup. Both the tag
+    # capture and the sweep write it there, so nothing has to be copied into the
+    # environment. It is loaded even when the default mode is handheld: the two
+    # are both available, and a request (or the page's Camera chip) picks one.
+    # An explicit --extrinsics names a different file.
+    rig_path = None
     if args.extrinsics:
-        path = Path(args.extrinsics)
+        rig_path = Path(args.extrinsics)
+    else:
+        candidate = app["calib"] / "extrinsics-fixed.json"
+        if candidate.is_file():
+            rig_path = candidate
+    if rig_path is not None:
         try:
-            app["rig"] = extrinsics.load_rig(path)
+            app["rig"] = extrinsics.load_rig(rig_path)
         except extrinsics.ExtrinsicsError as error:
             raise SystemExit(str(error)) from error
         try:
-            app["witness"] = witness.load_for(app["rig"], path.resolve().parent)
+            app["witness"] = witness.load_for(app["rig"], rig_path.resolve().parent)
         except witness.WitnessError as error:
             raise SystemExit("the rig's witness frame cannot be used: %s" % error) from error
+        app["extrinsics_path"] = str(rig_path)
     app["plane_z"] = args.plane_z
     app["tool_axis"] = args.tool_axis
     app["yaw"] = args.yaw
@@ -1321,19 +1433,18 @@ def main(argv=None):
                         help="calibration JSON; default is the newest in --calib-dir")
     parser.add_argument("--marker-at", default=os.environ.get("REBOT_MARKER_AT", ""),
                         help="'x,y,z' or 'x,y,z,yaw' of the base marker in the robot's frame "
-                             "(metres, radians): with it, a sweep needs no tap")
+                             "(metres, degrees): a capture that sees it writes the rig; a "
+                             "sweep needs no tap")
     parser.add_argument("--marker-size", type=float,
                         default=float(os.environ.get("REBOT_MARKER_SIZE", "0.04")),
                         help="the marker's printed side in metres (default 0.04)")
-    parser.add_argument("--mode", default=os.environ.get("REBOT_MODE", ""),
-                        choices=("", "fixed", "handheld"),
-                        help="fixed: rig from a sweep; handheld: the base marker on every tap")
     parser.add_argument("--hover-m", type=float,
                         default=float(os.environ.get("REBOT_HOVER_M", "0.10")),
                         help="how far above the tapped point the arm ends, in metres; "
                              "also the lowest tip z the planner accepts")
-    parser.add_argument("--extrinsics", default=os.environ.get("REBOT_EXTRINSICS", ""),
-                        help="fixed-camera rig JSON; then taps need no tag")
+    parser.add_argument("--extrinsics", default="",
+                        help="a fitted rig JSON; default is "
+                             "<calib-dir>/extrinsics-fixed.json when it exists")
     parser.add_argument("--camera", default=os.environ.get("REBOT_CAMERA", ""),
                         help="rtsp://, http:// snapshot, or device:N, for the automatic sweep")
     parser.add_argument("--mediamtx-api", default=os.environ.get("REBOT_MEDIAMTX_API",
@@ -1415,8 +1526,8 @@ def main(argv=None):
         print("             %s" % rig.describe().splitlines()[0])
         print("             witness %s, limit %.1f px"
               % ("on" if app["witness"] is not None else "MISSING", app["witness_max_px"]))
-    print("  mode     : %s, hover %.0f mm, tip %.0f mm below the flange"
-          % (app["mode"] or "auto", app["hover_m"] * 1000, app["tip_m"] * 1000))
+    print("  mode     : default %s, hover %.0f mm, tip %.0f mm below the flange"
+          % (effective_mode(app), app["hover_m"] * 1000, app["tip_m"] * 1000))
     if app["camera"]:
         print("  sweep    : %s (POST /calibrate/extrinsics)" % app["camera"])
     print("  agent    : %s" % ("%s at %s" % (app["llm_model"], app["llm_url"])

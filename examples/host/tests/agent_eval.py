@@ -231,6 +231,12 @@ def default_calibration() -> Path:
     return files[-1]
 
 
+def default_rig() -> str:
+    """The standard rig, when one has been fitted; nothing to configure."""
+    path = STATE / "calib" / "extrinsics-fixed.json"
+    return str(path) if path.is_file() else ""
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -988,8 +994,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", default="stills/frame.jpg", help="where --extract writes")
     parser.add_argument("--calibration", default="",
                         help="a calibration JSON; default is the one in state/calib")
-    parser.add_argument("--extrinsics", default=setting("REBOT_EXTRINSICS", ""),
-                        help="a fitted rig; without it the tag is solved per still")
+    parser.add_argument("--extrinsics", default=default_rig(),
+                        help="a fitted rig; default is state/calib/extrinsics-fixed.json, "
+                             "else the tag is solved per still")
     parser.add_argument("--marker-at", default=setting("REBOT_MARKER_AT", ""),
                         help="x,y,z[,yaw] of the base tag, metres and degrees")
     parser.add_argument("--marker-size", default=setting("REBOT_MARKER_SIZE", "0.04"),

@@ -809,6 +809,9 @@ class Rig:
     predicted: dict = field(default_factory=dict)
     device: str = ""
     mount: str = "fixed"
+    # How the pose was obtained: "tip-sweep" (the arm moved through a set of
+    # poses) or "base-marker" (one still of the tag on the base, no arm motion).
+    method: str = "tip-sweep"
     fitted: str = ""
     iterations: int = 0
     converged: bool = True
@@ -846,12 +849,19 @@ class Rig:
         bits = [
             "camera at [%+.3f %+.3f %+.3f] m, looking %.1f deg down, yaw %+.1f deg"
             % (origin[0], origin[1], origin[2], down, yaw),
-            "tip [%+.1f %+.1f %+.1f] mm in gripper_end"
-            % tuple(1000.0 * np.asarray(self.tip_offset, float)),
-            "%d poses, rms %.2f px / %.1f mm, worst %.2f px%s"
-            % (len(self.observations), self.rms_px, self.rms_mm, self.max_px,
-               "" if self.converged else ", did NOT converge"),
         ]
+        if self.method == "base-marker":
+            # No tip, no poses, no click scatter: the evidence is the tag's own
+            # corner reprojection, which is what decided the write.
+            bits.append("from the base marker, corners reproject %.2f px" % self.rms_px)
+        else:
+            bits.append(
+                "tip [%+.1f %+.1f %+.1f] mm in gripper_end"
+                % tuple(1000.0 * np.asarray(self.tip_offset, float)))
+            bits.append(
+                "%d poses, rms %.2f px / %.1f mm, worst %.2f px%s"
+                % (len(self.observations), self.rms_px, self.rms_mm, self.max_px,
+                   "" if self.converged else ", did NOT converge"))
         if predicted.get("centre_mm") is not None:
             bits.append("predicted %.1f mm at the centre, %.1f mm at the corner"
                         % (predicted["centre_mm"], predicted["corner_mm"]))
@@ -871,7 +881,7 @@ class Rig:
         return {
             "fingerprint": self.fingerprint,
             "mount": self.mount,
-            "method": "tip-sweep",
+            "method": self.method,
             "rms_mm": round(float(self.rms_mm), 2),
             "predicted_mm": predicted.get("centre_mm"),
             "poses": len(self.observations),
@@ -893,7 +903,7 @@ class Rig:
             "tip_offset": [float(v) for v in np.asarray(self.tip_offset, float)],
             "joint_zeros": (None if self.joint_zeros is None
                             else [float(v) for v in np.asarray(self.joint_zeros, float)]),
-            "method": "tip-sweep",
+            "method": self.method,
             "rms_px": float(self.rms_px),
             "rms_mm": float(self.rms_mm),
             "max_px": float(self.max_px),
@@ -940,6 +950,7 @@ class Rig:
             predicted=dict(data.get("predicted") or {}),
             device=str(data.get("device", "")),
             mount=str(data.get("mount", "fixed")),
+            method=str(data.get("method", "tip-sweep")),
             fitted=str(data.get("fitted", "")),
             iterations=int(data.get("iterations", 0)),
             converged=bool(data.get("converged", True)),

@@ -63,19 +63,18 @@ services:
       REBOT_MEDIAMTX_API: http://mediamtx:9997
       # A 4 cm ArUco tag on the base: where it sits in the robot's frame,
       # "x,y,z[,yaw]" in metres and degrees. Handheld mode reads it on every tap;
-      # fixed mode does not use it. Print docs/base-marker.pdf at actual size.
+      # fixed mode reads it in the calibration capture and writes the rig.
       REBOT_MARKER_AT: ${REBOT_MARKER_AT:-}
       REBOT_MARKER_SIZE: ${REBOT_MARKER_SIZE:-0.04}
-      REBOT_MODE: ${REBOT_MODE:-}
       # Where the arm ends: above the tapped point, with the tip a known distance
       # below the flange the planner aims.
       REBOT_HOVER_M: ${REBOT_HOVER_M:-0.10}
       REBOT_TIP_MM: ${REBOT_TIP_MM:-35}
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_EXECUTE: ${REBOT_EXECUTE:-0}
+      # A fitted rig is read from /app/state/calib/extrinsics-fixed.json at
+      # startup; a tag capture or a sweep writes it there, so nothing to set here.
       REBOT_CALIB_DIR: /app/state/calib
-      # A rig from calibrate_extrinsics.py --auto: fixed camera, taps need no tag.
-      REBOT_EXTRINSICS: ${REBOT_EXTRINSICS:-}
       REBOT_WITNESS_MAX_PX: ${REBOT_WITNESS_MAX_PX:-2.0}
       # Where the automatic calibration sweep reads its stills.
       REBOT_CAMERA: ${REBOT_CAMERA:-rtsp://mediamtx:8554/phone}

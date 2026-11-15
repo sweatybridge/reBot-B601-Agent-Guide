@@ -61,6 +61,11 @@
     // A page that can hand the overlay a pose but cannot detect the tag itself
     // (the workstation) says so, instead of repeating the phone's tag advice.
     const poseHint = options.poseHint || "";
+    // The page owns the choice: fixed uses the rig in /reach.json, handheld
+    // solves the tag. A fitted rig being present no longer forces fixed mode,
+    // so the phone's Camera chip can switch without a server restart.
+    const mode = options.mode || (() => "fixed");
+    const isFixed = () => mode() === "fixed";
     const context = canvas.getContext("2d");
     const useEkf = POSE_FILTER !== "tag" && Boolean(window.RebotEkf);
     let ekf = null;
@@ -376,7 +381,7 @@
 
     function startMotion() {
       if (!useEkf) return;
-      if (motionStarted || !visible || !config || config.T_base_cam) return;
+      if (motionStarted || !visible || !config || isFixed()) return;
       if (motionPermission !== "granted") return;
       window.addEventListener("devicemotion", onMotion);
       motionStarted = true;
@@ -562,7 +567,7 @@
 
     function animate() {
       animationId = 0;
-      if (!visible || !config || config.T_base_cam) return;
+      if (!visible || !config || isFixed()) return;
       if (livePose && Date.now() - liveAt < 3000) {
         draw();
         animationId = requestAnimationFrame(animate);
@@ -570,7 +575,7 @@
     }
 
     function startAnimation() {
-      if (animationId || !visible || !config || config.T_base_cam || !motionSeen) return;
+      if (animationId || !visible || !config || isFixed() || !motionSeen) return;
       animationId = requestAnimationFrame(animate);
     }
 
@@ -588,7 +593,7 @@
     }
 
     function startDetection() {
-      if (!visible || !config || config.T_base_cam) return;
+      if (!visible || !config || isFixed()) return;
       if (!config.marker || !window.ArucoPose) return;
       if (config.marker.id !== 0 || (config.marker.dictionary
         && config.marker.dictionary !== "4x4_50")) {
@@ -621,7 +626,7 @@
       lossLogged = false;
 
       function scheduleDetect() {
-        if (!visible || !config || config.T_base_cam || detectTimer || detectFrame) return;
+        if (!visible || !config || isFixed() || detectTimer || detectFrame) return;
         if (typeof video.requestVideoFrameCallback === "function") {
           // One tag solve per camera frame, not a fixed 320 ms timer: the
           // absolute anchor is then only one frame old when the phone moves.
@@ -637,7 +642,7 @@
       function tick() {
         detectTimer = null;
         detectFrame = 0;
-        if (!visible || !config || config.T_base_cam) return;
+        if (!visible || !config || isFixed()) return;
         if (video.videoWidth && video.videoHeight) {
           let found = null;
           try {
@@ -690,13 +695,15 @@
         drawEmpty("the arm model has no reachable band at this height");
         return;
       }
-      const fixed = Boolean(config.T_base_cam);
+      const fixed = isFixed();
       const live = !fixed && livePose && (Date.now() - liveAt) < 3000;
       const chosen = fixed ? config.T_base_cam : (live ? predictedPose() : (lastPose || null));
       if (!chosen) {
-        drawEmpty(poseHint || (config.marker
-          ? "point the camera at the base tag"
-          : "fit a fixed rig or configure the base tag"));
+        drawEmpty(poseHint || (fixed
+          ? "no fixed rig fitted: fit one with Rig"
+          : (config.marker
+            ? "point the camera at the base tag"
+            : "fit a fixed rig or configure the base tag")));
         return;
       }
       const pose = matrixPose(chosen);
@@ -743,7 +750,7 @@
       canvas.hidden = !visible;
       if (visible) {
         // Ask for the motion sensors while the toggle click is still a gesture.
-        if (!config || !config.T_base_cam) requestMotionPermission();
+        if (!config || !isFixed()) requestMotionPermission();
         apply();
       } else {
         stopDetection();
@@ -759,7 +766,7 @@
       if (!Array.isArray(T) || T.length < 4 || !Array.isArray(T[2])) return;
       lastPose = T;
       lastPoseLabel = label || "last tap";
-      if (visible && !(config && config.T_base_cam)) draw();
+      if (visible && !isFixed()) draw();
     }
 
     window.addEventListener("resize", () => { if (visible) draw(); });
@@ -806,7 +813,7 @@
     function projectPoint(point) {
       if (!config || !Array.isArray(point) || point.length < 3) return null;
       if (!video.videoWidth || !video.videoHeight) return null;
-      const fixed = Boolean(config.T_base_cam);
+      const fixed = isFixed();
       const live = !fixed && livePose && (Date.now() - liveAt) < 3000;
       const chosen = fixed ? config.T_base_cam : (live ? predictedPose() : null);
       if (!chosen) return null;
@@ -821,6 +828,8 @@
 
     return {
       toggle: toggle,
+      // The page's camera mode changed: restart detection/pose selection.
+      refresh: apply,
       setPose: setPose,
       projectPoint: projectPoint,
       setHeight: setHeight,

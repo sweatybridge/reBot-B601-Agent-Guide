@@ -9,10 +9,10 @@ with a different source for `T_base<-cam`:
 * **Fixed camera** (`--extrinsics`): the pose is a file, fitted once from the
   arm's tool tip. Nothing else has to be visible; the tap ray meets the table
   plane and that is the target. A witness frame checks the mount has not moved.
-* **Handheld phone** (the tag): `solvePnP` on an ArUco tag lying flat on the
-  worktop at a known offset from the base gives `T_cam<-tag`; the placement gives
-  `T_base<-tag`; the two compose into `T_base<-cam`. That is why the tag has to
-  be in the same frame as the target.
+* **Handheld phone** (the tag): `solvePnP` on an ArUco tag standing on the base at
+  a known offset from it gives `T_cam<-tag`; the placement gives `T_base<-tag`;
+  the two compose into `T_base<-cam`. That is why the tag has to be in the same
+  frame as the target.
 
     python locate_target.py --capture captures/<id> --calib calib/<device>.json \
         --extrinsics calib/extrinsics-fixed.json
@@ -31,7 +31,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import sys
 import time
 from dataclasses import dataclass
@@ -383,8 +382,9 @@ def main(argv=None):
                              "degrees (yaw is the way its face points)")
     parser.add_argument("--marker-size", type=float, default=0.04,
                         help="the marker's printed side, metres")
-    parser.add_argument("--extrinsics", default=os.environ.get("REBOT_EXTRINSICS", ""),
-                        help="extrinsics JSON for a fixed camera; then no tag is needed")
+    parser.add_argument("--extrinsics", default="",
+                        help="extrinsics JSON for a fixed camera; default is "
+                             "<calib-dir>/extrinsics-fixed.json when it exists")
     parser.add_argument("--witness-max-px", type=float, default=2.0,
                         help="refuse a capture whose background moved more than this, px")
     parser.add_argument("--plane-z", type=float, default=0.0, help="worktop height in base frame, m")
@@ -398,6 +398,13 @@ def main(argv=None):
     parser.add_argument("--annotate", default="", help="write an annotated JPEG here")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
+
+    # The rig lives next to the intrinsics, and both the tag capture and the
+    # sweep write the standard name there: a fitted camera needs no flag.
+    if not args.extrinsics:
+        candidate = Path(args.calib).resolve().parent / "extrinsics-fixed.json"
+        if candidate.is_file():
+            args.extrinsics = str(candidate)
 
     try:
         rig = extrinsics.load_rig(args.extrinsics) if args.extrinsics else None

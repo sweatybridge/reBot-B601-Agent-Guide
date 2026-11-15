@@ -7,6 +7,10 @@ One process:
     1. take a still, with the pose the arm actually had
        python app/calibrate_extrinsics.py --capture-pose --camera rtsp://...
 
+       If the base tag is in that still and REBOT_MARKER_AT (or --marker-at) is
+       set, the camera pose is solved on the spot and the rig is written: no
+       sweep, no tap. A still without the tag falls through to step 2.
+
     2. look at it, read the tool tip's pixel, then let the arm sweep
        python app/calibrate_extrinsics.py --auto --camera rtsp://... \\
            --from state/captures/<id> --uv 812 455
@@ -23,6 +27,11 @@ ray at any distance and any roll. `auto_calibrate.bootstrap_from_click()` fills
 that family in coarsely and keeps the member whose eight detections agree with
 each other -- the measurement decides, not a guess about where the bracket was
 bolted. There is no camera position to type and no second workflow.
+
+The tag short-circuits all of that. It is a printed square on the base, so its
+corners give `T_cam_tag` by PnP and `T_base_tag` is four measured numbers; one
+still is enough. The sweep remains the answer when the fixed camera cannot see
+the tag.
 
 The rig is written only if the fit verifies: `--check` reprints the numbers it
 was judged on, and every trajectory carries the rig's fingerprint.
@@ -49,6 +58,7 @@ ROOT = HERE.parent
 STATE = ROOT / "state"
 
 import base_marker  # noqa: E402
+import calib  # noqa: E402
 import extrinsics as ex  # noqa: E402
 import mediamtx  # noqa: E402
 import rebot_ik  # noqa: E402
@@ -110,10 +120,11 @@ def _load_calibration(args, size=None):
 # --------------------------------------------------------------------------- #
 
 def command_capture_pose(args):
-    """One still from the fixed camera, with the pose the arm actually had.
+    """One still from the fixed camera, with the pose the click path needs.
 
-    This is the first half of the calibration: the still is what the operator
-    taps. It deliberately does not touch the session or the rig.
+    The base tag is solved before the arm is touched. A tag capture therefore
+    reads no motor registers; the two `/pose` reads -- and the still-arm check --
+    only happen when the still is going to seed a tap.
     """
     import auto_calibrate as auto
     import camera as camera_mod
@@ -127,31 +138,77 @@ def command_capture_pose(args):
     finally:
         eye.close()
 
-    arm = auto.ArmGateway(args.planner or os.environ.get("REBOT_PLANNER",
-                                                        "http://127.0.0.1:8000"),
-                          args.planner_token or os.environ.get("REBOT_PLANNER_TOKEN", ""))
-    first = arm.pose()
-    time.sleep(0.2)
-    second = arm.pose()
-    moved = max(abs(float(a) - float(b)) for a, b in zip(first["q"], second["q"]))
-    if moved > 0.01:
-        raise CliError("the arm moved while the frame was taken (%.0f mrad): hold it still "
-                       "and capture again" % (1000.0 * moved))
-
     capture_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
     directory = STATE / "captures" / capture_id
     directory.mkdir(parents=True, exist_ok=False)
     cv2.imwrite(str(directory / "frame.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    (directory / "meta.json").write_text(json.dumps({
-        "purpose": "extrinsics",
-        "image_size": [int(frame.shape[1]), int(frame.shape[0])],
-        "server": {
+
+    def write_meta(pose):
+        record = {
             "id": capture_id,
-            "pose": first,
+            "pose": pose,
             "captured_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "source": "capture-pose",
-        },
-    }, indent=2) + "\n", encoding="utf-8")
+        }
+        if pose is None:
+            record["pose_note"] = "not read: the base tag solved the camera"
+        (directory / "meta.json").write_text(json.dumps({
+            "purpose": "extrinsics",
+            "image_size": [int(frame.shape[1]), int(frame.shape[0])],
+            "server": record,
+        }, indent=2) + "\n", encoding="utf-8")
+
+    # One still of the tag is the whole calibration: solve it now, and only ask
+    # for a tap when the tag is not in this picture.
+    marker = base_marker.parse_spec(getattr(args, "marker_at", ""),
+                                    getattr(args, "marker_size", base_marker.SIZE_M))
+    if marker:
+        try:
+            calibration = _load_calibration(args,
+                                            size=(frame.shape[1], frame.shape[0]))
+        except (CliError, calib.CalibError) as error:
+            print("marker    : not solved (%s)" % error)
+        else:
+            try:
+                run = auto.solve_marker(
+                    frame, calibration, marker,
+                    plane_z=float(args.plane_z if args.plane_z is not None else 0.0))
+            except (base_marker.MarkerError, auto.AutoError) as error:
+                print("marker    : not readable (%s)" % error)
+            else:
+                out = resolve(args.out or (STATE / "calib" / "extrinsics-fixed.json"))
+                _rig, verdict, written = auto.commit_marker(
+                    run, calibration, out, frame=frame, q=None)
+                print("marker    : %.0f px across, %+.0f deg grazing, %.2f px rms"
+                      % (run.evidence["side_px"], run.evidence["grazing_deg"],
+                         run.evidence["rms_px"]))
+                for warning in run.warnings:
+                    print("warning   : %s" % warning)
+                if written:
+                    write_meta(None)
+                    print("capture   : %s" % display(directory))
+                    print("pose      : not read (the base tag solved the camera)")
+                    print("rig       : %s" % display(written))
+                    print("next      : nothing -- taps use this rig")
+                    return 0
+                print("marker    : REFUSED -- %s"
+                      % "; ".join(verdict["reasons"]))
+
+    # The tap path: record where the arm actually was, and that it held still.
+    arm = auto.ArmGateway(args.planner or os.environ.get("REBOT_PLANNER",
+                                                        "http://127.0.0.1:8000"),
+                          args.planner_token or os.environ.get("REBOT_PLANNER_TOKEN", ""))
+    try:
+        first = arm.pose()
+        time.sleep(0.2)
+        second = arm.pose()
+    except auto.AutoError as error:
+        raise CliError(str(error)) from error
+    moved = max(abs(float(a) - float(b)) for a, b in zip(first["q"], second["q"]))
+    if moved > 0.01:
+        raise CliError("the arm moved while the frame was taken (%.0f mrad): hold it still "
+                       "and capture again" % (1000.0 * moved))
+    write_meta(first)
 
     print("capture   : %s" % display(directory))
     print("pose      : %s" % " ".join("%+.3f" % float(v) for v in first["q"][:6]))
@@ -337,7 +394,8 @@ def main(argv=None):
                         help="the tool tip's pixel in that capture")
     parser.add_argument("--marker-at", default=os.environ.get("REBOT_MARKER_AT", ""),
                         help="'x,y,z' or 'x,y,z,yaw' of the base marker in the robot's frame "
-                             "(metres, radians): with it, no tap is needed")
+                             "(metres, degrees): --capture-pose then writes the rig from the "
+                             "tag, and --auto needs no tap")
     parser.add_argument("--marker-size", type=float,
                         default=float(os.environ.get("REBOT_MARKER_SIZE", "0.04")),
                         help="the marker's printed side in metres (default 0.04)")
@@ -369,7 +427,8 @@ def main(argv=None):
         if args.auto:
             return command_auto(args)
         return command_check(args)
-    except (CliError, ex.ExtrinsicsError) as error:
+    except (CliError, calib.CalibError, base_marker.MarkerError,
+            ex.ExtrinsicsError) as error:
         raise SystemExit(str(error)) from error
 
 

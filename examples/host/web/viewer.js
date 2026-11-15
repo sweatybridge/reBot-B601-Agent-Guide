@@ -152,6 +152,7 @@
     let startedAt = 0;
     let poll = null;
     let shot = null;          // the still waiting for a tap
+    let note = null;          // why the base tag did not become a rig
     let armState = null;      // {ok, q} or {ok: false, error}: can the gateway see the arm?
     let pending = false;      // a short request is in flight
 
@@ -195,6 +196,7 @@
     async function capturePose() {
       if (pending) return;
       pending = true;
+      result = null;
       render();
       const answer = await postJson("/capture/pose", {});
       pending = false;
@@ -203,10 +205,36 @@
         render();
         return;
       }
-      shot = { id: answer.data.id, url: answer.data.image_url,
-               width: answer.data.image_size[0], height: answer.data.image_size[1],
+      const data = answer.data;
+      shot = { id: data.id, url: data.image_url,
+               width: data.image_size[0], height: data.image_size[1],
                point: null };
+      note = null;
       status = Object.assign({}, status, { error: null });
+
+      if (data.written) {
+        // One still, one tag, no arm motion: the rig is already fitted and the
+        // next tap uses it. There is no step 2 to show.
+        result = data;
+        shot = null;
+        const next = await load();
+        if (next && next.ok) status = next;
+        try {
+          window.dispatchEvent(new CustomEvent("rebot:rig"));
+        } catch (error) {
+          /* older browsers without CustomEvent still get the rest */
+        }
+      } else if (data.marker && data.marker.detected) {
+        // The tag was there but did not verify: keep the still for the tap path.
+        const reasons = ((data.verification || {}).reasons || []).join("; ");
+        note = "the base tag was read but not trusted" + (reasons ? ": " + reasons : "")
+          + " -- tap the tool tip to run the sweep";
+      } else if (data.marker && data.marker.detected === false) {
+        note = "the base tag is not in this still (" + (data.marker.error || "not found")
+          + ") -- tap the tool tip to run the sweep";
+      } else if (data.marker && data.marker.error) {
+        note = "the base tag was not solved (" + data.marker.error + ")";
+      }
       render();
     }
 
@@ -224,21 +252,35 @@
 
     function resultHtml(data) {
       if (!data || data.ok === undefined) return "";
+      const method = data.method || (data.rig || {}).method || "tip-sweep";
       if (data.ok) {
         const verification = data.verification || {};
         const predicted = verification.predicted_mm || {};
+        const marker = data.marker || {};
         const lines = ['<div class="rp-good" style="font-weight:650">Rig written</div>', '<div class="rp-kv">'];
         lines.push("<span>Fingerprint</span><span>" + escapeHtml((data.rig || {}).fingerprint || "?") + "</span>");
         lines.push("<span>Camera</span><span>" + escapeHtml(data.camera || "?") + "</span>");
-        lines.push("<span>Tip</span><span>[" + (data.tip_mm || []).join(", ") + "] mm in gripper_end</span>");
-        lines.push("<span>Fit</span><span>" + Number(verification.rms_px || 0).toFixed(2) + " px rms"
-          + (verification.worst_px == null ? "" : " · " + Number(verification.worst_px).toFixed(1)
-            + " px worst held-out") + "</span>");
+        if (method === "base-marker") {
+          lines.push("<span>Source</span><span>base tag · "
+            + (marker.side_px == null ? "?" : Number(marker.side_px).toFixed(0)) + " px across · "
+            + (marker.grazing_deg == null ? "?" : Number(marker.grazing_deg).toFixed(0)) + " deg</span>");
+          lines.push("<span>Tag fit</span><span>" + Number(verification.rms_px || 0).toFixed(2)
+            + " px corner rms</span>");
+        } else {
+          lines.push("<span>Tip</span><span>[" + (data.tip_mm || []).join(", ") + "] mm in gripper_end</span>");
+          lines.push("<span>Fit</span><span>" + Number(verification.rms_px || 0).toFixed(2) + " px rms"
+            + (verification.worst_px == null ? "" : " · " + Number(verification.worst_px).toFixed(1)
+              + " px worst held-out") + "</span>");
+        }
         if (predicted.centre_mm != null) {
           lines.push("<span>Predicted</span><span>" + predicted.centre_mm + " mm at the centre · "
             + predicted.corner_mm + " mm at the corner</span>");
         }
         lines.push("</div>");
+        if ((data.warnings || []).length) {
+          lines.push('<div class="rp-sub rp-warn" style="margin-top:6px">'
+            + data.warnings.map((warning) => escapeHtml(warning)).join(" · ") + "</div>");
+        }
         lines.push('<div class="rp-sub">Taps now use this rig; nothing needs to be in the frame '
           + "but the target.</div>");
         return lines.join("");
@@ -254,9 +296,12 @@
       }
       lines.push(detectionTable(data));
       if (verification.reasons && verification.reasons.length) {
-        lines.push('<div class="rp-sub" style="margin-top:8px">Nothing was written. Re-run the '
-          + "sweep with the arm still and the tool tip clearly in view. If it keeps refusing, "
-          + "that is the tip detector's limit, not the fit's.</div>");
+        lines.push('<div class="rp-sub" style="margin-top:8px">Nothing was written. '
+          + (method === "base-marker"
+            ? "Point the camera at the base tag, or tap the tool tip and run the sweep."
+            : "Re-run the sweep with the arm still and the tool tip clearly in view. If it "
+              + "keeps refusing, that is the tip detector's limit, not the fit's.")
+          + "</div>");
       }
       return lines.join("");
     }
@@ -282,10 +327,11 @@
       const info = status || {};
       const rig = info.rig;
       const rows = ['<h2>Camera rig &middot; fixed camera</h2>',
-        '<div class="rp-sub">One sweep fits where a bolted-down camera looks. Tap the tool tip '
-        + "in one still, the arm drives eight poses and the stills are taken for you; the pose is "
-        + "fitted and verified, and after that taps need no tag. <b>Handheld mode does not use "
-        + "this card</b> &mdash; there the base tag sets the camera on every tap.</div>",
+        '<div class="rp-sub">One capture fits where a bolted-down camera looks. If the base tag '
+        + "is in view, <b>Capture one pose</b> solves the rig from that single still and the arm "
+        + "never moves. Without the tag, tap the tool tip in the still and the arm drives eight "
+        + "poses for the fit. <b>Handheld mode does not use this card</b> &mdash; there the base "
+        + "tag sets the camera on every tap.</div>",
         '<div class="rp-kv">'];
 
       rows.push("<span>Arm</span><span>" + (info.execute
@@ -303,11 +349,14 @@
         + (info.sweep && info.sweep.seconds ? Math.round(info.sweep.seconds) : 90)
         + " s of motion</span>");
       rows.push("<span>Current rig</span><span>" + (rig
-        ? escapeHtml(rig.fingerprint || "?") + " · " + (rig.poses || 0) + " poses · "
-          + (rig.predicted_mm == null ? "?" : Number(rig.predicted_mm).toFixed(1)) + " mm predicted"
+        ? (rig.method === "base-marker"
+          ? escapeHtml(rig.fingerprint || "?") + " · from the base tag"
+          : escapeHtml(rig.fingerprint || "?") + " · " + (rig.poses || 0) + " poses · "
+            + (rig.predicted_mm == null ? "?" : Number(rig.predicted_mm).toFixed(1)) + " mm predicted")
         : "none fitted yet") + "</span>");
       rows.push("</div>");
       if (info.error) rows.push('<div class="rp-bad">' + escapeHtml(info.error) + "</div>");
+      if (note) rows.push('<div class="rp-sub rp-warn">' + escapeHtml(note) + "</div>");
 
       if (!running) {
         if (cameraMode !== "fixed") {
@@ -317,7 +366,8 @@
         rows.push('<div class="rp-row"><button data-action="capture"'
           + (pending ? " disabled" : "") + ">"
           + (shot ? "Retake the still" : "Capture one pose") + "</button>"
-          + '<span class="rp-sub">step 1</span></div>');
+          + '<span class="rp-sub">' + (info.marker
+            ? "step 1 &middot; reads the base tag first" : "step 1") + "</span></div>");
       }
 
       if (shot) {
@@ -339,25 +389,29 @@
         rows.push('<div class="rp-sub">' + progressText() + "</div>");
         rows.push('<div class="rp-sub">The arm is moving on its own; keep clear of the cell.</div>');
       } else {
-        // With a base marker configured the tap is not needed: the tag's PnP
-        // gives the camera, so the sweep can start from a bare "go".
+        // A tapped point is the stronger seed; the tag is the fallback when the
+        // still has no tap in it (or the tag was the only thing worth using).
         const hasMarker = Boolean(info.marker);
-        const ready = info.execute && info.camera && (hasMarker || (shot && shot.point));
+        const hasTap = Boolean(shot && shot.point);
+        const ready = info.execute && info.camera && (hasTap || hasMarker);
         let hint = "step 3";
         if (!info.camera) {
           hint = "no camera: set REBOT_CAMERA and restart capture";
         } else if (!info.execute) {
           hint = "execution is off: REBOT_EXECUTE=1 on the host, --allow-execute on the edge";
+        } else if (hasTap) {
+          hint = "the tap fixes the pixel; the arm drives the sweep";
         } else if (hasMarker) {
-          hint = "the base marker sets the camera; no tap needed";
+          hint = "the base tag sets the camera; Capture one pose solves it without moving the arm";
         } else if (!shot) {
           hint = "capture a pose first";
-        } else if (!shot.point) {
+        } else {
           hint = "tap the tool tip in the picture";
         }
         rows.push('<div class="rp-row"><button class="primary" data-action="run"'
           + (ready ? "" : " disabled") + ">"
-          + (hasMarker ? "Run the sweep from the base marker" : "Run the sweep from this tap") + "</button>"
+          + (hasTap ? "Run the sweep from this tap"
+            : (hasMarker ? "Run the sweep from the base marker" : "Run the sweep")) + "</button>"
           + '<span class="rp-sub rp-run-hint' + (ready ? "" : " rp-warn") + '">'
           + escapeHtml(hint) + "</span></div>");
       }
@@ -407,7 +461,8 @@
 
     async function onRun() {
       const hasMarker = Boolean(status && status.marker);
-      if (!hasMarker && (!shot || !shot.point)) return;
+      const hasTap = Boolean(shot && shot.point);
+      if (!hasMarker && !hasTap) return;
       const now = Date.now();
       if (now > armedUntil) {
         // Check the arm *before* arming: a gateway that cannot see the edge is
@@ -444,18 +499,14 @@
       posting = true;
       startedAt = Date.now();
       result = null;
+      note = null;
       progress = { pose: 0, of: (status && status.sweep ? status.sweep.poses : 8), phase: "starting" };
       render();
       poll = setInterval(refresh, 1000);
 
-      const body = hasMarker
-        ? { confirm: true }
-        : {
-          confirm: true,
-          capture: shot.id,
-          u: shot.point.u,
-          v: shot.point.v,
-        };
+      const body = hasTap
+        ? { confirm: true, capture: shot.id, u: shot.point.u, v: shot.point.v }
+        : { confirm: true };
 
       try {
         const answer = await postJson("/calibrate/extrinsics", body);

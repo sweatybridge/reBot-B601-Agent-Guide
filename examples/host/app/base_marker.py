@@ -5,13 +5,14 @@
 The tip-sweep solves for the camera from the arm's own motion, which means it has
 to *see* the tip in every frame -- and on a cluttered bench, with a gripper whose
 appearance changes as the wrist turns, that is where it keeps failing. A marker
-pasted flat on the base plate inverts the problem: the camera's pose relative to
-the marker is a plain PnP, exact to a millimetre, and the arm never enters it.
+pasted on the base inverts the problem: the camera's pose relative to the marker
+is a plain PnP, exact to a millimetre, and the arm never enters it.
 
-The marker's own frame is defined so that it is the natural one for a sticker on a
-horizontal plate: x across the marker, y up the marker, z out of the sheet (which
-is straight up, because the plate is level). `base_from_marker` then places that
-frame in the robot's base frame from four numbers the installer measures once.
+The standard placement is the upright one: the tag stands on the side of the base
+column, its printed face pointing along the heading, so a phone or a fixed camera
+sees it face-on. `base_from_marker` places that frame in the robot's base frame
+from four numbers the installer measures once. (`mode="flat"` remains for a tag
+lying on the plate; the hand-held and fixed workflows both use "vertical".)
 
 Everything downstream gets better for free: with the camera known to a pixel, the
 tip detector's projection lands on the gripper, so the sweep becomes a
@@ -55,7 +56,13 @@ def detect(image, marker_id=MARKER_ID):
     as seen in the frame.
     """
     gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    detector = cv2.aruco.ArucoDetector(_dictionary(), cv2.aruco.DetectorParameters())
+    parameters = cv2.aruco.DetectorParameters()
+    # A 4 cm tag at a metre is a few dozen pixels: half a pixel of corner error
+    # is a centimetre of depth, so the sub-pixel corners are worth having.
+    refine = getattr(cv2.aruco, "CORNER_REFINE_SUBPIX", None)
+    if refine is not None:
+        parameters.cornerRefinementMethod = refine
+    detector = cv2.aruco.ArucoDetector(_dictionary(), parameters)
     corners, ids, _rejected = detector.detectMarkers(gray)
     if ids is None or len(ids) == 0:
         raise MarkerError("no marker in the frame: is the tag facing the camera and lit?")
@@ -78,21 +85,104 @@ def object_points(size_m=SIZE_M):
                      [-half, -half, 0.0]], dtype=float)
 
 
-def pose(image, K, dist, size_m=SIZE_M, marker_id=MARKER_ID):
-    """`T_cam_marker`: the marker's pose in the camera's frame."""
+def solve(image, K, dist, size_m=SIZE_M, marker_id=MARKER_ID):
+    """`T_cam_marker` and the evidence behind it, from one frame.
+
+    The pose alone is not enough to decide whether it is worth a rig: a tag 10 px
+    across or seen nearly edge-on can solve, and still be centimetres out. This
+    returns the pose plus the four-corner reprojection error, the tag's side in
+    pixels and its grazing angle, so the caller can refuse the bad ones.
+
+    `T_cam_marker` maps a point in the tag frame to the camera frame, matching
+    `object_points`' corner order (top-left, top-right, bottom-right, bottom-left).
+    """
     corners = detect(image, marker_id=marker_id)
-    K = np.asarray(K, dtype=float)
-    dist = np.asarray(dist, dtype=float)
-    ok, rvec, tvec = cv2.solvePnP(object_points(size_m), corners, K, dist,
-                                  flags=cv2.SOLVEPNP_IPPE_SQUARE)
-    if not ok:
+    K = np.asarray(K, dtype=float).reshape(3, 3)
+    dist = np.asarray(dist, dtype=float).reshape(-1)
+    points = object_points(size_m)
+
+    # IPPE_SQUARE is exact for a square in theory, but it can pick a mirror
+    # solution from a nearly frontal quad (a 2 px corner bias is enough). SQPnP
+    # and the iterative solver are independent opinions; take the best one that
+    # sees the printed face, then let LM polish it.
+    candidates = []
+    solvers = [cv2.SOLVEPNP_IPPE_SQUARE,
+               getattr(cv2, "SOLVEPNP_SQPNP", None),
+               cv2.SOLVEPNP_ITERATIVE]
+    for flags in [solver for solver in solvers if solver is not None]:
+        try:
+            ok, rvec, tvec = cv2.solvePnP(points, corners, K, dist, flags=flags)
+        except cv2.error:
+            continue
+        if not ok:
+            continue
+        rotation, _jacobian = cv2.Rodrigues(rvec)
+        tvec = np.asarray(tvec, dtype=float).reshape(3)
+        projected, _jacobian = cv2.projectPoints(points, rvec, tvec, K, dist)
+        errors = np.linalg.norm(projected.reshape(-1, 2) - corners, axis=1)
+        candidates.append({
+            "rvec": rvec,
+            "tvec": tvec,
+            "rotation": rotation,
+            "rms_px": float(np.sqrt(np.mean(errors ** 2))),
+            # The tag's +z is out of the printed face: it has to point back at
+            # the camera for the pattern to be readable at all.
+            "front": float(rotation[:, 2] @ (-tvec)) > 0.0,
+        })
+    if not candidates:
         raise MarkerError("the PnP did not solve: the marker is probably too oblique or too "
                           "small in the frame")
-    rotation, _jacobian = cv2.Rodrigues(rvec)
+    front = [candidate for candidate in candidates if candidate["front"]]
+    if not front:
+        raise MarkerError("the tag solved only from behind: is the printed face toward the "
+                          "camera?")
+    best = min(front, key=lambda candidate: candidate["rms_px"])
+
+    rvec, tvec = best["rvec"], best["tvec"]
+    rotation = best["rotation"]
+    try:
+        # LM writes through its inputs; copies keep the candidate intact if the
+        # refinement turns out worse than what the solver already had.
+        rvec2, tvec2 = cv2.solvePnPRefineLM(points, corners.reshape(-1, 1, 2), K, dist,
+                                            rvec.copy(), tvec.copy())
+    except cv2.error:
+        rvec2 = tvec2 = None
+    if rvec2 is not None:
+        rotation2, _jacobian = cv2.Rodrigues(rvec2)
+        tvec2 = np.asarray(tvec2, dtype=float).reshape(3)
+        projected, _jacobian = cv2.projectPoints(points, rvec2, tvec2, K, dist)
+        errors = np.linalg.norm(projected.reshape(-1, 2) - corners, axis=1)
+        rms2 = float(np.sqrt(np.mean(errors ** 2)))
+        if rms2 <= best["rms_px"] * 1.05 and float(rotation2[:, 2] @ (-tvec2)) > 0.0:
+            rvec, tvec, rotation = rvec2, tvec2, rotation2
+
+    projected, _jacobian = cv2.projectPoints(points, rvec, tvec, K, dist)
+    errors = np.linalg.norm(projected.reshape(-1, 2) - corners, axis=1)
+    rms_px = float(np.sqrt(np.mean(errors ** 2)))
+    sides = [float(np.linalg.norm(corners[(index + 1) % 4] - corners[index]))
+             for index in range(4)]
+    side_px = float(np.mean(sides))
+    area_px = float(abs(cv2.contourArea(corners.astype(np.float32))))
+    view = -tvec / max(1e-12, float(np.linalg.norm(tvec)))
+    grazing_deg = float(np.degrees(np.arccos(np.clip(
+        abs(float(rotation[:, 2] @ view)), 0.0, 1.0))))
+
     matrix = np.eye(4)
     matrix[:3, :3] = rotation
-    matrix[:3, 3] = np.asarray(tvec, dtype=float).reshape(3)
-    return matrix
+    matrix[:3, 3] = tvec
+    return {
+        "T_cam_marker": matrix,
+        "rms_px": rms_px,
+        "side_px": side_px,
+        "area_px": area_px,
+        "grazing_deg": grazing_deg,
+        "id": None if marker_id is None else int(marker_id),
+    }
+
+
+def pose(image, K, dist, size_m=SIZE_M, marker_id=MARKER_ID):
+    """`T_cam_marker`: the marker's pose in the camera's frame."""
+    return solve(image, K, dist, size_m=size_m, marker_id=marker_id)["T_cam_marker"]
 
 
 def base_from_marker(at, yaw=0.0, mode="flat"):
@@ -124,12 +214,20 @@ def base_from_marker(at, yaw=0.0, mode="flat"):
     return matrix
 
 
+def camera_solve(image, K, dist, at, yaw=0.0, size_m=SIZE_M, marker_id=MARKER_ID,
+                 mode="flat"):
+    """`T_base_cam` from one photograph, and the PnP evidence for it."""
+    from_marker = base_from_marker(at, yaw, mode=mode)
+    evidence = solve(image, K, dist, size_m=size_m, marker_id=marker_id)
+    return from_marker @ np.linalg.inv(evidence["T_cam_marker"]), evidence
+
+
 def camera_pose(image, K, dist, at, yaw=0.0, size_m=SIZE_M, marker_id=MARKER_ID,
                 mode="flat"):
     """`T_base_cam` from one photograph of the marker."""
-    from_marker = base_from_marker(at, yaw, mode=mode)
-    camera_from_marker = pose(image, K, dist, size_m=size_m, marker_id=marker_id)
-    return from_marker @ np.linalg.inv(camera_from_marker)
+    matrix, _evidence = camera_solve(image, K, dist, at, yaw, size_m=size_m,
+                                     marker_id=marker_id, mode=mode)
+    return matrix
 
 
 def parse_spec(text, size_m=SIZE_M):

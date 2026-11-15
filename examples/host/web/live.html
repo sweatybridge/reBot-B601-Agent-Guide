@@ -288,9 +288,10 @@ function renderHost() {
     hint.innerHTML = HINT_START_HTML;
   }
   // This page only plans in fixed camera mode, so a host without a rig has
-  // nothing to plan with yet. The video is still worth connecting to: the Rig
-  // panel and the framing check do not need it.
-  if (health.mode !== "fixed") {
+  // nothing to plan with yet. It is the rig that matters, not the default mode:
+  // a host whose default is the phone's tag still has one fitted. The video is
+  // still worth connecting to: the Rig panel and the framing check do not need it.
+  if (!health.rig) {
     setState("no fixed rig: fit one with Rig", "wait");
     connectButton.disabled = false;
     return;
@@ -1106,7 +1107,7 @@ reachButton.addEventListener("click", () => {
     status("reach band off", "warn");
     return;
   }
-  const fixed = state.health && state.health.mode === "fixed";
+  const fixed = Boolean(state.health && state.health.rig);
   status(fixed
     ? "reach band on: the shaded ring is where a point can be planned"
     : "reach band needs a fixed rig: press Rig, or run calibrate_extrinsics.py --auto",

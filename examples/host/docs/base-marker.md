@@ -33,6 +33,11 @@ The camera moves. The tag does not, and it is in every frame the user taps on.
    module, a seventh of the square, is plenty).
 6. Choose **Handheld + base tag** with the switch in the tap card.
 
+The **Camera** chip can switch between the tag and a fitted rig at any time. The
+choice travels with each plan and each marker, so neither mode needs a server
+restart. With a rig fitted the page starts in fixed mode; the tag stays one click
+away, and without a rig handheld is the start.
+
 ### The standard location
 
 The RS URDF's `base_link.STL` settles most of this: a 140 x 200 x 10 mm foot plate
@@ -68,9 +73,49 @@ next marker only; the plan carries each marker's own tip point.
 
 No calibration session, and the phone can be picked up and moved between taps.
 
-## Mode 2 — fixed camera, no tag
+## Mode 2 — fixed camera
 
-The camera stays put; the tag is not needed.
+The camera stays put; after calibration the tag is not needed in the frame.
+
+### With the tag in reach: one capture, no sweep
+
+If the fixed camera can see the tag, that still **is** the calibration. The tag
+is the same one, in the same place, with the same `REBOT_MARKER_AT` as Mode 1.
+
+1. Open the **Rig** card on `/live` (or add `?rig=1` to the URL).
+2. Press **Capture one pose**.
+3. The new still is scanned for the tag. When it is found, its PnP gives
+   `T_cam_tag`, `T_base_tag` comes from `REBOT_MARKER_AT`, and the rig is
+   written and loaded immediately — **the arm never moves**. The card shows the
+   tag's size in pixels, its grazing angle and the corner reprojection rms.
+4. If the tag is not in that still, nothing is written and the card says so.
+   Either **Retake the still** with the tag in view, or tap the tool tip in the
+   picture and run the sweep as below.
+
+The same path is available without the page:
+
+```bash
+# one still; with the tag visible and REBOT_MARKER_AT set, this writes the rig
+python app/calibrate_extrinsics.py --capture-pose --camera rtsp://...
+```
+
+`POST /capture/pose` does the same over HTTP: the response carries `marker`,
+`verification` and `written` when the tag solved the camera.
+
+The tag path is fast, but it is a single PnP rather than a fitted sweep. At a
+metre a 4 cm tag is ~40 px across, so a corner error of half a pixel is about
+1% of the depth — a centimetre or so at the tap. That is a usable rig, not a
+metrology one; the sweep is the more accurate option, and it is still the one to
+use when the camera cannot see the tag. The capture card reports the numbers it
+judged (corner rms, tag size, grazing angle) so the result is not a black box.
+
+The tag capture deliberately reads no motor registers, so it works even when the
+arm gateway or the CAN bus is down. The trade-off is the mount **witness**: with
+no arm pose there is nothing to mask the gripper out of the reference frame, so
+that rig has no drift check. Run the sweep once afterwards if you want the
+witness; the tag-written rig still plans normally.
+
+### Without the tag: the sweep
 
 1. Run the calibration sweep once (the panel's *Run the sweep*): the arm visits
    eight poses and the fit solves `T_base_cam` and the tool tip's offset, then the
@@ -79,7 +124,8 @@ The camera stays put; the tag is not needed.
 
 From then on each tap projects through that rig: ray → plane at the selected
 height (10 cm above the worktop by default). Re-run the sweep if the bracket is
-bumped.
+bumped — or, before the sweep, try **Capture one pose** again if the tag is
+visible.
 
 ## What the two modes share
 

@@ -365,7 +365,7 @@ async def test_server(workdir: Path, geometry):
         planner="http://127.0.0.1:9", planner_token="", execute=False,
         calib_dir=str(calib_dir), calib="",
         marker_at="0.36,-0.10,0.12,180", marker_size=0.08,
-        mode="", hover="1", hover_m=0.10, tip_mm=35.0,
+        hover="1", hover_m=0.10, tip_mm=35.0,
         plane_z=0.0, tool_axis="z-", yaw=0.0,
         extrinsics="", witness_max_px=2.0, camera="",
     )
@@ -784,6 +784,28 @@ def textured_frame(size=(1600, 1200), seed=3):
     return cv2.GaussianBlur(image, (3, 3), 0)
 
 
+def render_marker(image, T_base_cam, K, dist, at, yaw_deg, size_m, mode="vertical"):
+    """Draw the tag where `T_base_cam` says it is: a photo without a camera."""
+    T_base_marker = base_marker.base_from_marker(at, math.radians(yaw_deg), mode=mode)
+    T_cam_marker = extrinsics.invert(np.asarray(T_base_cam, dtype=float)) @ T_base_marker
+    rvec, _ = cv2.Rodrigues(T_cam_marker[:3, :3])
+    projected, _ = cv2.projectPoints(base_marker.object_points(size_m), rvec,
+                                     T_cam_marker[:3, 3], K, dist)
+    quad = projected.reshape(4, 2).astype(np.float32)
+    bitmap = base_marker.marker_bitmap(size_m, 1200.0)
+    source = np.array([[0, 0], [bitmap.shape[1] - 1, 0],
+                       [bitmap.shape[1] - 1, bitmap.shape[0] - 1],
+                       [0, bitmap.shape[0] - 1]], dtype=np.float32)
+    homography = cv2.getPerspectiveTransform(source, quad)
+    height, width = image.shape[:2]
+    warped = cv2.warpPerspective(cv2.cvtColor(bitmap, cv2.COLOR_GRAY2BGR), homography,
+                                 (width, height))
+    mask = cv2.warpPerspective(np.full(bitmap.shape, 255, np.uint8), homography,
+                               (width, height))
+    image[mask > 0] = warped[mask > 0]
+    return image
+
+
 def test_base_marker():
     """A printed square on the plate: render it at a known pose, solve it back."""
     print("\nbase marker: the camera pose from one photograph")
@@ -816,6 +838,7 @@ def test_base_marker():
     cv2.imwrite(str(Path(".") / "marker-render.png"), warped)
 
     solved = base_marker.pose(warped, K, dist, size_m=size_m)
+    evidence = base_marker.solve(warped, K, dist, size_m=size_m)
     angle_error = float(np.degrees(np.arccos(np.clip(
         (np.trace(solved[:3, :3].T @ rotation) - 1.0) / 2.0, -1.0, 1.0))))
     distance_error = float(np.linalg.norm(solved[:3, 3] - T_cam_marker[:3, 3]))
@@ -825,6 +848,11 @@ def test_base_marker():
     check("the marker's pose is recovered from one frame",
           angle_error < 1.5 and distance_error < 25.0,
           "%.2f deg, %.1f mm" % (angle_error, 1000.0 * distance_error))
+    check("the tag solve reports the evidence it was judged on",
+          evidence["rms_px"] < 1.0 and evidence["side_px"] > 20.0
+          and 0.0 <= evidence["grazing_deg"] < 80.0,
+          "%.2f px rms, %.0f px side, %.0f deg"
+          % (evidence["rms_px"], evidence["side_px"], evidence["grazing_deg"]))
 
     recovered = base_marker.camera_pose(warped, K, dist, at, yaw, size_m=size_m)
     camera_error = float(np.linalg.norm(recovered[:3, 3] - T_base_cam[:3, 3]))
@@ -1031,7 +1059,7 @@ def test_fixed_rig(workdir: Path):
             planner="http://127.0.0.1:9", planner_token="", execute=False,
             calib_dir=str(calib_dir), calib="",
             marker_at="0.36,-0.10,0.12,180", marker_size=0.08,
-            mode="", hover="1", hover_m=0.10, tip_mm=35.0,
+            hover="1", hover_m=0.10, tip_mm=35.0,
             plane_z=0.0, tool_axis="z-", yaw=0.0,
             extrinsics=str(rig_file), witness_max_px=2.0, camera="",
         )
@@ -1159,9 +1187,11 @@ class FakeArm:
     def __init__(self, q=None):
         self.q = np.asarray(q if q is not None else sweep.HOME, dtype=float).copy()
         self.moves = 0
+        self.poses = 0
         self.visited = []
 
     def pose(self):
+        self.poses += 1
         return {"ids": [1, 2, 3, 4, 5, 6, 7],
                 "q": [float(v) for v in self.q] + [0.0],
                 "timestamp": "2026-01-01T00:00:00Z"}
@@ -1578,7 +1608,7 @@ def test_calibrate_api(workdir: Path):
             max_mb=4, quiet=True, planner="http://127.0.0.1:9", planner_token="",
             execute=execute, calib_dir=str(calib_dir), calib="",
             marker_at=marker_at, marker_size=0.08,
-            mode="", hover="1", hover_m=0.10, tip_mm=35.0,
+            hover="1", hover_m=0.10, tip_mm=35.0,
             plane_z=0.0, tool_axis="z-", yaw=0.0,
             extrinsics="", witness_max_px=2.0, camera="rtsp://fake/stream",
             mediamtx_api="http://127.0.0.1:9", recordings=str(calib_dir.parent / "recordings"),
@@ -1749,6 +1779,206 @@ def test_calibrate_api(workdir: Path):
 
 # --------------------------------------------------------------------------- #
 
+def test_marker_rig(workdir: Path):
+    print("\nbase tag: one capture writes the fixed rig, no sweep")
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import camera as camera_mod
+    import capture_server
+
+    # The tag solve is only as good as the tag's geometry, so this camera sees
+    # it at about 90 px across: the regime docs/base-marker.md describes.
+    K, dist, _T_arm, _tip, _observations = synthetic_rig()
+    T_true = extrinsics.look_at(np.array([0.15, -0.80, 0.90]),
+                                np.array([0.0, -0.047, 0.043]))
+    marker_at = (0.0, -0.047, 0.043)
+    marker_yaw = 270.0
+    marker_size = 0.08
+
+    captures = workdir / "marker-captures"
+    calib_dir = workdir / "marker-calib"
+    calib_dir.mkdir(parents=True, exist_ok=True)
+    (calib_dir / "synthetic.json").write_text(json.dumps({
+        "format": "rebot-camera-calib", "version": 1, "device": "synthetic",
+        "image_size": [1600, 1200], "K": K.tolist(), "dist": dist.tolist(), "rms": 0.2,
+    }), encoding="utf-8")
+
+    background = cv2.cvtColor(textured_frame(), cv2.COLOR_GRAY2BGR)
+    frame = render_marker(background.copy(), T_true, K, dist, marker_at, marker_yaw,
+                          marker_size)
+
+    class StillEye:
+        def __init__(self, image):
+            self.image = image
+
+        def read(self, retries=1):
+            return self.image.copy()
+
+        def close(self):
+            pass
+
+    eye = StillEye(frame)
+    arm = FakeArm()
+
+    def args_for(execute):
+        return SimpleNamespace(
+            host="127.0.0.1", port=0, captures=str(captures), cert="", key="",
+            token="", mediamtx="http://127.0.0.1:9", whip_path="phone", no_whip=True,
+            max_mb=4, quiet=True, planner="http://127.0.0.1:9", planner_token="",
+            execute=execute, calib_dir=str(calib_dir), calib="",
+            marker_at="%g,%g,%g,%g" % (marker_at + (marker_yaw,)),
+            marker_size=marker_size,
+            hover="1", hover_m=0.10, tip_mm=35.0,
+            plane_z=0.0, tool_axis="z-", yaw=0.0,
+            extrinsics="", witness_max_px=2.0, camera="rtsp://fake/stream",
+            mediamtx_api="http://127.0.0.1:9", recordings=str(calib_dir.parent / "recordings"),
+        )
+
+    original_gateway = auto_calibrate.ArmGateway
+    original_source = camera_mod.open_source
+    auto_calibrate.ArmGateway = lambda *a, **k: arm
+    camera_mod.open_source = lambda *a, **k: eye
+
+    def verdicts():
+        good = auto_calibrate.verify_marker(
+            {"rms_px": 0.7, "side_px": 60.0, "grazing_deg": 40.0, "id": 0})
+        tiny = auto_calibrate.verify_marker(
+            {"rms_px": 0.7, "side_px": 10.0, "grazing_deg": 40.0, "id": 0})
+        edge = auto_calibrate.verify_marker(
+            {"rms_px": 0.7, "side_px": 60.0, "grazing_deg": 85.0, "id": 0})
+        check("a readable tag is enough for a marker rig", good["ok"])
+        check("a tiny tag is refused", not tiny["ok"]
+              and "px across" in " ".join(tiny["reasons"]))
+        check("a nearly edge-on tag is refused", not edge["ok"]
+              and "edge-on" in " ".join(edge["reasons"]))
+
+    verdicts()
+
+    try:
+        app = capture_server.build_app(args_for(True))
+
+        async def scenarios():
+            async with TestClient(TestServer(app)) as client:
+                started = arm.moves
+                poses_started = arm.poses
+                answer = await client.post("/capture/pose", json={})
+                body = await answer.json()
+                check("a still of the tag writes the rig",
+                      answer.status == 200 and body.get("written")
+                      and (calib_dir / "extrinsics-fixed.json").is_file(),
+                      "status %s, %s" % (answer.status, str(body.get("error"))[:50]))
+                check("the tag capture runs no sweep", arm.moves == started,
+                      "%d moves" % (arm.moves - started))
+                check("the tag capture reads no arm pose", arm.poses == poses_started,
+                      "%d /pose reads" % (arm.poses - poses_started))
+                check("the tag capture returns without a pose", body.get("pose") is None)
+                check("the response says where the pose came from",
+                      body.get("method") == "base-marker"
+                      and (body.get("marker") or {}).get("detected") is True
+                      and (body.get("verification") or {}).get("ok") is True,
+                      str((body.get("verification") or {}).get("reasons")))
+                check("the tag solve is accurate enough to plan from",
+                      np.linalg.norm(np.asarray(app["rig"].T_base_cam, dtype=float)[:3, 3]
+                                     - T_true[:3, 3]) < 0.060,
+                      "%.0f mm"
+                      % (1000.0 * np.linalg.norm(app["rig"].T_base_cam[:3, 3] - T_true[:3, 3])))
+                check("the loaded rig remembers it came from a tag",
+                      app["rig"] is not None and app["rig"].method == "base-marker"
+                      and len(app["rig"].observations) == 0)
+                loaded = extrinsics.load_rig(calib_dir / "extrinsics-fixed.json")
+                check("the tag rig round-trips through its file",
+                      loaded.method == "base-marker" and loaded.witness is None,
+                      loaded.method)
+                check("the tag report says the witness was skipped",
+                      any("mount witness" in str(w) for w in (body.get("warnings") or [])),
+                      str(body.get("warnings")))
+
+                status = await (await client.get("/calibrate")).json()
+                check("GET /calibrate reports the tag solve",
+                      (status.get("last") or {}).get("state") == "ok"
+                      and (status.get("rig") or {}).get("method") == "base-marker",
+                      str(status.get("last")))
+
+                # A still without the tag is not a failure: it is the tap path.
+                eye.image = background.copy()
+                answer = await client.post("/capture/pose", json={})
+                body = await answer.json()
+                check("a still without the tag falls back to the tap",
+                      answer.status == 200 and body.get("ok") is True
+                      and (body.get("marker") or {}).get("detected") is False
+                      and not body.get("written"),
+                      str((body.get("marker") or {}).get("error"))[:50])
+                check("the fallback leaves the tag rig in place",
+                      app["rig"] is not None
+                      and app["rig"].method == "base-marker")
+
+        asyncio.run(scenarios())
+
+        # A restart is what the operator does next: the rig is on disk under the
+        # standard name, so no env var has to carry it.
+        restarted = capture_server.build_app(args_for(True))
+        check("a restart finds the tag rig without an env var",
+              restarted["rig"] is not None
+              and restarted["rig"].method == "base-marker"
+              and str(restarted["extrinsics_path"]).endswith("extrinsics-fixed.json"))
+        check("a fitted rig makes fixed the default",
+              capture_server.effective_mode(restarted) == "fixed")
+        handheld = capture_server.locate_options(restarted, {"mode": "handheld"})
+        check("a request can still choose handheld",
+              handheld.extrinsics is None and handheld.tag_size > 0)
+        check("a request can choose fixed",
+              capture_server.locate_options(restarted, {"mode": "fixed"}).extrinsics
+              is not None)
+        empty_args = args_for(True)
+        empty_args.calib_dir = str(workdir / "marker-empty-calib")
+        empty = capture_server.build_app(empty_args)
+        check("without a rig the default is handheld",
+              empty["rig"] is None
+              and capture_server.effective_mode(empty) == "handheld")
+
+        async def reach_json():
+            reach_app = capture_server.build_app(args_for(True))
+            async with TestClient(TestServer(reach_app)) as client:
+                return await (await client.get("/reach.json")).json()
+
+        reach = asyncio.run(reach_json())
+        check("reach.json offers the rig and the default mode",
+              reach.get("mode") == "fixed"
+              and reach.get("T_base_cam") is not None
+              and reach.get("rig") is not None,
+              str(reach.get("mode")))
+
+        # The same short path on the command line: --capture-pose with the tag
+        # configured writes the rig instead of printing tap instructions.
+        saved_state = extrinsics_cli.STATE
+        extrinsics_cli.STATE = workdir / "marker-cli-state"
+        eye.image = frame.copy()
+        cli_rig = workdir / "marker-cli-rig.json"
+        poses_before_cli = arm.poses
+        try:
+            code = extrinsics_cli.main([
+                "--capture-pose", "--camera", "rtsp://fake",
+                "--marker-at", "%g,%g,%g,%g" % (marker_at + (marker_yaw,)),
+                "--marker-size", str(marker_size),
+                "--calib", str(calib_dir / "synthetic.json"),
+                "--out", str(cli_rig), "--quiet",
+            ])
+        finally:
+            extrinsics_cli.STATE = saved_state
+        check("--capture-pose writes the rig from the tag",
+              code == 0 and cli_rig.is_file()
+              and extrinsics.load_rig(cli_rig).method == "base-marker",
+              "exit %s" % code)
+        check("--capture-pose reads no arm pose for a tag",
+              arm.poses == poses_before_cli,
+              "%d /pose reads" % (arm.poses - poses_before_cli))
+    finally:
+        auto_calibrate.ArmGateway = original_gateway
+        camera_mod.open_source = original_source
+
+
+# --------------------------------------------------------------------------- #
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Offline selftest for the capture pipeline.")
     parser.add_argument("--keep", action="store_true", help="keep the work directory")
@@ -1776,6 +2006,7 @@ def main(argv=None):
     test_base_marker()
     test_auto_sweep(workdir)
     test_calibrate_api(workdir)
+    test_marker_rig(workdir)
 
     failures = [name for name, ok, _ in RESULTS if not ok]
     print("\n%d checks, %d failed" % (len(RESULTS), len(failures)))

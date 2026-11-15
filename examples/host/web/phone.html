@@ -260,6 +260,8 @@ const state = {
   calibCount: 0,
   token: "",
   health: null,
+  modeInitialized: false,
+  rigFingerprint: null,
 };
 
 /* ------------------------------------------------------------------ utils */
@@ -323,11 +325,41 @@ function initToken() {
 
 /* --------------------------------------------------------------- server */
 
+// The page's camera mode is its own; the host default only seeds it. Switching
+// needs no server restart: every plan and marker carries the chosen mode, and a
+// fitted rig stays available on the host while handheld keeps using the tag.
+function setCameraMode(mode, announce) {
+  const fixed = mode === "fixed";
+  if (window.TapPlanner) TapPlanner.setMode(fixed ? "fixed" : "handheld");
+  cameraButton.textContent = "Camera: " + (fixed ? "fixed rig" : "handheld tag");
+  cameraButton.classList.toggle("on", fixed);
+  if (reachOverlay && reachOverlay.visible) reachOverlay.refresh();
+  if (!announce) return;
+  log(fixed
+    ? "fixed camera: markers use the rig fitted from /live"
+    : "handheld: the base tag sets the camera for each marker", "warn");
+}
+
 async function healthLoop() {
   try {
     const response = await api("/health");
     const data = await response.json();
     state.health = data;
+    // Follow the host's default once; after that the chip is in charge.
+    if (!state.modeInitialized && data.mode) {
+      state.modeInitialized = true;
+      setCameraMode(data.mode, false);
+    }
+    // A rig fitted from /live while this page was open: make its T_base_cam
+    // visible to the reach overlay and to BrowserLocate without a reload.
+    const fingerprint = (data.rig && data.rig.fingerprint) || "";
+    if (state.rigFingerprint === null) {
+      state.rigFingerprint = fingerprint;
+    } else if (fingerprint !== state.rigFingerprint) {
+      state.rigFingerprint = fingerprint;
+      if (window.RebotConfig) RebotConfig.invalidate();
+      if (reachOverlay && reachOverlay.visible) reachOverlay.refresh();
+    }
     if (heightControl) {
       // point.z is the tip. The lowest accepted tip is min_z, so the lowest tap
       // height is that minus the worktop only; the flange offset does not enter.
@@ -672,6 +704,9 @@ const reachOverlay = window.ReachOverlay.create({
   video: video,
   canvas: reachCanvas,
   token: () => state.token,
+  // The Camera chip is the truth for this page: fixed uses the rig, handheld
+  // solves the tag. A fitted rig does not force the band into fixed mode.
+  mode: () => (window.TapPlanner ? TapPlanner.getMode() : "handheld"),
   onStatus: (message, kind) => log(escapeHtml(message), kind),
 });
 
@@ -801,13 +836,8 @@ cameraButton.addEventListener("click", () => {
     return;
   }
   const next = TapPlanner.getMode() === "fixed" ? "handheld" : "fixed";
-  TapPlanner.setMode(next);
-  cameraButton.textContent = "Camera: " + (next === "fixed" ? "fixed rig" : "handheld tag");
-  cameraButton.classList.toggle("on", next === "fixed");
+  setCameraMode(next, true);
   markersOverlay.clear();
-  log(next === "fixed"
-    ? "fixed camera: markers use the rig fitted from /live"
-    : "handheld: the base tag sets the camera for each marker", "warn");
 });
 calibButton.addEventListener("click", () => {
   if (state.busy) {

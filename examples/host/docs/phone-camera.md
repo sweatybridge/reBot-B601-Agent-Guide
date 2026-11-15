@@ -84,7 +84,7 @@ container (certificates, calibration, tags).
 
 ```bash
 cd examples/host
-cp .env.example .env            # REBOT_HOST_IP, REBOT_EDGE_URL, camera mode
+cp .env.example .env            # REBOT_HOST_IP, REBOT_EDGE_URL, camera, tag
 docker compose up -d --build
 docker compose --profile tools run --rm tools app/make_cert.py --host rebot-host
 docker compose restart capture
@@ -217,6 +217,23 @@ A bracket turns the extrinsics from a per-frame measurement into a constant, and
 a constant can be measured without printing anything: the arm is an object of
 known geometry standing in the middle of the scene.
 
+**If the tag is visible, one capture is the whole fit.** The same tag from the
+handheld mode works here, and it is the faster path: *Capture one pose* takes a
+still from `REBOT_CAMERA`, scans it for the tag, and — when the tag is found and
+its geometry is good — writes and loads the rig immediately. The arm never moves,
+and there is no tap. `POST /capture/pose` does the same, and
+`calibrate_extrinsics.py --capture-pose` writes the rig from the command line.
+The response (and the Rig card) reports the tag's size in pixels, its grazing
+angle and the corner reprojection rms, so a weak detection is visible rather than
+silent.
+
+The tag path is a single PnP, so it is coarser than a fitted sweep: at a metre a
+4 cm tag is ~40 px across and a corner error of half a pixel is about 1% of the
+depth. It refuses a tag under 16 px across, one seen more than 75 deg off, or one
+whose corners reproject worse than 2 px. When the tag is not in the still it
+writes nothing and falls back to the tap; the sweep below remains the accurate
+option and the only one when the camera cannot see the tag.
+
 **One tap, then the arm sweeps.** Take one still, tap the tool tip in it, and the
 sweep does the rest:
 
@@ -300,8 +317,9 @@ a `./state/recordings` volume for MediaMTX, and the camera must be that stream -
 has no path to record. `REBOT_MEDIAMTX_API` and `REBOT_RECORDINGS` point at the
 API and the shared directory.
 
-Then set `REBOT_EXTRINSICS=state/calib/extrinsics-fixed.json`, restart `capture`,
-and `/health` will report `"mode": "fixed"` with the rig's fingerprint. Taps no
+The rig is written to `state/calib/extrinsics-fixed.json`. The running server
+hot-loads it, and a restart picks it up automatically — there is no env var to
+set — so `/health` reports `"mode": "fixed"` with the rig's fingerprint. Taps no
 longer look for a marker.
 
 **Why one tap is enough.** A tap is two constraints, not a pose: it fixes the ray
@@ -342,13 +360,15 @@ biases every plan with nothing in the log to show for it.
 
 ### The same thing over the API
 
-`POST /calibrate/extrinsics` is that pass in one call. The tap comes from
+`POST /calibrate/extrinsics` is the sweep in one call. The tap comes from
 `POST /capture/pose` and a pixel:
 
 ```bash
-# one still, with the pose the arm actually had
+# one still, with the pose the arm actually had. With the base tag in view and
+# REBOT_MARKER_AT set, this response already carries "written" and the rig.
 curl -sk -X POST https://127.0.0.1:8443/capture/pose -H "X-Rebot-Token: $REBOT_TOKEN"
-# {"ok": true, "id": "20261113T101500Z-a1b2c3", "image_url": "/captures/.../frame.jpg"}
+# {"ok": true, "id": "20261113T101500Z-a1b2c3", "image_url": "/captures/.../frame.jpg",
+#  "marker": {"detected": true, ...}, "written": "state/calib/extrinsics-fixed.json"}
 
 curl -sk -X POST https://127.0.0.1:8443/calibrate/extrinsics \
   -H "X-Rebot-Token: $REBOT_TOKEN" -H 'Content-Type: application/json' \
@@ -359,13 +379,14 @@ curl -sk -X POST https://127.0.0.1:8443/calibrate/extrinsics \
 URL, or `device:0` for a USB camera).
 
 The panel is the same flow with the picture in it: **Capture one pose** takes a
-still from `REBOT_CAMERA` and records the pose, the image appears in the card, a
-tap on the tool tip marks the pixel, and **Run the sweep from this tap** starts
-the arm. Nothing is typed and there is no second path.
+still from `REBOT_CAMERA`. If the base tag is in that still, the rig is written
+from it, the arm never moves, and no arm pose is read. Otherwise the still's pose
+is recorded, the image appears in the card, a tap on the tool tip marks the pixel,
+and **Run the sweep from this tap** starts the arm.
 
 | route | what it does |
 |---|---|
-| `POST /capture/pose` | one still plus `GET /pose`, written as a capture |
+| `POST /capture/pose` | one still; with the base tag visible, solves and writes the rig **without reading the arm**; otherwise also reads `GET /pose` for the tap path |
 | `POST /calibrate/extrinsics` | `{confirm, capture, u, v}` sweeps, fits, verifies, writes |
 | `GET /calibrate` | running state, progress, the last verdict, the current rig |
 | `GET /reach.json` | `K`, `dist`, plane/hover, the tag placement, and `T_base_cam` for the reach overlay |
@@ -509,15 +530,21 @@ execution enabled, Move arm is the one deliberate action that moves the arm (the
 two-step confirm that belongs to the single-tap panel is not part of this flow).
 The edge still re-checks limits and steps.
 
-- **One of two things supplies the extrinsics.** With `REBOT_EXTRINSICS` set, a
-  fitted rig does, and nothing else has to be in frame. Without it, the tag must
-  be visible in the same frame as the marker, on every marker tap.
+- **One of two things supplies the extrinsics.** When a rig has been fitted (the
+  standard file exists), it does, and nothing else has to be in frame. Until
+  then, the tag must be visible in the same frame as the marker, on every marker
+  tap.
+- **The mode is chosen per request.** `POST /plan` accepts
+  `"mode": "fixed" | "handheld"`, and the phone's **Camera** chip sends it on
+  every plan and marker. There is no host-wide mode switch: a fitted rig makes
+  fixed the default, and the chip sends the other mode when the user picks it,
+  so switching either way needs no server restart and no second deployment.
 - **Every plan is also a file.** `out/<id>.json` is a normal trajectory, so
   `rebot-edge --check` works on it without the browser.
 - **The workstation's `/live` page does everything except the camera** -- the
   same reach band, height badge and numbered markers, behind a
   `Tap: plan | markers` chip. It is **fixed-rig only**: every tap there goes
-  through `REBOT_EXTRINSICS`, and a host without one refuses with "fixed mode
+  through the fitted rig, and a host without one refuses with "fixed mode
   needs a rig". See
   [The same thing from the workstation](#the-same-thing-from-the-workstation).
 
@@ -924,11 +951,12 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | tap: "the camera moved since the extrinsics were fitted" | the witness caught a knock: refit, or put the mount back |
 | tap: "cannot verify the camera mount: only N of 64 witness patches" | the view changed too much to compare -- lens covered, lights off, or the camera moved far |
 | tap: "this rig was fitted at 4032x3024 but the camera is calibrated at ..." | the capture size changed (a different page mode or phone); refit at that size |
-| "no extrinsics at ..." on start-up | `REBOT_EXTRINSICS` points at a file that is not there; run `--auto` or unset it |
+| "no extrinsics at ..." on start-up | an explicit `--extrinsics` names a file that is not there; drop the flag to use the standard `state/calib/extrinsics-fixed.json`, or fit one with `--auto` |
 | the panel: "not reachable: cannot reach the arm gateway" | the capture server can not open a socket to `REBOT_PLANNER`; in compose it is `http://planner:8000` -- check `docker compose ps planner` |
 | the panel: "the gateway refused /pose" | the gateway answered, so the route or the method is wrong; `/pose` is a GET, `/plan`, `/execute`, `/move` are POSTs |
 | "pose N never stood still where it was sent" | the arm never reached the pose inside the hold: `/play` returned 200, so check `can_up`, the e-stop and the motor enables first |
 | "the board's CAN channel is down" | the interface exists but is not up; `ip link set can0 up type can bitrate 1000000` on the board |
+| "no reply to the 0x7019 read from motor N" | the edge asked motor N for its position and got nothing: CAN down, motor unpowered or e-stopped, wrong node id, or a wiring/termination fault. The **tag capture does not need it**; the tap and sweep paths do |
 | `--auto`: "the sweep leaves ... free to N mm" | the poses were too similar: add height and wrist variation (edit `sweep.py`) |
 | `--auto`: "the poses are degenerate (rank ...)" | every pose in one plane; move the arm in 3D |
 | `--auto`: "a capture has no pose" | the still was not taken with `/capture/pose` (or `--capture-pose`) |
@@ -938,8 +966,9 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | tap: the edge answers 503 on /pose | `can0` is down on the board; see the edge README |
 | `/live` tap: no "Move the arm" button | `REBOT_EXECUTE=0`; set it to 1 and `docker compose up -d` |
 | `/live` header: "host unreachable" | no token (open `/live?token=...` once) or the capture service is down; the dot is the `/health` poll |
-| `/live` header: "no fixed rig: fit one with Rig" | `/live` plans through a rig only: run the sweep (`Rig`, or `calibrate_extrinsics.py --auto`) and set `REBOT_EXTRINSICS` |
-| `/live` tap: "fixed mode needs a rig" | same thing from the server's side; nothing on that page can plan without `REBOT_EXTRINSICS` |
+| `/live` header: "no fixed rig: fit one with Rig" | `/live` plans through a rig only: **Capture one pose** with the base tag in view (no arm motion), or run the sweep (`Rig`, or `calibrate_extrinsics.py --auto`); the rig is written to `state/calib/extrinsics-fixed.json` and loaded on the next start |
+| Rig: "Capture one pose" writes no rig | the tag was not in the still, is under 16 px across, is more than 75 deg edge-on, or its corners reproject worse than 2 px; the card shows which. Retake with the tag in view, or tap the tool tip and sweep |
+| `/live` tap: "fixed mode needs a rig" | same thing from the server's side; nothing on that page can plan without a fitted rig |
 | `/live` tap: "the camera moved since the extrinsics were fitted" | the witness caught a knock since the rig was fitted; refit, or put the bracket back |
 | `/live` markers do not mention the witness | markers are solved in the page from the rig constant; only a plan tap or a capture runs the witness, so refit if the bracket may have been knocked |
 | phone: there is no Rig button | by design: fitting is a workstation job, press **Rig** on `/live`, then **Camera** on the phone |
