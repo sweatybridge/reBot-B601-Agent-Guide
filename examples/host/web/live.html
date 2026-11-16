@@ -268,6 +268,9 @@ async function healthLoop() {
     if (!response.ok) throw new Error("health " + response.status);
     const data = await response.json();
     state.health = data;
+    const agent = data.agent || {};
+    CHAT.contextTokens = Number(agent.context_tokens) || 0;
+    CHAT.maxTokens = Number(agent.max_tokens) || 0;
     // point.z is the tip. The lowest accepted tip is min_z, so the lowest tap
     // height is that minus the worktop only; the flange offset does not enter.
     const minZ = Number(data.min_z ?? data.hover_m ?? 0.10);
@@ -633,6 +636,10 @@ const CHAT = {
                       // refusal plus one fix-and-retry fits inside this
   maxFrames: 4,       // older frames are dropped so a turn stays small
   maxMessages: 48,    // older turns are dropped to stay under the host's cap
+  contextTokens: 0,   // /health agent.context_tokens; 0 means unknown
+  maxTokens: 0,       // /health agent.max_tokens, reserved from the context
+  promptTokens: 0,    // last reported usage.prompt_tokens
+  contextNote: "",    // appended to the system prompt after compaction
 };
 
 // Drop whole turns from the front. A tool result without its assistant message
@@ -652,6 +659,56 @@ function trimHistory(limit) {
     }
   }
   return dropped;
+}
+
+// Rough but conservative: text at ~3.5 chars/token, and a vision frame at the
+// server's minimum of ~1024 tokens. It only has to be good enough to trigger a
+// compaction before the real tokenizer refuses the request.
+function estimateTokens(messages) {
+  let chars = systemPrompt().length + JSON.stringify(AGENT_TOOLS).length;
+  let images = 0;
+  for (const message of messages) {
+    if (typeof message.content === "string") {
+      chars += message.content.length;
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (!part) continue;
+        if (part.type === "text") chars += String(part.text || "").length;
+        else if (part.type === "image_url") images += 1;
+      }
+    }
+    if (Array.isArray(message.tool_calls)) chars += JSON.stringify(message.tool_calls).length;
+  }
+  return Math.ceil(chars / 3.5) + images * 1200;
+}
+
+function compactHistory(targetTokens) {
+  pruneFrames(1);
+  let dropped = 0;
+  // Drop whole old turns, not one message at a time: an assistant left without
+  // its user is as invalid as a tool result left without its assistant call.
+  // The last user message and everything after it are the current request.
+  while (estimateTokens(CHAT.history) > targetTokens) {
+    const nextUser = CHAT.history.findIndex((message, index) =>
+      index > 0 && message.role === "user");
+    if (nextUser <= 0) break;
+    CHAT.history.splice(0, nextUser);
+    dropped += nextUser;
+  }
+  if (dropped) {
+    CHAT.contextNote = "Earlier turns were trimmed to fit the model context; "
+      + "continue from the latest messages and the current frame.";
+    pushChat("meta", "context compacted: dropped " + dropped + " older message(s)");
+  }
+}
+
+function prepareContext() {
+  if (!CHAT.contextTokens) return;
+  const reserve = CHAT.maxTokens > 0 ? CHAT.maxTokens : 1024;
+  const promptBudget = Math.max(1024, CHAT.contextTokens - reserve - 256);
+  if (estimateTokens(CHAT.history) > promptBudget * 0.85) {
+    compactHistory(promptBudget * 0.6);
+  }
 }
 
 // The one button is two controls: an up arrow that sends, a square that stops
@@ -687,7 +744,6 @@ function pushReasoning(text, turn) {
   const line = document.createElement("div");
   line.className = "msg reasoning";
   const details = document.createElement("details");
-  details.open = true;
   const summary = document.createElement("summary");
   const body = document.createElement("div");
   body.className = "text";
@@ -755,7 +811,7 @@ function systemPrompt() {
   const height = video.videoHeight;
   const size = width && height ? width + "x" + height + " pixels"
     : "the size rig() reports";
-  return [
+  const lines = [
     "You operate a B601 arm through a workstation page; the engineer watches the same view.",
     "You are shown a still from the fixed camera looking down at the workbench (" + size + ").",
     "Image coordinates are pixels: u grows right, v grows down, origin at the top-left.",
@@ -776,7 +832,9 @@ function systemPrompt() {
     "Never say the arm moved unless a tool result says executed: true.",
     "Heights are metres above the worktop, clamped to the floor; the badge height is the default.",
     "Keep replies to a few sentences: the engineer is watching the arm, not reading an essay.",
-  ].join("\n");
+  ];
+  if (CHAT.contextNote) lines.push("", CHAT.contextNote);
+  return lines.join("\n");
 }
 
 function grabFrame() {
@@ -792,7 +850,8 @@ function grabFrame() {
 
 // Keep the newest frames and replace older ones with a note, so a long
 // conversation does not turn into megabytes of base64 on every turn.
-function pruneFrames() {
+function pruneFrames(limit) {
+  const max = limit === undefined ? CHAT.maxFrames : limit;
   const frames = [];
   CHAT.history.forEach((message, index) => {
     if (!Array.isArray(message.content)) return;
@@ -800,7 +859,7 @@ function pruneFrames() {
       if (part && part.type === "image_url") frames.push({ index: index, at: at });
     });
   });
-  while (frames.length > CHAT.maxFrames) {
+  while (frames.length > max) {
     const old = frames.shift();
     CHAT.history[old.index].content[old.at] = { type: "text", text: "(older frame dropped)" };
   }
@@ -1021,6 +1080,7 @@ function summariseResult(result) {
 }
 
 async function postAgent(signal, onEvent) {
+  prepareContext();
   const dropped = trimHistory(CHAT.maxMessages);
   if (dropped) pushChat("meta", "dropped " + dropped + " older messages to fit the context");
   const response = await api("/agent", {
@@ -1044,7 +1104,12 @@ async function postAgent(signal, onEvent) {
   if (!contentType.includes("text/event-stream") || !response.body) {
     const data = await response.json().catch(() => ({}));
     if (!data.ok) throw new Error(data.error || "the agent answered without JSON");
-    return data.message || {};
+    return {
+      message: data.message || {},
+      finish_reason: data.finish_reason || "",
+      complete: data.complete !== false,
+      usage: data.usage || {},
+    };
   }
   if (!window.RebotStream) throw new Error("the stream parser is not loaded");
 
@@ -1062,7 +1127,7 @@ async function postAgent(signal, onEvent) {
         } else if (event.event === "content" && event.data && event.data.text) {
           onEvent("content", event.data.text);
         } else if (event.event === "done" && event.data && event.data.message) {
-          final = event.data.message;
+          final = event.data;
         } else if (event.event === "error") {
           throw new Error((event.data && event.data.error) || "the model stream failed");
         }
@@ -1074,7 +1139,12 @@ async function postAgent(signal, onEvent) {
     }
   }
   if (!final) throw new Error("the model stream ended without a final message");
-  return final;
+  return {
+    message: final.message,
+    finish_reason: final.finish_reason || "",
+    complete: final.complete !== false,
+    usage: final.usage || {},
+  };
 }
 
 function isAbort(error) {
@@ -1103,7 +1173,7 @@ async function runAgent() {
       // Until the first token arrives there is nothing else in the log: make
       // the wait visible, and remove it the moment reasoning or content starts.
       thinkingLine = pushChat("thinking", "Agent is thinking…");
-      const message = await postAgent(signal, (kind, text) => {
+      const turn = await postAgent(signal, (kind, text) => {
         if (thinkingLine) {
           thinkingLine.remove();
           thinkingLine = null;
@@ -1118,6 +1188,10 @@ async function runAgent() {
           setChatText(draft.contentLine, draft.content);
         }
       });
+      const message = turn.message || {};
+      if (turn.usage && Number.isFinite(Number(turn.usage.prompt_tokens))) {
+        CHAT.promptTokens = Number(turn.usage.prompt_tokens);
+      }
       if (thinkingLine) {
         // A non-streamed fallback, or a turn that only returned tool calls.
         thinkingLine.remove();
@@ -1134,6 +1208,14 @@ async function runAgent() {
       if (finalContent && finalContent !== draft.content) {
         if (!draft.contentLine) draft.contentLine = pushChat("agent", "");
         setChatText(draft.contentLine, finalContent);
+      }
+      if (turn.finish_reason === "length") {
+        pushChat("error", "the model hit its output limit; the reply above may be cut "
+          + "off. Raise REBOT_LLM_MAX_TOKENS, raise the endpoint's context window, or "
+          + "ask for a shorter answer.");
+      } else if (turn.complete === false) {
+        pushChat("error", "the model stream ended before it reported a finish; the "
+          + "reply above may be incomplete.");
       }
       const rawCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
       // A truncated tool call must never reach CHAT.history: the model server

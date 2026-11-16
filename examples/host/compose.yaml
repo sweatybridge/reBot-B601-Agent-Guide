@@ -90,6 +90,9 @@ services:
       REBOT_LLM_TOKEN: ${REBOT_LLM_TOKEN:-}
       REBOT_LLM_TEMPERATURE: ${REBOT_LLM_TEMPERATURE:-0.2}
       REBOT_LLM_MAX_TOKENS: ${REBOT_LLM_MAX_TOKENS:-1024}
+      # 0 means "read meta.n_ctx from /v1/models"; set it only for a server that
+      # does not expose its context.
+      REBOT_LLM_CONTEXT_TOKENS: ${REBOT_LLM_CONTEXT_TOKENS:-0}
       REBOT_LLM_TIMEOUT: ${REBOT_LLM_TIMEOUT:-300}
     extra_hosts:
       # host.docker.internal exists by default on Docker Desktop; on Linux this

@@ -267,8 +267,86 @@ async def _page(request: web.Request, name: str) -> web.StreamResponse:
                         headers={"Cache-Control": "no-store"})
 
 
+def models_url(llm_url):
+    """The OpenAI-compatible model list for a chat-completions URL."""
+    url = str(llm_url or "").rstrip("/")
+    if url.endswith("/v1/chat/completions"):
+        return url[:-len("/chat/completions")] + "/models"
+    if "/v1/" in url:
+        return url.split("/v1/", 1)[0] + "/v1/models"
+    return url + "/v1/models"
+
+
+async def ensure_llm_context(app):
+    """Read the loaded model's configured context from /v1/models, once.
+
+    llama.cpp exposes both `context_length` (the model's native maximum) and
+    `meta.n_ctx` (the context this server allocated). The latter is the useful
+    number: 262144 native does not mean 262144 is available. Other servers may
+    expose neither, in which case `REBOT_LLM_CONTEXT_TOKENS` is the fallback.
+    """
+    if not app.get("llm_url"):
+        return app["llm_context"]
+    info = app["llm_context"]
+    if info.get("tokens"):
+        return info
+    now = time.time()
+    if info.get("checked_at") and now - info["checked_at"] < 60:
+        return info
+    lock = app.get("llm_context_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        app["llm_context_lock"] = lock
+    async with lock:
+        info = app["llm_context"]
+        if info.get("tokens"):
+            return info
+        now = time.time()
+        if info.get("checked_at") and now - info["checked_at"] < 60:
+            return info
+        headers = {}
+        if app.get("llm_token"):
+            headers["Authorization"] = "Bearer " + app["llm_token"]
+        info = {"tokens": 0, "source": "", "error": "", "checked_at": now}
+        try:
+            async with app["client"].get(models_url(app["llm_url"]), headers=headers,
+                                         timeout=ClientTimeout(total=2)) as answer:
+                if answer.status != 200:
+                    info["error"] = "the model list answered %d" % answer.status
+                else:
+                    data = await answer.json()
+                    entries = data.get("data") if isinstance(data, dict) else None
+                    entry = next((item for item in (entries or [])
+                                  if item.get("id") == app["llm_model"]), None)
+                    if not isinstance(entry, dict):
+                        info["error"] = "the model list has no entry for %s" % app["llm_model"]
+                    else:
+                        meta = entry.get("meta") or {}
+                        configured = int(meta.get("n_ctx") or 0)
+                        native = int(entry.get("max_model_len")
+                                     or entry.get("context_length") or 0)
+                        if configured:
+                            info.update(tokens=configured, source="meta.n_ctx")
+                        elif native:
+                            info.update(tokens=native,
+                                        source=("max_model_len"
+                                                if entry.get("max_model_len")
+                                                else "context_length"))
+                        else:
+                            info["error"] = "the model entry has no context length"
+        except Exception as exc:  # noqa: BLE001 - a probe must not break health
+            info["error"] = str(exc)
+        app["llm_context"] = info
+        if info["tokens"]:
+            logging.info("agent context: %d tokens (%s)", info["tokens"], info["source"])
+        else:
+            logging.warning("agent context probe failed: %s", info["error"])
+        return info
+
+
 async def handle_health(request: web.Request) -> web.Response:
     app = request.app
+    await ensure_llm_context(app)
     captures = capture_dirs(app["captures"])
     return web.json_response({
         "ok": True,
@@ -313,6 +391,10 @@ async def handle_health(request: web.Request) -> web.Response:
             "configured": bool(app["llm_url"]),
             "model": app["llm_model"] if app["llm_url"] else "",
             "auth": bool(app["llm_token"]),
+            "max_tokens": app["llm_max_tokens"],
+            "context_tokens": app["llm_context"]["tokens"],
+            "context_source": app["llm_context"]["source"],
+            "context_error": app["llm_context"]["error"],
         },
     })
 
@@ -1115,16 +1197,18 @@ async def _relay_sse(request, upstream):
             "tool_calls": [tool_calls[index] for index in sorted(tool_calls)],
         }
         tool_error = _agent_tool_error(message, finish_reason)
+        complete = bool(finished or finish_reason)
         if tool_error:
             await send("error", {"error": tool_error})
         elif not message["content"] and not message["tool_calls"]:
             await send("error", {"error": "the model returned neither text nor tool calls"})
         else:
-            logging.info("agent stream: %d chars, %d tool call(s), %d reasoning chars",
+            logging.info("agent stream: %d chars, %d tool call(s), %d reasoning chars, "
+                         "finish=%s complete=%s usage=%s",
                          len(message["content"]), len(message["tool_calls"]),
-                         len(message["reasoning"]))
+                         len(message["reasoning"]), finish_reason or "-", complete, usage)
             await send("done", {"message": message, "finish_reason": finish_reason,
-                                "usage": usage})
+                                "complete": complete, "usage": usage})
     except asyncio.CancelledError:
         raise
     except (ConnectionResetError, ConnectionAbortedError):
@@ -1239,13 +1323,17 @@ async def handle_agent(request: web.Request) -> web.StreamResponse:
             "ok": False,
             "error": "the model returned neither text nor tool calls",
         }, status=502)
-    logging.info("agent: %d chars, %d tool call(s), %d reasoning chars",
+    complete = finish_reason != "length"
+    logging.info("agent: %d chars, %d tool call(s), %d reasoning chars, finish=%s "
+                 "complete=%s usage=%s",
                  len(message["content"]), len(message["tool_calls"]),
-                 len(message["reasoning"]))
+                 len(message["reasoning"]), finish_reason or "-", complete, usage)
     return web.json_response({
         "ok": True,
         "model": data.get("model") or app["llm_model"],
         "message": message,
+        "finish_reason": finish_reason,
+        "complete": complete,
         "usage": usage,
     })
 
@@ -1741,9 +1829,16 @@ async def handle_file(request: web.Request) -> web.StreamResponse:
 
 async def on_startup(app: web.Application):
     app["client"] = ClientSession()
+    if app.get("llm_url") and not app["llm_context"]["tokens"]:
+        # Do not hold up the listener; health (and the page) uses the result as
+        # soon as the probe returns.
+        app["llm_context_task"] = asyncio.create_task(ensure_llm_context(app))
 
 
 async def on_cleanup(app: web.Application):
+    task = app.get("llm_context_task")
+    if task is not None:
+        task.cancel()
     await app["client"].close()
 
 
@@ -1844,6 +1939,14 @@ def build_app(args) -> web.Application:
     max_tokens = getattr(args, "llm_max_tokens", None)
     app["llm_max_tokens"] = int(max_tokens if max_tokens is not None
                                 else os.environ.get("REBOT_LLM_MAX_TOKENS", "1024"))
+    context_tokens = int(getattr(args, "llm_context_tokens", 0)
+                         or os.environ.get("REBOT_LLM_CONTEXT_TOKENS", "0") or 0)
+    app["llm_context"] = {
+        "tokens": context_tokens,
+        "source": "env" if context_tokens else "",
+        "error": "",
+        "checked_at": time.time() if context_tokens else 0,
+    }
     timeout = getattr(args, "llm_timeout", None)
     app["llm_timeout"] = float(timeout if timeout is not None
                                else os.environ.get("REBOT_LLM_TIMEOUT", "300"))
@@ -1959,6 +2062,9 @@ def main(argv=None):
                         default=float(os.environ.get("REBOT_LLM_TEMPERATURE", "0.2")))
     parser.add_argument("--llm-max-tokens", type=int,
                         default=int(os.environ.get("REBOT_LLM_MAX_TOKENS", "1024")))
+    parser.add_argument("--llm-context-tokens", type=int,
+                        default=int(os.environ.get("REBOT_LLM_CONTEXT_TOKENS", "0") or 0),
+                        help="context window override; 0 reads meta.n_ctx from /v1/models")
     parser.add_argument("--llm-timeout", type=float,
                         default=float(os.environ.get("REBOT_LLM_TIMEOUT", "300")),
                         help="seconds to wait for one model turn")

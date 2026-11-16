@@ -632,6 +632,17 @@ async def test_server(workdir: Path, geometry):
 
         fake_llm = aiohttp_web.Application()
         fake_llm.router.add_post("/v1/chat/completions", fake_chat)
+
+        async def fake_models(request):
+            return aiohttp_web.json_response({
+                "data": [{
+                    "id": "Qwen3.8-27B",
+                    "context_length": 262144,
+                    "meta": {"n_ctx": 8192},
+                }],
+            })
+
+        fake_llm.router.add_get("/v1/models", fake_models)
         runner = aiohttp_web.AppRunner(fake_llm)
         await runner.setup()
         site = aiohttp_web.TCPSite(runner, "127.0.0.1", 0)
@@ -650,6 +661,10 @@ async def test_server(workdir: Path, geometry):
             check("health names the agent model and says it is on",
                   (agent_health.get("agent") or {}).get("configured") is True
                   and (agent_health.get("agent") or {}).get("model") == "Qwen3.8-27B",
+                  str(agent_health.get("agent")))
+            check("health discovers the model's configured context",
+                  (agent_health.get("agent") or {}).get("context_tokens") == 8192
+                  and (agent_health.get("agent") or {}).get("context_source") == "meta.n_ctx",
                   str(agent_health.get("agent")))
 
             tools = [{"type": "function", "function": {"name": "rig",
@@ -701,7 +716,8 @@ async def test_server(workdir: Path, geometry):
                   and (done.get("message") or {}).get("content") == "looking "
                   and ((done.get("message") or {}).get("tool_calls") or [{}])[0]
                       .get("function", {}).get("name") == "rig"
-                  and done.get("finish_reason") == "tool_calls",
+                  and done.get("finish_reason") == "tool_calls"
+                  and done.get("complete") is True,
                   str(done)[:120])
             truncated = await client.post(
                 "/agent",

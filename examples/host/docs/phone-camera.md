@@ -864,7 +864,8 @@ in the sidebar header.
 | `REBOT_LLM_MODEL` | `Qwen3.8-27B` | the model name that endpoint expects; it must accept images |
 | `REBOT_LLM_TOKEN` | *(empty)* | bearer token, if the endpoint wants one |
 | `REBOT_LLM_TEMPERATURE` | `0.2` | `0` also works, and is meaningful |
-| `REBOT_LLM_MAX_TOKENS` | `1024` | per turn |
+| `REBOT_LLM_MAX_TOKENS` | `1024` | per turn; this is an output cap, not the context window |
+| `REBOT_LLM_CONTEXT_TOKENS` | `0` | `0` reads `meta.n_ctx` from `/v1/models`; set it for a server that does not expose its context |
 | `REBOT_LLM_TIMEOUT` | `300` | seconds; a vision turn on a local model is slow |
 
 Inside compose, `localhost` is the container, so the shipped default is
@@ -910,16 +911,35 @@ event: error       data: {"error": "…"}    after the headers, so the page can 
 ```
 
 Tool calls are **assembled** from their deltas on the server and only appear in
-`done`, complete; the page executes them after the turn, as before. The
-`Reasoning` block grows live and the answer bubble streams underneath it. Until
+`done`, complete; the page executes them after the turn, as before. Each turn
+gets a collapsed `Reasoning` block whose summary tracks the character count;
+open it to read the chain of thought while the answer streams underneath. Until
 the first token arrives, a pulsing **Agent is thinking…** bubble holds the log;
 the first reasoning or content delta replaces it, so a slow model is visible
-without pretending it has answered.
+without pretending it has answered. `done` also carries `finish_reason` and
+`complete`; a `length` finish or a stream that closed without one is called out
+in the log instead of looking like a normal ending.
 
 The page falls back to the old JSON response if `/agent` answers with JSON (an
 older server, or a proxy that ignored the stream). `X-Accel-Buffering: no` is on
 the response so a reverse proxy does not hold the chunks until the end. Aborting
 the request cancels the upstream connection too.
+
+### Context compaction
+
+`/health` carries `agent.context_tokens`. The server reads it from the
+endpoint's `/v1/models`: llama.cpp exposes the allocated `meta.n_ctx` (and a
+much larger native `context_length`); vLLM may expose `max_model_len`;
+otherwise `REBOT_LLM_CONTEXT_TOKENS` is the fallback. The native maximum is not
+used when a configured value exists.
+
+Before each model turn the page estimates the prompt and reserves
+`max_tokens` for the answer. Above ~85% of `context_tokens - max_tokens`, it
+compacts: old frames are dropped to the newest one, then the oldest complete
+turns are removed (assistant tool calls stay with their tool results), keeping
+the latest user message and the current tool tail. A system note tells the model
+the earlier turns were trimmed. The log shows `context compacted: dropped N older
+message(s)`.
 
 ### Where it is weak
 
@@ -1144,6 +1164,7 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | `/live` sidebar: "cannot reach the model" | the endpoint is down or on the wrong address: inside compose it is `host.docker.internal`, not `localhost` |
 | `/live` sidebar: "the model refused (404)" | the base URL is a host, not the full path: it must end in `/v1/chat/completions` |
 | `add_marker() → error: arguments are not JSON` or the model refuses 500 with "Failed to parse tool call arguments" | a streamed tool call was cut off or malformed. The page now refuses that turn before it enters `CHAT.history`, so it cannot become a 500 loop; raise `REBOT_LLM_MAX_TOKENS`, reduce reasoning, or ask for one short tool call and retry. |
+| sidebar reply stops mid-sentence | the page now prints the reason from `finish_reason`: `length` means the output cap ran out (reasoning counts against it); no finish means the model or a proxy closed the stream early. Raise `REBOT_LLM_MAX_TOKENS`, raise the endpoint's context window (`num_ctx`/`--max-model-len`), or send fewer frames and less history. |
 | `/live` sidebar: the model chats but never calls a tool | it is not a tool-calling build, or the name is wrong; `Qwen3.8-27B` is the supported one |
 | the agent marks the bottle instead of the toy | a pixel guess: ask it to plan only and look at the pins before moving, or point it at the object in words |
 
