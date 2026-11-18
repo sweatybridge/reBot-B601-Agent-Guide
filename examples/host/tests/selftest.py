@@ -1261,6 +1261,534 @@ async def test_trace_server(workdir: Path, geometry):
 
 
 # --------------------------------------------------------------------------- #
+# 4d. Phase 2: the oracle's pure rules, the labeler, the gateway's new routes
+# --------------------------------------------------------------------------- #
+
+def test_oracle_rules():
+    print("\noracle: hold windows, downsampling, residual attribution")
+    import oracle
+
+    # Hold windows: constant cmd for >= 0.8 s; a 0.5 s stop is tracking-only.
+    waypoints = []
+    t = 0.0
+    for q in (0.0, 0.05, 0.1):                    # a move, not a hold
+        waypoints.append({"t": t, "q": [q, 0.0]})
+        t += 0.1
+    for _ in range(11):                             # 1.0 s hold at 0.2
+        waypoints.append({"t": t, "q": [0.2, 0.0]})
+        t += 0.1
+    waypoints.append({"t": t, "q": [0.3, 0.0]})
+    t += 0.1
+    for _ in range(6):                              # 0.5 s stop: too short
+        waypoints.append({"t": t, "q": [0.3, 0.0]})
+        t += 0.1
+    windows = oracle.hold_windows(waypoints)
+    check("hold_windows finds the >=0.8 s constant-cmd window",
+          len(windows) == 1 and windows[0]["q_cmd"] == [0.2, 0.0]
+          and abs(windows[0]["t_end"] - windows[0]["t_start"] - 1.0) < 1e-9)
+    check("hold_windows skips a short stop",
+          all(w["q_cmd"] != [0.3, 0.0] for w in windows))
+
+    # Downsampling: every hold sample survives the wire budget.
+    samples = []
+    for index in range(5000):
+        cmd = 0.5 if 1000 <= index < 1100 else (-0.25 if 3000 <= index < 3050
+                                               else index * 0.001)
+        samples.append({"t": index * 0.02, "cmd": [cmd], "meas": [cmd - 0.01]})
+    thinned = oracle.downsample(samples, 2000)
+    times = [sample["t"] for sample in thinned]
+    check("downsample stays within the wire budget", len(thinned) <= 2000)
+    check("downsample keeps every hold-window sample",
+          all(index * 0.02 in times for index in list(range(1000, 1100))
+              + list(range(3000, 3050))))
+    check("downsample keeps order, first and last",
+          times == sorted(times) and times[0] == 0.0 and times[-1] == 4999 * 0.02)
+    check("downsample leaves a small log alone",
+          oracle.downsample(samples[:10], 2000) == samples[:10])
+    long_hold = [{"t": float(i), "cmd": [0.7], "meas": [0.7]} for i in range(3000)]
+    check("holds win over the budget when they exceed it",
+          len(oracle.downsample(long_hold, 2000)) == 3000)
+
+    # Attribution: one synthetic document per residual-signature row (§5.4).
+    def hold(**fields):
+        base = {"hold_error_rad": [0.0] * 7, "tip_error_mm": 1.0,
+                "pixel_error_mm": 1.0, "detected_tip_px": [100.0, 100.0]}
+        base.update(fields)
+        return base
+
+    rows = [
+        ("rig-mismatch: camera disagrees, arm held",
+         {"holds": [hold(pixel_error_mm=15.0, tip_error_mm=2.0)]},
+         "camera-arm", "rig-mismatch"),
+        ("turns-correction: shape-fallback turn with pixel error",
+         {"holds": [hold(pixel_error_mm=15.0, tip_error_mm=2.0)],
+          "stream_turn": {"source": "shape", "turns": None}},
+         "camera-arm", "turns-correction"),
+        ("stale-rig: witness drift over the limit",
+         {"holds": [hold()], "witness": {"drift_px": 3.5, "scale": 1.0}},
+         "camera-arm", "stale-rig"),
+        ("sag: hold error tracks tau_g/kp",
+         {"holds": [hold(hold_error_rad=[-0.01, -0.05, -0.04, -0.005, -0.002, 0.0, 0.0],
+                         sag_rad=[0.01, 0.05, 0.04, 0.005, 0.002, 0.0],
+                         pixel_error_mm=1.0, tip_error_mm=1.0)]},
+         "arm-motor", "sag"),
+        ("joint-zeros: constant per-joint bias across poses",
+         {"holds": [hold(hold_error_rad=[0.04] * 6 + [0.0], pixel_error_mm=1.0,
+                         tip_error_mm=1.0),
+                    hold(hold_error_rad=[0.04] * 6 + [0.0], pixel_error_mm=1.0,
+                         tip_error_mm=1.0)]},
+         "arm-motor", "joint-zeros"),
+        ("reach-model: tip error at the boundary with IK refusals",
+         {"holds": [hold(tip_error_mm=14.0, pixel_error_mm=1.0)],
+          "ik_refusals": 2, "max_radius_m": 0.72, "max_reach_m": 0.75},
+         "reach", "reach-model"),
+        ("one-plane: z-only placement error the object's height",
+         {"holds": [hold()], "placement": {"error_mm": [2.0, 1.0, 40.0],
+                                            "object_height_mm": 40.0}},
+         "limitation", "one-plane"),
+        ("execution fault: abort and gripper stall in telemetry",
+         {"holds": [hold()], "telemetry": {"abort": {"t": 3.0, "reason": "not following"},
+                                            "gripper_stall": {"t": 3.0, "commanded": 2.4,
+                                                              "measured": 4.0}}},
+         "execution", "follow-abort"),
+    ]
+    for name, doc, layer, kind in rows:
+        verdict = oracle.attribute(doc)
+        kinds = [problem["kind"] for problem in verdict["problems"]]
+        check("attribute: %s" % name,
+              verdict["layer"] == layer and kind in kinds,
+              "layer=%s kinds=%s" % (verdict["layer"], kinds))
+    check("attribute: a clean run has no problems",
+          oracle.attribute({"holds": [hold(), hold()]})["problems"] == [])
+    check("attribute: no evidence is low confidence, not a pass",
+          oracle.attribute({})["confidence"] == "low"
+          and oracle.attribute({})["layer"] == "none")
+    check("attribute: an aborted run is medium confidence",
+          oracle.attribute(rows[-1][1])["confidence"] == "medium")
+
+
+def test_trace_triage(workdir: Path):
+    print("\ntrace triage: canned logs -> class / layer / signature")
+    import trace_triage
+
+    sid = "20261118T102320Z-abc123"
+    frame = {"$blob": "a" * 64}
+
+    def window(extra, final="done.", feedback=None):
+        events = [{"type": "user_message", "t": "2026-11-18T10:00:00.000Z",
+                   "pseq": 1, "text": "do the thing", "frame": frame}]
+        events += extra
+        events.append({"type": "task_end", "t": "2026-11-18T10:01:00.000Z",
+                       "final_text": final, "turns": 3, "exhausted": False})
+        if feedback:
+            events.append({"type": "feedback", "t": "2026-11-18T10:02:00.000Z",
+                           "verdict": feedback})
+        return events
+
+    plan_id = "20261118T100030Z-111111"
+    move_call = {"type": "tool_call", "name": "move_arm", "args": {"execute": True}}
+    plan_call = {"type": "tool_call", "name": "move_arm", "args": {"execute": False}}
+    planned = {"type": "tool_result", "name": "move_arm",
+               "result": {"ok": True, "planned": True, "executed": False,
+                          "plan_id": plan_id}}
+    executed = {"type": "execute", "plan_id": plan_id, "executed": True}
+
+    # Protocol fail: moved before planning, and claims a move that never ran.
+    labels = trace_triage.label_session(
+        window([move_call], final="I have moved the arm to the marker."),
+        sid, version="test-version")
+    kinds = {p["kind"] for p in labels[0]["problems"]}
+    check("triage: protocol fail (move-before-plan + dishonest claim)",
+          labels[0]["verdict"] == "fail" and labels[0]["class"] == "protocol"
+          and {"never-planned", "claims-move-not-executed"} <= kinds)
+
+    # Geometry fail: the oracle's pixel residual joins by plan_id.
+    oracle_doc = {"plan_id": plan_id, "holds": [
+        {"hold_error_rad": [0.0] * 7, "tip_error_mm": 2.0, "pixel_error_mm": 18.0,
+         "detected_tip_px": [100.0, 100.0]}]}
+    labels = trace_triage.label_session(
+        window([plan_call, planned, executed]), sid,
+        oracle_docs={plan_id: oracle_doc}, version="test-version")
+    check("triage: geometry fail joins the oracle by plan_id",
+          labels[0]["verdict"] == "fail" and labels[0]["class"] == "geometry"
+          and labels[0]["layer"] == "camera-arm"
+          and labels[0]["plan_ids"] == [plan_id]
+          and any(p["kind"] == "rig-mismatch" for p in labels[0]["problems"]))
+
+    # Limitation: z-only placement error is reported, never a protocol ticket.
+    limitation_doc = {"plan_id": plan_id, "holds": [],
+                      "placement": {"error_mm": [1.0, 2.0, 35.0],
+                                    "object_height_mm": 35.0}}
+    labels = trace_triage.label_session(
+        window([plan_call, planned, executed]), sid,
+        oracle_docs={plan_id: limitation_doc}, version="test-version")
+    check("triage: limitation is labelled, not ticketed",
+          labels[0]["class"] == "limitation" and labels[0]["layer"] == "limitation")
+
+    # Perception-suspect: user fail, clean oracle, markers present.
+    clean_doc = {"plan_id": plan_id, "holds": [
+        {"hold_error_rad": [0.0] * 7, "tip_error_mm": 1.0, "pixel_error_mm": 1.0,
+         "detected_tip_px": [100.0, 100.0]}]}
+    marker = {"type": "tool_call", "name": "add_marker", "args": {"u": 10, "v": 20}}
+    labels = trace_triage.label_session(
+        window([marker, plan_call, planned, executed], feedback="fail"), sid,
+        oracle_docs={plan_id: clean_doc}, version="test-version")
+    check("triage: perception-suspect (user fail, oracle clean, markers)",
+          labels[0]["verdict"] == "fail" and labels[0]["class"] == "perception"
+          and any(p["kind"] == "perception-suspect" for p in labels[0]["problems"]))
+
+    # Signatures: stable for the same evidence, keyed by frame and code version.
+    events = window([move_call], final="I have moved the arm.")
+    first = trace_triage.label_session(events, sid, version="v1")[0]["signature"]
+    again = trace_triage.label_session(events, sid, version="v1")[0]["signature"]
+    other_frame = trace_triage.label_session(
+        [dict(e, frame={"$blob": "b" * 64}) if e["type"] == "user_message" else e
+         for e in events], sid, version="v1")[0]["signature"]
+    other_code = trace_triage.label_session(events, sid, version="v2")[0]["signature"]
+    check("triage: signature is stable and keyed by frame + code version",
+          first == again and first != other_frame and first != other_code
+          and len(first) == 64)
+
+    # Telemetry abort without an oracle doc: an execution fault, class infra.
+    labels = trace_triage.label_session(
+        window([plan_call, planned, executed]), sid,
+        telemetry_docs={plan_id: {"abort": {"t": 2.0, "reason": "motor 2 not following"}}},
+        version="test-version")
+    check("triage: telemetry abort is infra, not a correspondence bug",
+          labels[0]["class"] == "infra"
+          and any(p["kind"] == "follow-abort" for p in labels[0]["problems"]))
+
+    # The batch runner: events + oracle files in a temp state -> labels.jsonl.
+    traces = workdir / "triage-state" / "traces"
+    (traces / sid).mkdir(parents=True)
+    (traces / sid / "events.jsonl").write_text(
+        "".join(json.dumps(e) + "\n" for e in
+                window([plan_call, planned, executed])), encoding="utf-8")
+    oracle_dir = workdir / "triage-state" / "oracle"
+    oracle_dir.mkdir(parents=True)
+    (oracle_dir / ("%s.json" % plan_id)).write_text(json.dumps(oracle_doc),
+                                                    encoding="utf-8")
+    trace_triage.run(traces)
+    written = [json.loads(line) for line in
+               (traces / sid / "labels.jsonl").read_text(encoding="utf-8").splitlines()]
+    check("triage run writes labels.jsonl per session",
+          len(written) == 1 and written[0]["class"] == "geometry"
+          and written[0]["task_id"] == sid + "-task-1")
+
+
+def _import_planner():
+    """planner_server imports plan_to_target (Pinocchio); stub it when absent.
+
+    The routes under test here (/fk, /execute, /move, /telemetry) never plan,
+    so a stub that refuses to plan is enough to import the module offline.
+    """
+    try:
+        import plan_to_target  # noqa: F401
+    except ImportError:
+        import types
+        stub = types.ModuleType("plan_to_target")
+
+        class Options:
+            hover = True
+            hover_m = 0.0
+            tip_m = 0.0
+            quiet = True
+            ik_pos_tol = 0.001
+
+        def _offline(*_args, **_kwargs):
+            raise RuntimeError("planning needs Pinocchio; not under test here")
+
+        stub.Options = Options
+        stub.PlanError = type("PlanError", (Exception,), {})
+        stub.plan = _offline
+        stub.plan_sequence = _offline
+        sys.modules["plan_to_target"] = stub
+    import planner_server
+    return planner_server
+
+
+def test_planner_offline(workdir: Path):
+    print("\nplanner gateway: /fk, telemetry persistence (no Pinocchio, no edge)")
+    import urllib.error
+    import urllib.request
+
+    planner = _import_planner()
+    saved = (planner.OUT_DIR, planner.TELEMETRY_DIR, planner.EXECUTE, planner.TOKEN)
+    planner.OUT_DIR = workdir / "planner-out"
+    planner.TELEMETRY_DIR = workdir / "planner-telemetry"
+    planner.EXECUTE = True
+    planner.TOKEN = "planner-token"
+    planner.OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    telemetry = {"format": "rebot-trajectory-log", "version": 2,
+                 "samples": [{"t": 0.0, "cmd": [0.0] * 7, "meas": [0.0] * 7}],
+                 "tick": {"mean_ms": 33.3, "p95_ms": 35.0, "max_ms": 40.0}}
+    played = (200, {"ok": True, "executed": True, "output": "played",
+                    "telemetry": telemetry})
+
+    def fake_edge(method, path, body=None, timeout=30):
+        if path == "/pose":
+            return 200, {"ids": [1, 2, 3, 4, 5, 6, 7], "q": [0.0] * 7}
+        if path == "/health":
+            return 200, {"can_up": True}
+        if path.startswith("/play"):
+            return played
+        raise AssertionError("unexpected edge call %s" % path)
+
+    real_edge = planner.edge_request
+    planner.edge_request = fake_edge
+    server = None
+    try:
+        # /fk is rebot_ik's FK: the tip and seven joint origins, read-only.
+        q = [0.1, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0]
+        answer = planner.fk_one({"q": q})
+        tool, links = rebot_ik.forward(np.asarray(q[:6]), with_links=True)
+        check("fk returns the tool tip and seven joint points",
+              answer["ok"] is True and len(answer["joint_points"]) == 7
+              and np.allclose(answer["tip_m"], tool[:3, 3])
+              and np.allclose(answer["joint_points"][-1], tool[:3, 3])
+              and np.allclose(answer["joint_points"][0], links[0][:3, 3]))
+        for bad in ({"q": [0.0] * 6}, {"q": [float("nan")] * 7}, {"q": "nope"}):
+            try:
+                planner.fk_one(bad)
+                check("fk refuses a bad pose", False)
+            except planner.GatewayError:
+                check("fk refuses a bad pose", True)
+
+        # execute_one persists the edge's log and relays the same block.
+        plan_id = planner.new_id()
+        limits = [[float(lo), float(hi)] for lo, hi in rebot_ik.LIMITS] + [[-0.1, 5.0]]
+        trajectory = traj.joint_move(np.zeros(7), np.append(sweep.POSES[0], 0.0),
+                                     3.0, limits=limits)
+        (planner.OUT_DIR / ("%s.json" % plan_id)).write_text(
+            json.dumps(trajectory), encoding="utf-8")
+        answer = planner.execute_one({"id": plan_id})
+        stored = planner.TELEMETRY_DIR / ("%s.json" % plan_id)
+        check("execute_one relays telemetry next to executed/log",
+              answer["executed"] is True and answer["telemetry"] == telemetry
+              and "log" in answer)
+        check("execute_one persists the full telemetry document",
+              stored.is_file()
+              and json.loads(stored.read_text(encoding="utf-8")) == telemetry)
+        check("read_telemetry reads it back",
+              planner.read_telemetry(plan_id) == telemetry)
+
+        # move_one is taped too, keyed by a generated move id.
+        answer = planner.move_one({"q": [0.0] * 6})
+        move_id = answer.get("id")
+        check("move_one returns a move id and its telemetry",
+              bool(move_id) and planner.PLAN_ID.match(move_id)
+              and answer["telemetry"] == telemetry
+              and (planner.TELEMETRY_DIR / ("%s.json" % move_id)).is_file())
+
+        # The HTTP surface: token-gated GET /telemetry/{id}, POST /fk.
+        from http.server import ThreadingHTTPServer
+        server = ThreadingHTTPServer(("127.0.0.1", 0), planner.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+
+        def call(method, path, body=None, token="planner-token"):
+            data = json.dumps(body).encode() if body is not None else None
+            request = urllib.request.Request(base + path, data=data, method=method,
+                                             headers={"X-Rebot-Token": token} if token else {})
+            try:
+                with urllib.request.urlopen(request, timeout=10) as answer:
+                    return answer.status, json.loads(answer.read())
+            except urllib.error.HTTPError as error:
+                return error.code, json.loads(error.read())
+
+        status, body = call("GET", "/telemetry/" + plan_id)
+        check("GET /telemetry/{id} serves the persisted log",
+              status == 200 and body["telemetry"] == telemetry)
+        status, _body = call("GET", "/telemetry/" + plan_id, token="")
+        check("GET /telemetry needs the token", status == 401)
+        status, _body = call("GET", "/telemetry/20261118T100030Z-ffffff")
+        check("GET /telemetry 404s an unknown id", status == 404)
+        status, body = call("POST", "/fk", {"q": q})
+        check("POST /fk answers over HTTP",
+              status == 200 and np.allclose(body["tip_m"], tool[:3, 3]))
+        status, _body = call("POST", "/fk", {"q": [0.0] * 6}, token="")
+        check("POST /fk needs the token", status == 401)
+    finally:
+        planner.edge_request = real_edge
+        (planner.OUT_DIR, planner.TELEMETRY_DIR, planner.EXECUTE, planner.TOKEN) = saved
+        if server is not None:
+            server.shutdown()
+
+
+async def test_oracle_server(workdir: Path, geometry):
+    print("\noracle end to end (mock gateway, fake camera, no arm)")
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import capture_server
+    import mock_arm
+
+    captures = workdir / "oracle-captures"
+    calib_dir = workdir / "oracle-calib"
+    traces = workdir / "oracle-traces"
+    calib_dir.mkdir(parents=True, exist_ok=True)
+    image = geometry["image"]
+    (calib_dir / "synthetic.json").write_text(json.dumps({
+        "format": "rebot-camera-calib", "version": 1, "device": "synthetic",
+        "image_size": [image.shape[1], image.shape[0]],
+        "K": geometry["K"].tolist(), "dist": geometry["dist"].tolist(), "rms": 0.2,
+    }), encoding="utf-8")
+
+    edge, edge_url, edge_state = mock_arm.serve(0)
+    args = SimpleNamespace(
+        host="127.0.0.1", port=0, captures=str(captures), cert="", key="",
+        token="oracle-token", mediamtx="http://127.0.0.1:9", whip_path="phone",
+        no_whip=True, max_mb=16, quiet=True,
+        planner=edge_url, planner_token="", execute=True,
+        calib_dir=str(calib_dir), calib="",
+        marker_at="", marker_size=0.08,
+        hover="1", hover_m=0.10, tip_mm=35.0,
+        plane_z=0.0, tool_axis="z-", yaw=0.0,
+        extrinsics="", witness_max_px=2.0, camera="device:0",
+        traces_dir=str(traces), trace_retention_days=30, no_trace=False,
+    )
+    app = capture_server.build_app(args)
+    app["rig"] = extrinsics.Rig(T_base_cam=geometry["T_base_cam"],
+                                image_size=(image.shape[1], image.shape[0]),
+                                tip_offset=np.array([0.0, 0.0, -0.035]))
+
+    # The fake camera serves the synthetic still with the arm's green tool
+    # drawn at each hold's *measured* pose (the camera sees where the arm
+    # actually is, sag included); the arm itself never moves. The mock
+    # gateway's /pose answers q=0, so grab_one's stillness check passes.
+    import camera as camera_mod
+    real_open = camera_mod.open_source
+
+    # A plan with two 1.0 s holds, and telemetry whose measured joints sag by
+    # exactly the model's tau_g/kp: the oracle must attribute that to sag.
+    plan_id = capture_server.new_capture_id()
+    limits = [[float(lo), float(hi)] for lo, hi in rebot_ik.LIMITS] + [[-0.1, 5.0]]
+    poses = [np.append(sweep.POSES[3], 0.0), np.append(sweep.POSES[4], 0.0)]
+    trajectory = traj.joint_sequence([np.zeros(7)] + poses, [0.5, 0.5],
+                                     hold_s=1.0, limits=limits)
+    out_dir = captures.parent / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / ("%s.json" % plan_id)).write_text(json.dumps(trajectory),
+                                                 encoding="utf-8")
+    kp = sweep.kp_vector()
+    samples = [{"t": point["t"], "cmd": point["q"],
+                "meas": [float(v) for v in
+                         np.asarray(point["q"]) - np.append(sweep.gravity_sag(
+                             np.asarray(point["q"][:6]), kp), 0.0)]}
+               for point in trajectory["waypoints"]]
+    edge_state.telemetry[plan_id] = {
+        "format": "rebot-trajectory-log", "version": 2, "samples": samples,
+        "kp": {str(m): float(kp[m - 1]) for m in range(1, 7)},
+    }
+
+    T_cam_base = extrinsics.invert(geometry["T_base_cam"])
+    frame = image.copy()
+    for pose in poses:
+        q_meas = np.asarray(pose) - np.append(sweep.gravity_sag(
+            np.asarray(pose[:6]), kp), 0.0)
+        tool = rebot_ik.forward(q_meas[:6])
+        wrist = tool[:3, 3]
+        tip = wrist + tool[:3, :3] @ np.array([0.0, 0.0, -0.035])
+        a = extrinsics.pixel(wrist, geometry["K"], geometry["dist"], T_cam_base)
+        b = extrinsics.pixel(tip, geometry["K"], geometry["dist"], T_cam_base)
+        if a and b:
+            cv2.line(frame, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])),
+                     (0, 255, 0), 16)
+    camera_mod.open_source = lambda url, **kw: SimpleNamespace(
+        read=lambda: frame.copy(), close=lambda: None)
+
+    sid = "20261118T102320Z-abc123"
+    headers = {"X-Rebot-Token": "oracle-token", "X-Rebot-Session": sid}
+    try:
+        async with TestClient(TestServer(app)) as client:
+            executed = await client.post("/execute", json={"id": plan_id},
+                                         headers=headers)
+            body = await executed.json()
+            check("execute with the oracle still returns the gateway answer",
+                  executed.status == 200 and body.get("executed") is True)
+            pending = list(app["oracle_tasks"])
+            check("the oracle verification runs as a background task", bool(pending))
+            if pending:
+                await asyncio.gather(*pending)
+
+            doc_path = captures.parent / "oracle" / ("%s.json" % plan_id)
+            check("the oracle doc is written", doc_path.is_file())
+            doc = json.loads(doc_path.read_text(encoding="utf-8")) if doc_path.is_file() else {}
+            holds = doc.get("holds") or []
+            check("both holds were measured from telemetry",
+                  len(holds) == 2 and all(h.get("q_meas") for h in holds)
+                  and all(h.get("tip_fk_meas") for h in holds))
+            check("hold error matches the injected sag",
+                  holds and all(abs(h["hold_error_rad"][1]
+                                      + sweep.gravity_sag(np.asarray(h["q_cmd"][:6]),
+                                                          kp)[1]) < 1e-6
+                                for h in holds))
+            check("the verdict attributes the residual to sag",
+                  (doc.get("verdict") or {}).get("layer") == "arm-motor"
+                  and any(p["kind"] == "sag"
+                          for p in (doc.get("verdict") or {}).get("problems", [])))
+            check("hold frames and the pre/post stills are on disk",
+                  (captures.parent / "oracle" / plan_id / "pre.jpg").is_file()
+                  and (captures.parent / "oracle" / plan_id / "hold-1.jpg").is_file()
+                  and (captures.parent / "oracle" / plan_id / "hold-2.jpg").is_file()
+                  and (captures.parent / "oracle" / plan_id / "post.jpg").is_file())
+            check("frames are content-addressed in the trace blobs",
+                  doc.get("pre_frame")
+                  and (traces / "blobs" / (doc["pre_frame"] + ".jpg")).is_file())
+            events = [json.loads(line) for line in
+                      (traces / sid / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+            check("an oracle trace event links the verdict to the session",
+                  any(e["type"] == "oracle" and e["plan_id"] == plan_id
+                      and (e.get("verdict") or {}).get("layer") == "arm-motor"
+                      for e in events))
+            check("the green tip detector finds the held tool",
+                  all(h.get("detector") == "green" for h in holds)
+                  and all(h.get("pixel_error_mm") is not None
+                          and h["pixel_error_mm"] < 10.0 for h in holds),
+                  str([(h.get("detector"), h.get("pixel_error_mm")) for h in holds]))
+
+            # §8.4: no telemetry -> the doc still lands, /execute still passes.
+            del edge_state.telemetry[plan_id]
+            again = await client.post("/execute", json={"id": plan_id}, headers=headers)
+            await asyncio.gather(*list(app["oracle_tasks"]))
+            doc2 = json.loads(doc_path.read_text(encoding="utf-8"))
+            check("missing telemetry degrades to a tracking-only doc",
+                  again.status == 200 and doc2.get("telemetry") is None
+                  and doc2.get("verdict") is not None)
+
+            # A broken camera costs the evidence, never the execution.
+            def broken_open(url, **kw):
+                raise camera_mod.CameraError("no camera")
+            camera_mod.open_source = broken_open
+            third = await client.post("/execute", json={"id": plan_id}, headers=headers)
+            check("a broken camera never fails /execute",
+                  third.status == 200 and (await third.json()).get("executed") is True
+                  and not app["oracle_tasks"])
+
+            # A broken recorder: the oracle still writes its doc.
+            camera_mod.open_source = lambda url, **kw: SimpleNamespace(
+                read=lambda: frame.copy(), close=lambda: None)
+            recorder = app["traces"]
+
+            async def broken_event(*a, **k):
+                raise RuntimeError("the disk is full")
+
+            real_event = recorder.event
+            recorder.event = broken_event
+            try:
+                fourth = await client.post("/execute", json={"id": plan_id},
+                                           headers=headers)
+                await asyncio.gather(*list(app["oracle_tasks"]))
+            finally:
+                recorder.event = real_event
+            check("a broken recorder never fails /execute or the oracle doc",
+                  fourth.status == 200 and doc_path.is_file())
+    finally:
+        camera_mod.open_source = real_open
+        edge.shutdown()
+
+
+# --------------------------------------------------------------------------- #
 # 5. locate_target.py as the host actually runs it
 # --------------------------------------------------------------------------- #
 
@@ -2708,10 +3236,14 @@ def main(argv=None):
     calibration = test_calibration(workdir)
     geometry = test_tag_geometry(workdir)
     test_schema()
+    test_oracle_rules()
+    test_trace_triage(workdir)
+    test_planner_offline(workdir)
     if not args.skip_server:
         asyncio.run(test_server(workdir, geometry))
         asyncio.run(test_trace_recorder(workdir))
         asyncio.run(test_trace_server(workdir, geometry))
+        asyncio.run(test_oracle_server(workdir, geometry))
     if calibration:
         test_locate_cli(workdir, geometry)
     test_rotation(workdir, geometry)

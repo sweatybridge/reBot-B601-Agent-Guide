@@ -51,6 +51,8 @@ import calib as calib_mod
 import extrinsics
 import locate_target as locator
 import mediamtx
+import oracle as oracle_mod
+import rebot_ik
 import sweep
 import trace as trace_mod
 import witness
@@ -1617,11 +1619,353 @@ async def handle_execute(request: web.Request) -> web.Response:
     except json.JSONDecodeError as exc:
         raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
     sid = request.headers.get("X-Rebot-Session", "")
+    # The oracle piggybacks on the plan's own holds (§5.3): no extra arm motion,
+    # no new path to /execute. Preparation is wrapped -- a broken camera or a
+    # missing plan file costs the evidence, never the execution (§8.4).
+    plan_id = str(body.get("id") or "")
+    prep = None
+    if CAPTURE_ID.match(plan_id):
+        prep = await oracle_prepare(app, plan_id)
     status, payload = await planner_call(app, "/execute", body, timeout=360, sid=sid)
     await trace_event(app, sid, "execute", plan_id=body.get("id"), status=status,
                       ok=payload.get("ok"), executed=payload.get("executed"),
                       error=payload.get("error"))
+    if prep is not None:
+        if status == 200 and payload.get("ok") and payload.get("executed"):
+            # Both gates agreed and the arm played: verify off the response
+            # path so the page is not held up by the camera and the FK calls.
+            task = asyncio.create_task(oracle_finish(app, prep, sid))
+            app["oracle_tasks"].add(task)
+            task.add_done_callback(app["oracle_tasks"].discard)
+        else:
+            prep["grabs"].cancel()
     return web.json_response(payload, status=status)
+
+
+async def trace_blob(app, data):
+    """Content-address one frame; §8.4: a bad blob write degrades to no ref."""
+    recorder = app.get("traces")
+    if recorder is None:
+        return None
+    try:
+        return await asyncio.to_thread(recorder.blob, data)
+    except Exception as exc:  # noqa: BLE001 - tracing is strictly additive
+        logging.warning("trace blob failed: %s", exc)
+        return None
+
+
+def _oracle_grab_frame(app):
+    """One raw still from the configured camera, or None.
+
+    Deliberately not grab_one: mid-playback the oracle must not read the arm's
+    pose (the edge is busy commanding it) and must not re-solve the rig from
+    the tag -- a still during a hold is evidence, not a calibration.
+    """
+    try:
+        eye = camera_mod.open_source(app["camera"])
+        try:
+            return eye.read()
+        finally:
+            eye.close()
+    except Exception as exc:  # noqa: BLE001 - a missed frame is a missed sample
+        logging.info("oracle grab failed: %s", exc)
+        return None
+
+
+async def oracle_prepare(app, plan_id):
+    """Pre-execution evidence: one still, the plan's hold windows, a grab task.
+
+    Returns None on any failure -- the execution proceeds unverified (§8.4).
+    The pre-still goes through grab_one, the existing capture path, so its
+    witness report and tag solve are recorded exactly as a manual capture's.
+    """
+    try:
+        if not app["camera"]:
+            return None
+        path = app["out_dir"] / ("%s.json" % plan_id)
+        if not path.is_file():
+            return None
+        trajectory = json.loads(path.read_text(encoding="utf-8"))
+        windows = oracle_mod.hold_windows(trajectory.get("waypoints") or [])
+        if not windows:
+            return None
+        pre = await asyncio.to_thread(grab_one, app, app["camera"])
+        frame_path = app["captures"] / pre["id"] / "frame.jpg"
+        pre_bytes = await asyncio.to_thread(frame_path.read_bytes)
+        directory = app["oracle_dir"] / plan_id
+        await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread((directory / "pre.jpg").write_bytes, pre_bytes)
+        prep = {
+            "plan_id": plan_id,
+            "windows": windows,
+            "pre_capture": pre["id"],
+            "pre_frame_path": str(frame_path),
+            "pre_blob": await trace_blob(app, pre_bytes),
+            # Wherever a capture path ran, its witness report is persisted.
+            "witness": pre.get("verification"),
+            "holds": {},
+            "started": time.monotonic(),
+        }
+        prep["grabs"] = asyncio.create_task(_oracle_hold_grabs(app, prep))
+        return prep
+    except Exception as exc:  # noqa: BLE001 - the oracle never fails /execute
+        logging.warning("oracle prep for %s failed: %s", plan_id, exc)
+        return None
+
+
+async def _oracle_hold_grabs(app, prep):
+    """Two grabs 300 ms apart at each hold's midpoint; keep the later.
+
+    The middle of the window is chosen so stream latency up to half the window
+    cannot pull the frame out of the hold (the sweep_video.select argument).
+    Windows under HOLD_MIN_S never reach here: tracking-only oracle for those.
+    """
+    import cv2
+
+    try:
+        for window in prep["windows"]:
+            midpoint = 0.5 * (window["t_start"] + window["t_end"])
+            delay = prep["started"] + midpoint - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            frame = None
+            for attempt in range(2):
+                if attempt:
+                    await asyncio.sleep(0.3)
+                shot = await asyncio.to_thread(_oracle_grab_frame, app)
+                if shot is not None:
+                    frame = shot
+            if frame is None:
+                continue
+            number = window["index"]
+            path = app["oracle_dir"] / prep["plan_id"] / ("hold-%d.jpg" % number)
+            ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            if not ok:
+                continue
+            data = buffer.tobytes()
+            await asyncio.to_thread(path.write_bytes, data)
+            prep["holds"][number] = {"path": str(path), "blob": await trace_blob(app, data)}
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a missed hold is a missed sample
+        logging.warning("oracle hold grabs for %s failed: %s", prep["plan_id"], exc)
+
+
+def _oracle_detect(frame, q6, K, dist, T_base_cam, t_tip, pre_image, predicted):
+    """The tip pixel: green first, then the pre-frame's template. None, never a guess.
+
+    A failed detection is `detected: null` (§5.3): the oracle reports what it
+    saw, and a missing measurement is not a zero error.
+    """
+    import cv2
+
+    options = auto_calibrate.DetectOptions()
+    size = (int(frame.shape[1]), int(frame.shape[0]))
+    try:
+        found = auto_calibrate.detect_tip_green(frame, q6, K, dist, T_base_cam, t_tip,
+                                                options, size)
+        return {"detector": "green", "uv": [found.u, found.v], "score": found.score}
+    except auto_calibrate.AutoError:
+        pass
+    if pre_image is None or predicted is None:
+        return None
+    try:
+        templates, centre = auto_calibrate.tip_templates(pre_image, predicted, options)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        found = auto_calibrate.match_tip(gray, templates, centre, predicted, options, size)
+    except (auto_calibrate.AutoError, cv2.error):
+        return None
+    if found is None:
+        return None
+    u, v, score = found
+    return {"detector": "template", "uv": [u, v], "score": score}
+
+
+def _oracle_tool_tip(app, rig):
+    """The fitted flange-to-tip vector, or the configured offset along -z.
+
+    plan_to_target aims `tip = gripper_end - [0, 0, tip_offset_m]`; the rig's
+    fitted tip_offset is the measured version of the same vector.
+    """
+    if rig is not None and float(np.linalg.norm(rig.tip_offset)) > 1e-6:
+        return np.asarray(rig.tip_offset, dtype=float)
+    return np.array([0.0, 0.0, -float(app["tip_m"])])
+
+
+async def oracle_finish(app, prep, sid):
+    """Post-execution verification: telemetry + FK + pixels -> the oracle doc.
+
+    Runs after /execute returned, as a background task. Every step is wrapped:
+    the worst outcome is a doc with an `error` field, never a failed execution
+    (§8.4). Nothing here moves the arm.
+    """
+    plan_id = prep["plan_id"]
+    doc = {"plan_id": plan_id, "created": utc_now(), "session": sid or None,
+           "pre_capture": prep["pre_capture"], "pre_frame": prep["pre_blob"],
+           "witness": prep.get("witness"), "holds": [], "telemetry": None,
+           "verdict": None}
+    try:
+        import cv2
+
+        await prep["grabs"]
+        status, payload = await planner_call(app, "/telemetry/" + plan_id, {},
+                                             timeout=30, method="GET", sid=sid)
+        telemetry = payload.get("telemetry") if status == 200 else None
+        if telemetry:
+            doc["telemetry"] = {key: telemetry.get(key) for key in
+                                ("version", "abort", "gripper_stall", "tick",
+                                 "follow_error_max", "kp", "kd")}
+        samples = (telemetry or {}).get("samples") or []
+
+        calibration = calib_mod.load(resolve_calibration(app))
+        rig = app["rig"]
+        K = np.asarray(calibration.K, dtype=float)
+        dist = np.asarray(calibration.dist, dtype=float).reshape(-1)
+        turn = stream_turn(app, calibration)
+        measured = app.get("measured_turn")
+        doc["stream_turn"] = ({"turns": int(measured["turns"]), "source": "measured",
+                               "error_px": round(float(measured["error_px"]), 2)}
+                              if measured else
+                              {"turns": turn, "source": "phone" if turn is not None else "shape"})
+        # The tag reprojection error measure_stream_turn already computed, and
+        # a fresh witness check on the pre-still wherever the capture path ran.
+        if measured:
+            doc["tag_reprojection_px"] = round(float(measured["error_px"]), 2)
+        pre_image = cv2.imread(prep["pre_frame_path"])
+        if pre_image is not None:
+            doc["landscape"] = bool(pre_image.shape[1] > pre_image.shape[0])
+            # Templates and the witness live in the calibration grid: turn the
+            # pre-still back the same way the hold frames are turned.
+            pre_image, _pre_calib, _pre_turn = locator.upright_frame(
+                resolve_calibration(app), pre_image, turn)
+            if app["witness"] is not None and doc["witness"] is None:
+                try:
+                    doc["witness"] = witness.check(app["witness"], pre_image,
+                                                   max_drift_px=app["witness_max_px"])
+                except witness.WitnessError as exc:
+                    doc["witness"] = {"error": str(exc)}
+        t_tip = _oracle_tool_tip(app, rig)
+        kp = sweep.kp_vector()
+        if telemetry and isinstance(telemetry.get("kp"), dict):
+            try:
+                kp = np.asarray([float(telemetry["kp"][str(m)]) for m in range(1, 7)])
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        for window in prep["windows"]:
+            hold = {"index": window["index"], "t_start": window["t_start"],
+                    "t_end": window["t_end"]}
+            inside = [s for s in samples
+                      if window["t_start"] - 1e-6 <= float(s.get("t", -1))
+                      <= window["t_end"] + 1e-6]
+            tip_meas = None
+            if inside:
+                q_cmd = np.mean([s["cmd"] for s in inside], axis=0)
+                q_meas = np.mean([s["meas"] for s in inside], axis=0)
+                hold["q_cmd"] = [float(v) for v in q_cmd]
+                hold["q_meas"] = [float(v) for v in q_meas]
+                hold["hold_error_rad"] = [float(v) for v in (q_meas - q_cmd)]
+                hold["hold_error_max_rad"] = float(np.max(np.abs(q_meas - q_cmd)))
+                try:
+                    hold["sag_rad"] = [float(v) for v in sweep.gravity_sag(q_cmd[:6], kp)]
+                except ValueError:
+                    pass
+                fk_cmd = await planner_call(app, "/fk", {"q": hold["q_cmd"]},
+                                            timeout=30, sid=sid)
+                fk_meas = await planner_call(app, "/fk", {"q": hold["q_meas"]},
+                                             timeout=30, sid=sid)
+                tip_cmd = (fk_cmd[1].get("tip_m") if fk_cmd[0] == 200 else None)
+                tip_meas = (fk_meas[1].get("tip_m") if fk_meas[0] == 200 else None)
+                hold["tip_fk_cmd"] = tip_cmd
+                hold["tip_fk_meas"] = tip_meas
+                if tip_cmd and tip_meas:
+                    hold["tip_error_mm"] = round(1000.0 * float(np.linalg.norm(
+                        np.asarray(tip_meas) - np.asarray(tip_cmd))), 3)
+            shot = prep["holds"].get(window["index"])
+            if shot and rig is not None and tip_meas:
+                frame = cv2.imread(shot["path"])
+                if frame is not None:
+                    frame, calibration, _turn = locator.upright_frame(
+                        resolve_calibration(app), frame, turn)
+                    K = np.asarray(calibration.K, dtype=float)
+                    dist = np.asarray(calibration.dist, dtype=float).reshape(-1)
+                    # The point the detector looks for: FK tip plus the tool
+                    # offset, in the base frame (locate_target.project).
+                    rotation = rebot_ik.forward(np.asarray(hold["q_meas"][:6]))[:3, :3]
+                    point = np.asarray(tip_meas, dtype=float) + rotation @ t_tip
+                    predicted = locator.project(K, rig.T_base_cam, point, dist)
+                    hold["predicted_tip_px"] = (list(predicted) if predicted else None)
+                    found = await asyncio.to_thread(
+                        _oracle_detect, frame, np.asarray(hold["q_meas"][:6]),
+                        K, dist, np.asarray(rig.T_base_cam, dtype=float), t_tip,
+                        pre_image, predicted)
+                    hold["detected_tip_px"] = found["uv"] if found else None
+                    hold["detector"] = found["detector"] if found else None
+                    hold["detector_score"] = found["score"] if found else None
+                    hold["frame"] = shot["blob"]
+                    if found and predicted:
+                        error_px = float(np.hypot(found["uv"][0] - predicted[0],
+                                                  found["uv"][1] - predicted[1]))
+                        hold["pixel_error_px"] = round(error_px, 2)
+                        mm_per_px = witness.millimetres_per_pixel(rig, K, point=point)
+                        hold["pixel_error_mm"] = (round(error_px * mm_per_px, 2)
+                                                  if mm_per_px else None)
+            doc["holds"].append(hold)
+
+        # Post-execution still: the arm is back at park (the board's one-shot
+        # semantics), out of the way. The pre/post difference around each
+        # destination is a secondary placement signal, not ground truth.
+        post = await asyncio.to_thread(_oracle_grab_frame, app)
+        if post is not None:
+            ok, buffer = cv2.imencode(".jpg", post, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            if ok:
+                data = buffer.tobytes()
+                await asyncio.to_thread(
+                    (app["oracle_dir"] / plan_id / "post.jpg").write_bytes, data)
+                doc["post_frame"] = await trace_blob(app, data)
+            if pre_image is not None:
+                post_upright, _calib, _turn = locator.upright_frame(
+                    resolve_calibration(app), post, turn)
+                pre_gray = cv2.cvtColor(pre_image, cv2.COLOR_BGR2GRAY)
+                post_gray = cv2.cvtColor(post_upright, cv2.COLOR_BGR2GRAY)
+                if pre_gray.shape == post_gray.shape:
+                    for hold in doc["holds"]:
+                        pixel = hold.get("predicted_tip_px")
+                        if not pixel:
+                            continue
+                        u, v = int(pixel[0]), int(pixel[1])
+                        half = 40
+                        box_pre = pre_gray[max(0, v - half):v + half,
+                                           max(0, u - half):u + half]
+                        box_post = post_gray[max(0, v - half):v + half,
+                                             max(0, u - half):u + half]
+                        if box_pre.size and box_pre.shape == box_post.shape:
+                            hold["pre_post_diff"] = round(float(np.mean(
+                                cv2.absdiff(box_pre, box_post))), 2)
+        radii = [float(np.hypot(h["tip_fk_cmd"][0], h["tip_fk_cmd"][1]))
+                 for h in doc["holds"] if h.get("tip_fk_cmd")]
+        if radii:
+            doc["max_radius_m"] = round(max(radii), 4)
+        doc["verdict"] = oracle_mod.attribute(doc)
+        await asyncio.to_thread(
+            (app["oracle_dir"] / ("%s.json" % plan_id)).write_text,
+            json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=doc["verdict"],
+                          holds=len(doc["holds"]),
+                          telemetry=bool(telemetry), error=None)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the oracle never fails /execute
+        logging.warning("oracle for %s failed: %s", plan_id, exc)
+        doc["error"] = "%s: %s" % (type(exc).__name__, exc)
+        try:
+            await asyncio.to_thread(
+                (app["oracle_dir"] / ("%s.json" % plan_id)).write_text,
+                json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+            await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=None,
+                              holds=len(doc["holds"]), error=doc["error"])
+        except Exception as inner:  # noqa: BLE001 - not even the report is fatal
+            logging.warning("oracle report for %s failed: %s", plan_id, inner)
 
 
 async def handle_pose(request: web.Request) -> web.Response:
@@ -2256,6 +2600,12 @@ def build_app(args) -> web.Application:
             snapshot=lambda sid: trace_manifest(app, sid))
     app["captures"].mkdir(parents=True, exist_ok=True)
     app["calib"].mkdir(parents=True, exist_ok=True)
+    # The oracle's evidence (§5.3) lives beside the captures, under the same
+    # state root the planner writes out/ to (a shared bind mount in production).
+    # Deriving from --captures keeps a test workdir entirely self-contained.
+    app["out_dir"] = app["captures"].parent / "out"
+    app["oracle_dir"] = app["captures"].parent / "oracle"
+    app["oracle_tasks"] = set()
 
     app.router.add_get("/", handle_index)
     app.router.add_get("/live", handle_live)
