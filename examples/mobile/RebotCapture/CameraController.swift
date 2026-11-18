@@ -151,10 +151,11 @@ final class CameraController: NSObject, ObservableObject, ARSessionDelegate {
     /// T_world_cam as a row-major matrix (simd is column-major).
     func worldFromCamera(_ frame: ARFrame) -> Mat4 {
         let m = frame.camera.transform
+        let columns = [m.columns.0, m.columns.1, m.columns.2, m.columns.3]
         var out: Mat4 = Array(repeating: Array(repeating: 0.0, count: 4), count: 4)
         for row in 0..<4 {
             for column in 0..<4 {
-                out[row][column] = Double(m.columns[column][row])
+                out[row][column] = Double(columns[column][row])
             }
         }
         return out
@@ -204,7 +205,7 @@ final class CameraController: NSObject, ObservableObject, ARSessionDelegate {
         var gray = [UInt8](repeating: 0, count: width * height)
         gray.withUnsafeMutableBufferPointer { out in
             for y in 0..<height {
-                let row = base.advanced(by: y * stride)
+                let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt8.self)
                 for x in 0..<width {
                     out[y * width + x] = row[x]
                 }
