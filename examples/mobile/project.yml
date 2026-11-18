@@ -1,0 +1,76 @@
+name: RebotCapture
+options:
+  bundleIdPrefix: ai.rebot
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+packages:
+  RebotCore:
+    path: RebotCore
+  WebRTC:
+    url: https://github.com/stasel/WebRTC
+    branch: main
+
+targets:
+  RebotCapture:
+    type: application
+    platform: iOS
+    sources:
+      - RebotCapture
+    dependencies:
+      - package: RebotCore
+      - package: WebRTC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.rebot.capture
+        PRODUCT_NAME: RebotCapture
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: "1.0"
+    info:
+      path: RebotCapture/Info.plist
+      properties:
+        CFBundleDisplayName: B601 Capture
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: "The camera is the sensor: taps on the preview become points for the arm."
+        NSLocalNetworkUsageDescription: "The app talks to the B601 capture server on your local network."
+        ITSAppUsesNonExemptEncryption: false
+
+  # The same cross-validation suite, run against the iOS SDK in the simulator
+  # (logic tests, no host app). `xcodebuild test -scheme RebotCapture` builds
+  # the full app for iphonesimulator and then runs these.
+  RebotCaptureTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: RebotCore/Tests/RebotCoreTests/CrossValidationTests.swift
+      - path: RebotCore/Tests/RebotCoreTests/DepthFitTests.swift
+      - path: RebotCore/Tests/RebotCoreTests/Fixtures
+        type: folder
+    dependencies:
+      - package: RebotCore
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+        PRODUCT_BUNDLE_IDENTIFIER: ai.rebot.capture.tests
+
+schemes:
+  RebotCapture:
+    build:
+      targets:
+        RebotCapture: all
+        RebotCaptureTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - RebotCaptureTests
