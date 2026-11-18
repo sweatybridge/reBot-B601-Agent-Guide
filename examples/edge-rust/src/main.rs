@@ -1,13 +1,12 @@
 //! rebot-edge - play a planned joint-space trajectory on a B601-RS over SocketCAN.
 //!
-//! This is a single-file, dependency-light rewrite of the Python edge example
-//! (`play_trajectory.py` + `gradual_motion_demo.py` + `mit_frames.py`). It reads
-//! the trajectory JSON produced by `host/plan_with_pinocchio.py`, re-checks it
-//! against the file's own limits, and streams MIT frames at the file's control
-//! rate. Planning stays on the workstation; the board only sends joint angles and
+//! A single-file, dependency-light player. It reads the trajectory JSON
+//! produced by `host/app/plan_with_pinocchio.py`, re-checks it against the
+//! file's own limits, and streams MIT frames at the file's control rate.
+//! Planning stays on the workstation; the board only sends joint angles and
 //! the optional gravity feedforward.
 //!
-//! Safety model (same as the Python player):
+//! Safety model:
 //!
 //! * dry run is the default; nothing moves without `--execute`
 //! * the file's joint limits and the per-waypoint step are checked again here
@@ -60,18 +59,15 @@ const GRIPPER_STALL_ERROR: f64 = 0.15; // rad of commanded-vs-measured gap
 const GRIPPER_STALL_VELOCITY: f64 = 0.08; // rad/s below which the jaw is "not moving"
 const GRIPPER_STALL_MIN_S: f64 = 0.10;
 const GRIPPER_STALL_MAX_S: f64 = 5.0;
-// The return leg. It used to be a flat 1.5 s whatever the distance, so a long
-// way back was rushed: 3 rad in 1.5 s is 2 rad/s, five times the speed the host
-// moves at. The duration now follows the same rule as the way out -- a cosine
-// ease (`ease_in_out`, peak = pi/2 x average) capped at a peak speed -- so the
-// arm comes home as gradually as it left, and a short nudge still takes long
-// enough to have a beginning and an end.
-const RETURN_PEAK_SPEED: f64 = 0.35; // rad/s, matches sweep.PEAK_SPEED
-const RETURN_MIN_S: f64 = 3.0;       // matches sweep.MIN_SECONDS
-// The shutdown still returns the gripper to its pre-play angle, but at three
-// times the normal return speed: a fully open jaw then closes in ~7.3 s
-// instead of ~22 s (half-closed in ~3.7 s). The arm joints use the same
-// shutdown duration, so they also return three times as fast.
+// The return ramp. The duration follows the same rule as the way out -- a
+// cosine ease (`ease_in_out`, peak = pi/2 x average) capped at a peak speed --
+// so a long way home is not rushed, and a short nudge still takes long enough
+// to have a beginning and an end.
+const RETURN_PEAK_SPEED: f64 = 0.35; // rad/s, base speed for the return cap
+const RETURN_MIN_S: f64 = 3.0;       // s, floor for any return ramp
+// Every exit (normal end, fault, Ctrl-C/SIGTERM) ramps home at three times the
+// base speed, so a fully open jaw closes in ~7.3 s (half-closed in ~3.7 s).
+// The arm joints use the same duration.
 const SHUTDOWN_PEAK_SPEED: f64 = 3.0 * RETURN_PEAK_SPEED;
 
 // RobStride communication types (see robstride_dynamics/protocol.py).
@@ -359,8 +355,8 @@ fn parse_trajectory(path: &Path, text: &str) -> Result<Trajectory> {
 
 fn check_against_limits(raw: &TrajectoryFile, ids: &[u8]) -> Result<()> {
     // A file without limits is accepted (the planner normally writes them); a
-    // file whose limit block does not match the motor list is ignored, exactly
-    // like the Python player, because there is nothing to index it by.
+    // file whose limit block does not match the motor list is ignored, because
+    // there is nothing to index it by.
     if let Some(limits) = &raw.limits {
         if limits.len() == ids.len() {
             for (joint, limit) in limits.iter().enumerate() {
@@ -495,7 +491,7 @@ fn clamp_u16(value: f64) -> u16 {
     }
 }
 
-/// Build the MIT operation frame exactly like `mit_frames.MitSender.build`.
+/// Build the MIT operation frame (RobStride MIT-mode layout).
 ///
 /// The model matters: rs-06 shares the 4*pi position range with rs-00 but not
 /// the gain ranges (5000 vs 500 Nm/rad) or the torque range (60 vs 17 Nm).
@@ -642,7 +638,7 @@ impl CanBus {
             let error = io::Error::last_os_error();
             bail!(
                 "cannot open a CAN_RAW socket ({error}).\n\
-                 This needs root or CAP_NET_RAW, like the Python player:\n  \
+                 This needs root or CAP_NET_RAW:\n  \
                  sudo ./rebot-edge ..."
             );
         }
@@ -1417,7 +1413,7 @@ impl<T: Transport> Arm<T> {
     ) -> Result<()> {
         let begin: Vec<f64> = self.last[..targets.len()].to_vec();
         let t0 = Instant::now();
-        // `steps = round(duration * hz)` in the Python player.
+        // One step per tick period, at least one.
         let steps = (duration / self.period.as_secs_f64()).round().max(1.0) as u32;
         let sample_at: BTreeSet<u32> = if track {
             [0.25_f64, 0.5, 0.75, 1.0]
@@ -1508,10 +1504,10 @@ impl<T: Transport> Arm<T> {
         }
         println!("  returning to the start pose...");
         // All joints, including the gripper, return to the pose measured before
-        // playback. The ramp is three times the normal return speed so an open
-        // jaw closes in about 7.3 s rather than 22 s. On a gripper stall the
-        // play loop has already rewritten `start[gripper]` to the blocked
-        // opening, so the return holds that instead of pressing further.
+        // playback. The ramp is capped at 1.05 rad/s so an open jaw closes in
+        // about 7.3 s. On a gripper stall the play loop has already rewritten
+        // `start[gripper]` to the blocked opening, so the return holds that
+        // instead of pressing further.
         let home = self.start.clone();
 
         // Ramp home first, then hold; attempt the disable even if the ramp fails,
@@ -1715,7 +1711,7 @@ USAGE:
     rebot-edge dump [--channel IFACE] [--ids 1,2,...]
     rebot-edge serve [OPTIONS]
 
-The input is the JSON written by host/plan_with_pinocchio.py (format
+The input is the JSON written by host/app/plan_with_pinocchio.py (format
 'rebot-joint-trajectory'). Dry run is the default; nothing moves without
 --execute. `dump` is the read-only pose snapshot (parameter 0x7019) that the
 planner takes as its `--joints` input; it enables nothing.
@@ -1723,7 +1719,7 @@ planner takes as its `--joints` input; it enables nothing.
 `serve` replaces the ssh path: it exposes GET /health, GET /pose,
 POST /play?dry=1, POST /play (trajectory JSON in the body) and POST /stop over
 plain HTTP. Execution stays off until the server is started with
---allow-execute, and a token is required on anything but 0.0.0.0.
+--allow-execute, and a token is required on anything but loopback.
 
 OPTIONS:
     --channel <IFACE>        SocketCAN interface (default: can0)
@@ -1737,9 +1733,10 @@ OPTIONS:
     --speed <FACTOR>         Time scale, 0.5 = twice as slow (default: 1.0)
     --delay <SECONDS>        Hold the start pose before the motion starts
     --max-follow-error <RAD> Abort when measured position lags by more than this
-                             (checked twice a second; 0 disables)
+                             (checked once a second of trajectory time; 0 disables)
     --gripper-stall <SECONDS> Abort if motor 7 is >0.15 rad from its command and
-                             moving <0.08 rad/s for this long; 0 disables
+                             moving <0.08 rad/s for this long; 0 disables,
+                             otherwise 0.1..5.0 s
                              (default: 0; the systemd unit uses 0.3)
     --log <FILE>             Write commanded and measured angles as JSON
     --allow-kp-mismatch      Play a sag-compensated file at a different kp
@@ -1805,7 +1802,7 @@ fn parse_args(argv: Vec<String>) -> Result<Command> {
             "--check" => args.check = true,
             "--fast-frames" => {}
             "--sdk-path" => bail!(
-                "--sdk-path is a Python-only option; the Rust player talks to SocketCAN directly"
+                "--sdk-path is not supported; the Rust player talks to SocketCAN directly"
             ),
             "--channel" => args.channel = take_value(&mut iter, inline, "--channel")?,
             "--model" => args.model = take_value(&mut iter, inline, "--model")?,
@@ -2212,8 +2209,8 @@ fn write_log(
     Ok(())
 }
 
-/// UTC ISO-8601, no chrono dependency. The Python player wrote local time; UTC
-/// with an explicit `Z` is unambiguous and good enough for a run log.
+/// UTC ISO-8601, no chrono dependency. An explicit `Z` is unambiguous and good
+/// enough for a run log.
 fn utc_timestamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2287,7 +2284,7 @@ fn read_drift<T: Transport>(arm: &mut Arm<T>, trajectory: &Trajectory) -> Result
     if worst > 20.0_f64.to_radians() {
         bail!(
             "the arm is more than 20 deg from the plan's start pose; \
-             re-plan from a fresh dump_joints.py instead of ramping across"
+             re-plan from a fresh `rebot-edge dump` instead of ramping across"
         );
     }
     Ok(worst)
@@ -3316,7 +3313,7 @@ mod tests {
 
     #[test]
     fn mit_frames_match_python_reference() {
-        // Generated with the Python `mit_frames.MitSender.build` formulas.
+        // Golden vectors for the RobStride MIT-mode packing formulas.
         let cases: [(&str, u8, f64, f64, f64, f64, f64, u32, [u8; 8]); 5] = [
             (
                 "rs-00",

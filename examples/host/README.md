@@ -15,7 +15,7 @@ phone / workstation  --tap-->  capture_server (opencv)  -->  planner_server (Pin
 | service | image | listens on | job |
 |---|---|---|---|
 | `capture` | `Dockerfile` | `:8443` (LAN) | HTTPS for the phone, `/capture`, `/plan`, `/execute`, WHIP/WHEP relay |
-| `mediamtx` | `bluenviron/mediamtx` | `:8189/udp` | WebRTC relay: phone publishes, `/live` reads |
+| `mediamtx` | `bluenviron/mediamtx` | `:8189/udp`, `:8554` (RTSP), `127.0.0.1:9997` (API, host loopback) | WebRTC relay: phone publishes, `/live` reads |
 | `planner` | `Dockerfile.pinocchio` | nothing | the arm gateway: edge `/pose`, planning, gated `/execute` |
 | `tools` | `Dockerfile` | nothing | one-shot: calibration, tag, certificate, selftest |
 
@@ -89,11 +89,13 @@ app/
   sweep.py                the fixed eight-pose calibration sweep + clearance check
   auto_calibrate.py       drives the sweep, grabs the stills, finds the tip
   camera.py               RTSP / HTTP snapshot / device frames for that sweep
+  mediamtx.py             MediaMTX control API: record a sweep, find its segments
+  sweep_video.py          the sweep's pose log -> the recorded frame for each pose
   plan_to_target.py       plan(): target + pose -> trajectory (CLI and gateway)
   traj.py                 payload assembly + the player's schema checks
   plan_with_pinocchio.py  the measured demo trajectory (peel / lift / grip)
   rebot_ik.py             the URDF transcription, model reference for the docs
-  make_tag.py             printable ArUco tag, handheld mode only
+  base_marker.py          the base ArUco tag: printable sheet, placement spec, PnP pose
   make_cert.py            local CA + leaf certificate for the phone
   healthcheck.py          compose healthcheck for the capture service
 

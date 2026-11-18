@@ -2027,7 +2027,7 @@ def main(argv=None):
                         help="the marker's printed side in metres (default 0.04)")
     parser.add_argument("--hover-m", type=float,
                         default=float(os.environ.get("REBOT_HOVER_M", "0.10")),
-                        help="how far above the tapped point the arm ends, in metres; "
+                        help="height of the tap plane above the worktop, in metres; "
                              "also the lowest tip z the planner accepts")
     parser.add_argument("--extrinsics", default="",
                         help="a fitted rig JSON; default is "

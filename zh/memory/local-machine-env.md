@@ -3,7 +3,7 @@
 > **使用说明**：此文件用于记录当前机器的环境信息，避免重复初始化和配置。
 > Agent 在执行流程时会自动读取和更新此文件。
 >
-> **文件位置**：请将此文件放在当前项目或固定路径下，执行 Skill 前确认 `memory/local-machine-env.md` 可被访问。
+> **文件位置**：请将此文件放在当前项目或固定路径下，执行**工作流**前确认 `memory/local-machine-env.md` 可被访问。
 
 ---
 
@@ -26,9 +26,17 @@
 - 是否重启后自动生效（是 / 否，以及实现方式）：
 - CAN HAT overlay 配置行 / 配置文件：
 
+## 长时间运行的进程
+
+<!-- gateway 启动后由 Agent 自动写入 -->
+
+- gateway PID：
+- gateway 日志路径：
+
 ## conda
 
 <!-- 安装 Miniforge 后由 Agent 自动写入 -->
+<!-- 若改用 uv venv，则记录 "## Python Environment (uv)" 小节（venv 路径），代替以下 conda 字段 -->
 
 - 安装路径：
 - conda.sh：

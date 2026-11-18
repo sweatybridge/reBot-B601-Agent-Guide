@@ -21,8 +21,8 @@ webrtcAddress: :8889
 # webrtcAdditionalHosts: [192.168.1.23]
 
 # The control API, used by the capture server to start and stop recording around
-# a calibration sweep. It stays on the compose network: port 9997 is not
-# published, so only the containers can reach it.
+# a calibration sweep. Compose publishes port 9997 on the host's loopback only
+# (127.0.0.1:9997), so nothing on the LAN can reach it.
 api: yes
 apiAddress: :9997
 

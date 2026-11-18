@@ -370,8 +370,9 @@ def command_check(args):
                           "rms_px": round(float(np.sqrt(np.mean(residual_px ** 2))), 2)},
                          indent=2))
     if float(np.max(residual_px)) > 6.0:
-        print("\nwarning: at least one pose is 6 px off. Re-run the sweep, or give the "
-              "detector a cleaner background (--background / REBOT_CAMERA).")
+        print("\nwarning: at least one pose is 6 px off. Re-run the sweep with a still, "
+              "uncluttered scene: each pose is differenced against the median of the "
+              "other frames.")
         return 1
     return 0
 
@@ -412,7 +413,7 @@ def main(argv=None):
     parser.add_argument("--work-radius", type=float, default=0.55,
                         help="radius of the grid the predicted error is reported over, m")
     parser.add_argument("--settle", type=float, default=0.5,
-                        help="seconds to wait at each pose before the still, s")
+                        help="seconds to settle before the optional background frame, s")
     parser.add_argument("--planner", default=os.environ.get("REBOT_PLANNER",
                                                            "http://127.0.0.1:8000"),
                         help="the arm gateway base URL")

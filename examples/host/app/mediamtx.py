@@ -13,11 +13,11 @@ media server that already has the stream. This is the seam:
     rec.disable()
     for segment in rec.segments(since=started): ...
 
-The API is not published outside the compose network: it can reconfigure any
-path, so only the containers should reach it.
+The API can reconfigure any path, so compose publishes it on the host's loopback
+only (127.0.0.1:9997); nothing on the LAN can reach it.
 
 Segment names are written by MediaMTX with *its* local time, and the container
-runs in UTC (`TZ: UTC` in compose). The name is therefore parsed as UTC: parsing
+defaults to UTC (compose sets no TZ). The name is therefore parsed as UTC: parsing
 it as the host's local time would put every recording eight hours away from the
 pose log in, say, Singapore.
 """

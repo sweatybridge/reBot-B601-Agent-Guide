@@ -173,11 +173,12 @@ the CLIs. See [`host/README.md`](host/README.md) for the map and
   pinned and the dip grows to -18 mm; the elbow is the binding stop, and 8° over
   the jaw-opening leg removes the dip entirely.
 - **Dry run is the default.** Nothing moves without `--execute`.
-- **30 Hz no longer needs a special frame path.** The Rust player builds MIT
+- **30 Hz needs no special frame path.** The Rust player builds MIT
   frames directly and measured 33.3 ms mean tick spacing on the Zero W.
 - **`--payload kg`** on the planner folds a held mass into `tau` (1 kg at the tool
   adds -2.77 / +5.08 / +2.84 Nm on j2/j3/j4 at the parked pose).
-- **Limits are re-checked on the edge**; a waypoint outside the URDF range is
-  refused before any frame is sent.
+- **Limits are re-checked on the edge**; when the file's `limits` block matches
+  the motor list, a waypoint outside it is refused before any frame is sent.
+  The ±4π MIT range and 0.5 rad step checks always apply.
 - The trajectory is bound to the gains only through the file's `trim` block (this
   file has none), so `--kp`/`--kd` can be changed freely.

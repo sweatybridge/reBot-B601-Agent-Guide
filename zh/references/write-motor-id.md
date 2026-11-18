@@ -302,7 +302,7 @@ scan done: 7 motor(s) found
 > **写入 memory**：最终扫描完成后，更新 `../memory/local-machine-env.md`：
 >
 > ```markdown
-> ### 电机 ID 设置完成
+> ### 已设置的电机
 > - 已设置 ID：1, 2, 3, 4, 5, 6, 7
 > - 最终扫描时间：YYYY-MM-DD
 > ```

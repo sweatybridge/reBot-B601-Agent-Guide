@@ -1,4 +1,4 @@
-"""Build the 15 mess cards and 3 layout sheets.
+"""Build the 15 mess cards (the layout sheets come from make_layouts.py).
 
 Run from the repo root:
     .rebot-venv\\Scripts\\python.exe manuals/_build/make_cards.py

@@ -34,6 +34,8 @@ Please follow the workflow in AGENTS.md (https://github.com/sweatybridge/reBot-B
 - [演示开发与验证](zh/references/demo-validation-pi-zero.md) — 在 Pi Zero W 上构建并验证运动演示
 - [写入电机 ID](zh/references/write-motor-id.md) — 写入电机 ID 1–7
 - [零点校准](zh/references/write-motor-zero.md) — 校准电机零点
+- [示例](examples/README.md) — `edge-rust/`（树莓派）、`host/`（工作站）与 `trajectories/` 代码，含实测轨迹流水线
+- [手机拍摄](examples/host/docs/phone-camera.md) — 手机浏览器或固定相机作为标定传感器：在手机或工作站画面中点选目标，机械臂即规划到位；固定安装时场景无需标签
 - [厨房部署手册](manuals/README.md) — 3 种厨房布局与 15 种清理场景（英文）
 
 

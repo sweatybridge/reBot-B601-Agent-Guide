@@ -13,9 +13,9 @@
  *
  * The server only supplies numbers it already has: the calibration (K, dist)
  * and, when a fixed-camera rig is fitted, `T_base_cam`. In handheld mode the
- * browser ArUco detector solves `T_base_cam`; between tag frames the phone IMU
- * propagates orientation from the gyro and translation from the tag-anchored
- * accelerometer. A page that got a pose some other way can hand it over with
+ * browser ArUco detector solves `T_base_cam`; tag-only is the default, and
+ * `?filter=ekf` opts into IMU fusion between tag frames. A page that got a pose
+ * some other way can hand it over with
  * `setPose()`; no page needs to today, because `/live` is fixed-rig only and the
  * phone detects its own tag.
  *

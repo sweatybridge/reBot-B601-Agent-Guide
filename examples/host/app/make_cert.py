@@ -129,7 +129,7 @@ def main(argv=None):
                         help="directory for the PEM files")
     parser.add_argument("--host", default="rebot-host.local", help="DNS name the phone will use")
     parser.add_argument("--ip", action="append", default=[], help="extra IP SAN, repeatable")
-    parser.add_argument("--days", type=int, default=825, help="leaf lifetime (Apple caps at 825)")
+    parser.add_argument("--days", type=int, default=825, help="leaf lifetime (Apple caps at 398)")
     parser.add_argument("--reuse", action="store_true", help="reuse tls/ca.pem instead of a new CA")
     parser.add_argument("--force", action="store_true", help="overwrite an existing CA")
     args = parser.parse_args(argv)

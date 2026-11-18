@@ -43,7 +43,9 @@ uv pip install --python .rebot-venv\Scripts\python.exe --cache-dir $env:UV_CACHE
 | `make_atlas.py` | Builds `assets/mess-atlas.png` |
 | `workspace_probe.py` | Samples the tool-down cleaning envelope (pure stdlib) |
 | `reach_bands.py` | Reach by height and wall-approach bands |
-| `check_links.py` | Verifies every image and relative link resolves |
+| `check_links.py` | Scans root `readme.md` + `manuals/*.md` for relative links and prints missing ones (report only, always exits 0) |
+| `check_images.py` | Prints the pixel dimensions of every PNG in `manuals/assets/` |
+| `check_tables.py` | Checks markdown table column counts in `manuals/*.md` and prints issues (report only, always exits 0) |
 
 ## Envelope numbers
 

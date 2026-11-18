@@ -231,7 +231,7 @@ def camera_pose(image, K, dist, at, yaw=0.0, size_m=SIZE_M, marker_id=MARKER_ID,
 
 
 def parse_spec(text, size_m=SIZE_M):
-    """`{"at", "yaw", "size_m"}` from "x,y,z[,yaw]", or None when empty.
+    """`{"at", "yaw", "size_m", "id"}` from "x,y,z[,yaw[,id]]", or None when empty.
 
     Empty means the plate has no tag, which leaves the tap path in charge. A typo
     is an error at startup rather than a wrong calibration later.

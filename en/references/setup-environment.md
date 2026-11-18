@@ -215,8 +215,8 @@ If the command is not found, check whether the Python Scripts directory is in PA
 >
 > ```markdown
 > ## motorbridge
-> - CLI: `/f/miniforge/envs/rebot/Scripts/motorbridge-cli`
-> - Installation: pip install in conda rebot environment
+> - CLI path: `/f/miniforge/envs/rebot/Scripts/motorbridge-cli`
+> - Installation method: pip install in conda rebot environment
 > ```
 
 ---

@@ -17,13 +17,13 @@ with a different source for `T_base<-cam`:
     python locate_target.py --capture captures/<id> --calib calib/<device>.json \
         --extrinsics calib/extrinsics-fixed.json
     python locate_target.py --capture captures/<id> --calib calib/<device>.json \
-        --tag-size 0.080 --tag-x 0.35 --tag-y -0.20 --tag-yaw 15
+        --marker-at 0.35,-0.20,0.0,15 --marker-size 0.080
 
 `locate_capture()` is the same code the capture server calls when someone taps
 the video, so a tap and a command line cannot drift apart.
 
-The metric part always comes from the intrinsics and the table plane; the tag
-never supplied scale, only the camera pose.
+The printed tag size gives PnP its metric scale, so the camera pose it supplies
+is in metres; the table plane then turns the tap ray into the target point.
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@
 Eight poses, chosen once and checked in code rather than by hand:
 
 * every pose is inside the joint limits with margin, and puts the tool in front
-  of the base, 0.12-0.42 m above the worktop, within 0.5 m of the base axis;
+  of the base, 0.10-0.42 m above the worktop, within 0.6 m of the base axis;
 * every *leg* between consecutive poses is checked with the capsule model from
   `manuals/_build/under_cabinet_probe.py`: no link centre passes within its own
   radius of the table, at any point of the interpolation, not just at the ends;
@@ -284,7 +284,7 @@ def seconds_for(a, b, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SE
     A cosine ease has peak speed `pi/2 * travel / seconds`, so inverting that
     for the cap is the whole policy. It is used for every leg -- out to a pose,
     between poses, and back to the parked pose -- so the return is never the
-    quickest part of the sweep, which is what it used to be.
+    quickest part of the sweep.
     """
     travel = float(np.max(np.abs(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))))
     return max(minimum, min(maximum, (math.pi / 2.0) * travel / float(peak_speed)))

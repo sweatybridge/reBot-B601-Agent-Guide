@@ -932,7 +932,7 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
             if not options.click:
                 raise AutoError(
                     "the base marker could not be read: %s. Is the tag pasted on the side of "
-                    "the base, facing the camera, printed at 100%% (5 cm), and lit? See "
+                    "the base, facing the camera, printed at 100%% (4 cm), and lit? See "
                     "docs/base-marker.md" % error) from error
             # A tap was supplied as well: fall back rather than fail the pass, and
             # say so, because a tag that is configured but not visible is a setup

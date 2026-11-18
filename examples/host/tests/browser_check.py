@@ -25,8 +25,9 @@ IPC), start one separately and attach:
     chrome --headless=new --remote-debugging-port=9333 --user-data-dir=/tmp/x about:blank
     python examples/host/tests/browser_check.py --connect 9333 --url "..."
 
-Needs Chrome or Edge on the machine. It is a check of the page, not of the
-camera: the lens, the focus and the intrinsics are still the phone's problem.
+Browser autodetect only probes the Windows Chrome/Edge install paths; anywhere
+else pass `--chrome <path>`. It is a check of the page, not of the camera: the
+lens, the focus and the intrinsics are still the phone's problem.
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@
 Two callers share this module:
 
 * `main()` -- the CLI, inside the Pinocchio container or via compose:
-  `docker compose --profile plan run --rm planner --joints ... --target ... --out ...`
+  `docker compose run --rm planner python app/plan_to_target.py --joints ... --target ... --out ...`
 * `planner_server.py` -- the long-running arm gateway the viewers talk to when
   someone taps the video. It calls `plan()` directly, so a tap and a shell
   command produce byte-identical trajectories.

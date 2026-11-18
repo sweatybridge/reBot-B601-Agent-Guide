@@ -62,6 +62,9 @@ specification and from measurements in this repository.
 The arm can *touch* a 755 mm radius, but it is fully stretched there and the wrist
 compliance is worst. The manuals therefore assign work inside **600 mm**, keep
 600–755 mm as a **reserve band**, and put everything beyond 755 mm out of scope.
+The host planner gates targets at **750 mm** by default (`--max-reach 0.75` in
+`examples/host/app/plan_to_target.py`), so targets in the top of the reserve band
+need the gate raised.
 Tool-down cleaning reaches the worktop across the full disc; vertical wiping
 reaches roughly **600 mm above the counter**.
 
@@ -82,7 +85,7 @@ Use one, or both only if the host has two camera ports.
 | Option | Mount | Lens height | View | Best for |
 |---|---|---|---|---|
 | **Hood edge** | front edge of the cooker hood | 1500 AFF | 1.66 × 1.25 m, straight down | Hob / cooking zone |
-| **Under-cabinet** | bottom edge of a 300 × 350 camera cabinet over the base (soffit in C) | 1350 AFF (1450 in C) | ≈1.2 × 0.9 m, oblique (straight down in C) | Arm motion |
+| **Under-cabinet** | bottom edge of a 300 × 350 camera cabinet over the base (soffit in C) | 1350 AFF (1450 in C) | ≈1.2 × 0.9 m oblique in A/B; ≈1.5 × 1.1 m straight down in C | Arm motion |
 
 ![Hood-edge camera detail](assets/hood-camera-detail.png)
 
@@ -174,7 +177,7 @@ footer, and the annotations give the size window and the limiting condition.
   <https://wiki.seeedstudio.com/robotics/rebot_physical_ai_course_chapter_2/>
 - Payload, repeatability, reach and power: Seeed's B601-RS specification table.
 - Chain, joint limits, gripper stroke, compliance and trajectory measurements:
-  this repository, [`examples/host/rebot_ik.py`](../examples/host/rebot_ik.py),
+  this repository, [`examples/host/app/rebot_ik.py`](../examples/host/app/rebot_ik.py),
   [`examples/README.md`](../examples/README.md) and
   [`en/references/demo-validation-pi-zero.md`](../en/references/demo-validation-pi-zero.md).
 - Working-envelope sampling: `manuals/_build/workspace_probe.py` and

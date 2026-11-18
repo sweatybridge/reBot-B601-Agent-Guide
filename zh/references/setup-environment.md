@@ -268,6 +268,8 @@ export DYLD_LIBRARY_PATH="/usr/local/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH
 EOF
 ```
 
+> **注意**：macOS 上 `motorbridge-gateway` 调用 `dlopen("PCBUSB")`，默认不会搜索 `/usr/local/lib/`，必须设置 `DYLD_LIBRARY_PATH` 才能让它找到该库。`motorbridge-cli` 不受影响。
+
 3. 验证安装是否就绪：
 
 ```bash

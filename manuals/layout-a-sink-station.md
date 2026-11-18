@@ -24,7 +24,7 @@ wedge is the 40° dead sector that faces the wall.*
 | Arm base | (1550, 350) on a 250 mm bay at the end of the run |
 | Working radius | 600 mm (solid), 755 mm reserve (dashed) |
 | Covers | Sink deck, drainboard, prep board, grinder, tool dock |
-| Does not cover | Cooktop (1.45 m), knife block (738 mm, reserve band), fridge |
+| Does not cover | Cooktop (1.45 m), knife block (738–776 mm, centre beyond maximum), fridge |
 | Best for | Post-cook wet cleanup, flour/bread mess, sink-side spills |
 | Mount | Counter base, 4 × M6 through-bolts + 6 mm steel backer |
 | Payload margin | Tool 0.15–0.3 kg; residue <0.2 kg; well under 2.5 kg rated |
@@ -62,9 +62,9 @@ Three design moves make the layout work:
 |---|---|---|
 | Reach to sink centre | 600 mm | At the working limit; work the near half and drainboard |
 | Reach to sink rim | 350 mm (260 mm clear from the foot edge) | Comfortable; full wrist articulation |
-| Reach to board centre | 400 mm | Comfortable |
+| Reach to board centre | 415 mm | Comfortable |
 | Reach to grinder | 362 mm | Comfortable |
-| Reach to knife block | 738 mm | Inside 755 mm maximum, outside 600 mm working — human only |
+| Reach to knife block | 738–776 mm (near corner to centre) | Centre beyond the 755 mm maximum; all of it outside 600 mm working — human only |
 | Reach to cooktop | 1450 mm | Outside 755 mm — human only |
 | Vertical reach, splashback | 320 mm above counter | Inside the ~600 mm vertical envelope |
 | Payload, tool + residue | <0.5 kg | 20 % of rated payload |
@@ -352,8 +352,9 @@ clean drainboard.
   the floor; the arm stops if a person enters the disc.
 - **Allergens:** flour and egg are allergens. Tools are colour-coded and washed
   after every cycle; the board is wiped, not just brushed.
-- **Knife block:** 738 mm away, inside the 755 mm maximum but outside the 600 mm
-  working envelope. Still treated as a no-go zone; the arm never reaches across it.
+- **Knife block:** 738–776 mm away (near corner to centre); the centre is beyond
+  the 755 mm maximum and all of it is outside the 600 mm working envelope. Still
+  treated as a no-go zone; the arm never reaches across it.
 - **Camera:** local processing only; LED when active. The hood and cabinet cameras
   are context views, not safety-rated stops; the hob interlock and the arm's limits
   do that.

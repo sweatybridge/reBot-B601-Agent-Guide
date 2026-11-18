@@ -16,7 +16,7 @@ the MIT frame's torque field; it generalises to other trajectories, unlike the
 measured trim, but it inherits the model's 30-40 % error at folded poses.
 
     docker run --rm -v "$PWD:/work" rebot-pino \
-        python /work/examples/host/plan_with_pinocchio.py \
+        python /work/examples/host/app/plan_with_pinocchio.py \
         --joints /work/current.json --out /work/seq_pino.json
 """
 

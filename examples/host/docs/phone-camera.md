@@ -205,7 +205,7 @@ REBOT_MARKER_SIZE=0.05
 ```
 
 `docs/base-marker.md` has the measurement detail. A tag lying flat on the worktop
-is no longer supported.
+is not supported.
 
 The tag supplies the extrinsics on every frame, so a handheld phone is fine.
 Which means the rule that matters: **the tag must be visible in the same frame
@@ -576,7 +576,7 @@ is disconnected and connected again.
 
 ## Markers, then Move arm
 
-On the phone a tap no longer plans. It grabs the exact frame under the finger,
+On the phone a tap pins a marker rather than planning. It grabs the exact frame under the finger,
 solves the camera pose and the tap ray in the page, computes the arm-space tip,
 and pins a numbered marker on the preview. Up to ten; **Clear marker** removes the
 last one. **Move arm** is disabled until at least one marker is on screen. Odd
@@ -1010,8 +1010,8 @@ A case costs about two minutes on `Qwen3.8-27B`: six vision turns at roughly
 20 s each. Keep `--workers 1` -- the endpoint has one slot, so concurrent cases
 only queue and the turns get slower.
 
-Tool names are checked against `live.html` at start-up, so the eval cannot test a
-contract the page no longer has.
+Tool names are checked against `live.html` at start-up, so the eval always tests
+the contract the page actually has.
 
 ### With the arm side mocked
 

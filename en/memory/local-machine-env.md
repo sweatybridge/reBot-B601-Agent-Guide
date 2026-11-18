@@ -26,9 +26,17 @@
 - Configured persistently across reboots (yes / no, and how):
 - CAN HAT overlay line / config file:
 
+## Long-Running Processes
+
+<!-- Automatically written by Agent after the gateway is started -->
+
+- Gateway PID:
+- Gateway log path:
+
 ## conda
 
 <!-- Automatically written by Agent after Miniforge installation -->
+<!-- If a uv venv is used instead, record a "## Python Environment (uv)" section with the venv path in place of these conda fields -->
 
 - Install path:
 - conda.sh:

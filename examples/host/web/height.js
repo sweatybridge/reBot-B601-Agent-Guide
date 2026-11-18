@@ -4,7 +4,7 @@
  * with a finger on the preview, so one owner has to arbitrate. A short press that
  * stays put is a tap: the page adds a marker there. Once the finger moves past
  * SLOP_PX the press becomes a height drag, up increases and down decreases
- * `hover_m`, the distance above the tapped point where the arm ends. The badge
+ * `hover_m`, the height of the tap plane above the worktop. The badge
  * in the top bar shows the current value.
  *
  * The module knows nothing about markers or the reach band. It reports the tap

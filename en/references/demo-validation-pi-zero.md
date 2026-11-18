@@ -2,9 +2,7 @@
 
 > **Note: This reference document is a beta version and for reference only. If you have any questions or encounter issues, please contact Seeed for support.**
 
-> **File layout note.** The Python edge implementation described below has been removed. The player is now the Rust binary in [`examples/edge-rust/`](../../examples/edge-rust/README.md), which also provides the read-only `dump` subcommand. The Python paths and commands below are historical context; the measurements and lessons still stand.
-
-This documents how the pure-Python motion demo (`examples/edge/gradual_motion_demo.py`, since removed) was built and validated on a 32-bit Raspberry Pi, and — more usefully — the checks that caught real defects before they reached the arm. The same checks live in the [Rust player](../../examples/edge-rust/README.md) now; follow the same order for any new motion script on this class of hardware.
+This documents how motion is developed and validated on a 32-bit Raspberry Pi with the [Rust player](../../examples/edge-rust/README.md) (`rebot-edge`) and the offline planner — and, more usefully, the checks that catch real defects before they reach the arm, with the measurements taken on the reference unit. Follow the same order for any new motion on this class of hardware.
 
 **Verified baseline**
 
@@ -13,11 +11,9 @@ This documents how the pure-Python motion demo (`examples/edge/gradual_motion_de
 | Board | Raspberry Pi Zero W Rev 1.1 (BCM2835, 512 MB) |
 | Architecture | `armv6l` (32-bit, no NEON) |
 | OS / kernel | Raspbian GNU/Linux 12 (bookworm) / `6.6.20+rpt-rpi-v6` |
-| Python | 3.11.2 (system) |
 | CAN | RS485 CAN HAT, MCP2515 over SPI0 CE0, 12 MHz crystal, `INT` = GPIO25 |
 | Motors | 7x RobStride RS series: **RS-06 on joints 1-3, RS-00 on joints 4-7** |
-| Library | Seeed `RobStride_Control` → `robstride_dynamics` (pure Python) |
-| Packages | `python3-can` 4.1.0, `python3-numpy` 1.24.2, `python3-tqdm` 4.64.1 (all from apt) |
+| Player | `rebot-edge`, a static ARMv6 musl binary — no Python, numpy or SDK on the board |
 
 ## Gate 1: Can the documented stack run at all?
 
@@ -31,7 +27,7 @@ python3 -m venv ~/mb-probe
 
 `motorbridge` has no `armv6l`/`armv7l` wheels — PyPI carries `linux_x86_64`, `linux_aarch64`, `macos_arm64` and `win_amd64` builds only — and its sdist is a thin Python wrapper around a prebuilt `libmotor_abi.so` + `ws_gateway` binary (`abi.py` resolves `MOTORBRIDGE_LIB`, `motorbridge/lib/`, `target/release/`). On `armv6l` there is nothing to load, so a source install yields an importable module that fails at runtime. Miniforge is no help either — no `armv6l`/`armv7l` builds.
 
-**Verdict**: motorbridge and everything layered on it (Motorbridge Studio, the Zero Calibration UI, `reBotArm_control_py`, the ROS 2 workspace) cannot run on this board. Keep the CAN path and choose a different client library.
+**Verdict**: motorbridge and everything layered on it (Motorbridge Studio, the Zero Calibration UI, `reBotArm_control_py`, the ROS 2 workspace) cannot run on this board. Keep the CAN path and use the Rust player.
 
 ## Gate 2: Get `can0` up, and make it survive a reboot
 
@@ -54,7 +50,7 @@ Two things that cost time and are worth knowing up front:
 
 Full procedure and troubleshooting table: [CAN HAT Setup](setup-can-hat.md).
 
-## Gate 3: Prove bus and motors are healthy before writing motion code
+## Gate 3: Prove bus and motors are healthy before any motion
 
 Three read-only checks, cheapest first.
 
@@ -66,27 +62,28 @@ sudo ip link set can0 type can bitrate 1000000 loopback on
 # 2. Bus presence: in normal mode, send one frame to an ID the motors ignore
 #    ACKed -> stays ERROR-ACTIVE, tx_errors=0; nothing there -> BUS-OFF
 
-# 3. Motor presence: ping every ID (read-only, no torque)
-RobstrideBus.scan_channel("can0", 1, 9)     # -> motors 1..7 with UUIDs
-bus.read(name, ParameterType.MECHANICAL_POSITION)   # -> joint angles in rad
+# 3. Motor presence: read every joint's position (read-only, no torque)
+./rebot-edge dump --ids 1,2,3,4,5,6,7    # -> ids, q in rad, timestamp
 ```
+
+`dump` reads parameter `0x7019` from each motor; a motor that does not answer within 500 ms is reported missing. On a supported host, `motorbridge-cli scan` (AGENTS.md Step 2) is the equivalent presence check.
 
 The loopback test needs no extra packages — a `socket(AF_CAN, SOCK_RAW, CAN_RAW)` socket works with the stdlib, provided `CAN_RAW_RECV_OWN_MSGS` is enabled and the interface is in loopback mode. That matters because it lets you separate "HAT broken" from "motors unpowered" without installing anything.
 
-## Gate 4: Design the motion script around refusals, not features
+## Gate 4: The player is designed around refusals, not features
 
-| Decision | Reason |
+| Property | Reason |
 |---|---|
-| Dry run is the default; `--execute` required | A stray `python3 demo.py` must not move a 6-DOF arm |
+| Dry run is the default; `--execute` required | A stray invocation must not move a 6-DOF arm |
 | Start pose read from the **ENABLE status frame**, never assumed | The arm's zero has already changed once between sessions; assuming zero is how arms get commanded to move when they should not |
-| `\|delta\| ≤ 0.35 rad`, gains clamped, targets kept 0.2 rad inside the ±4π MIT range | Flags may only make motion smaller |
-| Fault frames (comm type 21) raise instead of being drained | Otherwise the loop keeps commanding a motor that already faulted |
+| Start drift > 20° refused; every waypoint re-checked against the file's limits, the ±4π MIT range and a 0.5 rad step cap | Flags may only make motion smaller |
+| Fault frames (comm type 21) abort instead of being drained | Otherwise the loop keeps commanding a motor that already faulted |
 | Every leg ramps from the **last commanded** position | See defect 1 |
 | Exit ramps home, holds, then disables (or `--stay-enabled`) | Crash-safe, and makes the gravity-sag trade-off explicit |
 
 ## Gate 5: Validate with measurement, not with wall-clock
 
-Three defects were found during validation. All three produced plausible-looking output first.
+Three defects these checks caught on the reference arm. All three produced plausible-looking output first; the fixes are in the player today.
 
 | # | Symptom | Root cause | Fix |
 |---|---|---|---|
@@ -94,22 +91,17 @@ Three defects were found during validation. All three produced plausible-looking
 | 2 | `WARNING: Invalid device ID, got 7, expected 1` in `--track` output | Status frames arrive in arbitrary order once several motors are enabled; "read the next frame" attributed another joint's position | `read_status()` filters on device ID, fails after a timeout |
 | 3 | Joints 3–4 settled 0.05–0.14 rad below target | Arm now carries its own weight; a single `--kp` cannot suit an unloaded base joint and a loaded wrist joint | Per-joint gains (`--kp 4:45,5:35`) |
 
-Defect 1 is the one to internalise: **the loop running for the full duration proves nothing about the motion.** `--track` (measured position at 25/50/76/100 % of each leg) is what turned it into evidence.
+Defect 1 is the one to internalise: **the loop running for the full duration proves nothing about the motion.** `--track` (measured position at 25/50/75/100 % of each leg) is what turned it into evidence.
 
 Defect 2 matters beyond logging: the same call seeded the start pose at bring-up, where a mis-attributed reading becomes the target of the first command.
 
 ## Measurements
 
-One thing to keep in mind while reading these: the runs used the rs-00 MIT table
-for every motor. Joints 1-3 are RS-06, whose kp range is ten times rs-00's, so
-their stiffness in effect was ten times the `--kp` on the command line (kp 15 →
-150 Nm/rad); the rs-00 wrist joints match the command. The scripts default to the
-correct per-joint models now, so reproducing these exact numbers needs
-`--model-spec ""` — the command lines at the end of this page have it.
+One thing to keep in mind while reading these: the runs used the rs-00 MIT table for every motor (`--model-spec ""`). Joints 1-3 are RS-06, whose kp range is ten times rs-00's, so their stiffness in effect was ten times the `--kp` on the command line (kp 15 → 150 Nm/rad); the rs-00 wrist joints match the command. The player defaults to the correct per-joint models (`1:rs-06,2:rs-06,3:rs-06`), so these specific numbers correspond to the rs-00-table configuration.
 
 Single joint, δ = 0.0524 rad (3°), kp 15 / kd 0.6, 30 Hz — measured positions:
 
-| leg | 24 % | 50 % | 76 % | 100 % |
+| leg | 25 % | 50 % | 75 % | 100 % |
 |---|---|---|---|---|
 | outbound | +0.0284 | +0.0456 | +0.0629 | +0.0736 |
 | return | +0.0717 | +0.0548 | +0.0376 | +0.0268 |
@@ -128,106 +120,58 @@ All 7 joints, δ = 0.1048 rad (6°), `--track`, tracking error at the far point 
 | 6 | −0.007 | −0.003 |
 | 7 | −0.001 | +0.002 |
 
-Joints 3 and 4 remain short — joint 4 even at 45 Nm/rad, joint 3 still at the 20 base — and both track to ~2 mrad when the arm is at rest, which points at load rather than mistuning. Gravity compensation is the correct fix: `reBotArm_control_py` has it but needs motorbridge, and the historical gravity example (`examples/edge/gravity_comp_demo.py`, removed) did it on the old pure-Python path, calibrated against the measured droop. Timing: 3.35–3.40 s per 3 s leg at 20 Hz, i.e. **~18 Hz effective for 7 joints** — about the Zero W's ceiling over this HAT.
+Joints 3 and 4 remain short — joint 4 even at 45 Nm/rad, joint 3 still at the 20 base — and both track to ~2 mrad when the arm is at rest, which points at load rather than mistuning. Gravity feedforward is the correct fix: the planner bakes the Pinocchio gravity torque of every waypoint into the trajectory (`examples/host/app/plan_with_pinocchio.py`) and the player sends it in the MIT torque field; the measured effect is below. The player holds the 30 Hz schedule for all 7 joints on this board — see the control-loop budget below and the [edge README](../../examples/edge-rust/README.md)'s "Measured on the reference arm".
 
 ## Checklist for the next Pi Zero W session
 
-1. `dpkg -s python3-can python3-numpy python3-tqdm` — install from apt, never pip (avoids building numpy on a 512 MB armv6 CPU)
+1. The board needs only the static `rebot-edge` binary — build and copy it per the [edge README](../../examples/edge-rust/README.md); no Python, numpy or apt packages
 2. `ip -details link show can0` — `ERROR-ACTIVE`, `bitrate 1000000`
 3. Motor scan before any motion; confirm IDs 1–7
 4. **Dry run first** — the plan should match what you expect to see physically
 5. Validate one joint before seven; the others being limp hides gravity load
-6. Use `--track`; compare a leg's `done in +X.XXs` against `--duration` to catch loop overrun
-7. Keep `--hz ≤ 20` for 7 joints, `≤ 30` for 1–2
+6. Use `--track` and the tick-spacing summary the player prints (mean / max / late) against the plan's duration to catch loop overrun
+7. Set the rate in the trajectory file's `control_hz` — the player holds 30–100 Hz for 7 joints on the Zero W ([edge README](../../examples/edge-rust/README.md), "Measured on the reference arm")
 8. After torque drops the arm sags — re-read positions before the next run rather than assuming the previous start pose
 
-## Reproducing the runs
+## Running the pipeline
 
 ```bash
-# one-time setup (apt, not pip: no compiling numpy on a 512 MB armv6 CPU)
-curl -sL -o /tmp/rs.tar.gz https://codeload.github.com/Seeed-Projects/RobStride_Control/tar.gz/refs/heads/master
-tar xzf /tmp/rs.tar.gz && mv RobStride_Control-master ~/RobStride_Control
-sudo apt-get install -y python3-can python3-numpy python3-tqdm
+# on the board: read-only pose snapshot
+./rebot-edge dump --ids 1,2,3,4,5,6,7 > current.json
 
-# single joint, 3 degrees, measured
-# (--model-spec "" = the rs-00 table these tables were measured with)
-python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
-    --model-spec "" --execute --joints 1 --delta 0.0524 --duration 3 --kp 15 \
-    --hz 30 --track
+# on the workstation: plan inside the Pinocchio image (see examples/README.md)
+docker run --rm -v "$PWD:/work" rebot-pino \
+    python /work/examples/host/app/plan_with_pinocchio.py \
+    --joints /work/current.json --out /work/seq.json
 
-# all joints, 6 degrees, stiffer wrist
-python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
-    --model-spec "" --execute --joints all --delta 0.1048 --kp 4:45,5:35 \
-    --hz 20 --track
-
-# with the per-joint models (the default now) --kp is the real stiffness, so
-# this is ten times softer on joints 1-3 than the run above was
-python3 edge/gradual_motion_demo.py --sdk-path ~/RobStride_Control/python \
-    --execute --joints all --delta 0.1048 --kp 20 --hz 20 --track
+# back on the board
+./rebot-edge seq.json                     # dry run
+./rebot-edge seq.json --execute --track
 ```
 
 ## Offline cartesian planning
 
-The Pi cannot do IK in a control loop: one damped-least-squares solve costs
-~1.3 s on a Zero W, so 20 Hz is hopeless. This is why the historical examples
-were laid out as `edge/`, `host/` and `trajectories/`; the current layout and
-commands are in [`examples/README.md`](../../examples/README.md), with the Rust
-player replacing the Python edge files below.
+The Pi cannot do IK in a control loop: one damped-least-squares solve costs ~1.3 s on a Zero W, so 20 Hz is hopeless. Planning therefore lives on the workstation; the layout is `edge-rust/`, `host/` and `trajectories/`, with commands in [`examples/README.md`](../../examples/README.md).
 
-| Stage | Where | File | Job |
+| Stage | Where | Tool | Job |
 |---|---|---|---|
-| 1. Snapshot | edge | `edge/dump_joints.py` | Read `0x7019` from motors 1-6, print JSON. Read-only, no torque. |
-| 2. Plan | host | `host/plan_cartesian.py` + `host/rebot_ik.py` | FK at the current pose, move a cartesian delta, solve IK per waypoint, write a joint-space trajectory |
-| 3. Play | edge | `edge/play_trajectory.py` | Stream the waypoints at `control_hz`. No IK, no numpy needed. |
+| 1. Snapshot | edge | `rebot-edge dump` | Read `0x7019` from every motor, print JSON. Read-only, no torque. |
+| 2. Plan | host | `host/app/plan_with_pinocchio.py` + `host/app/rebot_ik.py` | FK at the current pose, build the cartesian path, solve IK per waypoint, write a joint-space trajectory with gravity feedforward |
+| 3. Play | edge | `rebot-edge` | Stream the waypoints at `control_hz`. No IK, no numpy needed. |
 
-```bash
-# on the edge device
-python3 edge/dump_joints.py --sdk-path ~/RobStride_Control/python > current.json
-# on the host
-python3 host/plan_cartesian.py --joints current.json --delta 0,0,0.10 \
-    --duration 5 --pause 1.0 --hz 20 --out trajectories/raise10cm.json
-# back on the edge device
-python3 edge/play_trajectory.py trajectories/raise10cm.json            # dry run
-python3 edge/play_trajectory.py trajectories/raise10cm.json --execute
-```
-
-Kinematics come from Seeed's URDF (`ReBot_Arm_RS.urdf`), transcribed into
-`host/rebot_ik.py`. Six revolute joints with a **non-spherical wrist** — the last three
-axes are 104 mm and 60 mm apart — so there is no closed form; it is numeric.
+Kinematics come from Seeed's URDF (`ReBot_Arm_RS.urdf`), transcribed into `host/app/rebot_ik.py`. Six revolute joints with a **non-spherical wrist** — the last three axes are 104 mm and 60 mm apart — so there is no closed form; it is numeric.
 
 ### Control-loop budget on this board
 
-Measured with motor 7 added to the six arm joints:
+The board sets the budget. A numpy scalar operation costs ~1 ms on the 1 GHz ARMv6, and a 7-joint MIT tick built through numpy measured **50 ms** (~72 ms with the reply drain and motors enabled) — over the 50 ms budget of 20 Hz. Packing the same frames with plain arithmetic costs **8.2 ms** per 7-joint tick, which is what the Rust player does: integer scaling in `mit_frame`, pinned by golden-vector unit tests.
 
-| quantity | value |
-|---|---|
-| one tick of 7 MIT frames | **50 ms** (drain of the 7 replies adds 3.8 ms; ~72 ms/tick with motors enabled) |
-| 20 Hz budget | 50 ms — **exceeded**, a 25 s trajectory plays in 35 s |
-| 15 Hz budget | 66.7 ms — marginal, a 22.1 s trajectory plays in 23.9 s |
-| one tick of 6 MIT frames | ~43 ms — fits 20 Hz, which is why 6-joint runs kept time |
+At 30 Hz the player ran **22.00 s of 22.00 s planned, 33.3 ms mean tick spacing, max 34.8 ms, 0 of 660 ticks late**; 50–200 Hz resamples of the same path also hold schedule ([edge README](../../examples/edge-rust/README.md), "Measured on the reference arm"). Keep command intervals at 33 ms or shorter: a 66 ms interval (15 Hz) at kp 30–45 makes the motor execute discrete position steps and dwell between them — visible stepping and 8–9 % lag.
 
-The cost is inside `write_operation_frame`, which does ~6 numpy scalar operations
-per joint at ~1 ms each on a 1 GHz ARMv6. Two consequences: keep 7-joint
-trajectories at 15 Hz (12 Hz if you want margin), and do not chase timing
-problems with read-side tuning — this was misdiagnosed as a sampling cost twice
-before the write path was measured.
-
-**The fix is to stop calling numpy.** `edge/mit_frames.MitSender` builds the same MIT
-frame with plain arithmetic and `struct`: 8.2 ms per 7-joint tick instead of
-50.6 ms (6.1x), enough for a comfortable 30-40 Hz. `edge/test_mit_frames.py` compares
-its bytes against `write_operation_frame` over positions, gains and torques in
-and out of range - 488 frames, 0 mismatches - before it is trusted with a motor.
-
-At 30 Hz with hand-built frames the same sequence ran **22.00 s of 22.00 s
-planned with 33.3 ms mean tick spacing, max 34.8 ms, 0 of 660 ticks late**. The
-previous 15 Hz run lagged 8-9 % with visible stepping, because a 66 ms command
-interval at kp 30-45 makes the motor execute discrete position steps and then
-dwell between them.
+Do not chase timing problems with read-side tuning: telemetry is non-blocking (the player drains queued status frames with zero-timeout reads), so the write path is the only place ticks are spent.
 
 ### Result of a 10 cm raise (validated)
 
-Planned: 221 waypoints, 5 s up, 1 s hold, 5 s down, 20 Hz, peak joint speed
-0.137 rad/s, worst IK residual 0.49 mm.
+Planned: 221 waypoints, 5 s up, 1 s hold, 5 s down, 20 Hz, peak joint speed 0.137 rad/s, worst IK residual 0.49 mm.
 
 | quantity | value |
 |---|---|
@@ -238,24 +182,13 @@ Planned: 221 waypoints, 5 s up, 1 s hold, 5 s down, 20 Hz, peak joint speed
 | playback time vs plan | 11.00 s / 11.00 s |
 | joint error at the top | j2 −3 mrad, j3 −18 mrad, j4 −43 mrad |
 
-So the *path* is right — vertical, straight, and it comes home — but the tool
-finishes 21 mm low. That is joint compliance under gravity, not an IK error: the
-planner's own residual is 0.5 mm. Joint 4 carries the wrist and is the one that
-gives (43 mrad ≈ 2.5°).
+So the *path* is right — vertical, straight, and it comes home — but the tool finishes 21 mm low. That is joint compliance under gravity, not an IK error: the planner's own residual is 0.5 mm. Joint 4 carries the wrist and is the one that gives (43 mrad ≈ 2.5°).
 
-A second run at **20 cm** (same profile, 180.9 mm measured of 199.5 mm planned)
-came up 18.6 mm short. A third, compound run — up 25 cm, then forward 10 cm with
-a 0.5 s corner pause — reached 225.2 mm of 250.2 mm vertically and 102.7 mm of
-99.8 mm forward: **25 mm off in z, 3 mm in x**.
+A second run at **20 cm** (same profile, 180.9 mm measured of 199.5 mm planned) came up 18.6 mm short. A third, compound run — up 25 cm, then forward 10 cm with a 0.5 s corner pause — reached 225.2 mm of 250.2 mm vertically and 102.7 mm of 99.8 mm forward: **25 mm off in z, 3 mm in x**.
 
-So the shortfall sits around 18-25 mm for 10-25 cm moves and grows only slowly as
-the arm extends, i.e. it is dominated by wrist compliance rather than a scale
-error. Accuracy therefore improves in percentage terms with amplitude: 21 % short
-at 10 cm, 9 % at 20 cm, 10 % at 25 cm (with the extra reach offsetting the gain).
+So the shortfall sits around 18-25 mm for 10-25 cm moves and grows only slowly as the arm extends, i.e. it is dominated by wrist compliance rather than a scale error. Accuracy therefore improves in percentage terms with amplitude: 21 % short at 10 cm, 9 % at 20 cm, 10 % at 25 cm (with the extra reach offsetting the gain).
 
-Gravity feedforward was modelled (`host/rebot_ik.gravity_torques`, validated against
-`dU/dq` to 3.5e-9 Nm). Comparing the model against the droop the arm shows at the
-top of the lift, with the kp that was actually in effect:
+Gravity feedforward was modelled (`gravity_torques` in `host/app/rebot_ik.py`, validated against `dU/dq` to 3.5e-9 Nm). Comparing the model against the droop the arm shows at the top of the lift, with the kp that was actually in effect:
 
 | joint | kp in effect | droop | implied load | URDF model | ratio |
 |---|---|---|---|---|---|
@@ -263,23 +196,11 @@ top of the lift, with the kp that was actually in effect:
 | j3 | 200 Nm/rad | 0.037 | 7.4 Nm | 5.81 Nm | 1.27 |
 | j4 | 45 Nm/rad | 0.045 | 2.0 Nm | 1.67 Nm | 1.20 |
 
-Those kp values are not the commanded ones. Joints 1-3 are RS-06, whose MIT kp
-range is 5000 Nm/rad against rs-00's 500, so with the rs-00 table (which these
-runs used) a command of kp 20 is 200 Nm/rad on the base joints; the wrist is
-rs-00, so its kp 45 is 45. The model agrees to within 30-40 %, so the 78 mm
-shortfall is joint compliance under load, and feeding the model torque in is the
-right fix — which is what the example below does.
+Those kp values are not the commanded ones. Joints 1-3 are RS-06, whose MIT kp range is 5000 Nm/rad against rs-00's 500, so with the rs-00 table (which these runs used) a command of kp 20 is 200 Nm/rad on the base joints; the wrist is rs-00, so its kp 45 is 45. The model agrees to within 30-40 %, so the 78 mm shortfall is joint compliance under load, and feeding the model torque in is the right fix — which is what the planner's per-waypoint feedforward does.
 
-### Applying it: the calibrated example
+### Gravity feedforward, measured
 
-`examples/edge/gravity_comp_demo.py` (since removed)
-takes that last step rather than leaving it as advice, and it has since been run
-on this arm. In `--mode hold` it holds one pose with position control, reads the
-droop as `kp × droop`, derives a per-joint scale against the model, then holds
-again with feedforward recomputed from the measured pose every tick.
-
-Run at the top of the 10 cm lift above, with the per-joint models the arm needs
-(`--model-spec "1:rs-06,2:rs-06,3:rs-06"`), kp 30, 10 Hz:
+The calibration method: hold one pose with position control, read the droop as `kp × droop`, derive a per-joint scale against the model, then hold again with feedforward recomputed from the measured pose. Run at the top of the 10 cm lift above, with the per-joint models the arm needs (`--model-spec "1:rs-06,2:rs-06,3:rs-06"`), kp 30, 10 Hz:
 
 | joint | model Nm | measured load Nm | scale | droop before | droop after |
 |---|---|---|---|---|---|
@@ -287,71 +208,38 @@ Run at the top of the 10 cm lift above, with the per-joint models the arm needs
 | 3 | 6.22 | 7.46 | 1.199 | 0.2485 | 0.0909 |
 | 4 | 1.65 | 1.85 | 1.120 | 0.0616 | 0.0183 |
 
-Mean |droop| fell from 0.057 to 0.020 rad (65 %), 63-70 % on each loaded joint;
-the scales are 0.6-1.2, i.e. the URDF model is roughly right and the calibration
-trims it.
+Mean |droop| fell from 0.057 to 0.020 rad (65 %), 63-70 % on each loaded joint; the scales are 0.6-1.2, i.e. the URDF model is roughly right and the calibration trims it.
 
 Three things the runs made concrete:
 
-- **Feedforward only cancels a load it exceeds.** Joint 3 applied 7.46 Nm and
-  recovered 63 % of its 0.25 rad droop; the rest is friction and stiction, which
-  sets how well a low-torque joint can track.
-- **A pose on the stops measures the support, not gravity.** The same
-  experiment at the resting pose (joints 2-3 exactly on their 0 rad limits) gave
-  scales of 0.08 and 0.63 and removed 4 %: the arm was resting on its support.
-  Lift it clear before calibrating.
-- **The model costs ~80 ms per call on this board**, so the demo defaults to
-  10 Hz and holds 100 ms ticks. A 20 Hz attempt ran 90 ms ticks with half of
-  them late; the bus is not the bottleneck, numpy is.
+- **Feedforward only cancels a load it exceeds.** Joint 3 applied 7.46 Nm and recovered 63 % of its 0.25 rad droop; the rest is friction and stiction, which sets how well a low-torque joint can track.
+- **A pose on the stops measures the support, not gravity.** The same experiment at the resting pose (joints 2-3 exactly on their 0 rad limits) gave scales of 0.08 and 0.63 and removed 4 %: the arm was resting on its support. Lift it clear before calibrating.
+- **The model costs ~80 ms per call on this board** — which is why gravity is computed offline, per waypoint, on the workstation, and the player only sends the precomputed torque.
 
-`examples/host/fit_gravity.py` fits one scale per joint over several poses and
-reports whether it travels. Setup and usage:
-[Examples](../../examples/README.md#gravity-compensation).
+The planner bakes Pinocchio gravity feedforward into every waypoint (`examples/host/app/plan_with_pinocchio.py`). Setup and usage: [Examples](../../examples/README.md).
 
 ### Gripper (motor 7)
 
-Motor 7 is not part of the arm chain, so no IK applies: `plan_gripper.py` writes a
-one-motor trajectory that `edge/play_trajectory.py` replays like any other, and the
-arm's other joints stay disabled throughout.
+Motor 7 is not part of the arm chain, so no IK applies: it is planned directly in joint space by `examples/host/app/plan_with_pinocchio.py` (closed target −0.015 rad, open 4.90 rad) and replayed by `rebot-edge` like any other motor.
 
 Two things measured on the reference unit:
 
-- **The closed stop sits at about −0.015 rad, not 0.** The encoder reads −0.015
-  with the jaws shut, and commanding below that changes nothing: the player's
-  align ramp asked for −0.0277 and the gripper stayed at −0.015 for the whole
-  leg. Plan `--start-rad`/`--close-rad` at the measured stop so the motor does
-  not sit pressing against it (at kp 10 that is a steady ~0.13 Nm for no gain).
-- **Tracking to 4.12 rad is clean** (measured 4.083-4.111, no stall), so the
-  stroke extends past 4.12 rad and Seeed's 0-5 rad closed-to-open range is
-  plausible.
+- **The closed stop sits at about −0.015 rad, not 0.** The encoder reads −0.015 with the jaws shut, and commanding below that changes nothing: the player's align ramp asked for −0.0277 and the gripper stayed at −0.015 for the whole leg. Plan the closed target at the measured stop (the planner uses −0.015 rad) so the motor does not sit pressing against it (at kp 10 that is a steady ~0.13 Nm for no gain).
+- **Tracking to 4.12 rad is clean** (measured 4.083-4.111, no stall), so the stroke extends past 4.12 rad and Seeed's 0-5 rad closed-to-open range is plausible.
 
-Radians to centimetres is pinion geometry that the URDF does not model (it makes
-the fingers prismatic, 0.05 m + 0.0715 m). The default 0.412 rad/cm comes from
-assuming 5 rad spans that ~12 cm stroke, and it is a linear map through the
-closed stop, so a single ruler measurement fixes it.
+Radians to centimetres is pinion geometry that the URDF does not model (it makes the fingers prismatic, 0.05 m + 0.0715 m). A first approximation is 0.412 rad/cm — 5 rad spanning that ~12 cm stroke — a linear map through the closed stop, so a single ruler measurement fixes it.
 
 ### Measuring the lift by hand
 
-The tool moves by pure translation (orientation is held constant), so **any
-single point on the gripper** rises by the same amount — measure that against a
-fixed external reference. Do **not** measure between two joints: two points on
-different links describe a chord, not a displacement. The j2→j5 centre-to-centre
-chord grows by 88.6 mm for a 99.4 mm tool rise, and an edge-to-edge version of
-the same measurement reads differently again, which is plenty to make a 78 mm
-result look like "about 100 mm".
+The tool moves by pure translation (orientation is held constant), so **any single point on the gripper** rises by the same amount — measure that against a fixed external reference. Do **not** measure between two joints: two points on different links describe a chord, not a displacement. The j2→j5 centre-to-centre chord grows by 88.6 mm for a 99.4 mm tool rise, and an edge-to-edge version of the same measurement reads differently again, which is plenty to make a 78 mm result look like "about 100 mm".
 
-### Two IK details that bit during development
+### Two IK details that matter
 
-1. **The joint-limit margin must not push a joint that already sits inside it.**
-   Joint 2 rests at 0.005 rad against a 0 rad limit; enforcement with a 0.02 rad
-   margin silently moved the seed to 0.02 and every solve stalled ~1 mm short.
-   The band is now `min(lo+margin, seed) .. max(hi−margin, seed)`.
-2. **The band must also include the plan's start pose** (`anchor=`). Without it a
-   return leg stalls in the last 4 % — it cannot get back down to the pose it
-   began from, because that pose is inside the margin band.
+1. **The joint-limit margin must not push a joint that already sits inside it.** Joint 2 rests at 0.005 rad against a 0 rad limit; enforcement with a 0.02 rad margin silently moved the seed to 0.02 and every solve stalled ~1 mm short. The band is `min(lo+margin, seed) .. max(hi−margin, seed)`.
+2. **The band must also include the plan's start pose** (`anchor=`). Without it a return leg stalls in the last 4 % — it cannot get back down to the pose it began from, because that pose is inside the margin band.
 
 ## Known limits
 
-- **Cartesian motion is planned offline.** `host/rebot_ik.py` + `host/plan_cartesian.py` run on a workstation; the Pi only replays joint waypoints. Accuracy at the tool is limited by joint compliance (21 mm of a 100 mm lift at kp 30-45), not by the planner.
-- **No gravity compensation in the vendor/motorbridge path.** A model exists and is numerically validated (`host/rebot_ik.gravity_torques`), and `examples/edge/gravity_comp_demo.py` (since removed) applied it on the old pure-Python path — with the per-joint motor models it needs (RS-06 on joints 1-3, RS-00 on 4-6) and a scale fitted from measured droop at the pose in question. It removed ~65 % of the static droop there; the remainder is joint friction. The vendor `reBotArm_control_py` path is unaffected by the example and still needs motorbridge.
-- **`write_id()` in the vendored library is broken**: it calls `CommunicationType.SET_CAN_ID`, which does not exist (the constant is `SET_DEVICE_ID = 7`). Irrelevant once IDs are set, but do not trust that method.
+- **Cartesian motion is planned offline.** `examples/host/app/plan_with_pinocchio.py` (with `app/rebot_ik.py`) runs on a workstation; the Pi only replays joint waypoints. Accuracy at the tool is limited by joint compliance (21 mm of a 100 mm lift at kp 30-45), not by the planner.
+- **Gravity compensation is offline feedforward, not a vendor feature.** The model is numerically validated (`gravity_torques` in `host/app/rebot_ik.py`) and the planner bakes it into every waypoint; measured, it removes ~65 % of the static droop with the per-joint motor models (RS-06 on joints 1-3, RS-00 on 4-6) and a scale fitted from measured droop at the pose in question. The remainder is joint friction. The vendor `reBotArm_control_py` path has its own compensation but needs motorbridge, which does not run on this board.
+- **`write_id()` in Seeed's `RobStride_Control` SDK is broken**: it calls `CommunicationType.SET_CAN_ID`, which does not exist (the constant is `SET_DEVICE_ID = 7`). Irrelevant once IDs are set, but do not trust that method.

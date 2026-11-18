@@ -1,18 +1,16 @@
 # rebot-edge — the edge player as one Rust binary
 
 The edge half of the B601-RS pipeline, in one static executable. Input is the
-trajectory JSON that `host/plan_with_pinocchio.py` writes:
+trajectory JSON that `host/app/plan_with_pinocchio.py` writes:
 
 ```
 seq_pino_peel.json ──► rebot-edge ──► SocketCAN can0 ──► motors 1-7
 ```
 
-It replaces the former Python edge player (`play_trajectory.py`,
-`gradual_motion_demo.py`, `mit_frames.py` and `dump_joints.py`, now removed)
-with `src/main.rs` (serde + libc only). The wire format, the re-checked limits,
-the eased alignment, dry-run default and the shutdown ramp are the same; the
-only thing that changes on the board is that there is no Python, numpy or
-`RobStride_Control` checkout to install.
+Everything lives in `src/main.rs` (serde + libc only): the wire format, the
+re-checked limits, the eased alignment, the dry-run default and the shutdown
+ramp. There is no Python, numpy or `RobStride_Control` checkout to install on
+the board.
 
 ## Build with Docker
 
@@ -51,8 +49,8 @@ Run the unit tests (host architecture, inside the build image):
 docker build --target test .
 ```
 
-The tests include byte-for-byte golden vectors generated from the Python
-`MitSender`, so a change to the frame scaling fails the build. A second test
+The tests include byte-for-byte golden vectors for the MIT frame encoding, so
+a change to the frame scaling fails the build. A second test
 runs bring-up and the whole playback loop against an in-memory motor simulator,
 so the control loop is covered without hardware.
 
@@ -87,19 +85,19 @@ The dry run still opens the CAN socket and reads `0x7019` from every motor
 
 `--execute` prints the drift between the plan's start pose and the measured one,
 refuses to start if it is more than 20°, eases onto the plan start with
-`--ramp`, streams the waypoints, then ramps home and disables torque. The way home
-is timed by the distance it covers -- a cosine ease capped at 0.35 rad/s, at least
-3 s -- not by a constant, so a long return is not rushed. The shutdown uses
-three times that speed (1.05 rad/s), so an open gripper auto-closes in about
-7.3 s instead of 22 s (half-closed in about 3.7 s); the arm joints return at the
-same faster rate. On a gripper stall the measured blocked opening is held
-instead, so the return does not resume the press. Ctrl-C or SIGTERM
-interrupts at the next tick, ramps home the same way and then disables.
+`--ramp`, streams the waypoints, then ramps home and disables torque. Every
+exit -- normal end, fault, Ctrl-C or SIGTERM -- takes the same single ramp
+home: a cosine ease capped at 1.05 rad/s, at least 3 s, timed by the distance
+it covers rather than a constant, so a long return is not rushed. At that cap
+an open gripper auto-closes in about 7.3 s (half-closed in about 3.7 s); the
+arm joints return at the same rate. On a gripper stall the measured blocked
+opening is held instead, so the return does not resume the press. Ctrl-C or
+SIGTERM interrupts at the next tick, ramps home the same way and then disables.
 
 ## Pose snapshot
 
-The planner's `--joints` input is still a read-only pose JSON. The former
-`dump_joints.py` is replaced by the `dump` subcommand:
+The planner's `--joints` input is a read-only pose JSON, produced by the `dump`
+subcommand:
 
 ```bash
 ./rebot-edge dump --ids 1,2,3,4,5,6,7 > current.json
@@ -167,10 +165,12 @@ ssh qh812@raspberrypi
 curl -s http://<board-ip>:8081/health
 ```
 
-[`rebot-edge.service`](rebot-edge.service) is the unit: it waits for
-`can0-setup.service`, restarts on failure, and reads the token from
-`/etc/rebot-edge.token` so it never appears in `ps`. Drop `--allow-execute` from
-its `ExecStart` to keep the board read-only over HTTP.
+[`rebot-edge.service`](rebot-edge.service) is the unit: it starts after
+`can0-setup.service` when that unit is enabled (the CAN HAT guide enables it;
+the unit only orders after it, it does not pull it in), restarts on failure,
+and reads the token from `/etc/rebot-edge.token` so it never appears in `ps`.
+Drop `--allow-execute` from its `ExecStart` to keep the board read-only over
+HTTP.
 
 ## Input
 
@@ -196,7 +196,7 @@ Checks performed before anything is enabled:
 - `format`, at least two waypoints, monotonic `t`, one `q` per motor;
 - every `q` inside the file's `limits` (when the lengths match) and outside no
   limit by more than 2 mrad;
-- at most 0.5 rad between consecutive waypoints (sanity, as in Python);
+- at most 0.5 rad between consecutive waypoints (sanity);
 - every `q` inside the MIT frame's ±4π range, rather than letting the frame
   encoder clip it silently;
 - `tau` present on every waypoint or none, finite, one per motor;
@@ -214,8 +214,8 @@ Checks performed before anything is enabled:
 | `--ramp S` | ease-on time, default 2.0 s (clamped 0.5..10) |
 | `--speed X` | time scale, default 1.0 (clamped 0.1..5) |
 | `--delay S` | hold the start pose before moving |
-| `--max-follow-error RAD` | abort when a joint lags by more than this (checked twice a second) |
-| `--gripper-stall SECONDS` | abort when motor 7 is >0.15 rad from its command and moving <0.08 rad/s for this long; `0` disables |
+| `--max-follow-error RAD` | abort when a joint lags by more than this (checked once a second of trajectory time) |
+| `--gripper-stall SECONDS` | abort when motor 7 is >0.15 rad from its command and moving <0.08 rad/s for this long; `0` disables, otherwise 0.1..5.0 s |
 | `--log FILE` | write commanded/measured angles as `rebot-trajectory-log` JSON |
 | `--allow-kp-mismatch` | replay a sag-compensated file at another `kp` |
 | `--stay-enabled` | leave torque on at exit |
@@ -225,7 +225,7 @@ Checks performed before anything is enabled:
 | `--check` | validate/describe the file offline, no CAN |
 | `--fast-frames` | accepted for command-line compatibility; frames are always hand-built |
 
-`--sdk-path` is rejected with a hint: there is no Python SDK to find.
+`--sdk-path` is rejected with a hint: there is no SDK to find.
 
 ## Higher rates
 
@@ -276,35 +276,30 @@ and tracking degraded (gripper peak 0.77 rad vs 0.29 rad at 100 Hz active).
 Use active reporting at 100 Hz or below; at 200 Hz leave it off. Both runs
 switched reporting off at exit — zero Type-24 frames were seen afterwards.
 
-## Differences from the Python player
+## Behavior worth knowing
 
 - **One static binary.** No Python, numpy, `python-can` or `RobStride_Control`
   on the board. MIT frames are built with integer scaling in `mit_frame`; the
-  tests pin the bytes to the Python implementation.
+  tests pin the exact wire bytes.
 - **`--check`.** Validates and prints the plan on the workstation or in CI.
-- **Stricter input checks.** Duplicate IDs, non-finite values, partially present
-  `tau`, and angles outside ±4π are refused; the Python player would either
-  crash or let the frame encoder clip.
+- **Strict input checks.** Duplicate IDs, non-finite values, partially present
+  `tau`, and angles outside ±4π are refused up front, before any frame is sent.
 - **A partial bring-up disables torque.** If a motor accepts ENABLE but never
-  returns a status frame, the Rust player disables every motor instead of
-  leaving torque on while it reports the error. The Python player's `enabled`
-  flag is only set after the whole loop, so that failure leaves the earlier
-  motors enabled.
+  returns a status frame, the player disables every motor instead of leaving
+  torque on while it reports the error.
 - **Reads have timeouts.** A missing motor reports after 500 ms instead of
   hanging forever in a blocking parameter read.
 - **Non-blocking telemetry.** With `--active-report`, a reader thread owns the
   CAN receive side and publishes the latest status per joint. Without it, the
   playback loop drains already-queued status frames with a zero-timeout read,
-  so `--log`, `--track` and follow-error checks never wait on the bus either
-  (the Python player blocks up to 12 ms per waypoint).
+  so `--log`, `--track` and follow-error checks never wait on the bus either.
 - **`operstate` accepts `unknown`.** CAN interfaces (and `vcan`) often report
   `unknown` when administratively up; only `down` is treated as down, so the
   player also works against `vcan0` for bench tests.
-- **Log timestamps are UTC** (`...Z`), not local time. Everything else in the
-  log follows the Python `rebot-trajectory-log` format.
-- **Dump is included.** `rebot-edge dump` replaces the former Python
-  `dump_joints.py` and produces the planner's `--joints` input. It enables
-  nothing; the playback path still needs only the trajectory.
+- **Log timestamps are UTC** (`...Z`), not local time. The log uses the
+  `rebot-trajectory-log` format.
+- **Dump is included.** `rebot-edge dump` produces the planner's `--joints`
+  input. It enables nothing; the playback path still needs only the trajectory.
 
 ## Measured on the reference arm
 
@@ -362,7 +357,7 @@ opening when the grip matters.
 - A fault frame, a failed status read or a follow-error aborts playback; the arm
   is ramped back to the pose captured at enable before torque is dropped.
 - A gravity-loaded joint will sag when torque drops. Make sure the arm is
-  resting safely before running, as with the Python demo.
+  resting safely before running.
 - Active reporting is telemetry only, but it is switched off on exit. If the
   process is SIGKILLed, the motors keep reporting until the next power cycle;
   use `--active-report` with the normal Ctrl-C/SIGTERM path.

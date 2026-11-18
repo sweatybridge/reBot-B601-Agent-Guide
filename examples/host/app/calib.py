@@ -30,7 +30,11 @@ class CalibError(Exception):
 
 
 def same_shape(a, b) -> bool:
-    """Do two image sizes describe the same rectangle, up to a quarter turn?"""
+    """Do two image sizes describe the same rectangle (same aspect ratio)?
+
+    A quarter turn exchanges the sides and fails this test; that case is
+    `swapped_shape`'s question.
+    """
     aw, ah = float(a[0]), float(a[1])
     bw, bh = float(b[0]), float(b[1])
     if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:

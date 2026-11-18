@@ -1,7 +1,7 @@
 # Host image: the capture server and every one-shot CV tool.
 #
 # One image, three entry points: `app/capture_server.py` (the long-running
-# service), the CLIs in `app/` (calibrate_intrinsics, locate_target, make_tag,
+# service), the CLIs in `app/` (calibrate_intrinsics, locate_target, base_marker,
 # make_cert) and `tests/selftest.py`. compose.yaml runs it as `capture` and
 # `tools`.
 #

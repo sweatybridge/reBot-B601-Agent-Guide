@@ -8,7 +8,7 @@
 #
 #   docker build -t rebot-pino -f examples/host/Dockerfile.pinocchio .
 #   docker run --rm -v "$PWD:/work" rebot-pino \
-#       python /work/examples/host/plan_with_pinocchio.py \
+#       python /work/examples/host/app/plan_with_pinocchio.py \
 #       --joints /work/current.json --out /work/seq_pino.json
 FROM python:3.11-slim
 

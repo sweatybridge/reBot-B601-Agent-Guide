@@ -15,9 +15,31 @@ motorbridge-cli --help 2>/dev/null || echo "motorbridge-cli not found"
 
 If the command is not found:
 - Linux/macOS: ensure the conda environment is activated (`conda activate rebot`)
-- Windows: use the full path, e.g. `<Python_install_dir>\Scripts\motorbridge-cli.exe`
+- Windows: use the full path, e.g. `<miniforge_path>\envs\rebot\Scripts\motorbridge-cli.exe`
 
 > **Important: Motors must be powered on (RS: 48V, DM: 24V) to respond to scans.** If a scan fails, first ask the user to verify that power is applied.
+
+## Pre-Flight Information Gathering
+
+Before starting any scan, **confirm the following with the user first**:
+
+| Information | Description | Example |
+| --- | --- | --- |
+| Motor type | robstride or damiao | robstride |
+| Device version | Unassembled kit (write IDs one by one) or assembled (IDs may already be set) | Unassembled kit |
+| Target ID range | Which IDs the user wants the motors set to | 1~7 |
+| Hardware connection | PCAN-USB/serial plugged in, CAN cable connected, motors powered on | Connected and powered |
+| Motors connected | Only one motor may be connected while changing IDs | 1 only |
+
+> **Write to memory**: After collecting the information above, append to `../memory/local-machine-env.md` (if it has no motor information yet):
+>
+> ```markdown
+> ## Motor Configuration
+> - Motor type (robstride / damiao):
+> - Device version (unassembled kit / assembled):
+> - Target ID range: 1~7
+> - Serial port: COMx (damiao, if applicable)
+> ```
 
 ## Identify Device Type
 
@@ -236,6 +258,13 @@ motorbridge-cli scan --vendor robstride --channel can0 --start-id <new_id> --end
 - If new ID hits and old ID doesn't respond → modification successful
 - If old ID still hits → modification failed, re-run `id-set`
 
+> **Write to memory**: After each motor ID is set successfully, append to `../memory/local-machine-env.md`:
+>
+> ```markdown
+> ### Configured Motors
+> - ID 1: confirmed ✅
+> ```
+
 ---
 
 ## Step 4: Final Confirmation
@@ -268,3 +297,11 @@ scan done: 7 motor(s) found
 ```
 
 Inform the user which motors were detected. Once the user confirms all IDs 1–7 are correct, this process is complete; if any are missing, go back to re-modify the corresponding motor.
+
+> **Write to memory**: After the final scan, update `../memory/local-machine-env.md`:
+>
+> ```markdown
+> ### Configured Motors
+> - Configured IDs: 1, 2, 3, 4, 5, 6, 7
+> - Final scan time: YYYY-MM-DD
+> ```

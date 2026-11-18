@@ -7,12 +7,13 @@
 #
 #   cp .env.example .env        # REBOT_HOST_IP, tag placement, REBOT_EDGE_URL
 #   docker compose up -d --build
-#   docker compose --profile tools run --rm tools calibrate_intrinsics.py
+#   docker compose --profile tools run --rm tools app/calibrate_intrinsics.py
 #
-# The phone only ever talks to :8443. MediaMTX's signaling stays on the compose
-# network and is reached through the relay in capture_server.py; only the media
-# port 8189/udp is published, because after the handshake the phone sends RTP
-# straight to <REBOT_HOST_IP>:8189.
+# The phone only ever talks to :8443 and :8189/udp. MediaMTX's signaling stays
+# on the compose network and is reached through the relay in capture_server.py;
+# the media port 8189/udp is published because after the handshake the phone
+# sends RTP straight to <REBOT_HOST_IP>:8189. Also published: 8554 (RTSP, for
+# host-run tools) and the control API on 127.0.0.1:9997 (host loopback only).
 #
 # Everything that persists lives in ./state/{captures,calib,tls,tags,out,work},
 # mounted at /app/state so the paths are the same inside and outside.
@@ -62,12 +63,12 @@ services:
       REBOT_RECORDINGS: /app/state/recordings
       REBOT_MEDIAMTX_API: http://mediamtx:9997
       # A 4 cm ArUco tag on the base: where it sits in the robot's frame,
-      # "x,y,z[,yaw]" in metres and degrees. Handheld mode reads it on every tap;
+      # "x,y,z[,yaw[,id]]" in metres and degrees. Handheld mode reads it on every tap;
       # fixed mode reads it in the calibration capture and writes the rig.
       REBOT_MARKER_AT: ${REBOT_MARKER_AT:-}
       REBOT_MARKER_SIZE: ${REBOT_MARKER_SIZE:-0.04}
-      # Where the arm ends: above the tapped point, with the tip a known distance
-      # below the flange the planner aims.
+      # Height of the tap plane above the worktop: the tip is planned at the
+      # tapped x/y, at plane_z + hover_m.
       REBOT_HOVER_M: ${REBOT_HOVER_M:-0.10}
       REBOT_TIP_MM: ${REBOT_TIP_MM:-35}
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
