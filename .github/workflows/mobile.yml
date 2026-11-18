@@ -54,7 +54,11 @@ jobs:
         run: swift test
 
   ios-sdk-tests:
-    runs-on: macos-15
+    # Intel pool: the arm64 macos-15 pool has a capacity incident where jobs
+    # queue for 15 min and are cancelled (actions/runner#4833). Xcode 16 here
+    # still satisfies the Xcode 15+ requirement; the simulator build is
+    # architecture-agnostic.
+    runs-on: macos-15-intel
     continue-on-error: true
     timeout-minutes: 45
     env:
