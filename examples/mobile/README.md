@@ -151,7 +151,7 @@ tools/gen_fixtures.js  regenerates test fixtures from the guide repo's web JS
 
 ## Continuous Integration (GitHub Actions)
 
-[`.github/workflows/mobile.yml`](../../.github/workflows/mobile.yml) defines two
+[`.github/workflows/mobile.yml`](../../.github/workflows/mobile.yml) defines three
 jobs, run on pushes and pull requests that touch `examples/mobile`, the web JS
 it is validated against (`examples/host/web`), or the workflow itself:
 
@@ -159,6 +159,7 @@ it is validated against (`examples/host/web`), or the workflow itself:
 |---|---|---|
 | `core-tests` | Linux, `swift:6.0` container | the ported math matches the page's JS (fixtures are regenerated from the checked-out commit each run, so they never go stale) |
 | `ios-sdk-tests` | GitHub-hosted `macos-15-intel` (Xcode 16) | the **full app compiles against the iOS SDK** (simulator) and the same suite passes as an Xcode test bundle (`RebotCaptureTests`) |
+| `testflight` | GitHub-hosted `macos-15-intel` (Xcode 16) | **only on pushes to `main`**: archives the signed Release app and uploads it to TestFlight for on-device testing |
 
 The iOS job is `continue-on-error: true` (the GitLab original used
 `allow_failure`) so the macOS layer never blocks the pipeline — `core-tests`
@@ -172,6 +173,34 @@ Run the iOS layer locally the same way CI does:
 xcodebuild test -project RebotCapture.xcodeproj -scheme RebotCapture \
   -destination 'platform=iOS Simulator,name=iPhone 15' CODE_SIGNING_ALLOWED=NO
 ```
+
+### On-device builds (TestFlight)
+
+Every iOS change merged to `main` is archived (Release, arm64) and uploaded to
+**TestFlight internal testing**, so testers get the new build in the TestFlight
+app with no cables or UDID registration. Signing is automatic: Xcode manages the
+distribution certificate and App Store profile via `-allowProvisioningUpdates`
+and an App Store Connect API key, so no certificate/profile secrets are needed.
+
+Prerequisites (one-time):
+
+- An **Apple Developer Program** account.
+- An **App Store Connect app record** for the bundle id `ai.rebot.capture`.
+- An **App Store Connect API key** (Admin role, so it can manage signing) —
+  download the `.p8`, note its Key ID and the Issuer ID.
+
+Set these repository **Actions secrets** to enable the job (it skips with a
+notice until they are present):
+
+| secret | value |
+|---|---|
+| `APP_STORE_CONNECT_API_KEY_BASE64` | base64 of the `.p8` key file |
+| `APP_STORE_CONNECT_API_KEY_ID` | the key's Key ID |
+| `APP_STORE_CONNECT_API_ISSUER_ID` | the Issuer ID from App Store Connect |
+| `APPLE_TEAM_ID` | your 10-character Apple Developer team id |
+
+Internal testers (up to 100) are added in App Store Connect → TestFlight; they
+install via the TestFlight app and auto-update on each new build.
 
 ## Verification
 
