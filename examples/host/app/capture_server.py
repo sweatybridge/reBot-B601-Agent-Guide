@@ -38,6 +38,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
 from aiohttp import ClientSession, ClientTimeout, web
@@ -51,6 +52,7 @@ import extrinsics
 import locate_target as locator
 import mediamtx
 import sweep
+import trace as trace_mod
 import witness
 
 VERSION = "0.2.0"
@@ -66,6 +68,9 @@ RESERVED_META = {"id", "frame", "server"}
 # A chat turn carries the frames the model has been shown, and every frame is a
 # base64 JPEG. Past this many messages the page must drop old frames.
 AGENT_MAX_MESSAGES = 80
+# One page flush of trace events: a frame is ~100 KiB of base64, so 8 MiB is
+# generous for 64 events and still refuses a runaway page in one request.
+TRACE_MAX_BODY = 8 * 1024 * 1024
 
 
 def utc_now() -> str:
@@ -259,6 +264,174 @@ async def handle_stream_js(request: web.Request) -> web.StreamResponse:
                         headers={"Cache-Control": "no-store"})
 
 
+async def handle_trace_js(request: web.Request) -> web.StreamResponse:
+    script = WEB_DIR / "trace.js"
+    if not script.is_file():
+        return web.Response(text="trace.js is missing next to capture_server.py", status=500)
+    return web.Response(text=script.read_text(encoding="utf-8"),
+                        content_type="text/javascript",
+                        headers={"Cache-Control": "no-store"})
+
+
+async def trace_event(app, sid, type, **fields):
+    """Record one server event; §8.4: a broken collector never fails a request.
+
+    Every recorder call in the chat and arm paths goes through here (or the
+    equally wrapped handle_trace), so a full disk degrades to "no trace for
+    this session", never to a failed /agent, /sequence or /execute.
+    """
+    recorder = app.get("traces")
+    if recorder is None or not sid:
+        return None
+    try:
+        return await recorder.event(sid, "server", type, **fields)
+    except Exception as exc:  # noqa: BLE001 - tracing is strictly additive
+        logging.warning("trace %s for %s failed: %s", type, sid, exc)
+        return None
+
+
+def trace_manifest(app, sid):
+    """The environment snapshot frozen at first sight of a session (§4.2).
+
+    The rig and calib *file bytes* are copied into the session dir, not just
+    fingerprinted: the live files may be refitted later, and a replay must see
+    the geometry this session actually ran with.
+    """
+    directory = app["traces"].session_dir(sid)
+    directory.mkdir(parents=True, exist_ok=True)
+    live = WEB_DIR / "live.html"
+    measured = app.get("measured_turn")
+    marker = app.get("marker")
+    snapshot = {
+        "version": VERSION,
+        "created": utc_now(),
+        "live_html_sha256": (hashlib.sha256(live.read_bytes()).hexdigest()
+                             if live.is_file() else None),
+        "rig": (None if app["rig"] is None else
+                dict(app["rig"].provenance(), fingerprint=app["rig"].fingerprint)),
+        "rig_file": None,
+        "calib_fingerprint": None,
+        "calib_file": None,
+        "plane_z": app["plane_z"],
+        "tip_m": app["tip_m"],
+        "min_z": app["min_z"],
+        "hover_m": app["hover_m"],
+        "execute": app["execute"],
+        "planner_host": urlparse(app["planner"]).hostname,
+        "stream_turn": ({"turns": int(measured["turns"]), "source": "measured",
+                         "error_px": round(float(measured["error_px"]), 2),
+                         "size": measured["size"]}
+                        if measured else {"turns": None, "source": "shape"}),
+        "stream_orientation": app["stream_orientation"],
+        "marker": (None if marker is None else
+                   {"size_m": float(marker["size_m"]),
+                    "at": [float(v) for v in marker["at"]],
+                    "yaw_deg": math.degrees(float(marker.get("yaw", 0.0)))}),
+        # The model config minus every secret: the recorder redacts keys too,
+        # but the URL never enters the snapshot in full in the first place.
+        "llm": {"model": app["llm_model"],
+                "temperature": app["llm_temperature"],
+                "max_tokens": app["llm_max_tokens"],
+                "url_host": urlparse(app["llm_url"]).hostname,
+                "context_tokens": app["llm_context"]["tokens"]},
+        # Pinned by the first /agent turn that carries tools; null until then.
+        "tool_schemas_sha256": app.get("tool_schemas_sha256"),
+    }
+    try:
+        calib_path = resolve_calibration(app)
+        snapshot["calib_fingerprint"] = calib_mod.load(calib_path).fingerprint
+        (directory / "calib.json").write_bytes(calib_path.read_bytes())
+        snapshot["calib_file"] = "calib.json"
+    except Exception as exc:  # noqa: BLE001 - a session without calib still traces
+        logging.warning("trace manifest for %s has no calibration: %s", sid, exc)
+    if app["rig"] is not None and app["extrinsics_path"]:
+        try:
+            (directory / "rig.json").write_bytes(Path(app["extrinsics_path"]).read_bytes())
+            snapshot["rig_file"] = "rig.json"
+        except OSError as exc:
+            logging.warning("trace manifest for %s has no rig copy: %s", sid, exc)
+    return snapshot
+
+
+async def handle_trace(request: web.Request) -> web.Response:
+    """`POST /trace` -- one batch of page events for a sidebar session.
+
+    Fire-and-forget from the page: the answer carries the assigned seqs, but a
+    failure here only costs trace evidence, never a chat turn (§8.4).
+    """
+    app = request.app
+    recorder = app.get("traces")
+    if recorder is None:
+        return web.json_response({"ok": False,
+                                  "error": "tracing is disabled on this host (--no-trace)"},
+                                 status=503)
+    if (request.content_length or 0) > TRACE_MAX_BODY:
+        raise web.HTTPRequestEntityTooLarge(max_size=TRACE_MAX_BODY,
+                                            actual_size=request.content_length)
+    body = await request.read()
+    if len(body) > TRACE_MAX_BODY:
+        raise web.HTTPRequestEntityTooLarge(max_size=TRACE_MAX_BODY, actual_size=len(body))
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
+    sid = str(data.get("session") or "")
+    if not CAPTURE_ID.match(sid):
+        raise web.HTTPBadRequest(text="'session' must be a session id (stamp-hex6)")
+    items = data.get("events")
+    if not isinstance(items, list) or not items:
+        raise web.HTTPBadRequest(text="'events' must be a non-empty list")
+    if len(items) > trace_mod.MAX_BATCH:
+        raise web.HTTPBadRequest(text="a trace batch is limited to %d events"
+                                 % trace_mod.MAX_BATCH)
+    try:
+        seqs = await recorder.events(sid, items)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - the page drops the batch and moves on
+        logging.warning("trace write for %s failed: %s", sid, exc)
+        return web.json_response({"ok": False, "error": "the trace could not be written"},
+                                 status=500)
+    return web.json_response({"ok": True, "seqs": seqs})
+
+
+async def handle_trace_read(request: web.Request) -> web.Response:
+    """`GET /trace/{sid}/events|manifest` -- read a session back.
+
+    token_middleware exempts GET so the LAN can read captures, but a trace
+    carries prompts and kitchen frames: the token is checked explicitly here.
+    """
+    app = request.app
+    token = app["token"]
+    if token and not hmac.compare_digest(request.headers.get("X-Rebot-Token", ""), token):
+        return web.json_response({"ok": False, "error": "missing or wrong X-Rebot-Token"},
+                                 status=401)
+    recorder = app.get("traces")
+    if recorder is None:
+        return web.json_response({"ok": False,
+                                  "error": "tracing is disabled on this host (--no-trace)"},
+                                 status=503)
+    sid = request.match_info["sid"]
+    if not CAPTURE_ID.match(sid):
+        raise web.HTTPNotFound()
+    directory = recorder.session_dir(sid)
+    kind = request.path.rsplit("/", 1)[-1]
+    path = directory / ("events.jsonl" if kind == "events" else "manifest.json")
+    if not path.is_file():
+        raise web.HTTPNotFound(text="no trace %s for %s" % (kind, sid))
+    text = path.read_text(encoding="utf-8")
+    if kind == "manifest":
+        return web.json_response({"ok": True, "session": sid,
+                                  "manifest": json.loads(text)})
+    events = []
+    for line in text.splitlines():
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # a torn line must not hide the rest of the log
+    return web.json_response({"ok": True, "session": sid, "events": events})
+
+
 async def _page(request: web.Request, name: str) -> web.StreamResponse:
     page = WEB_DIR / name
     if not page.is_file():
@@ -396,7 +569,22 @@ async def handle_health(request: web.Request) -> web.Response:
             "context_source": app["llm_context"]["source"],
             "context_error": app["llm_context"]["error"],
         },
+        "traces": {
+            "enabled": app.get("traces") is not None,
+            "sessions": _trace_session_count(app),
+            "retention_days": app.get("trace_retention_days", 30),
+        },
     })
+
+
+def _trace_session_count(app) -> int:
+    recorder = app.get("traces")
+    if recorder is None:
+        return 0
+    try:
+        return len(recorder.session_ids())
+    except OSError:
+        return 0  # health must survive an unreadable traces dir
 
 
 async def handle_reach(request: web.Request) -> web.Response:
@@ -780,25 +968,39 @@ async def capture_pose(app):
     return record
 
 
-async def planner_call(app, path, body, timeout=120, method="POST"):
+async def planner_call(app, path, body, timeout=120, method="POST", sid=None):
     """Call the arm gateway; returns (status, payload).
 
     The method matters: `/pose` is a GET on the gateway and a POST gets a 404.
     The capture server used to POST everything, which made the panel report "the
     arm is not reachable" on a gateway that was answering fine.
+
+    With a session id this is also the response tape (§4.2): every gateway
+    interaction flows through here, so one hook records them all. The key is
+    the sha256 of method|path|canonical-JSON request, the replay lookup key.
     """
     headers = {"X-Rebot-Token": app["planner_token"]} if app["planner_token"] else {}
     url = app["planner"].rstrip("/") + path
+    started = time.monotonic()
     try:
         async with app["client"].request(method, url, json=body, headers=headers,
                                          timeout=ClientTimeout(total=timeout)) as answer:
             payload = await answer.json(content_type=None)
-            return answer.status, payload
+            status = answer.status
     except Exception as exc:  # noqa: BLE001 - surfaced to the viewer
         logging.warning("planner %s %s failed: %s", method, url, exc)
-        return 502, {"ok": False,
-                     "error": "cannot reach the arm gateway at %s (%s)" % (url, exc),
-                     "unreachable": True}
+        status = 502
+        payload = {"ok": False,
+                   "error": "cannot reach the arm gateway at %s (%s)" % (url, exc),
+                   "unreachable": True}
+    if sid:
+        canonical = json.dumps(body, sort_keys=True, ensure_ascii=False)
+        await trace_event(app, sid, "gateway_call", path=path, method=method,
+                          request=body, response=payload, status=status,
+                          ms=round((time.monotonic() - started) * 1000),
+                          key=hashlib.sha256(("%s|%s|%s" % (method, path, canonical))
+                                             .encode("utf-8")).hexdigest())
+    return status, payload
 
 
 async def handle_sequence(request: web.Request) -> web.Response:
@@ -842,12 +1044,20 @@ async def handle_sequence(request: web.Request) -> web.Response:
     planner_targets = [compact_target(tip, target)
                        for tip, target in zip(tips, targets)]
 
+    sid = request.headers.get("X-Rebot-Session", "")
     status, payload = await planner_call(app, "/plan", {
         "targets": planner_targets,
         "tip_offset_m": float(app["tip_m"]),
         "gripper": "alternate",
         "options": plan_options,
-    }, timeout=300)
+    }, timeout=300, sid=sid)
+    # plan_id <-> session: the page's sequence_result and the server's tape
+    # meet on this id, so a failed plan is replayable from either side.
+    await trace_event(app, sid, "plan", plan_id=payload.get("id"),
+                      targets=planner_targets, summary=payload.get("summary"),
+                      execute=bool(app["execute"] and payload.get("execute", True)),
+                      status=status, ok=status == 200,
+                      error=payload.get("error") if status != 200 else None)
     if status != 200:
         return web.json_response({"ok": False, "stage": "plan",
                                   "error": payload.get("error", "sequence plan failed")},
@@ -1044,6 +1254,14 @@ def _agent_tool_error(message, finish_reason=""):
     return ""
 
 
+def _tools_sha256(tools):
+    """Pin the tool contract: a replay against a changed page is flagged (§8.3)."""
+    if not tools:
+        return None
+    return hashlib.sha256(json.dumps(tools, sort_keys=True, ensure_ascii=False)
+                          .encode("utf-8")).hexdigest()
+
+
 def _sse(event, data):
     """One Server-Sent Event frame, as bytes."""
     return ("event: %s\ndata: %s\n\n"
@@ -1093,13 +1311,25 @@ def _sse_payload(frame):
     return "\n".join(lines) if lines else None
 
 
-async def _relay_sse(request, upstream):
+async def _relay_sse(request, upstream, on_turn=None):
     """Relay one model turn as normalized SSE events.
 
     The browser sees `reasoning` and `content` deltas as they arrive, then one
     `done` with the complete assistant message. Tool-call fragments are assembled
     here so the page never parses a half-written argument string.
+
+    `on_turn` (optional) receives the assembled turn -- or the error -- so the
+    recorder sees exactly what the page saw. It is awaited after the event is
+    sent and guarded: tracing must not change the stream (§8.4).
     """
+    async def note(payload):
+        if on_turn is None:
+            return
+        try:
+            await on_turn(payload)
+        except Exception as exc:  # noqa: BLE001 - the stream outranks the trace
+            logging.warning("agent turn trace failed: %s", exc)
+
     response = web.StreamResponse(status=200, headers={
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
@@ -1200,8 +1430,10 @@ async def _relay_sse(request, upstream):
         complete = bool(finished or finish_reason)
         if tool_error:
             await send("error", {"error": tool_error})
+            await note({"error": tool_error})
         elif not message["content"] and not message["tool_calls"]:
             await send("error", {"error": "the model returned neither text nor tool calls"})
+            await note({"error": "the model returned neither text nor tool calls"})
         else:
             logging.info("agent stream: %d chars, %d tool call(s), %d reasoning chars, "
                          "finish=%s complete=%s usage=%s",
@@ -1209,6 +1441,8 @@ async def _relay_sse(request, upstream):
                          len(message["reasoning"]), finish_reason or "-", complete, usage)
             await send("done", {"message": message, "finish_reason": finish_reason,
                                 "complete": complete, "usage": usage})
+            await note({"message": message, "finish_reason": finish_reason,
+                        "complete": complete, "usage": usage})
     except asyncio.CancelledError:
         raise
     except (ConnectionResetError, ConnectionAbortedError):
@@ -1220,6 +1454,7 @@ async def _relay_sse(request, upstream):
             await send("error", {"error": str(exc)})
         except (ConnectionResetError, ConnectionAbortedError):
             pass
+        await note({"error": str(exc)})
     finally:
         try:
             await response.write_eof()
@@ -1263,6 +1498,30 @@ async def handle_agent(request: web.Request) -> web.StreamResponse:
     if tools is not None and not isinstance(tools, list):
         raise web.HTTPBadRequest(text="'tools' must be a list of tool schemas")
 
+    # The sidebar names its session on every turn; without the header the turn
+    # still runs, untraced. The full upstream messages array is stored per turn
+    # so the log is immune to the page's context compaction (§4.2).
+    sid = request.headers.get("X-Rebot-Session", "")
+    tools_sha = _tools_sha256(tools)
+    if tools and tools_sha:
+        app["tool_schemas_sha256"] = tools_sha
+
+    async def on_turn(payload):
+        if "error" in payload:
+            await trace_event(app, sid, "stream_error", error=payload["error"])
+            return
+        await trace_event(app, sid, "model_turn",
+                          messages=messages,
+                          message=payload.get("message"),
+                          finish_reason=payload.get("finish_reason", ""),
+                          complete=payload.get("complete"),
+                          usage=payload.get("usage") or {},
+                          stream=bool(body.get("stream")),
+                          config={"model": app["llm_model"],
+                                  "temperature": app["llm_temperature"],
+                                  "max_tokens": app["llm_max_tokens"],
+                                  "tools_sha256": tools_sha})
+
     stream = bool(body.get("stream"))
     payload = {
         "model": app["llm_model"],
@@ -1288,18 +1547,22 @@ async def handle_agent(request: web.Request) -> web.StreamResponse:
                 text = await answer.text()
                 logging.warning("agent %s answered %d: %s", app["llm_url"],
                                 answer.status, text[:200])
+                error = "the model refused (%d): %s" % (answer.status, text[:300])
+                await trace_event(app, sid, "stream_error", error=error,
+                                  status=answer.status)
                 return web.json_response({
                     "ok": False,
-                    "error": "the model refused (%d): %s" % (answer.status, text[:300]),
+                    "error": error,
                 }, status=502)
             content_type = answer.headers.get("Content-Type") or ""
             if stream and "text/event-stream" in content_type:
-                return await _relay_sse(request, answer)
+                return await _relay_sse(request, answer, on_turn=on_turn)
             # A server that ignores `stream`, or the ordinary non-streamed
             # request: read the one JSON body and answer in kind.
             text = await answer.text()
     except Exception as exc:  # noqa: BLE001 - surfaced to the chat
         logging.warning("agent %s failed: %s", app["llm_url"], exc)
+        await trace_event(app, sid, "stream_error", error=str(exc))
         return web.json_response({
             "ok": False,
             "error": "cannot reach the model at %s (%s)" % (app["llm_url"], exc),
@@ -1308,6 +1571,8 @@ async def handle_agent(request: web.Request) -> web.StreamResponse:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
+        await trace_event(app, sid, "stream_error",
+                          error="the model answered something that is not JSON")
         return web.json_response({
             "ok": False,
             "error": "the model answered something that is not JSON: %s" % text[:200],
@@ -1317,8 +1582,11 @@ async def handle_agent(request: web.Request) -> web.StreamResponse:
     finish_reason = (((data.get("choices") or [{}])[0] or {}).get("finish_reason") or "")
     tool_error = _agent_tool_error(message, finish_reason)
     if tool_error:
+        await trace_event(app, sid, "stream_error", error=tool_error)
         return web.json_response({"ok": False, "error": tool_error}, status=502)
     if not message["content"] and not message["tool_calls"]:
+        await trace_event(app, sid, "stream_error",
+                          error="the model returned neither text nor tool calls")
         return web.json_response({
             "ok": False,
             "error": "the model returned neither text nor tool calls",
@@ -1328,6 +1596,8 @@ async def handle_agent(request: web.Request) -> web.StreamResponse:
                  "complete=%s usage=%s",
                  len(message["content"]), len(message["tool_calls"]),
                  len(message["reasoning"]), finish_reason or "-", complete, usage)
+    await on_turn({"message": message, "finish_reason": finish_reason,
+                   "complete": complete, "usage": usage})
     return web.json_response({
         "ok": True,
         "model": data.get("model") or app["llm_model"],
@@ -1346,7 +1616,11 @@ async def handle_execute(request: web.Request) -> web.Response:
         body = await request.json()
     except json.JSONDecodeError as exc:
         raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
-    status, payload = await planner_call(app, "/execute", body, timeout=360)
+    sid = request.headers.get("X-Rebot-Session", "")
+    status, payload = await planner_call(app, "/execute", body, timeout=360, sid=sid)
+    await trace_event(app, sid, "execute", plan_id=body.get("id"), status=status,
+                      ok=payload.get("ok"), executed=payload.get("executed"),
+                      error=payload.get("error"))
     return web.json_response(payload, status=status)
 
 
@@ -1827,16 +2101,33 @@ async def handle_file(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(path, headers={"Cache-Control": "no-store"})
 
 
+async def trace_prune_loop(app):
+    """Retention sweep once a day (§3); off the loop, and never fatal."""
+    while True:
+        try:
+            await asyncio.to_thread(app["traces"].prune)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - retention must not kill the server
+            logging.warning("trace prune failed: %s", exc)
+        await asyncio.sleep(86400)
+
+
 async def on_startup(app: web.Application):
     app["client"] = ClientSession()
     if app.get("llm_url") and not app["llm_context"]["tokens"]:
         # Do not hold up the listener; health (and the page) uses the result as
         # soon as the probe returns.
         app["llm_context_task"] = asyncio.create_task(ensure_llm_context(app))
+    if app.get("traces") is not None:
+        app["trace_prune_task"] = asyncio.create_task(trace_prune_loop(app))
 
 
 async def on_cleanup(app: web.Application):
     task = app.get("llm_context_task")
+    if task is not None:
+        task.cancel()
+    task = app.get("trace_prune_task")
     if task is not None:
         task.cancel()
     await app["client"].close()
@@ -1950,6 +2241,19 @@ def build_app(args) -> web.Application:
     timeout = getattr(args, "llm_timeout", None)
     app["llm_timeout"] = float(timeout if timeout is not None
                                else os.environ.get("REBOT_LLM_TIMEOUT", "300"))
+    # Session traces (§4). getattr defaults keep older callers (the selftest's
+    # hand-built args) working: tracing is on unless --no-trace says otherwise.
+    app["trace_retention_days"] = int(getattr(args, "trace_retention_days", 30) or 30)
+    app["traces_dir"] = Path(getattr(args, "traces_dir", "") or STATE / "traces").resolve()
+    app["tool_schemas_sha256"] = None
+    if getattr(args, "no_trace", False):
+        app["traces"] = None
+    else:
+        # The snapshot callable runs lazily at a session's first event, when
+        # the app state (rig, calib, gates) is fully populated.
+        app["traces"] = trace_mod.TraceRecorder(
+            app["traces_dir"], retention_days=app["trace_retention_days"],
+            snapshot=lambda sid: trace_manifest(app, sid))
     app["captures"].mkdir(parents=True, exist_ok=True)
     app["calib"].mkdir(parents=True, exist_ok=True)
 
@@ -1964,6 +2268,9 @@ def build_app(args) -> web.Application:
     app.router.add_post("/sequence", handle_sequence)
     app.router.add_post("/execute", handle_execute)
     app.router.add_post("/agent", handle_agent)
+    app.router.add_post("/trace", handle_trace)
+    app.router.add_get("/trace/{sid}/events", handle_trace_read)
+    app.router.add_get("/trace/{sid}/manifest", handle_trace_read)
     app.router.add_get("/pose", handle_pose)
     app.router.add_post("/calibrate/extrinsics", handle_calibrate)
     app.router.add_get("/calibrate", handle_calibrate_status)
@@ -1981,6 +2288,7 @@ def build_app(args) -> web.Application:
     app.router.add_get("/locate.js", handle_locate_js)
     app.router.add_get("/ekf.js", handle_ekf_js)
     app.router.add_get("/stream.js", handle_stream_js)
+    app.router.add_get("/trace.js", handle_trace_js)
     app.router.add_get("/captures/{id}/{name}", handle_file)
     app.router.add_get("/favicon.ico", handle_favicon)
     if not args.no_whip:
@@ -2069,6 +2377,14 @@ def main(argv=None):
                         default=float(os.environ.get("REBOT_LLM_TIMEOUT", "300")),
                         help="seconds to wait for one model turn")
     parser.add_argument("--max-mb", type=int, default=25, help="largest accepted frame, MB")
+    parser.add_argument("--traces-dir", default=os.environ.get("REBOT_TRACES_DIR",
+                                                               str(STATE / "traces")),
+                        help="where session traces and their blobs are written")
+    parser.add_argument("--trace-retention-days", type=int,
+                        default=int(os.environ.get("REBOT_TRACE_RETENTION_DAYS", "30")),
+                        help="prune session dirs and unreferenced blobs older than this")
+    parser.add_argument("--no-trace", action="store_true",
+                        help="disable session trace collection entirely (sensitive deployments)")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -2123,6 +2439,9 @@ def main(argv=None):
     print("  agent    : %s" % ("%s at %s" % (app["llm_model"], app["llm_url"])
                                 if app["llm_url"] else
                                 "off (set REBOT_LLM_URL to enable the /live chat sidebar)"))
+    print("  traces   : %s" % ("%s (retention %d days)" % (app["traces_dir"],
+                                                            app["trace_retention_days"])
+                                if app["traces"] is not None else "disabled (--no-trace)"))
     print("  auth     : %s" % ("token required on writes" if args.token else "open on the LAN"))
     web.run_app(app, host=args.host, port=args.port, ssl_context=ssl_context,
                 print=None, shutdown_timeout=2.0)

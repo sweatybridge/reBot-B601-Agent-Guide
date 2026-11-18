@@ -12,6 +12,7 @@ examples/edge-rust/.bench/
 examples/host/state/
 examples/host/.env
 examples/host/tests/.selftest-work/
+examples/host/tests/.browser-check-work/
 examples/host/tests/.e2e-*
 
 # Local tooling / venvs (machine-specific, not part of the guide)
