@@ -1789,6 +1789,528 @@ async def test_oracle_server(workdir: Path, geometry):
 
 
 # --------------------------------------------------------------------------- #
+# 4e. Phase 3: the tape, the bundler, offline replay, export (§6, §9)
+# --------------------------------------------------------------------------- #
+
+def test_mock_tape(workdir: Path):
+    print("\nmock arm tape mode: hit / miss / FIFO / fail_first precedence")
+    import hashlib
+    import urllib.error
+    import urllib.request
+
+    import mock_arm
+
+    def call(base, method, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(base + path, data=data, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as answer:
+                return answer.status, json.loads(answer.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    plan_body = {"targets": [{"tip": [0.45, 0.0, 0.16], "pixel": [640, 480]}],
+                 "tip_offset_m": 0.035, "gripper": "alternate",
+                 "options": {"tool_axis": "current", "yaw": 0.0, "min_z": 0.1}}
+    plan_key = mock_arm.tape_key("POST", "/plan", plan_body)
+    # The key must be capture_server.planner_call's computation, character for
+    # character: same canonical JSON, same method|path|body framing.
+    canonical = json.dumps(plan_body, sort_keys=True, ensure_ascii=False)
+    expected = hashlib.sha256(("POST|/plan|%s" % canonical).encode("utf-8")).hexdigest()
+    check("tape key matches planner_call's computation", plan_key == expected)
+
+    pose_key = mock_arm.tape_key("GET", "/pose", {})
+    tape = {"entries": [
+        {"key": plan_key, "method": "POST", "path": "/plan", "request": plan_body,
+         "status": 200, "response": {"ok": True, "id": "20261118T100030Z-aaaaaa",
+                                     "summary": {"markers": 1, "waypoints": 660}}},
+        {"key": pose_key, "method": "GET", "path": "/pose", "request": {},
+         "status": 200, "response": {"ok": True, "pose": {"ids": [1, 2, 3, 4, 5, 6, 7],
+                                                         "q": [0.1] * 7}}},
+        {"key": pose_key, "method": "GET", "path": "/pose", "request": {},
+         "status": 200, "response": {"ok": True, "pose": {"ids": [1, 2, 3, 4, 5, 6, 7],
+                                                         "q": [0.2] * 7}}},
+    ]}
+    tape_path = workdir / "tape.json"
+    tape_path.write_text(json.dumps(tape), encoding="utf-8")
+    server, url, state = mock_arm.serve(0, tape=tape_path)
+    try:
+        status, body = call(url, "POST", "/plan", plan_body)
+        check("tape hit returns the recorded status and body verbatim",
+              status == 200 and body["id"] == "20261118T100030Z-aaaaaa"
+              and body["summary"] == {"markers": 1, "waypoints": 660})
+        first = call(url, "GET", "/pose")[1]
+        second = call(url, "GET", "/pose")[1]
+        check("same-key entries are a FIFO queue",
+              first["pose"]["q"] == [0.1] * 7 and second["pose"]["q"] == [0.2] * 7)
+        third = call(url, "GET", "/pose")[1]
+        check("an exhausted queue falls back to synthetic and counts a miss",
+              third["pose"]["q"] == [0.0] * 7 and state.tape_misses == 1)
+        status, body = call(url, "POST", "/plan", {"targets": [{"tip": [0.5, 0.1, 0.2]}]})
+        check("a key miss synthesizes and counts", status == 200 and body["ok"] is True
+              and state.tape_misses == 2 and body["id"] != "20261118T100030Z-aaaaaa")
+        snapshot = call(url, "GET", "/mock/state")[1]
+        check("/mock/state exposes tape_misses", snapshot["tape_misses"] == 2
+              and snapshot["tape_hits"] == 3)
+        state.tape_reset()
+        again = call(url, "GET", "/pose")[1]
+        check("tape_reset rewinds the queue and counters",
+              again["pose"]["q"] == [0.1] * 7 and state.tape_misses == 0)
+    finally:
+        server.shutdown()
+
+    # fail_first keeps precedence: the injected refusal comes before the tape.
+    server, url, state = mock_arm.serve(0, tape=tape, fail_first=1)
+    try:
+        status, body = call(url, "POST", "/plan", plan_body)
+        check("fail_first refusal takes precedence over a tape hit",
+              status == 422 and body["ok"] is False and state.tape_hits == 0)
+        status, body = call(url, "POST", "/plan", plan_body)
+        check("the tape answers once the injection is spent",
+              status == 200 and body["id"] == "20261118T100030Z-aaaaaa")
+    finally:
+        server.shutdown()
+
+    # No tape: today's synthetic behavior, unchanged, and no miss counting.
+    server, url, state = mock_arm.serve(0)
+    try:
+        status, body = call(url, "POST", "/plan", plan_body)
+        check("without a tape the mock is unchanged",
+              status == 200 and body["ok"] is True and state.tape_misses == 0
+              and state.tape_active is False)
+    finally:
+        server.shutdown()
+
+
+def _phase3_still(workdir: Path, geometry):
+    """The geometry fixture's frame as the JPEG a session would have uploaded."""
+    ok, buffer = cv2.imencode(".jpg", geometry["image"], [cv2.IMWRITE_JPEG_QUALITY, 82])
+    still = workdir / "phase3-still.jpg"
+    still.write_bytes(buffer.tobytes())
+    return still
+
+
+def _phase3_rig(workdir: Path, geometry):
+    """A rig file with the fixture's true pose -- no fit needed to replay it."""
+    rig = extrinsics.Rig(T_base_cam=np.asarray(geometry["T_base_cam"], dtype=float),
+                         calib_fingerprint="synthetic", image_size=(1600, 1200),
+                         plane_z=0.0, tip_offset=np.array([0.0, 0.0, -0.035]),
+                         device="synthetic", method="tip-sweep",
+                         fitted="2026-11-18T10:00:00Z")
+    path = workdir / "phase3-rig.json"
+    extrinsics.save_rig(rig, path)
+    return path, rig
+
+
+def _phase3_calib(workdir: Path, geometry):
+    path = workdir / "phase3-calib.json"
+    path.write_text(json.dumps({
+        "format": "rebot-camera-calib", "version": 1, "device": "synthetic",
+        "image_size": [1600, 1200], "K": geometry["K"].tolist(),
+        "dist": geometry["dist"].tolist(), "rms": 0.2,
+    }), encoding="utf-8")
+    return path
+
+
+def _phase3_record(workdir, geometry, sid, extra_rig=False):
+    """One recording pass: the harness's own tools against MockEdge, with the
+    server taping every gateway call under the session id. Returns the merged
+    page+server events, the manifest the server froze, and the plan id."""
+    import base64
+
+    import agent_eval
+    import trace as trace_mod
+
+    still = _phase3_still(workdir, geometry)
+    rig_path, rig = _phase3_rig(workdir, geometry)
+    calib_path = _phase3_calib(workdir, geometry)
+    args = agent_eval.build_parser().parse_args([])
+    args.calibration = str(calib_path)
+    args.extrinsics = str(rig_path)
+    args.plane_z, args.tip_mm, args.min_z, args.hover_m = 0.0, 35.0, 0.10, 0.10
+    args.session = sid
+    mock = agent_eval.MockEdge(args)
+    # The server's manifest copies the calib it actually planned with.
+    (mock.work / "calib").mkdir(parents=True, exist_ok=True)
+    (mock.work / "calib" / "synthetic.json").write_bytes(calib_path.read_bytes())
+    u, v = geometry["pixel"]
+    sequence = [("rig", {}), ("pixel_to_arm", {"u": u, "v": v}),
+                ("add_marker", {"u": u, "v": v}), ("move_arm", {"execute": False})]
+    if extra_rig:
+        sequence.insert(1, ("rig", {}))
+    page = [{"type": "user_message", "text": "mark the target and plan the move",
+             "frame": "data:image/jpeg;base64,"
+                      + base64.b64encode(still.read_bytes()).decode("ascii")}]
+    plan_id = ""
+    try:
+        session = agent_eval.Session(args, {"id": sid, "user": "mark and plan"}, still)
+        for name, tool_args in sequence:
+            result = session.call(name, tool_args)
+            page.append({"type": "tool_call", "name": name, "args": tool_args})
+            if name in ("pixel_to_arm", "add_marker"):
+                # Page-only fields the harness cannot compute (web/arm-model.js):
+                # the replay must list them as uncovered, never diff them.
+                result = dict(result, reach_band_m=[0.15, 0.65], inside_band=True)
+            if name == "move_arm":
+                plan_id = result.get("plan_id") or ""
+            page.append({"type": "tool_result", "name": name, "args": tool_args,
+                         "result": result, "ms": 5})
+        page.append({"type": "task_end", "final_text": "planned the move.",
+                     "turns": 2, "exhausted": False})
+        server_events = [json.loads(line) for line in
+                         (mock.work / "traces" / sid / "events.jsonl")
+                         .read_text(encoding="utf-8").splitlines()]
+        manifest = json.loads((mock.work / "traces" / sid / "manifest.json")
+                              .read_text(encoding="utf-8"))
+        calib_bytes = (mock.work / "traces" / sid / "calib.json").read_bytes()
+    finally:
+        mock.close()
+    # One merged log with explicit stamps: the window order is the truth, and
+    # task_windows sorts by (t, src, pseq) exactly as the live merge does. The
+    # gateway tape lands between the last tool result and task_end, where the
+    # live server wrote it -- after task_end it would fall out of the window.
+    merged = []
+    pseq = 0
+    ordered = page[:-1] + server_events + [page[-1]]
+    for index, event in enumerate(ordered):
+        if event.get("src") == "server" or "key" in event or event.get("type") == "plan":
+            merged.append(dict(event, src="server",
+                               t="2026-11-18T10:00:%02d.000Z" % index))
+        else:
+            pseq += 1
+            merged.append(dict(event, src="page", pseq=pseq,
+                               t="2026-11-18T10:00:%02d.000Z" % index))
+    return {"merged": merged, "manifest": manifest, "plan_id": plan_id,
+            "rig_path": rig_path, "rig": rig, "calib_bytes": calib_bytes,
+            "still": still, "u": u, "v": v}
+
+
+async def test_trace_bundle(workdir: Path, geometry):
+    print("\ntrace bundle: freeze, completeness gate, export, deterministic replay")
+    import hashlib
+
+    import agent_eval
+    import trace as trace_mod
+    import trace_bundle
+    import trace_triage
+
+    sid = "20261118T102320Z-abc123"
+    recorded = _phase3_record(workdir, geometry, sid)
+    traces = workdir / "bundle-state" / "traces"
+    state = traces.parent
+    recorder = trace_mod.TraceRecorder(traces)
+    await recorder.events(sid, recorded["merged"])
+    labels = trace_triage.label_session(recorded["merged"], sid, version="test-version")
+    (traces / sid / "labels.jsonl").write_text(
+        "".join(json.dumps(label) + "\n" for label in labels), encoding="utf-8")
+    # The frozen geometry beside the manifest, as trace_manifest writes it live.
+    (traces / sid / "rig.json").write_bytes(recorded["rig_path"].read_bytes())
+    (traces / sid / "calib.json").write_bytes(recorded["calib_bytes"])
+    manifest = dict(recorded["manifest"], rig_file="rig.json",
+                    rig={"fingerprint": recorded["rig"].fingerprint},
+                    tool_schemas_sha256=hashlib.sha256(json.dumps(
+                        agent_eval.TOOLS, sort_keys=True,
+                        ensure_ascii=False).encode("utf-8")).hexdigest())
+    (traces / sid / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (state / "out").mkdir(parents=True, exist_ok=True)
+    (state / "out" / (recorded["plan_id"] + ".json")).write_text(
+        json.dumps({"waypoints": []}), encoding="utf-8")
+
+    result = trace_bundle.bundle_session(traces, sid)
+    bundle = result["dir"]
+    check("bundler freezes a complete bundle", result["complete"],
+          "; ".join(result["reasons"]))
+    check("bundle carries the window, tape, stills and frozen geometry",
+          (bundle / "events.jsonl").is_file() and (bundle / "tape.json").is_file()
+          and (bundle / "calib.json").is_file() and (bundle / "rig.json").is_file()
+          and len(list((bundle / "stills").glob("*.jpg"))) == 1
+          and len(json.loads((bundle / "tape.json").read_text())["entries"]) == 1
+          and (bundle / "trajectories" / (recorded["plan_id"] + ".json")).is_file())
+
+    # The gate: a missing blob or rig is an incomplete bundle, not an export.
+    written = trace_bundle.read_events(traces / sid / "events.jsonl")
+    sha = next(iter(set().union(*(trace_bundle.blob_refs(e) for e in written))))
+    blob = traces / "blobs" / (sha + ".jpg")
+    saved = blob.read_bytes()
+    blob.unlink()
+    broken = trace_bundle.bundle_session(traces, sid)
+    check("a missing blob marks the bundle incomplete",
+          not broken["complete"] and any("does not resolve" in r for r in broken["reasons"]))
+    check("an incomplete bundle is not exported",
+          trace_bundle.export_bundle(broken["dir"], workdir / "no-export") is None
+          and not (workdir / "no-export").exists())
+    blob.write_bytes(saved)
+    rig_copy = traces / sid / "rig.json"
+    rig_bytes = rig_copy.read_bytes()
+    rig_copy.unlink()
+    broken = trace_bundle.bundle_session(traces, sid)
+    check("a missing rig marks the bundle incomplete",
+          not broken["complete"] and any("rig.json" in r for r in broken["reasons"]))
+    rig_copy.write_bytes(rig_bytes)
+    trace_bundle.bundle_session(traces, sid)
+
+    # Export -> load_case round-trip (§6.4).
+    export_root = workdir / "plain-export"
+    target = trace_bundle.export_bundle(bundle, export_root)
+    case = agent_eval.load_case(target / "case.json")
+    still = agent_eval.still_for(case)
+    check("export round-trips through load_case/still_for",
+          target is not None and still.is_file()
+          and still.parent == (target / "stills").resolve()
+          and case["needs_mock_edge"] is True and case["tape"] == "tape.json"
+          and (target / "report.md").is_file() and (target / "trace.jsonl").is_file())
+
+    # THE core regression (§9): unchanged code replays bit-exact ...
+    clean_report = workdir / "replay-clean.json"
+    code = agent_eval.main(["--trace", str(bundle), "--replay",
+                            "--json", str(clean_report), "--quiet"])
+    report = json.loads(clean_report.read_text(encoding="utf-8"))
+    check("replay against unchanged code is bit-exact",
+          code == 0 and report["passed"] is True and report["diffs"] == []
+          and report["tape_misses"] == 0, "%d diffs" % len(report["diffs"]))
+    check("page-only fields are uncovered, not diffed",
+          "pixel_to_arm.reach_band_m" in report["uncovered"]
+          and "add_marker.inside_band" in report["uncovered"])
+
+    # ... and a perturbed geometry constant must FAIL with geometry-diff.
+    original_init = agent_eval.Session.__init__
+
+    def perturbed_init(self, *a, **k):
+        original_init(self, *a, **k)
+        self.plane_z += 0.02        # 2 cm of worktop: every tip z moves
+
+    agent_eval.Session.__init__ = perturbed_init
+    try:
+        bad_report = workdir / "replay-perturbed.json"
+        code = agent_eval.main(["--trace", str(bundle), "--replay",
+                                "--json", str(bad_report), "--quiet"])
+        report = json.loads(bad_report.read_text(encoding="utf-8"))
+    finally:
+        agent_eval.Session.__init__ = original_init
+    classes = {diff["class"] for diff in report["diffs"]}
+    check("a perturbed plane_z fails the replay with geometry-diff",
+          code == 1 and report["passed"] is False and "geometry-diff" in classes,
+          "classes: %s" % sorted(classes))
+    check("the diff names the numbers that moved",
+          any(diff["field"] == "plane_z" and diff["tool"] == "rig"
+              for diff in report["diffs"])
+          and any(diff["field"].startswith("tip_m") for diff in report["diffs"]))
+
+    # A geometry failure: recorded oracle residual, frozen rig, full evidence.
+    sid2 = "20261118T102321Z-def456"
+    recorded2 = _phase3_record(workdir, geometry, sid2, extra_rig=True)
+    traces2 = workdir / "geo-state" / "traces"
+    state2 = traces2.parent
+    recorder2 = trace_mod.TraceRecorder(traces2)
+    await recorder2.events(sid2, recorded2["merged"])
+    q = list(sweep.POSES[0]) + [0.0]
+    tool = rebot_ik.forward(np.asarray(q[:6], dtype=float))
+    tip = tool[:3, :3] @ np.array([0.0, 0.0, -0.035]) + tool[:3, 3]
+    predicted = locate.project(geometry["K"], geometry["T_base_cam"], tip,
+                               geometry["dist"])
+    detected = [predicted[0] + 80.0, predicted[1]]
+    point, _d, _g = extrinsics.ray_plane(geometry["K"], geometry["dist"],
+                                         geometry["T_base_cam"], detected[0],
+                                         detected[1], float(tip[2]))
+    error_mm = 1000.0 * float(np.linalg.norm(np.asarray(point) - tip))
+    plan_id2 = recorded2["plan_id"]
+    oracle_doc = {"plan_id": plan_id2, "holds": [{
+        "index": 1, "q_cmd": q, "q_meas": q, "hold_error_rad": [0.0] * 7,
+        "tip_error_mm": 1.0, "pixel_error_px": 80.0, "pixel_error_mm": round(error_mm, 2),
+        "predicted_tip_px": list(predicted), "detected_tip_px": detected}]}
+    labels2 = trace_triage.label_session(recorded2["merged"], sid2,
+                                         oracle_docs={plan_id2: oracle_doc},
+                                         version="test-version")
+    check("the canned geometry session labels as a camera-arm failure",
+          labels2[0]["verdict"] == "fail" and labels2[0]["class"] == "geometry"
+          and labels2[0]["layer"] == "camera-arm" and error_mm > 10.0,
+          "%.1f mm" % error_mm)
+    (traces2 / sid2 / "labels.jsonl").write_text(
+        "".join(json.dumps(label) + "\n" for label in labels2), encoding="utf-8")
+    (traces2 / sid2 / "rig.json").write_bytes(recorded2["rig_path"].read_bytes())
+    (traces2 / sid2 / "calib.json").write_bytes(recorded2["calib_bytes"])
+    manifest2 = dict(recorded2["manifest"], rig_file="rig.json",
+                     rig={"fingerprint": recorded2["rig"].fingerprint},
+                     tool_schemas_sha256=manifest["tool_schemas_sha256"])
+    (traces2 / sid2 / "manifest.json").write_text(json.dumps(manifest2), encoding="utf-8")
+    (state2 / "oracle").mkdir(parents=True, exist_ok=True)
+    oracle_path = state2 / "oracle" / (plan_id2 + ".json")
+    oracle_path.write_text(json.dumps(oracle_doc), encoding="utf-8")
+
+    geo = trace_bundle.bundle_session(traces2, sid2)
+    check("a geometry bundle with its oracle doc is complete", geo["complete"],
+          "; ".join(geo["reasons"]))
+    oracle_path.unlink()
+    no_oracle = trace_bundle.bundle_session(traces2, sid2)
+    check("a geometry failure without an oracle doc is incomplete",
+          not no_oracle["complete"]
+          and any("oracle" in r for r in no_oracle["reasons"]))
+    oracle_path.write_text(json.dumps(oracle_doc), encoding="utf-8")
+    geo = trace_bundle.bundle_session(traces2, sid2)
+    geo_export = trace_bundle.export_bundle(geo["dir"], workdir / "geo-export")
+    geo_case = json.loads((geo_export / "case.json").read_text(encoding="utf-8"))
+    check("geometry export derives the oracle-recompute expect",
+          geo_case["expect"].get("geometry_check") is True
+          and (geo_export / "oracle.json").is_file()
+          and (geo_export / "calib" / "rig.json").is_file())
+
+    # Dedup (§6.5): same signature across sessions -> one canonical, N occurrences.
+    groups = trace_bundle.dedup(traces2)
+    check("dedup groups by signature with occurrences",
+          len(groups) == 1 and next(iter(groups.values()))["occurrences"] == 1
+          and (traces2 / "dedup.json").is_file())
+
+    return {"geo_bundle": geo["dir"], "geo_export": geo_export, "sid2": sid2,
+            "plan_id": plan_id2, "oracle_doc": oracle_doc,
+            "u": recorded2["u"], "v": recorded2["v"],
+            "rig_tip_offset": [0.0, 0.0, -0.035]}
+
+
+def test_trace_live(workdir: Path, geometry, ctx):
+    print("\ntrace live replay: expect derivation, classification, minimization, graduation")
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import agent_eval
+    import trace_bundle
+
+    # expect{} derivation and classification are pure: drive them directly.
+    protocol_label = {"class": "protocol", "problems": [
+        {"kind": "repeated-tool-error"}, {"kind": "claims-move-not-executed"}]}
+    expect = trace_bundle.derive_expect(protocol_label, [], {})
+    check("protocol expect translates the retry and honesty rules",
+          expect.get("plan_attempts_min") == 2 and expect.get("honest") is True
+          and expect.get("plan_first") is True)
+    perception = trace_bundle.derive_expect({"class": "perception", "problems": []}, [], {})
+    check("perception expect is the scaffold-style zero-box case",
+          perception.get("must_mark") == ["object"] and perception.get("plan_first") is True)
+    check("classification: stable fail, flaky, pass",
+          agent_eval.classify_runs([{"problems": ["x 1 mm"]}, {"problems": ["x 2 mm"]}])
+          == "stable-fail"
+          and agent_eval.classify_runs([{"problems": ["x"]}, {"problems": []}]) == "flaky"
+          and agent_eval.classify_runs([{"problems": []}]) == "pass")
+
+    # Minimization (§6.5): drop the redundant rig turn while the perturbed
+    # replay still reproduces the same geometry-diff signature.
+    bundle = ctx["geo_bundle"]
+    original_init = agent_eval.Session.__init__
+
+    def perturbed_init(self, *a, **k):
+        original_init(self, *a, **k)
+        self.plane_z += 0.02
+
+    def replay_report(candidate):
+        out = candidate / "min-replay.json"
+        code = agent_eval.main(["--trace", str(candidate), "--replay",
+                                "--json", str(out), "--quiet"])
+        report = json.loads(out.read_text(encoding="utf-8"))
+        return code, report
+
+    def signature(report):
+        # Which numbers moved, not how often: a redundant turn repeats a diff.
+        return sorted({(d["tool"], d["field"], d["class"]) for d in report["diffs"]})
+
+    agent_eval.Session.__init__ = perturbed_init
+    try:
+        _code, full = replay_report(bundle)
+        wanted = signature(full)
+        check("the perturbed geometry bundle reproduces before minimizing",
+              _code == 1 and any(c == "geometry-diff" for _t, _f, c in wanted))
+
+        def reproduces(candidate):
+            code, report = replay_report(candidate)
+            return code == 1 and signature(report) == wanted
+
+        before = len(trace_bundle.read_events(bundle / "events.jsonl"))
+        outcome = trace_bundle.minimize_bundle(bundle, reproduces)
+        after = len(trace_bundle.read_events(bundle / "events.jsonl"))
+        code, report = replay_report(bundle)
+        check("delta-debug drops turns and keeps the failure signature",
+              outcome["minimized"] and after < before and code == 1
+              and signature(report) == wanted,
+              "%d -> %d events" % (before, after))
+    finally:
+        agent_eval.Session.__init__ = original_init
+
+    # A scripted OpenAI-compatible endpoint (the Phase 1 fake-model pattern):
+    # turn 1 marks and plans, turn 2 finishes. No real model anywhere.
+    class FakeModel(BaseHTTPRequestHandler):
+        script = [
+            {"content": "marking and planning.", "tool_calls": [
+                ("add_marker", json.dumps({"u": ctx["u"], "v": ctx["v"]})),
+                ("move_arm", json.dumps({"execute": False}))]},
+            {"content": "done: the plan is ready."},
+        ]
+        seen = []
+
+        def log_message(self, fmt, *args):  # noqa: A002 - stdlib signature
+            pass
+
+        def do_POST(self):  # noqa: N802 - stdlib signature
+            length = int(self.headers.get("Content-Length") or 0)
+            json.loads(self.rfile.read(length) or b"{}")
+            FakeModel.seen.append(1)
+            # The script repeats per conversation: every run is seeded identically.
+            step = FakeModel.script[(len(FakeModel.seen) - 1) % len(FakeModel.script)]
+            message = {"role": "assistant", "content": step.get("content", "")}
+            calls = step.get("tool_calls") or []
+            if calls:
+                message["tool_calls"] = [
+                    {"id": "call_%d" % i, "type": "function",
+                     "function": {"name": name, "arguments": arguments}}
+                    for i, (name, arguments) in enumerate(calls)]
+            raw = json.dumps({"choices": [{"message": message,
+                                           "finish_reason": "tool_calls" if calls else "stop"}]}
+                             ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeModel)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    llm_url = "http://127.0.0.1:%d/v1/chat/completions" % server.server_address[1]
+    try:
+        # Live-model replay x2: the oracle residual reproduces every run, so
+        # the classification is stable-fail and the case exports (§6.3b).
+        live_report = workdir / "trace-live.json"
+        code = agent_eval.main(["--trace", str(bundle), "--mock-edge", "--runs", "2",
+                                "--llm-url", llm_url, "--model", "stub-model",
+                                "--json", str(live_report), "--quiet"])
+        report = json.loads(live_report.read_text(encoding="utf-8"))
+        check("live-model replay classifies a stable fail and exports",
+              code == 1 and report["classification"] == "stable-fail"
+              and report["exported"] and Path(report["exported"]).is_dir()
+              and len(FakeModel.seen) == 4,
+              report["classification"])
+        check("the live runs used the recorded prompt and bundle frames",
+              all(problem and "geometry residual" in problem[0]
+                  for problem in report["problems"]))
+
+        # Graduation (§6.4): the exported case runs under plain --mock-edge.
+        FakeModel.seen = []
+        case = agent_eval.load_case(ctx["geo_export"] / "case.json")
+        still = agent_eval.still_for(case)
+        args = agent_eval.build_parser().parse_args(
+            ["--mock-edge", "--llm-url", llm_url, "--model", "stub-model", "--runs", "1"])
+        mock = agent_eval.MockEdge(args)
+        args._mock = mock
+        try:
+            run = agent_eval.run_once(args, case, still)
+            problems = agent_eval.judge(args, case, run)
+        finally:
+            mock.close()
+        check("a graduated case runs under plain --mock-edge",
+              run["turns"] >= 1 and any("geometry residual" in p for p in problems),
+              "%d problem(s)" % len(problems))
+        check("the exported report carries versions and repro commands",
+              "git commit" in (ctx["geo_export"] / "report.md").read_text(encoding="utf-8")
+              and "--replay" in (ctx["geo_export"] / "report.md").read_text(encoding="utf-8"))
+    finally:
+        server.shutdown()
+
+
+# --------------------------------------------------------------------------- #
 # 5. locate_target.py as the host actually runs it
 # --------------------------------------------------------------------------- #
 
@@ -3239,11 +3761,14 @@ def main(argv=None):
     test_oracle_rules()
     test_trace_triage(workdir)
     test_planner_offline(workdir)
+    test_mock_tape(workdir)
     if not args.skip_server:
         asyncio.run(test_server(workdir, geometry))
         asyncio.run(test_trace_recorder(workdir))
         asyncio.run(test_trace_server(workdir, geometry))
         asyncio.run(test_oracle_server(workdir, geometry))
+        bundle_ctx = asyncio.run(test_trace_bundle(workdir, geometry))
+        test_trace_live(workdir, geometry, bundle_ctx)
     if calibration:
         test_locate_cli(workdir, geometry)
     test_rotation(workdir, geometry)

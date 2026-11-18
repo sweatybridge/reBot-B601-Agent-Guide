@@ -16,17 +16,28 @@ It can also refuse the first N plans with a realistic error, which is how the
 agent's "read the error, fix the marker, try again" loop gets tested:
 
     python tests/mock_arm.py --port 18080 --fail-first 1
+
+With `--tape <path>` (or `serve(..., tape=...)`) the mock replays *recorded*
+gateway responses instead of synthesizing them (spec §6.1): the tape is the
+`gateway_call` events a session recorded, keyed exactly as capture_server's
+planner_call keys them. A hit returns the recorded status and body verbatim;
+same-key entries form a FIFO queue (/pose legitimately changes between calls);
+a miss falls back to the synthetic behavior and is counted in `tape_misses`,
+so a replay with gaps reports partial fidelity instead of passing silently.
+`fail_first` injection keeps precedence -- the retry tests are unchanged.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
 import threading
 import time
 import uuid
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -41,11 +52,43 @@ IK_REFUSAL = ("IK failed at target 1: the tool tip cannot reach "
               "[%.3f, %.3f, %.3f] m with the tool pointing down")
 
 
+def tape_key(method: str, path: str, body) -> str:
+    """The replay lookup key -- must match capture_server.planner_call exactly.
+
+    Same canonical JSON (sort_keys, ensure_ascii=False, default separators) and
+    same method|path|body framing, or a recorded /plan would never be found.
+    """
+    canonical = json.dumps(body, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(("%s|%s|%s" % (method, path, canonical))
+                          .encode("utf-8")).hexdigest()
+
+
+def _load_tape(tape) -> list:
+    """Accept a path or an already-read {"entries": [...]} document."""
+    if tape is None:
+        return []
+    if isinstance(tape, (str, Path)):
+        tape = json.loads(Path(tape).read_text(encoding="utf-8"))
+    entries = tape.get("entries") if isinstance(tape, dict) else tape
+    if not isinstance(entries, list):
+        raise ValueError("a tape needs an 'entries' list")
+    out = []
+    for entry in entries:
+        entry = dict(entry)
+        # A hand-built tape may omit the key; compute it the same way rather
+        # than silently never matching.
+        entry.setdefault("key", tape_key(entry.get("method", "POST"),
+                                         entry.get("path", ""),
+                                         entry.get("request") or {}))
+        out.append(entry)
+    return out
+
+
 class State:
     """What the mock has been asked to do, and how it is told to misbehave."""
 
     def __init__(self, fail_first: int = 0, fail_mode: str = "ik",
-                 fail_execute: bool = False, execute: bool = True):
+                 fail_execute: bool = False, execute: bool = True, tape=None):
         self.fail_first = int(fail_first)
         self.fail_mode = fail_mode
         self.fail_execute = bool(fail_execute)
@@ -58,13 +101,48 @@ class State:
         # Playback logs keyed by plan/move id, as the edge's /play telemetry
         # (§5.1): a test seeds these before /execute to replay a recorded run.
         self.telemetry = {}
+        # The response tape (§6.1): recorded gateway answers, FIFO per key.
+        self._tape_entries = _load_tape(tape)
+        self.tape_active = bool(self._tape_entries)
+        self.tape_misses = 0
+        self.tape_hits = 0
+        self._tape_queues = {}
+        self.tape_reset()
         self.lock = threading.Lock()
+
+    def tape_reset(self):
+        """Rewind the queues and counters; each replay starts from turn one."""
+        self._tape_queues = {}
+        for entry in self._tape_entries:
+            self._tape_queues.setdefault(entry["key"], deque()).append(entry)
+        self.tape_misses = 0
+        self.tape_hits = 0
+
+    def tape_take(self, method: str, path: str, body):
+        """(status, response) from the tape, or None. A miss is counted once.
+
+        Same-key entries are a FIFO queue: /pose is read repeatedly and the
+        recorded pose legitimately changes between calls. An exhausted queue
+        is a miss like any other -- the synthetic answer takes over.
+        """
+        if not self.tape_active:
+            return None
+        key = tape_key(method, path, body)
+        with self.lock:
+            queue = self._tape_queues.get(key)
+            if queue:
+                self.tape_hits += 1
+                entry = queue.popleft()
+                return int(entry.get("status", 200)), entry.get("response") or {}
+            self.tape_misses += 1
+            return None
 
     def snapshot(self) -> dict:
         with self.lock:
             return {"ok": True, "plans": self.plans, "executes": self.executes,
                     "refusals": self.refusals, "last_targets": self.last_targets,
-                    "last_plan": self.last_plan}
+                    "last_plan": self.last_plan,
+                    "tape_misses": self.tape_misses, "tape_hits": self.tape_hits}
 
     def plan_refusal(self, tip) -> str:
         if self.fail_mode == "below-floor":
@@ -174,12 +252,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/mock/state":
             self._send(200, self.state.snapshot())
             return
-        if self.path.rstrip("/") == "/pose":
+        path = self.path.split("?")[0].rstrip("/")
+        if path == "/pose":
+            hit = self.state.tape_take("GET", path, {})
+            if hit is not None:
+                self._send(*hit)
+                return
             self._send(200, {"ok": True, "pose": {"ids": [1, 2, 3, 4, 5, 6, 7],
                                                   "q": [0.0] * 7}})
             return
-        if self.path.startswith("/telemetry/"):
-            entry_id = self.path[len("/telemetry/"):]
+        if path.startswith("/telemetry/"):
+            entry_id = path[len("/telemetry/"):]
+            hit = self.state.tape_take("GET", path, {})
+            if hit is not None:
+                self._send(*hit)
+                return
             telemetry = self.state.telemetry.get(entry_id)
             if telemetry is None:
                 self._send(404, {"ok": False, "error": "no telemetry %s" % entry_id})
@@ -195,14 +282,35 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, self.state.snapshot())
             return
         if path == "/plan":
-            status, answer = plan_payload(body, self.state)
+            # fail_first keeps precedence over the tape (§6.1): the retry loop
+            # must see its injected refusal even when a plan was recorded.
+            with self.state.lock:
+                refuse_pending = self.state.refusals < self.state.fail_first
+            hit = None if refuse_pending else self.state.tape_take("POST", path, body)
+            if hit is not None:
+                status, answer = hit
+                with self.state.lock:
+                    self.state.plans += 1
+                    self.state.last_targets = [t.get("tip") for t in body.get("targets") or []]
+                    self.state.last_plan = answer.get("id") or self.state.last_plan
+            else:
+                status, answer = plan_payload(body, self.state)
         elif path == "/execute":
-            status, answer = execute_payload(body, self.state)
+            hit = None if self.state.fail_execute else self.state.tape_take("POST", path, body)
+            if hit is not None:
+                status, answer = hit
+                with self.state.lock:
+                    self.state.executes += 1
+            else:
+                status, answer = execute_payload(body, self.state)
         elif path == "/move":
-            status, answer = 200, {"ok": True, "id": "mock-move", "moved": True,
-                                   "log": "mock edge: moved"}
+            hit = self.state.tape_take("POST", path, body)
+            status, answer = hit if hit is not None else (
+                200, {"ok": True, "id": "mock-move", "moved": True,
+                      "log": "mock edge: moved"})
         elif path == "/fk":
-            status, answer = fk_payload(body)
+            hit = self.state.tape_take("POST", path, body)
+            status, answer = hit if hit is not None else fk_payload(body)
         else:
             status, answer = 404, {"ok": False, "error": "no such route"}
         self._send(status, answer)
@@ -230,13 +338,18 @@ def main(argv=None) -> int:
     parser.add_argument("--fail-execute", action="store_true")
     parser.add_argument("--no-execute", action="store_true",
                         help="report execution as disabled, as REBOT_EXECUTE=0 does")
+    parser.add_argument("--tape", default="",
+                        help="a recorded gateway_call tape (JSON) to replay verbatim")
     args = parser.parse_args(argv)
     server, url, state = serve(args.port, args.host, fail_first=args.fail_first,
                                fail_mode=args.fail_mode,
                                fail_execute=args.fail_execute,
-                               execute=not args.no_execute)
+                               execute=not args.no_execute,
+                               tape=args.tape or None)
     print("mock arm gateway on %s" % url)
     print("  POST /plan  POST /execute  GET /pose  GET /mock/state")
+    if args.tape:
+        print("  replaying tape %s (%d entries)" % (args.tape, len(state._tape_entries)))
     if args.fail_first:
         print("  refusing the first %d plan(s) with a %s error"
               % (args.fail_first, args.fail_mode))

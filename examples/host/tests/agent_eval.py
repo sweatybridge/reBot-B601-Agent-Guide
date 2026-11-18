@@ -21,16 +21,24 @@ does not claim the arm moved when nothing did.
     python tests/agent_eval.py --scaffold <capture-id>   # a case for a new still
     python tests/agent_eval.py --extract state/recordings/phone/x.mp4 --at 4.0 \
         --out tests/stills/sweep-4s.jpg                  # a still from a recording
+    python tests/agent_eval.py --trace <bundle-dir> --replay
+        # deterministic replay of a recorded failure: no LLM, MockEdge + tape,
+        # every tool result diffed against the recording (spec §6.3a)
+    python tests/agent_eval.py --trace <bundle-dir> --mock-edge --runs 3
+        # live-model replay of the bundle: seeded conversation, recorded prompt,
+        # auto-derived expect{}, stable-fail -> export (spec §6.3b)
 
-Nothing here is a unit test: it needs the model endpoint. The endpoint, model and
-key come from the usual host environment, so the same variables that configure
-the page's sidebar configure this.
+Nothing here is a unit test: it needs the model endpoint -- except --dry, --list
+and --trace --replay, which run fully offline. The endpoint, model and key come
+from the usual host environment, so the same variables that configure the page's
+sidebar configure this.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
@@ -47,6 +55,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import mock_arm
+import trace_bundle
 
 # The model answers in prose, and this console is cp1252 on Windows: without this
 # a curly quote or an arrow in a reply kills the report.
@@ -206,12 +215,27 @@ def load_case(path: Path) -> dict:
         raise EvalError("%s has no 'user' message" % path.name)
     if not (case.get("capture") or case.get("still")):
         raise EvalError("%s needs a 'capture' id or a 'still' path" % path.name)
+    # Exported bundles (§6.4) carry bundle-relative paths: remember where the
+    # case file lives so still_for/Session can resolve against it.
+    case["_case_dir"] = str(path.resolve().parent)
     return case
+
+
+def _case_relative(case: dict, value: str) -> Path:
+    """A case-relative path resolves against the case file's own directory."""
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    if case.get("_case_dir"):
+        candidate = Path(case["_case_dir"]) / path
+        if candidate.exists():
+            return candidate.resolve()
+    return path
 
 
 def still_for(case: dict) -> Path:
     if case.get("still"):
-        path = Path(case["still"])
+        path = _case_relative(case, case["still"])
         if not path.is_absolute():
             path = (HERE / path).resolve()
         if not path.is_file():
@@ -254,21 +278,33 @@ class MockEdge:
     `executed: true` and plays no trajectory.
     """
 
-    def __init__(self, args):
+    def __init__(self, args, tape=None, geometry=None):
         self.fail_first = int(args.mock_fail_first)
         self.server, self.url, self.state = mock_arm.serve(
             0, "127.0.0.1", fail_first=self.fail_first,
-            fail_mode=args.mock_fail_mode, execute=not args.mock_no_execute)
+            fail_mode=args.mock_fail_mode, execute=not args.mock_no_execute,
+            tape=tape)
         self.work = Path(tempfile.mkdtemp(prefix="agent-eval-"))
         self.token = args.token or "eval-token"
         self.base = "http://127.0.0.1:%d" % free_port()
+        command = [sys.executable, str(APP / "capture_server.py"),
+                   "--host", "127.0.0.1", "--port", self.base.rsplit(":", 1)[1],
+                   "--token", self.token, "--planner", self.url, "--execute", "--no-whip",
+                   "--quiet", "--captures", str(self.work / "captures"),
+                   "--calib-dir", str(self.work / "calib"),
+                   # Keep the server's own trace out of the repo's state dir.
+                   "--traces-dir", str(self.work / "traces")]
+        environment = None
+        if geometry:
+            # A replay must plan against the geometry the session recorded,
+            # not this process's defaults (§6.3a). The tip offset has no flag
+            # on the server -- it reads REBOT_TIP_MM.
+            command += ["--plane-z", str(geometry.get("plane_z", 0.0)),
+                        "--hover-m", str(geometry.get("hover_m", 0.10))]
+            environment = dict(os.environ, REBOT_TIP_MM=str(geometry.get("tip_mm", 35.0)))
         self.proc = subprocess.Popen(
-            [sys.executable, str(APP / "capture_server.py"),
-             "--host", "127.0.0.1", "--port", self.base.rsplit(":", 1)[1],
-             "--token", self.token, "--planner", self.url, "--execute", "--no-whip",
-             "--quiet", "--captures", str(self.work / "captures"),
-             "--calib-dir", str(self.work / "calib")],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            command,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -290,6 +326,7 @@ class MockEdge:
             self.state.executes = 0
             self.state.refusals = 0
             self.state.fail_first = self.fail_first
+        self.state.tape_reset()
 
     def close(self):
         try:
@@ -348,16 +385,26 @@ class Session:
         if self.image is None:
             raise EvalError("%s: cannot read %s" % (case["id"], still))
         self.height_px, self.width_px = self.image.shape[:2]
-        self.calibration_path = Path(args.calibration) if args.calibration else default_calibration()
+        # An exported bundle (§6.4) pins its own geometry beside the case file;
+        # a plain case keeps the command-line/environment defaults.
+        calibration = case.get("calibration") or args.calibration
+        if calibration and case.get("calibration"):
+            calibration = str(_case_relative(case, calibration))
+        self.calibration_path = Path(calibration) if calibration else default_calibration()
         self.calibration = calib_mod.load(str(self.calibration_path),
                                           image_size=(self.width_px, self.height_px))
-        self.plane_z = float(args.plane_z)
-        self.tip_m = float(args.tip_mm) / 1000.0
-        self.floor = max(0.0, float(args.min_z) - self.plane_z)
-        self.default_height = float(args.hover_m)
+        extrinsics_path = case.get("extrinsics") or args.extrinsics
+        if extrinsics_path and case.get("extrinsics"):
+            extrinsics_path = str(_case_relative(case, extrinsics_path))
+        self.extrinsics_path = str(extrinsics_path or "")
+        self.plane_z = float(case.get("plane_z", args.plane_z))
+        self.tip_m = float(case.get("tip_mm", args.tip_mm)) / 1000.0
+        self.floor = max(0.0, float(case.get("min_z", args.min_z)) - self.plane_z)
+        self.default_height = float(case.get("hover_m", args.hover_m))
         self.markers = []           # {"u","v","tip","height"}
         self.tool_calls = []        # (name, args)
         self.plan_results = []      # move_arm results
+        self.rig_tip_offset = np.zeros(3)   # the fitted offset, when a rig is used
         self.T = self._pose()
         self.image_url = ("data:image/jpeg;base64,"
                           + base64.b64encode(still.read_bytes()).decode())
@@ -366,8 +413,9 @@ class Session:
 
     def _pose(self):
         """T_base_cam for this still: a fitted rig, or the tag in the frame."""
-        if self.args.extrinsics:
-            rig = extrinsics.load_rig(self.args.extrinsics)
+        if self.extrinsics_path:
+            rig = extrinsics.load_rig(self.extrinsics_path)
+            self.rig_tip_offset = np.asarray(rig.tip_offset, dtype=float)
             return np.asarray(rig.T_base_cam, dtype=float)
         spec = base_marker.parse_spec(self.args.marker_at, float(self.args.marker_size))
         if spec is None:
@@ -394,8 +442,10 @@ class Session:
         return np.asarray(point, dtype=float), float(grazing)
 
     def pixel_of(self, point):
-        pixel = extrinsics.project(self.calibration.K, self.T,
-                                   np.asarray(point, dtype=float), self.calibration.dist)
+        # locate_target.project is the host's projection; extrinsics has no
+        # `project` (a latent defect the trace replay surfaced, §9).
+        pixel = locate_target.project(self.calibration.K, self.T,
+                                      np.asarray(point, dtype=float), self.calibration.dist)
         return None if pixel is None else (float(pixel[0]), float(pixel[1]))
 
     def report(self, tip, height, pixel):
@@ -431,7 +481,7 @@ class Session:
     def _tool_rig(self, args):
         return {
             "ok": True,
-            "mode": "fixed" if self.args.extrinsics else "handheld",
+            "mode": "fixed" if self.extrinsics_path else "handheld",
             "image_size": [self.width_px, self.height_px],
             "K": np.asarray(self.calibration.K, dtype=float).tolist(),
             "dist": np.asarray(self.calibration.dist, dtype=float).reshape(-1).tolist(),
@@ -495,6 +545,10 @@ class Session:
         headers = {"Content-Type": "application/json"}
         if self.args.token:
             headers["X-Rebot-Token"] = self.args.token
+        if getattr(self.args, "session", ""):
+            # Recording pass: the server tapes every gateway call under this
+            # session, which is exactly the bundle's tape (§4.2).
+            headers["X-Rebot-Session"] = self.args.session
         try:
             answer = _post_json(self.args.server.rstrip("/") + "/sequence", body, headers,
                                 timeout=300, insecure=True)
@@ -537,6 +591,8 @@ class Session:
         headers = {"Content-Type": "application/json"}
         if self.args.token:
             headers["X-Rebot-Token"] = self.args.token
+        if getattr(self.args, "session", ""):
+            headers["X-Rebot-Session"] = self.args.session
         try:
             return _post_json(self.args.server.rstrip("/") + "/execute",
                               {"id": plan_id}, headers, timeout=120, insecure=True)
@@ -675,12 +731,34 @@ CLAIM = re.compile(r"(?i)\b(i (?:have )?moved|the arm (?:has )?moved|"
                    r"is now (?:at|next to)|successfully moved)\b")
 
 
+def _geometry_problems(case: dict, run: dict, session) -> list:
+    """The oracle recomputation (§6.3b): frozen evidence vs the code under test.
+
+    Live trace runs pass the bundle's docs in the run; a graduated case reads
+    the oracle.json beside its case file. Either way the residual is recomputed
+    with this session's geometry -- not read back from the recording.
+    """
+    docs = run.get("oracle_docs")
+    if docs is None:
+        docs = {}
+        if case.get("oracle"):
+            path = _case_relative(case, case["oracle"])
+            if path.is_file():
+                docs = json.loads(path.read_text(encoding="utf-8"))
+    return trace_bundle.geometry_problems(
+        session.calibration.K, session.calibration.dist, session.T,
+        session.tip_m, session.rig_tip_offset, docs)
+
+
 def judge(args, case: dict, run: dict) -> list[str]:
     """Every reason this run does not count, in the operator's words."""
     problems = []
     expect = case.get("expect") or {}
     session = run["session"]
     markers = session.markers
+
+    if expect.get("geometry_check"):
+        problems += _geometry_problems(case, run, session)
 
     low = int(expect.get("markers_min", 1))
     high = int(expect.get("markers_max", 4))
@@ -739,6 +817,388 @@ def judge(args, case: dict, run: dict) -> list[str]:
     if run["turns"] >= args.max_turns:
         problems.append("used every turn without stopping (%d)" % run["turns"])
     return problems
+
+
+# --------------------------------------------------------------------------- #
+# Trace replay (§6.3): a recorded failure, replayed offline
+# --------------------------------------------------------------------------- #
+
+# Prose differs by construction between the page and the harness; the numbers
+# are the contract. `error` text is prose too -- only the ok flag is compared.
+PROSE_FIELDS = {"note", "error"}
+# The reach band is computed in web/arm-model.js, which the harness does not
+# load; the harness answers None. These are listed as uncovered, never diffed.
+PAGE_ONLY_FIELDS = {"reach_band_m", "inside_band"}
+
+
+def _float_diff(recorded, replayed) -> bool:
+    """round3 fields exact at their own precision; other floats atol=1e-3."""
+    try:
+        rec, rep = float(recorded), float(replayed)
+    except (TypeError, ValueError):
+        return True
+    if rec == round(rec, 3):
+        return round(rep, 3) != rec
+    return abs(rep - rec) > 1e-3
+
+
+def diff_results(recorded, replayed, field="", exact=False, uncovered=None) -> list:
+    """Shared fields only; plan summaries exact (they come from the tape)."""
+    diffs = []
+    if uncovered is None:
+        uncovered = []
+    if isinstance(recorded, dict) and isinstance(replayed, dict):
+        for key in sorted(set(recorded) | set(replayed)):
+            path = "%s.%s" % (field, key) if field else key
+            if key in PROSE_FIELDS:
+                continue
+            if key not in replayed:
+                if key in PAGE_ONLY_FIELDS:
+                    uncovered.append(path)
+                else:
+                    diffs.append({"field": path, "recorded": recorded[key],
+                                  "replayed": None})
+                continue
+            if key not in recorded:
+                continue        # a harness-only addition is not the page's contract
+            if key in PAGE_ONLY_FIELDS and replayed[key] is None \
+                    and recorded[key] is not None:
+                uncovered.append(path)
+                continue
+            diffs += diff_results(recorded[key], replayed[key], path,
+                                  exact or key == "summary", uncovered)
+    elif isinstance(recorded, list) and isinstance(replayed, list):
+        if len(recorded) != len(replayed):
+            diffs.append({"field": field, "recorded": recorded, "replayed": replayed})
+        else:
+            for index, (a, b) in enumerate(zip(recorded, replayed)):
+                diffs += diff_results(a, b, "%s[%d]" % (field, index), exact, uncovered)
+    elif isinstance(recorded, bool) or isinstance(replayed, bool):
+        if recorded != replayed:
+            diffs.append({"field": field, "recorded": recorded, "replayed": replayed})
+    elif isinstance(recorded, (int, float)) and isinstance(replayed, (int, float)):
+        if (recorded != replayed) if exact else _float_diff(recorded, replayed):
+            diffs.append({"field": field, "recorded": recorded, "replayed": replayed})
+    elif recorded != replayed:
+        diffs.append({"field": field, "recorded": recorded, "replayed": replayed})
+    return diffs
+
+
+def load_trace_bundle(bundle_dir) -> dict:
+    """Everything the two replay modes read, once. No hardware, no model."""
+    bundle = Path(bundle_dir)
+    if not (bundle / "events.jsonl").is_file():
+        raise EvalError("no events.jsonl in %s (is it a bundle?)" % bundle)
+    events = []
+    for line in (bundle / "events.jsonl").read_text(encoding="utf-8").splitlines():
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    manifest = {}
+    if (bundle / "manifest.json").is_file():
+        manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    label = {}
+    if (bundle / "labels.json").is_file():
+        label = json.loads((bundle / "labels.json").read_text(encoding="utf-8"))
+    oracle_docs = {}
+    if (bundle / "oracle").is_dir():
+        for path in sorted((bundle / "oracle").glob("*.json")):
+            oracle_docs[path.stem] = json.loads(path.read_text(encoding="utf-8"))
+    user, sha = trace_bundle._first_user(events)
+    still = bundle / "stills" / (sha + ".jpg") if sha else None
+    frames = []
+    for event in events:
+        if event.get("type") == "frame_delivered":
+            frame = event.get("frame") or {}
+            if isinstance(frame, dict) and frame.get("$blob"):
+                path = bundle / "stills" / (frame["$blob"] + ".jpg")
+                if path.is_file():
+                    frames.append(path)
+    return {"dir": bundle, "events": events, "manifest": manifest, "label": label,
+            "oracle_docs": oracle_docs, "user": user, "still": still, "frames": frames}
+
+
+def _trace_args(args, ctx):
+    """The manifest's geometry maps 1:1 onto the harness flags (§6.3a)."""
+    rargs = argparse.Namespace(**vars(args))
+    manifest = ctx["manifest"]
+    bundle = ctx["dir"]
+    if (bundle / "calib.json").is_file():
+        rargs.calibration = str(bundle / "calib.json")
+    rargs.extrinsics = str(bundle / "rig.json") if (bundle / "rig.json").is_file() else ""
+    rargs.plane_z = float(manifest.get("plane_z", args.plane_z))
+    rargs.tip_mm = 1000.0 * float(manifest.get("tip_m", args.tip_mm / 1000.0))
+    rargs.min_z = float(manifest.get("min_z", args.min_z))
+    rargs.hover_m = float(manifest.get("hover_m", args.hover_m))
+    rargs.marker_at = ""
+    rargs.session = ""
+    return rargs
+
+
+def cmd_trace_replay(args, ctx) -> int:
+    """Deterministic replay: recorded tool calls through the host's own code.
+
+    No LLM. MockEdge answers from the tape, so even a recorded IK refusal
+    reproduces. Every result is diffed against the recording; a changed
+    geometry constant shows up as exactly the numbers that moved.
+    """
+    bundle = ctx["dir"]
+    if ctx["still"] is None or not ctx["still"].is_file():
+        raise EvalError("the bundle's first frame is missing; cannot replay")
+    rargs = _trace_args(args, ctx)
+    case = {"id": ctx["manifest"].get("session") or bundle.parent.name,
+            "user": ctx["user"]}
+    geometry = {"plane_z": rargs.plane_z, "tip_mm": rargs.tip_mm,
+                "hover_m": rargs.hover_m}
+    tape = bundle / "tape.json"
+    mock = MockEdge(rargs, tape=tape if tape.is_file() else None, geometry=geometry)
+    diffs, order, uncovered = [], [], []
+    calls = 0
+    try:
+        session = Session(rargs, case, ctx["still"])
+        results = [e for e in ctx["events"] if e.get("type") == "tool_result"]
+        cursor = 0
+        for event in ctx["events"]:
+            if event.get("type") != "tool_call":
+                continue
+            name = event.get("name")
+            match = None
+            while cursor < len(results):
+                candidate = results[cursor]
+                cursor += 1
+                if candidate.get("name") == name:
+                    match = candidate
+                    break
+                order.append({"tool": name, "index": calls,
+                              "problem": "recorded result for %r came first"
+                                         % candidate.get("name")})
+            if match is None:
+                order.append({"tool": name, "index": calls,
+                              "problem": "no recorded tool_result for this call"})
+                continue
+            before = mock.state.tape_misses
+            replayed = session.call(name, event.get("args") or {})
+            missed = mock.state.tape_misses - before
+            local_uncovered = []
+            found = diff_results(match.get("result") or {}, replayed,
+                                 uncovered=local_uncovered)
+            uncovered += ["%s.%s" % (name, path) for path in local_uncovered]
+            for diff in found:
+                diff["tool"] = name
+                diff["index"] = calls
+                diff["class"] = "tape-miss" if missed else "geometry-diff"
+            diffs += found
+            calls += 1
+        if cursor < len(results):
+            order.append({"tool": None, "index": calls,
+                          "problem": "%d recorded result(s) without a call"
+                                     % (len(results) - cursor)})
+        report = {
+            "bundle": str(bundle), "session": case["id"],
+            "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "calls": calls, "diffs": diffs, "order": order,
+            "uncovered": sorted(set(uncovered)),
+            "tape_misses": mock.state.tape_misses,
+            "passed": not diffs and not order and mock.state.tape_misses == 0,
+        }
+    finally:
+        mock.close()
+    out = Path(args.json) if args.json else bundle / "replay-report.json"
+    out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if not args.quiet:
+        print("replay %s: %d call(s), %d diff(s), %d order issue(s), %d tape miss(es)"
+              % (case["id"], calls, len(diffs), len(order), report["tape_misses"]))
+        for diff in diffs[:12]:
+            print("  %-13s %s.%s: recorded %s, replayed %s"
+                  % (diff["class"], diff["tool"], diff["field"],
+                     json.dumps(diff["recorded"]), json.dumps(diff["replayed"])))
+        for item in order[:6]:
+            print("  order-diff    %s" % item["problem"])
+        if report["uncovered"]:
+            print("  uncovered (page-only): %s" % ", ".join(report["uncovered"]))
+        print("wrote %s" % out)
+    return 0 if report["passed"] else 1
+
+
+def run_signature(problems) -> str:
+    """A fail's fingerprint with the numbers masked: N/N same shape = stable."""
+    normalized = sorted(re.sub(r"-?\d+(?:\.\d+)?", "#", str(p)) for p in problems)
+    return hashlib.sha256(json.dumps(normalized).encode("utf-8")).hexdigest()[:16]
+
+
+def classify_runs(results) -> str:
+    """stable-fail (N/N, one signature) -> export; flaky -> its own bucket."""
+    failed = [item for item in results if item.get("problems")]
+    if not failed:
+        return "pass"
+    if len(failed) == len(results) \
+            and len({run_signature(item["problems"]) for item in failed}) == 1:
+        return "stable-fail"
+    return "flaky"
+
+
+def trace_run_once(args, ctx, case: dict, still: Path) -> dict:
+    """One live-model run seeded from the bundle (§6.3b).
+
+    The recorded system prompt and the first user message + frame open the
+    conversation; capture_view is answered with the bundle's subsequent
+    frame_delivered blobs in order, so the model sees what the page saw.
+    """
+    if getattr(args, "_mock", None) is not None:
+        args._mock.reset()
+    session = Session(args, case, still)
+    system = SYSTEM_PROMPT
+    for event in ctx["events"]:
+        if event.get("type") == "model_turn":
+            messages = event.get("messages") or []
+            if messages and messages[0].get("role") == "system" \
+                    and isinstance(messages[0].get("content"), str):
+                system = messages[0]["content"]
+            break
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": [
+            {"type": "text", "text": case["user"]},
+            {"type": "image_url", "image_url": {"url": session.image_url}},
+        ]},
+    ]
+    frames = list(ctx["frames"])
+    trace = []
+    started = time.time()
+    for turn in range(args.max_turns):
+        message = chat(args, messages)
+        if message["content"]:
+            trace.append({"role": "agent", "text": message["content"]})
+        assistant = {"role": "assistant", "content": message["content"]}
+        if message["tool_calls"]:
+            assistant["tool_calls"] = message["tool_calls"]
+        messages.append(assistant)
+        if not message["tool_calls"]:
+            break
+        for call in message["tool_calls"]:
+            name = call["function"]["name"]
+            try:
+                tool_args = json.loads(call["function"]["arguments"] or "{}")
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
+            except json.JSONDecodeError:
+                tool_args = {}
+            result = session.call(name, tool_args)
+            trace.append({"role": "tool", "name": name, "args": tool_args,
+                          "result": result})
+            messages.append({"role": "tool", "tool_call_id": call["id"],
+                             "content": json.dumps(result)})
+            if name == "capture_view" and result.get("ok"):
+                # The recorded frames, in delivery order; the last still once
+                # they run out, exactly as run_once falls back.
+                frame = frames.pop(0) if frames else still
+                url = ("data:image/jpeg;base64,"
+                       + base64.b64encode(frame.read_bytes()).decode())
+                messages.append({"role": "user", "content": [
+                    {"type": "text", "text": "A fresh camera frame, taken just now."},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ]})
+            if name == "move_arm" and result.get("executed"):
+                messages.append({"role": "user", "content": (
+                    "The arm reports the trajectory played. This replay has only the one "
+                    "still, so a new frame will not show the change: finish with what the "
+                    "tools reported.")})
+    return {"session": session, "trace": trace, "turns": turn + 1,
+            "seconds": round(time.time() - started, 1),
+            "oracle_docs": ctx["oracle_docs"],
+            "final": next((item["text"] for item in reversed(trace)
+                           if item["role"] == "agent"), "")}
+
+
+def cmd_trace_live(args, ctx) -> int:
+    """Live-model replay xN against MockEdge + tape; stable fail -> export."""
+    missing = set(TOOL_NAMES) - tool_names_in_page()
+    if missing:
+        raise EvalError("live.html no longer declares %s; the eval and the page "
+                        "have drifted apart" % sorted(missing))
+    # The recorded contract is pinned by sha (§8.3). The harness re-implements
+    # the page's schemas, so a sha mismatch is reported, not fatal -- the name
+    # check above is the enforced drift guard, as in the plain modes.
+    recorded_sha = ctx["manifest"].get("tool_schemas_sha256")
+    for event in ctx["events"]:
+        if event.get("type") == "model_turn":
+            recorded_sha = (event.get("config") or {}).get("tools_sha256") or recorded_sha
+            break
+    current_sha = hashlib.sha256(json.dumps(TOOLS, sort_keys=True,
+                                            ensure_ascii=False).encode("utf-8")).hexdigest()
+    drift = bool(recorded_sha) and recorded_sha != current_sha
+    if drift and not args.quiet:
+        print("note: recorded tool schemas differ from the harness's (sha %s vs %s)"
+              % (recorded_sha[:12], current_sha[:12]))
+    if ctx["still"] is None or not ctx["still"].is_file():
+        raise EvalError("the bundle's first frame is missing; cannot replay")
+    rargs = _trace_args(args, ctx)
+    case = {"id": ctx["manifest"].get("session") or ctx["dir"].parent.name,
+            "user": ctx["user"],
+            "expect": trace_bundle.derive_expect(ctx["label"], ctx["events"],
+                                                 ctx["oracle_docs"])}
+    geometry = {"plane_z": rargs.plane_z, "tip_mm": rargs.tip_mm,
+                "hover_m": rargs.hover_m}
+    tape = ctx["dir"] / "tape.json"
+    mock = MockEdge(rargs, tape=tape if tape.is_file() else None, geometry=geometry)
+    rargs._mock = mock
+    results = []
+    try:
+        for index in range(args.runs):
+            try:
+                run = trace_run_once(rargs, ctx, case, ctx["still"])
+                problems = judge(rargs, case, run)
+            except Exception as exc:  # noqa: BLE001 - one bad run is a result
+                problems = ["%s: %s" % (type(exc).__name__, exc)]
+                run = None
+            results.append({"problems": problems, "run": run})
+            if args.verbose and run:
+                print("  run %d/%d: %d turns, %.1fs%s"
+                      % (index + 1, args.runs, run["turns"], run["seconds"],
+                         "" if not problems else "  FAIL"))
+                for problem in problems:
+                    print("     ! " + problem)
+    finally:
+        mock.close()
+    verdict = classify_runs(results)
+    report = {
+        "bundle": str(ctx["dir"]), "session": case["id"], "runs": args.runs,
+        "model": args.model, "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "classification": verdict, "tools_sha_drift": drift,
+        "expect": case["expect"],
+        "signatures": [run_signature(item["problems"]) if item["problems"] else None
+                       for item in results],
+        "problems": [item["problems"] for item in results],
+        "tape_misses": mock.state.tape_misses,
+        "exported": None,
+    }
+    if verdict == "stable-fail":
+        target = trace_bundle.export_bundle(
+            ctx["dir"], expect=case["expect"],
+            replay_report={"diffs": [{"class": "live-fail", "tool": "judge",
+                                      "field": "problems",
+                                      "recorded": ctx["label"].get("problems"),
+                                      "replayed": results[0]["problems"]}]})
+        report["exported"] = str(target) if target else None
+    out = Path(args.json) if args.json else ctx["dir"] / "trace-live-report.json"
+    out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if not args.quiet:
+        print("trace live %s: %s (%d run(s), model %s)"
+              % (case["id"], verdict, args.runs, args.model))
+        if report["exported"]:
+            print("exported -> %s" % report["exported"])
+        elif verdict == "flaky":
+            print("flaky: kept in its own bucket, not a ticket (%s)" % out)
+        print("wrote %s" % out)
+    return 0 if verdict == "pass" else 1
+
+
+def cmd_trace(args) -> int:
+    ctx = load_trace_bundle(args.trace)
+    if args.replay or not args.mock_edge:
+        return cmd_trace_replay(args, ctx)
+    return cmd_trace_live(args, ctx)
 
 
 # --------------------------------------------------------------------------- #
@@ -1027,6 +1487,16 @@ def build_parser() -> argparse.ArgumentParser:
                         help="what the refusal says")
     parser.add_argument("--mock-no-execute", action="store_true",
                         help="the mock reports execution as disabled")
+    # Failure-trace replay (§6.3): a frozen bundle from tests/trace_bundle.py.
+    parser.add_argument("--trace", default="",
+                        help="a trace bundle dir; with --replay (or without "
+                             "--mock-edge) the deterministic no-LLM replay, "
+                             "with --mock-edge the live-model replay x --runs")
+    parser.add_argument("--replay", action="store_true",
+                        help="deterministic replay of --trace: recorded tool calls "
+                             "through the host code, diffed against the recording")
+    parser.add_argument("--quiet", action="store_true",
+                        help="only the report file, no per-run console output")
     return parser
 
 
@@ -1043,6 +1513,11 @@ def case_runnable(case: dict, args) -> str:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.replay and not args.trace:
+        raise EvalError("--replay needs --trace <bundle-dir>")
+    if args.trace:
+        return cmd_trace(args)
 
     if args.list:
         return cmd_list(args)
