@@ -1,0 +1,102 @@
+# Two layers of verification (converted from the example's original GitLab CI):
+#
+# 1. core-tests — the Swift port of the page's math, cross-validated against
+#    fixtures generated from the REAL web JS of this repo (Node runs
+#    aruco.js / geometry.js / arm-model.js / locate.js to produce expected
+#    outputs). Pure Foundation + XCTest in a swift:6.0 container, so it runs
+#    on Linux with no iOS SDK.
+#
+# 2. ios-sdk-tests — builds the FULL app (SwiftUI + AVFoundation + WebRTC)
+#    for the iOS simulator SDK and runs the same suite as an Xcode test
+#    bundle (RebotCaptureTests) on a GitHub-hosted macOS runner (Xcode 16).
+#    continue-on-error mirrors GitLab's allow_failure: a flaky macOS layer
+#    never blocks the pipeline; the Linux core tests remain the required
+#    gate.
+#
+# Test fixtures (.gray renders + expected JSON) are generated, not committed:
+# tools/gen_fixtures.js writes them from the checked-out guide repo before
+# tests run. Unlike the GitLab job (which cloned the guide repo's default
+# branch), this uses the same commit's web JS, so fixtures never go stale.
+
+name: mobile
+
+on:
+  push:
+    paths:
+      - "examples/mobile/**"
+      - "examples/host/web/**"
+      - ".github/workflows/mobile.yml"
+  pull_request:
+    paths:
+      - "examples/mobile/**"
+      - "examples/host/web/**"
+      - ".github/workflows/mobile.yml"
+
+defaults:
+  run:
+    working-directory: examples/mobile
+
+jobs:
+  core-tests:
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Swift version
+        run: swift --version
+      - name: Install Node
+        run: apt-get update -qq && apt-get install -y -qq nodejs >/dev/null
+      - name: Generate fixtures from the guide's web JS
+        run: node tools/gen_fixtures.js RebotCore/Tests/RebotCoreTests/Fixtures "$GITHUB_WORKSPACE"
+      - name: Run core tests
+        working-directory: examples/mobile/RebotCore
+        run: swift test
+
+  ios-sdk-tests:
+    runs-on: macos-15
+    continue-on-error: true
+    timeout-minutes: 45
+    env:
+      CLONED_SOURCE_PACKAGES_DIR_PATH: ${{ github.workspace }}/examples/mobile/.spm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Xcode version
+        run: xcodebuild -version
+      - name: Install XcodeGen
+        run: command -v xcodegen || brew install xcodegen
+      - name: Generate fixtures from the guide's web JS
+        run: node tools/gen_fixtures.js RebotCore/Tests/RebotCoreTests/Fixtures "$GITHUB_WORKSPACE"
+      - name: Generate Xcode project
+        run: xcodegen generate
+      # Pick the first available iPhone simulator on this runner's Xcode.
+      - name: Pick an iPhone simulator
+        id: simulator
+        run: |
+          DEVICE=$(xcrun simctl list devices available | grep -m1 -E "iPhone" | sed -E 's/^ *([^(]+) *\(.*$/\1/' | xargs)
+          echo "Testing on iOS Simulator: $DEVICE"
+          echo "device=$DEVICE" >> "$GITHUB_OUTPUT"
+      - name: Cache SPM checkouts
+        uses: actions/cache@v4
+        with:
+          path: examples/mobile/.spm
+          key: spm-packages
+      - name: Resolve package dependencies
+        run: xcodebuild -resolvePackageDependencies -project RebotCapture.xcodeproj -scheme RebotCapture -clonedSourcePackagesDirPath "$CLONED_SOURCE_PACKAGES_DIR_PATH"
+      - name: Build and test against the iOS SDK
+        run: >
+          xcodebuild test
+          -project RebotCapture.xcodeproj
+          -scheme RebotCapture
+          -destination "platform=iOS Simulator,name=${{ steps.simulator.outputs.device }}"
+          -configuration Debug
+          -clonedSourcePackagesDirPath "$CLONED_SOURCE_PACKAGES_DIR_PATH"
+          CODE_SIGNING_ALLOWED=NO
+          -resultBundlePath build/RebotCapture.xcresult
+      - name: Upload result bundle on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RebotCapture.xcresult
+          path: examples/mobile/build/RebotCapture.xcresult
+          retention-days: 7
