@@ -368,6 +368,7 @@ async def test_server(workdir: Path, geometry):
         hover="1", hover_m=0.10, tip_mm=35.0,
         plane_z=0.0, tool_axis="z-", yaw=0.0,
         extrinsics="", witness_max_px=2.0, camera="",
+        traces_dir=str(workdir / "server-traces"),
     )
     app = capture_server.build_app(args)
 
@@ -454,7 +455,7 @@ async def test_server(workdir: Path, geometry):
         # physical offset and the safety floor, then posts the compact request.
         forwarded = []
 
-        async def fake_planner_call(app, path, body, timeout=120, method="POST"):
+        async def fake_planner_call(app, path, body, timeout=120, method="POST", sid=None):
             forwarded.append((path, body))
             return 200, {"id": "fake-sequence",
                          "summary": {"markers": len(body.get("targets") or [])},
@@ -783,6 +784,480 @@ async def test_server(workdir: Path, geometry):
         check("a non-quarter-turn angle is refused", bad_angle.status == 400)
         no_orientation_token = await client.post("/orientation", json={"angle": 90})
         check("orientation still needs the page token", no_orientation_token.status == 401)
+
+
+# --------------------------------------------------------------------------- #
+# 4b. The trace recorder: append-only log, blobs, redaction, retention
+# --------------------------------------------------------------------------- #
+
+async def test_trace_recorder(workdir: Path):
+    print("\ntrace recorder unit checks")
+    import base64
+    import hashlib
+    import os
+
+    import trace as trace_mod
+
+    root = workdir / "trace-unit"
+    recorder = trace_mod.TraceRecorder(root, retention_days=30)
+    sid = "20261118T102320Z-abc123"
+
+    first = await recorder.event(sid, "server", "session_start")
+    seqs = await recorder.events(sid, [
+        {"type": "user_message", "pseq": 1, "text": "hello"},
+        {"type": "tool_call", "pseq": 2, "name": "rig", "args": {}},
+    ])
+    lines = [json.loads(line) for line in
+             (root / sid / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    check("trace seq is monotonic from 1", [line["seq"] for line in lines] == [1, 2, 3]
+          and first == 1 and seqs == [2, 3])
+    check("trace batch preserves order and pseq",
+          [line["type"] for line in lines] == ["session_start", "user_message", "tool_call"]
+          and [line.get("pseq") for line in lines[1:]] == [1, 2])
+    check("trace stamps src and t",
+          lines[0]["src"] == "server" and lines[1]["src"] == "page"
+          and all(line.get("t") for line in lines))
+
+    restarted = trace_mod.TraceRecorder(root, retention_days=30)
+    again = await restarted.event(sid, "server", "abort")
+    check("trace seq continues across a restart", again == 4)
+
+    ok, buffer = cv2.imencode(".jpg", np.full((24, 32, 3), 120, np.uint8),
+                              [cv2.IMWRITE_JPEG_QUALITY, 82])
+    jpeg = buffer.tobytes()
+    sha_a = recorder.blob(jpeg)
+    sha_b = recorder.blob(jpeg)
+    check("blob dedup writes one file per sha", sha_a == sha_b
+          and len(list((root / "blobs").iterdir())) == 1
+          and (root / "blobs" / (sha_a + ".jpg")).read_bytes() == jpeg)
+
+    url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+    await recorder.event(sid, "page", "user_message", frame=url,
+                         messages=[{"role": "user", "content": [
+                             {"type": "image_url", "image_url": {"url": url}}]}])
+    line = json.loads((root / sid / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    check("data-URL frames become blob refs",
+          line["frame"] == {"$blob": sha_a}
+          and line["messages"][0]["content"][0]["image_url"]["url"] == {"$blob": sha_a})
+
+    await recorder.event(sid, "server", "model_turn",
+                         usage={"prompt_tokens": 10, "total_tokens": 12},
+                         config={"token": "secret", "Authorization": "Bearer x",
+                                 "api_key": "k", "nested": {"planner_token": "t", "keep": 1},
+                                 "llm_url": "http://modelhost:11434/v1/chat/completions"})
+    line = json.loads((root / sid / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    config = line["config"]
+    check("secret keys are redacted recursively",
+          not ({"token", "Authorization", "api_key"} & set(config))
+          and "planner_token" not in config["nested"] and config["nested"]["keep"] == 1)
+    check("usage counters survive redaction",
+          line["usage"] == {"prompt_tokens": 10, "total_tokens": 12})
+    check("llm_url is reduced to its host", config["llm_url"] == "modelhost")
+
+    other = "20261118T102321Z-def456"
+    recorder.manifest(other, {"version": "first"})
+    recorder.manifest(other, {"version": "second"})
+    frozen = json.loads((root / other / "manifest.json").read_text(encoding="utf-8"))
+    check("manifest is written once", frozen["version"] == "first")
+
+    factory_sid = "20261118T102322Z-012345"
+    factory = trace_mod.TraceRecorder(root, snapshot=lambda s: {"version": "factory", "sid": s})
+    await factory.event(factory_sid, "page", "session_start")
+    await factory.event(factory_sid, "page", "user_message", text="hi")
+    made = json.loads((root / factory_sid / "manifest.json").read_text(encoding="utf-8"))
+    check("first event writes the snapshot manifest once",
+          made["version"] == "factory" and made["sid"] == factory_sid)
+
+    try:
+        await recorder.event("../escape", "page", "user_message")
+        check("a malformed session id is refused", False)
+    except ValueError:
+        check("a malformed session id is refused", True)
+    try:
+        await recorder.events(sid, [{"type": "x"}] * 65)
+        check("a batch over 64 events is refused", False)
+    except ValueError:
+        check("a batch over 64 events is refused", True)
+
+    # Retention: an old session and its private blob go; a fresh session, its
+    # blob, and anything export/ references stay.
+    old = "20250101T000000Z-aaaaaa"
+    fresh = "20261118T102323Z-bbbbbb"
+    await recorder.event(old, "page", "user_message", frame={"$blob": recorder.blob(b"old-frame")})
+    await recorder.event(fresh, "page", "user_message", frame={"$blob": recorder.blob(b"new-frame")})
+    orphan = recorder.blob(b"orphan-frame")
+    exported = recorder.blob(b"exported-frame")
+    export_dir = root / "export" / "case-1"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    (export_dir / "case.json").write_text(json.dumps({"still": {"$blob": exported}}),
+                                          encoding="utf-8")
+    aged = time.time() - 40 * 86400
+    for directory in (root / old, export_dir):
+        for path in list(directory.iterdir()) + [directory]:
+            os.utime(path, (aged, aged))
+    recorder.prune()
+    check("prune drops a session past retention", not (root / old).exists())
+    check("prune keeps a fresh session", (root / fresh / "events.jsonl").is_file())
+    check("prune drops unreferenced blobs",
+          not (root / "blobs" / (orphan + ".jpg")).exists()
+          and not (root / "blobs" / (hashlib.sha256(b"old-frame").hexdigest() + ".jpg")).exists())
+    check("prune keeps blobs a live session references",
+          (root / "blobs" / (sha_a + ".jpg")).is_file()
+          and (root / "blobs" / (hashlib.sha256(b"new-frame").hexdigest() + ".jpg")).is_file())
+    check("export is exempt from prune",
+          export_dir.is_dir()
+          and (root / "blobs" / (exported + ".jpg")).is_file())
+
+
+# --------------------------------------------------------------------------- #
+# 4c. Trace end to end: the real server, MockEdge, a scripted model -- no arm
+# --------------------------------------------------------------------------- #
+
+async def test_trace_server(workdir: Path, geometry):
+    print("\ntrace collector end to end (mock gateway, scripted model)")
+    import base64
+    import hashlib
+
+    from aiohttp import web as aiohttp_web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import capture_server
+    import mock_arm
+    import trace as trace_mod
+
+    image = geometry["image"]
+    captures = workdir / "trace-captures"
+    calib_dir = workdir / "trace-calib"
+    traces = workdir / "trace-store"
+    calib_dir.mkdir(parents=True, exist_ok=True)
+    calib_bytes = json.dumps({
+        "format": "rebot-camera-calib", "version": 1, "device": "synthetic",
+        "image_size": [image.shape[1], image.shape[0]],
+        "K": geometry["K"].tolist(), "dist": geometry["dist"].tolist(), "rms": 0.2,
+    }).encode("utf-8")
+    (calib_dir / "synthetic.json").write_bytes(calib_bytes)
+
+    edge, edge_url, edge_state = mock_arm.serve(0)
+    args = SimpleNamespace(
+        host="127.0.0.1", port=0, captures=str(captures), cert="", key="",
+        token="trace-token", mediamtx="http://127.0.0.1:9", whip_path="phone",
+        no_whip=True, max_mb=16, quiet=True,
+        planner=edge_url, planner_token="", execute=True,
+        calib_dir=str(calib_dir), calib="",
+        marker_at="0.36,-0.10,0.12,180", marker_size=0.08,
+        hover="1", hover_m=0.10, tip_mm=35.0,
+        plane_z=0.0, tool_axis="z-", yaw=0.0,
+        extrinsics="", witness_max_px=2.0, camera="",
+        traces_dir=str(traces), trace_retention_days=30, no_trace=False,
+    )
+    app = capture_server.build_app(args)
+
+    ok, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    jpeg = buffer.tobytes()
+    frame_url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+    frame_sha = hashlib.sha256(jpeg).hexdigest()
+    sid = "20261118T102320Z-abc123"
+    headers = {"X-Rebot-Token": "trace-token", "X-Rebot-Session": sid}
+    tools = [{"type": "function", "function": {"name": "rig",
+                                               "parameters": {"type": "object"}}}]
+    tools_sha = hashlib.sha256(json.dumps(tools, sort_keys=True,
+                                          ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    # A scripted model: turn 1 calls a tool over SSE, turn 2 answers in JSON.
+    script = [
+        {"content": "looking ", "tool_calls": [("rig", "{}")]},
+        {"content": "the rig is fitted; nothing moved."},
+    ]
+    seen = []
+
+    async def fake_chat(request):
+        payload = await request.json()
+        seen.append(payload)
+        step = script[len(seen) - 1] if len(seen) <= len(script) else {"content": "ok"}
+        calls = step.get("tool_calls") or []
+        if payload.get("stream"):
+            response = aiohttp_web.StreamResponse(
+                status=200, headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            chunks = []
+            if step.get("content"):
+                chunks.append({"choices": [{"delta": {"content": step["content"]}}]})
+            for index, (name, arguments) in enumerate(calls):
+                chunks.append({"choices": [{"delta": {"tool_calls": [{
+                    "index": index, "id": "call_%d" % index, "type": "function",
+                    "function": {"name": name, "arguments": arguments}}]}}]})
+            chunks.append({"choices": [{"finish_reason": "tool_calls" if calls else "stop",
+                                        "delta": {}}]})
+            chunks.append({"usage": {"prompt_tokens": 10, "total_tokens": 12}, "choices": []})
+            for chunk in chunks:
+                await response.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+            await response.write(b"data: [DONE]\n\n")
+            await response.write_eof()
+            return response
+        message = {"role": "assistant", "content": step.get("content", "")}
+        if calls:
+            message["tool_calls"] = [{"function": {"name": name, "arguments": arguments}}
+                                     for name, arguments in calls]
+        return aiohttp_web.json_response({
+            "model": "stub-model",
+            "choices": [{"message": message,
+                         "finish_reason": "tool_calls" if calls else "stop"}],
+            "usage": {"total_tokens": 12},
+        })
+
+    async def fake_models(request):
+        return aiohttp_web.json_response({"data": [{"id": "stub-model",
+                                                    "meta": {"n_ctx": 8192}}]})
+
+    fake_llm = aiohttp_web.Application()
+    fake_llm.router.add_post("/v1/chat/completions", fake_chat)
+    fake_llm.router.add_get("/v1/models", fake_models)
+    runner = aiohttp_web.AppRunner(fake_llm)
+    await runner.setup()
+    site = aiohttp_web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    llm_port = site._server.sockets[0].getsockname()[1]
+    app["llm_url"] = "http://127.0.0.1:%d/v1/chat/completions" % llm_port
+    app["llm_model"] = "stub-model"
+
+    def read_events(session=sid):
+        path = traces / session / "events.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    try:
+        async with TestClient(TestServer(app)) as client:
+            check("serves the trace queue module",
+                  (await client.get("/trace.js")).status == 200)
+
+            page_events = [
+                {"type": "session_start", "pseq": 1},
+                {"type": "user_message", "pseq": 2, "text": "place a marker",
+                 "frame": frame_url},
+                {"type": "tool_call", "pseq": 3, "name": "rig", "args": {}},
+                {"type": "tool_result", "pseq": 4, "name": "rig", "args": {},
+                 "result": {"ok": True}, "ms": 12},
+                {"type": "frame_delivered", "pseq": 5, "frame": frame_url,
+                 "width": image.shape[1], "height": image.shape[0], "reason": "capture_view"},
+            ]
+            posted = await client.post("/trace", json={"session": sid, "events": page_events},
+                                       headers={"X-Rebot-Token": "trace-token"})
+            posted_body = await posted.json()
+            check("POST /trace accepts a page batch",
+                  posted.status == 200 and posted_body.get("ok") is True
+                  and posted_body.get("seqs") == [1, 2, 3, 4, 5])
+            logged = read_events()
+            check("the page log keeps every event type",
+                  [event["type"] for event in logged]
+                  == ["session_start", "user_message", "tool_call", "tool_result",
+                      "frame_delivered"])
+            check("the frame uploads once and resolves to its bytes",
+                  logged[1]["frame"] == {"$blob": frame_sha}
+                  and logged[4]["frame"] == {"$blob": frame_sha}
+                  and (traces / "blobs" / (frame_sha + ".jpg")).read_bytes() == jpeg)
+
+            manifest = json.loads((traces / sid / "manifest.json").read_text(encoding="utf-8"))
+            live_sha = hashlib.sha256((capture_server.WEB_DIR / "live.html").read_bytes()).hexdigest()
+            check("the manifest snapshots the environment on first sight",
+                  manifest["version"] == capture_server.VERSION
+                  and manifest["live_html_sha256"] == live_sha
+                  and manifest["calib_fingerprint"]
+                  and manifest["execute"] is True
+                  and manifest["planner_host"] == "127.0.0.1"
+                  and abs(manifest["tip_m"] - 0.035) < 1e-9)
+            check("the manifest copies the calib file bytes",
+                  (traces / sid / "calib.json").read_bytes() == calib_bytes)
+            check("the manifest carries no secrets",
+                  not ({"token", "llm_token", "api_key", "authorization"}
+                       & set(manifest.get("llm") or {}))
+                  and (manifest.get("llm") or {}).get("url_host") == "127.0.0.1"
+                  and "authorization" not in json.dumps(manifest).lower()
+                  and "api_key" not in json.dumps(manifest).lower())
+
+            no_token = await client.get("/trace/%s/events" % sid)
+            check("trace reads need the token even though GET is exempt",
+                  no_token.status == 401)
+            read_back = await client.get("/trace/%s/events" % sid,
+                                         headers={"X-Rebot-Token": "trace-token"})
+            read_body = await read_back.json()
+            check("GET /trace/{sid}/events reads the log back",
+                  read_back.status == 200 and len(read_body.get("events") or []) == 5)
+            read_manifest = await client.get("/trace/%s/manifest" % sid,
+                                             headers={"X-Rebot-Token": "trace-token"})
+            check("GET /trace/{sid}/manifest reads the snapshot",
+                  read_manifest.status == 200
+                  and (await read_manifest.json())["manifest"]["version"]
+                  == capture_server.VERSION)
+
+            bad_sid = await client.post("/trace", json={"session": "../escape",
+                                                        "events": [{"type": "x"}]},
+                                        headers={"X-Rebot-Token": "trace-token"})
+            check("POST /trace refuses a malformed session", bad_sid.status == 400)
+            too_many = await client.post("/trace",
+                                         json={"session": sid,
+                                               "events": [{"type": "x"}] * 65},
+                                         headers={"X-Rebot-Token": "trace-token"})
+            check("POST /trace caps a batch at 64 events", too_many.status == 400)
+            too_big = await client.post("/trace",
+                                        json={"session": sid,
+                                              "events": [{"type": "x", "blob": "y" * (9 * 1024 * 1024)}]},
+                                        headers={"X-Rebot-Token": "trace-token"})
+            check("POST /trace caps the body at 8 MiB", too_big.status == 413)
+
+            # A streamed turn: the recorder must see the exact prompt (with
+            # blob refs) and the assembled assistant message.
+            streamed = await client.post(
+                "/agent",
+                json={"messages": [
+                    {"role": "system", "content": "you operate an arm"},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "place a marker"},
+                        {"type": "image_url", "image_url": {"url": frame_url}}]},
+                ], "tools": tools, "stream": True},
+                headers=headers)
+            await streamed.text()
+            turns = [event for event in read_events() if event["type"] == "model_turn"]
+            check("the SSE done path records model_turn",
+                  streamed.status == 200 and len(turns) == 1
+                  and turns[0]["finish_reason"] == "tool_calls"
+                  and turns[0]["complete"] is True
+                  and turns[0]["usage"].get("total_tokens") == 12)
+            turn = turns[0] if turns else {}
+            prompt = (turn.get("messages") or [{}, {}])[1]
+            check("model_turn stores the full prompt with blob refs",
+                  isinstance(prompt.get("content"), list)
+                  and prompt["content"][1]["image_url"]["url"] == {"$blob": frame_sha}
+                  and (turn.get("message") or {}).get("content") == "looking "
+                  and ((turn.get("message") or {}).get("tool_calls") or [{}])[0]
+                      .get("function", {}).get("name") == "rig")
+            check("model_turn pins the model config and tool contract",
+                  (turn.get("config") or {}).get("model") == "stub-model"
+                  and (turn.get("config") or {}).get("tools_sha256") == tools_sha
+                  and not ({"token", "api_key", "authorization"}
+                           & set(turn.get("config") or {})))
+
+            # The JSON path records too, and a second session's manifest pins
+            # the tool schemas because /agent was its first event.
+            sid2 = "20261118T102321Z-def456"
+            json_turn = await client.post(
+                "/agent",
+                json={"messages": [{"role": "user", "content": "and now?"}],
+                      "tools": tools},
+                headers={"X-Rebot-Token": "trace-token", "X-Rebot-Session": sid2})
+            json_body = await json_turn.json()
+            turns2 = [event for event in read_events(sid2) if event["type"] == "model_turn"]
+            check("the JSON path records model_turn",
+                  json_turn.status == 200 and json_body.get("ok") is True
+                  and len(turns2) == 1
+                  and turns2[0]["message"]["content"] == "the rig is fitted; nothing moved.")
+            manifest2 = json.loads((traces / sid2 / "manifest.json").read_text(encoding="utf-8"))
+            check("a first-seen /agent pins tool_schemas_sha256 in the manifest",
+                  manifest2.get("tool_schemas_sha256") == tools_sha)
+
+            # The gateway tape: /sequence and /execute flow through planner_call.
+            sequenced = await client.post(
+                "/sequence", json={"targets": [{"tip": [0.45, 0.0, 0.16],
+                                                "pixel": [640, 480]}]},
+                headers=headers)
+            sequence_body = await sequenced.json()
+            plan_id = (sequence_body.get("plan") or {}).get("id")
+            plan_events = [event for event in read_events() if event["type"] == "plan"]
+            tape = [event for event in read_events() if event["type"] == "gateway_call"]
+            check("sequence records plan linked to the session",
+                  sequenced.status == 200 and plan_id == edge_state.last_plan
+                  and len(plan_events) == 1 and plan_events[0]["plan_id"] == plan_id
+                  and plan_events[0]["ok"] is True)
+            check("planner_call tapes the gateway request and response",
+                  len(tape) == 1 and tape[0]["path"] == "/plan"
+                  and tape[0]["status"] == 200
+                  and tape[0]["response"]["id"] == plan_id
+                  and tape[0]["request"]["targets"][0]["tip"] == [0.45, 0.0, 0.16]
+                  and len(tape[0]["key"]) == 64 and tape[0]["ms"] >= 0)
+
+            executed = await client.post("/execute", json={"id": plan_id}, headers=headers)
+            execute_body = await executed.json()
+            execute_events = [event for event in read_events() if event["type"] == "execute"]
+            check("execute records the plan_id and the outcome",
+                  executed.status == 200 and execute_body.get("executed") is True
+                  and len(execute_events) == 1
+                  and execute_events[0]["plan_id"] == plan_id
+                  and execute_events[0]["executed"] is True)
+            check("execute is taped too",
+                  any(event["path"] == "/execute" for event in read_events()
+                      if event["type"] == "gateway_call"))
+
+            # An unreachable model is a stream_error, not a lost turn.
+            saved_url = app["llm_url"]
+            app["llm_url"] = "http://127.0.0.1:9/v1/chat/completions"
+            failed = await client.post("/agent",
+                                       json={"messages": [{"role": "user", "content": "hi"}]},
+                                       headers=headers)
+            app["llm_url"] = saved_url
+            errors = [event for event in read_events() if event["type"] == "stream_error"]
+            check("a failed turn records stream_error",
+                  failed.status == 502 and len(errors) == 1
+                  and "127.0.0.1:9" in errors[0]["error"])
+
+            health = await (await client.get("/health")).json()
+            check("health reports the trace collector",
+                  (health.get("traces") or {}).get("enabled") is True
+                  and (health.get("traces") or {}).get("sessions") == 2
+                  and (health.get("traces") or {}).get("retention_days") == 30)
+
+            # §8.4: a broken recorder degrades to "no trace", never a failure.
+            recorder = app["traces"]
+
+            async def broken_event(*a, **k):
+                raise RuntimeError("the disk is full")
+
+            async def broken_events(*a, **k):
+                raise RuntimeError("the disk is full")
+
+            real_event, real_events = recorder.event, recorder.events
+            recorder.event, recorder.events = broken_event, broken_events
+            try:
+                still_ok = await client.post(
+                    "/agent", json={"messages": [{"role": "user", "content": "hi"}]},
+                    headers=headers)
+                still_planned = await client.post(
+                    "/sequence", json={"targets": [{"tip": [0.45, 0.0, 0.16]}]},
+                    headers=headers)
+                dropped = await client.post("/trace",
+                                            json={"session": sid,
+                                                  "events": [{"type": "user_message"}]},
+                                            headers={"X-Rebot-Token": "trace-token"})
+            finally:
+                recorder.event, recorder.events = real_event, real_events
+            check("a broken recorder never fails /agent or /sequence",
+                  still_ok.status == 200 and still_planned.status == 200)
+            check("a broken recorder drops the page batch with a 500",
+                  dropped.status == 500 and (await dropped.json()).get("ok") is False)
+
+            # Every blob reference in the merged log resolves to real bytes.
+            refs = set(trace_mod.BLOB_REF.findall(
+                (traces / sid / "events.jsonl").read_text(encoding="utf-8")))
+            check("every $blob in the log resolves",
+                  refs and all((traces / "blobs" / (sha + ".jpg")).is_file() for sha in refs))
+
+        # --no-trace disables collection entirely.
+        off_args = SimpleNamespace(**vars(args))
+        off_args.no_trace = True
+        off_args.traces_dir = str(workdir / "trace-off")
+        off = capture_server.build_app(off_args)
+        async with TestClient(TestServer(off)) as client:
+            refused = await client.post("/trace",
+                                        json={"session": sid, "events": [{"type": "x"}]},
+                                        headers={"X-Rebot-Token": "trace-token"})
+            off_health = await (await client.get("/health")).json()
+            check("--no-trace refuses writes and reports disabled",
+                  refused.status == 503
+                  and (off_health.get("traces") or {}).get("enabled") is False)
+            check("--no-trace leaves no trace directory",
+                  not (workdir / "trace-off").exists())
+    finally:
+        await runner.cleanup()
+        edge.shutdown()
 
 
 # --------------------------------------------------------------------------- #
@@ -1294,6 +1769,7 @@ def test_fixed_rig(workdir: Path):
             hover="1", hover_m=0.10, tip_mm=35.0,
             plane_z=0.0, tool_axis="z-", yaw=0.0,
             extrinsics=str(rig_file), witness_max_px=2.0, camera="",
+            traces_dir=str(workdir / "rig-server-traces"),
         )
 
     async def fixed_server_checks():
@@ -1844,6 +2320,7 @@ def test_calibrate_api(workdir: Path):
             plane_z=0.0, tool_axis="z-", yaw=0.0,
             extrinsics="", witness_max_px=2.0, camera="rtsp://fake/stream",
             mediamtx_api="http://127.0.0.1:9", recordings=str(calib_dir.parent / "recordings"),
+            traces_dir=str(workdir / "sweep-server-traces"),
         )
 
     # The arm gateway and the camera are the two things a test cannot own; both
@@ -2064,6 +2541,7 @@ def test_marker_rig(workdir: Path):
             plane_z=0.0, tool_axis="z-", yaw=0.0,
             extrinsics="", witness_max_px=2.0, camera="rtsp://fake/stream",
             mediamtx_api="http://127.0.0.1:9", recordings=str(calib_dir.parent / "recordings"),
+            traces_dir=str(workdir / "marker-server-traces"),
         )
 
     original_gateway = auto_calibrate.ArmGateway
@@ -2232,6 +2710,8 @@ def main(argv=None):
     test_schema()
     if not args.skip_server:
         asyncio.run(test_server(workdir, geometry))
+        asyncio.run(test_trace_recorder(workdir))
+        asyncio.run(test_trace_server(workdir, geometry))
     if calibration:
         test_locate_cli(workdir, geometry)
     test_rotation(workdir, geometry)

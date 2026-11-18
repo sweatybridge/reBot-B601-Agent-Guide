@@ -19,6 +19,16 @@ placement (`--marker-at`/`REBOT_MARKER_AT`), because the browser locator reads
     # terminal 2
     python examples/host/tests/browser_check.py --url "https://127.0.0.1:8443/?token=test-token"
 
+With `--serve` no external server is needed: the phone check's server is hosted
+in-process with a synthetic calibration, and everything runs offline.
+
+After the phone checks, the /live agent sidebar is driven in the same browser
+against a second in-process server (fitted rig, MockEdge gateway, a scripted
+local model -- no real endpoint, no hardware): a chat task must leave a complete
+trace (user_message, tool_call/tool_result, frame_delivered, model_turn, plan,
+gateway tape), a forced context compaction must be logged without losing prior
+turns, and the feedback buttons must record a verdict.
+
 If the shell cannot launch a browser itself (confined sandboxes block Chromium's
 IPC), start one separately and attach:
 
@@ -26,7 +36,8 @@ IPC), start one separately and attach:
     python examples/host/tests/browser_check.py --connect 9333 --url "..."
 
 Browser autodetect only probes the Windows Chrome/Edge install paths; anywhere
-else pass `--chrome <path>`. It is a check of the page, not of the camera: the
+else pass `--chrome <path>`. When no browser is found the check skips with a
+message instead of failing. It is a check of the page, not of the camera: the
 lens, the focus and the intrinsics are still the phone's problem.
 """
 
@@ -37,15 +48,19 @@ import asyncio
 import base64
 import json
 import math
+import shutil
 import socket
 import subprocess
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import aiohttp
 
 HERE = Path(__file__).resolve().parent
+APP = HERE.parent / "app"
 WINDOWS_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -126,12 +141,70 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
+def server_args(workdir: Path, **overrides) -> SimpleNamespace:
+    """The capture server's args, as the selftest builds them: all state local."""
+    args = SimpleNamespace(
+        host="127.0.0.1", port=0, captures=str(workdir / "captures"), cert="", key="",
+        token="check-token", mediamtx="http://127.0.0.1:9", whip_path="phone",
+        no_whip=True, max_mb=16, quiet=True,
+        planner="http://127.0.0.1:9", planner_token="", execute=False,
+        calib_dir=str(workdir / "calib"), calib="",
+        marker_at="0.36,-0.10,0.12,180", marker_size=0.08,
+        hover="1", hover_m=0.10, tip_mm=35.0,
+        plane_z=0.0, tool_axis="z-", yaw=0.0,
+        extrinsics="", witness_max_px=2.0, camera="",
+        traces_dir=str(workdir / "traces"), trace_retention_days=30, no_trace=False,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def write_synthetic_calib(calib_dir: Path) -> None:
+    """The same 1280x960 grid the canvas camera stub publishes."""
+    calib_dir.mkdir(parents=True, exist_ok=True)
+    (calib_dir / "synthetic.json").write_text(json.dumps({
+        "format": "rebot-camera-calib", "version": 1, "device": "synthetic",
+        "image_size": [1280, 960],
+        "K": [[1000.0, 0.0, 640.0], [0.0, 1000.0, 480.0], [0.0, 0.0, 1.0]],
+        "dist": [0.0] * 5, "rms": 0.2,
+    }), encoding="utf-8")
+
+
+@asynccontextmanager
+async def hosted_server(app):
+    """The real capture server on a loopback port, in this process."""
+    from aiohttp import web
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        yield "http://127.0.0.1:%d" % port
+    finally:
+        await runner.cleanup()
+
+
+@asynccontextmanager
+async def hosted_phone_server(workdir: Path):
+    """A handheld host for the phone-page checks: synthetic calib, base marker."""
+    sys.path.insert(0, str(APP))
+    import capture_server
+
+    write_synthetic_calib(workdir / "calib")
+    app = capture_server.build_app(server_args(workdir))
+    async with hosted_server(app) as url:
+        yield url + "/?token=check-token"
+
+
 def centimetres(label: str) -> float:
     """Read the height badge ("10.5 cm") back as a number."""
     return float(str(label).replace("cm", "").strip())
 
 
-def find_browser(explicit: str) -> Path:
+def find_browser(explicit: str):
     if explicit:
         path = Path(explicit)
         if not path.is_file():
@@ -140,7 +213,7 @@ def find_browser(explicit: str) -> Path:
     for candidate in WINDOWS_CANDIDATES:
         if Path(candidate).is_file():
             return Path(candidate)
-    raise SystemExit("no Chrome or Edge found; pass --chrome")
+    return None
 
 
 async def wait_for_devtools(port: int, timeout=20.0):
@@ -159,9 +232,17 @@ async def wait_for_devtools(port: int, timeout=20.0):
 
 async def run(args) -> int:
     if args.connect:
-        return await drive(args, args.connect)
+        code = await drive(args, args.connect)
+        if code == 0:
+            code = await live_check(args, args.connect)
+        return code
 
     browser = find_browser(args.chrome)
+    if browser is None:
+        print("skip: no Chrome or Edge found on this machine; the browser checks "
+              "need one. Pass --chrome <path>, or start a browser with "
+              "--remote-debugging-port and use --connect.")
+        return 0
     port = free_port()
     profile = Path(args.profile)
     profile.mkdir(parents=True, exist_ok=True)
@@ -181,7 +262,18 @@ async def run(args) -> int:
 
     try:
         await wait_for_devtools(port)
-        return await drive(args, port)
+        if args.serve:
+            workdir = HERE / ".browser-check-work"
+            shutil.rmtree(workdir, ignore_errors=True)
+            workdir.mkdir(parents=True, exist_ok=True)
+            async with hosted_phone_server(workdir / "phone") as url:
+                args.url = url
+                code = await drive(args, port)
+        else:
+            code = await drive(args, port)
+        if code == 0:
+            code = await live_check(args, port)
+        return code
     finally:
         process.terminate()
         try:
@@ -505,10 +597,338 @@ async def drive_page(cdp, args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# The /live sidebar: a chat task must leave a complete, replayable trace
+# --------------------------------------------------------------------------- #
+
+LIVE_VIDEO_STUB = """
+(() => {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1280; canvas.height = 960;
+  const context = canvas.getContext('2d');
+  context.fillStyle = '#dedede'; context.fillRect(0, 0, 1280, 960);
+  context.fillStyle = '#333'; context.fillRect(500, 420, 280, 220);
+  context.fillStyle = '#c33'; context.fillRect(900, 700, 200, 140);
+  context.strokeStyle = '#2a7'; context.lineWidth = 10;
+  context.beginPath(); context.arc(640, 600, 70, 0, Math.PI * 2); context.stroke();
+  const video = document.getElementById('video');
+  video.srcObject = canvas.captureStream(15);
+  return true;
+})()
+"""
+
+# What the scripted model does, turn by turn: mark a pixel, plan without moving,
+# ask for a fresh frame, answer; then answer again after the forced compaction.
+LIVE_SCRIPT = [
+    {"content": "Marking the dark box.",
+     "tool_calls": [("add_marker", '{"u":640,"v":600,"height_m":0.12}')]},
+    {"tool_calls": [("move_arm", '{"execute":false}')]},
+    {"tool_calls": [("capture_view", "{}")]},
+    {"content": "Planned one marker; nothing moved."},
+    {"content": "My context was trimmed, but the trace keeps the earlier turns."},
+]
+
+
+def scripted_llm():
+    """A local model endpoint that answers from LIVE_SCRIPT, SSE or JSON."""
+    from aiohttp import web
+
+    seen = []
+
+    async def chat(request):
+        payload = await request.json()
+        seen.append(payload)
+        step = LIVE_SCRIPT[len(seen) - 1] if len(seen) <= len(LIVE_SCRIPT) else {"content": "ok"}
+        calls = step.get("tool_calls") or []
+        if payload.get("stream"):
+            response = web.StreamResponse(status=200,
+                                          headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            chunks = []
+            if step.get("content"):
+                chunks.append({"choices": [{"delta": {"content": step["content"]}}]})
+            for index, (name, arguments) in enumerate(calls):
+                chunks.append({"choices": [{"delta": {"tool_calls": [{
+                    "index": index, "id": "call_%d" % index, "type": "function",
+                    "function": {"name": name, "arguments": arguments}}]}}]})
+            chunks.append({"choices": [{"finish_reason": "tool_calls" if calls else "stop",
+                                        "delta": {}}]})
+            chunks.append({"usage": {"prompt_tokens": 10, "total_tokens": 12}, "choices": []})
+            for chunk in chunks:
+                await response.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+            await response.write(b"data: [DONE]\n\n")
+            await response.write_eof()
+            return response
+        message = {"role": "assistant", "content": step.get("content", "")}
+        if calls:
+            message["tool_calls"] = [{"function": {"name": name, "arguments": arguments}}
+                                     for name, arguments in calls]
+        return web.json_response({"model": "stub-model",
+                                  "choices": [{"message": message,
+                                               "finish_reason": "tool_calls" if calls else "stop"}],
+                                  "usage": {"total_tokens": 12}})
+
+    async def models(request):
+        return web.json_response({"data": [{"id": "stub-model", "meta": {"n_ctx": 8192}}]})
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", chat)
+    app.router.add_get("/v1/models", models)
+    return app, seen
+
+
+@asynccontextmanager
+async def hosted_live_server(workdir: Path):
+    """A fixed-rig host for the sidebar: MockEdge gateway, scripted model, traces."""
+    sys.path.insert(0, str(APP))
+    import capture_server
+    import extrinsics
+    import mock_arm
+    import numpy as np
+    from aiohttp import web
+
+    write_synthetic_calib(workdir / "calib")
+    # The same slanted pose the phone check stubs: camera at [0,-1,1], 45 deg
+    # down, so the browser's ray-plane solve has a visible x/y shift.
+    T = extrinsics.look_at(np.array([0.0, -1.0, 1.0]), np.zeros(3))
+    (workdir / "calib" / "extrinsics-fixed.json").write_text(json.dumps({
+        "format": "rebot-extrinsics", "version": 1,
+        "T_base_cam": T.tolist(), "image_size": [1280, 960],
+        "plane_z": 0.0, "tip_offset": [0.0, 0.0, 0.035],
+        "mount": "fixed", "method": "tip-sweep", "rms_px": 0.5, "rms_mm": 2.0,
+        "observations": [],
+    }), encoding="utf-8")
+
+    edge, edge_url, edge_state = mock_arm.serve(0)
+    fake_llm, seen = scripted_llm()
+    runner = web.AppRunner(fake_llm)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    llm_port = site._server.sockets[0].getsockname()[1]
+
+    app = capture_server.build_app(server_args(workdir, planner=edge_url, marker_at=""))
+    app["llm_url"] = "http://127.0.0.1:%d/v1/chat/completions" % llm_port
+    app["llm_model"] = "stub-model"
+    app["llm_token"] = "stub-key"
+    try:
+        async with hosted_server(app) as url:
+            yield url, workdir / "traces", edge_state, seen
+    finally:
+        await runner.cleanup()
+        edge.shutdown()
+
+
+def read_trace_events(traces: Path):
+    """Every event of every session under the traces dir (there is one)."""
+    events = []
+    if not traces.is_dir():
+        return events
+    for directory in sorted(traces.iterdir()):
+        path = directory / "events.jsonl"
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return events
+
+
+async def poll_until(predicate, timeout=30.0, interval=0.2):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = predicate()
+        if value:
+            return value
+        await asyncio.sleep(interval)
+    return None
+
+
+async def live_check(args, port: int) -> int:
+    await wait_for_devtools(port)
+    async with aiohttp.ClientSession() as session:
+        async with session.get("http://127.0.0.1:%d/json/version" % port) as response:
+            endpoint = (await response.json())["webSocketDebuggerUrl"]
+        async with session.ws_connect(endpoint, max_msg_size=0) as ws:
+            return await drive_live(cdp=Cdp(ws), args=args)
+
+
+async def drive_live(cdp, args) -> int:
+    print("\nlive sidebar: the chat task leaves a complete trace")
+    workdir = HERE / ".browser-check-work" / "live"
+    shutil.rmtree(workdir, ignore_errors=True)
+    workdir.mkdir(parents=True, exist_ok=True)
+    failures = []
+
+    def report(name, ok, detail=""):
+        print("  [%s] %s%s" % ("ok  " if ok else "FAIL", name,
+                               ("  -- " + detail) if detail else ""))
+        if not ok:
+            failures.append(name)
+        return bool(ok)
+
+    async with hosted_live_server(workdir) as (url, traces, edge_state, seen):
+        target = await cdp.call("Target.createTarget", {"url": "about:blank"})
+        attached = await cdp.call("Target.attachToTarget",
+                                  {"targetId": target["targetId"], "flatten": True})
+        page = attached["sessionId"]
+        await cdp.call("Page.enable", session=page)
+        await cdp.call("Runtime.enable", session=page)
+        await cdp.call("Page.navigate", {"url": url + "/live?token=check-token"}, page)
+        for _ in range(100):
+            if await cdp.evaluate("document.readyState", page) == "complete":
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise SystemExit("the live page never finished loading")
+
+        # No MediaMTX here: the canvas stream goes straight into the video
+        # element, and pinStream() records the geometry a connect would pin.
+        await cdp.evaluate(LIVE_VIDEO_STUB, page)
+        sized = await cdp.evaluate("""(async () => {
+            for (let i = 0; i < 100; i += 1) {
+              const video = document.getElementById('video');
+              if (video.videoWidth === 1280 && video.videoHeight === 960) {
+                pinStream();
+                streamWarned = '';
+                document.getElementById('hint').hidden = true;
+                return {w: video.videoWidth, h: video.videoHeight};
+              }
+              await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+            return null;
+        })()""", page)
+        if not report("the sidebar preview has the stub camera", bool(sized), str(sized)):
+            return 1
+        agent_ready = await cdp.evaluate("""(async () => {
+            for (let i = 0; i < 100; i += 1) {
+              if (typeof CHAT !== 'undefined' && CHAT.ready && state.health) return true;
+              await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+            return false;
+        })()""", page)
+        if not report("the host offers the agent and a fixed rig", bool(agent_ready)):
+            return 1
+        session_id = await cdp.evaluate("CHAT.sessionId", page)
+        report("the page stamps a capture-format session id",
+               bool(session_id) and len(str(session_id)) == 23
+               and str(session_id)[8] == "T" and str(session_id)[15] == "Z",
+               str(session_id))
+
+        # Task 1: mark, plan, fresh frame, final reply -- all through the real
+        # chat input, the real tool loop and the real /sequence route.
+        await cdp.evaluate("""(() => {
+            const box = document.getElementById('chatText');
+            box.value = 'Place a marker on the dark box and plan it.';
+            box.dispatchEvent(new Event('input'));
+            document.getElementById('chatSend').click();
+            return true;
+        })()""", page)
+        done = await poll_until(
+            lambda: any(e["type"] == "task_end" for e in read_trace_events(traces)))
+        if not report("the first task runs to task_end", bool(done)):
+            print("    chat log: %s" % await cdp.evaluate(
+                "Array.from(document.querySelectorAll('#chatLog .msg'))"
+                ".map((m) => m.textContent).join(' | ')", page))
+            return 1
+        events = read_trace_events(traces)
+        types = {e["type"] for e in events}
+        for wanted in ("session_start", "user_message", "tool_call", "tool_result",
+                       "frame_delivered", "marker_solved", "sequence_result",
+                       "model_turn", "plan", "gateway_call", "task_end"):
+            report("the log carries %s" % wanted, wanted in types)
+        report("the tool wrapper saw all three tools",
+               [e["name"] for e in events if e["type"] == "tool_call"]
+               == ["add_marker", "move_arm", "capture_view"])
+        report("the plan links the gateway's plan_id to the session",
+               any(e["type"] == "plan" and e.get("plan_id") == edge_state.last_plan
+                   for e in events), str(edge_state.last_plan))
+        report("the model turn stores the prompt with blob refs",
+               any(e["type"] == "model_turn"
+                   and '{"$blob"' in json.dumps(e.get("messages")) for e in events))
+        report("the host's model key never enters the log",
+               "stub-key" not in json.dumps(events))
+
+        # The explicit verdict: Bad plus a note on the task's final reply.
+        clicked = await cdp.evaluate("""(() => {
+            const rows = document.querySelectorAll('.msg.agent .feedback');
+            const row = rows[rows.length - 1];
+            if (!row) return {error: 'no feedback row on the final reply'};
+            row.querySelectorAll('button')[1].click();
+            const input = row.querySelector('input');
+            if (!input) return {error: 'no note input'};
+            input.value = 'the marker was off the object';
+            input.dispatchEvent(new Event('change'));
+            return {ok: true};
+        })()""", page)
+        feedback = await poll_until(
+            lambda: next((e for e in read_trace_events(traces)
+                          if e["type"] == "feedback"), None))
+        report("the feedback buttons record a verdict with the note",
+               bool(feedback) and feedback.get("verdict") == "fail"
+               and feedback.get("note") == "the marker was off the object",
+               str(clicked if not feedback else feedback.get("verdict")))
+
+        # Force a compaction on the next turn: a tiny context budget makes
+        # prepareContext trim the history. The log must keep every prior turn.
+        before = await cdp.evaluate("CHAT.history.length", page)
+        await cdp.evaluate("""(() => {
+            CHAT.contextTokens = 1500;
+            CHAT.maxTokens = 512;
+            const box = document.getElementById('chatText');
+            box.value = 'What did you do so far?';
+            box.dispatchEvent(new Event('input'));
+            document.getElementById('chatSend').click();
+            return true;
+        })()""", page)
+        done2 = await poll_until(
+            lambda: sum(1 for e in read_trace_events(traces) if e["type"] == "task_end") >= 2)
+        report("the second task completes after compaction", bool(done2))
+        events = read_trace_events(traces)
+        compactions = [e for e in events if e["type"] == "compaction"]
+        report("compaction is logged with what it dropped",
+               bool(compactions) and compactions[0].get("dropped_messages", 0) > 0,
+               str(compactions[0]) if compactions else "no compaction event")
+        after = await cdp.evaluate("CHAT.history.length", page)
+        report("the page context really was trimmed", after < before,
+               "%s -> %s messages" % (before, after))
+        first_user = next((e for e in events if e["type"] == "user_message"), None)
+        report("compaction lost no prior turn from the log",
+               first_user is not None
+               and first_user.get("text") == "Place a marker on the dark box and plan it."
+               and sum(1 for e in events if e["type"] == "user_message") >= 2
+               and sum(1 for e in events if e["type"] == "tool_result") == 3)
+
+        # Every frame reference resolves to stored bytes: the replay contract.
+        import re as _re
+        refs = set(_re.findall(r'"\$blob":\s*"([0-9a-f]{64})"', json.dumps(events)))
+        report("every $blob in the log resolves",
+               bool(refs) and all((traces / "blobs" / (sha + ".jpg")).is_file()
+                                  for sha in refs), "%d blob(s)" % len(refs))
+        manifest_files = list(traces.glob("*/manifest.json"))
+        report("the session manifest froze the environment",
+               len(manifest_files) == 1
+               and json.loads(manifest_files[0].read_text(encoding="utf-8")).get("rig_file")
+               == "rig.json"
+               and (manifest_files[0].parent / "rig.json").is_file()
+               and (manifest_files[0].parent / "calib.json").is_file())
+
+    if failures:
+        print("\nlive sidebar trace check: %d failure(s): %s" % (len(failures), failures))
+        return 1
+    print("\nlive sidebar: user_message, tools, frames, compaction and feedback all traced")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Headless check of phone.html against a running server.")
     parser.add_argument("--url", default="http://127.0.0.1:8443/",
                         help="the page as the phone would open it, token included")
+    parser.add_argument("--serve", action="store_true",
+                        help="host the phone check's capture server in-process with a "
+                             "synthetic calibration: no external server needed")
     parser.add_argument("--chrome", default="", help="browser executable")
     parser.add_argument("--connect", type=int, default=0,
                         help="attach to an already running --remote-debugging-port instead of "

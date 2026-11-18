@@ -107,6 +107,18 @@
   .msg.meta { align-self: center; color: #626d7d; font-size: 11.5px; }
   .msg.error { align-self: stretch; background: #2a1416; border: 1px solid #6b2b2b;
     color: #ffb3b3; }
+  /* Explicit verdict on a task's final reply: the one signal triage cannot
+     infer from the transcript alone (§4.3). */
+  .feedback { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+  .feedback button { font: inherit; font-size: 11px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid #2b3644; background: #12171e; color: #9aa4b2; cursor: pointer; }
+  .feedback button:hover { border-color: #4ea1ff; color: #4ea1ff; }
+  .feedback button.chosen { border-color: #45c98a; color: #45c98a; }
+  .feedback button.chosen.bad { border-color: #ff6b6b; color: #ff6b6b; }
+  .feedback button:disabled { opacity: .55; cursor: default; }
+  .feedback input { font: inherit; font-size: 11.5px; flex: 1 1 auto; min-width: 0;
+    padding: 2px 8px; border-radius: 8px; border: 1px solid #2b3644;
+    background: #0d1116; color: #e8eaed; }
   .chat-input { display: flex; gap: 8px; align-items: flex-end; padding: 10px 12px;
     border-top: 1px solid #262c34; }
   #chatText { flex: 1 1 auto; min-width: 0; resize: none; font: inherit; font-size: 13px;
@@ -174,6 +186,7 @@
   </div>
 </aside>
 <script src="/api.js"></script>
+<script src="/trace.js"></script>
 <script src="/stream.js"></script>
 <script src="/video.js"></script>
 <script src="/viewer.js"></script>
@@ -233,8 +246,13 @@ function status(message, kind) {
 }
 
 function api(path, options) {
-  return RebotApi.request(path, Object.assign({ cache: "no-store" }, options || {}),
-    () => state.token);
+  const opts = Object.assign({ cache: "no-store" }, options || {});
+  // The session header links the server's model_turn/gateway tape to this
+  // page's event log; only the chat's own routes carry it (§4.3).
+  if (/^\/(agent|sequence|execute|trace)(\?|$)/.test(path)) {
+    opts.headers = Object.assign({}, opts.headers, { "X-Rebot-Session": CHAT.sessionId });
+  }
+  return RebotApi.request(path, opts, () => state.token);
 }
 
 // The token can arrive in the link -- a bookmark, or the URL the phone page was
@@ -518,6 +536,15 @@ async function runSequence(execute) {
     result.error = error.message;
     return result;
   } finally {
+    // The in-page-solved targets exactly as posted: the server's plan event
+    // links the same plan_id, so either side alone can seed a replay.
+    RebotTrace.trace("sequence_result", {
+      plan_id: result.planId || null,
+      targets: markersOverlay.targets,
+      summary: result.summary || null,
+      executed: Boolean(result.executed),
+      error: result.error || null,
+    });
     state.busy = false;
     state.busyText = "";
     markersOverlay.setEnabled(state.tapMode === "markers");
@@ -627,7 +654,17 @@ const AGENT_TOOLS = [
   },
 ];
 
+// One id per page load, in the capture format (UTCstamp-hex6): captures,
+// sessions and plans share one scheme, so a trace can name a capture directly.
+function newSessionId() {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  const bytes = crypto.getRandomValues(new Uint8Array(3));
+  const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return stamp + "-" + hex;
+}
+
 const CHAT = {
+  sessionId: newSessionId(),
   history: [],        // OpenAI messages, frames included
   busy: false,
   ready: false,       // the host has a model configured
@@ -645,7 +682,19 @@ const CHAT = {
 // Drop whole turns from the front. A tool result without its assistant message
 // is invalid for a strict server, so an assistant message always takes the tool
 // results that follow it.
+function countFrames(messages) {
+  let frames = 0;
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part && part.type === "image_url") frames += 1;
+    }
+  }
+  return frames;
+}
+
 function trimHistory(limit) {
+  const framesBefore = countFrames(CHAT.history);
   let dropped = 0;
   while (CHAT.history.length > limit) {
     const first = CHAT.history.shift();
@@ -657,6 +706,15 @@ function trimHistory(limit) {
         dropped += 1;
       }
     }
+  }
+  // Compaction of the model context is an event, never a rewrite of the log:
+  // the trace keeps every dropped turn (§3).
+  if (dropped) {
+    RebotTrace.trace("compaction", {
+      dropped_messages: dropped,
+      dropped_frames: framesBefore - countFrames(CHAT.history),
+      reason: "message_limit",
+    });
   }
   return dropped;
 }
@@ -683,6 +741,7 @@ function estimateTokens(messages) {
 }
 
 function compactHistory(targetTokens) {
+  const framesBefore = countFrames(CHAT.history);
   pruneFrames(1);
   let dropped = 0;
   // Drop whole old turns, not one message at a time: an assistant left without
@@ -694,6 +753,14 @@ function compactHistory(targetTokens) {
     if (nextUser <= 0) break;
     CHAT.history.splice(0, nextUser);
     dropped += nextUser;
+  }
+  const droppedFrames = framesBefore - countFrames(CHAT.history);
+  if (dropped || droppedFrames) {
+    RebotTrace.trace("compaction", {
+      dropped_messages: dropped,
+      dropped_frames: droppedFrames,
+      reason: "context_tokens",
+    });
   }
   if (dropped) {
     CHAT.contextNote = "Earlier turns were trimmed to fit the model context; "
@@ -734,6 +801,53 @@ function pushChat(kind, text) {
   chatLog.appendChild(line);
   chatLog.scrollTop = chatLog.scrollHeight;
   return line;
+}
+
+// Thumbs up/down beside a task's final agent reply. "Good" records the verdict
+// at once; "Bad" offers an optional note first, so a failure can say what went
+// wrong while the engineer still remembers. One feedback event per task.
+function addFeedback(line) {
+  if (!line || line.querySelector(".feedback")) return;
+  const body = line.querySelector(".text") || line;
+  const row = document.createElement("div");
+  row.className = "feedback";
+  const good = document.createElement("button");
+  good.type = "button";
+  good.textContent = "Good";
+  good.setAttribute("aria-label", "This reply was good");
+  const bad = document.createElement("button");
+  bad.type = "button";
+  bad.textContent = "Bad";
+  bad.setAttribute("aria-label", "This reply was bad");
+  row.append(good, bad);
+  body.appendChild(row);
+  let settled = false;
+  function done(verdict, note, chosen) {
+    if (settled) return;
+    settled = true;
+    good.disabled = true;
+    bad.disabled = true;
+    chosen.classList.add("chosen");
+    if (verdict === "fail") chosen.classList.add("bad");
+    const input = row.querySelector("input");
+    if (input) input.remove();
+    RebotTrace.trace("feedback", note ? { verdict: verdict, note: note } : { verdict: verdict });
+  }
+  good.addEventListener("click", () => done("ok", "", good));
+  bad.addEventListener("click", () => {
+    if (row.querySelector("input")) return;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "what went wrong? (optional, Enter to save)";
+    input.setAttribute("aria-label", "Optional note about the bad reply");
+    row.appendChild(input);
+    const commit = () => done("fail", input.value.trim(), bad);
+    input.addEventListener("change", commit);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") { event.preventDefault(); commit(); }
+    });
+    input.focus();
+  });
 }
 
 // The model's chain of thought is kept out of the answer bubble and collapsed
@@ -1004,6 +1118,16 @@ async function toolAddMarker(args) {
   const report = tipReport(config, placed.marker.target.tip, height, { u: u, v: v });
   report.index = placed.index;
   report.count = markersOverlay.count;
+  // Client-side geometry provenance: agent markers never touch the
+  // witness-checked capture path, so the trace is the only record of the
+  // rig, turn and band this solve actually used (§4.3).
+  RebotTrace.trace("marker_solved", {
+    u: round3(u), v: round3(v),
+    height_m: report.height_m, tip_m: report.tip_m,
+    turns: streamTurn(),
+    rig_fingerprint: (config.rig && config.rig.fingerprint) || null,
+    inside_band: report.inside_band, above_floor: report.above_floor,
+  });
   // Lay the pins out again now that the marker list and the mode have settled,
   // and say so in the transcript: the pin is the only visible proof it landed.
   markersOverlay.redraw();
@@ -1035,7 +1159,30 @@ async function toolMoveArm(args) {
   };
 }
 
+// One wrapper covers all seven tools: the page executes them, so the server
+// never sees a tool result -- the trace is the only record of what ran (§4.4).
 async function runTool(name, args) {
+  const started = performance.now();
+  RebotTrace.trace("tool_call", { name: name, args: args });
+  let result;
+  try {
+    result = await runToolDispatch(name, args);
+  } catch (error) {
+    RebotTrace.trace("tool_result", {
+      name: name, args: args,
+      result: { ok: false, error: String((error && error.message) || error) },
+      ms: Math.round(performance.now() - started),
+    });
+    throw error;
+  }
+  RebotTrace.trace("tool_result", {
+    name: name, args: args, result: result,
+    ms: Math.round(performance.now() - started),
+  });
+  return result;
+}
+
+async function runToolDispatch(name, args) {
   switch (name) {
     case "rig": return toolRig();
     case "pixel_to_arm": return toolPixelToArm(args);
@@ -1157,6 +1304,7 @@ function isAbort(error) {
 // queued behind it starts.
 function stopAgent() {
   if (!CHAT.busy || !CHAT.abort) return;
+  RebotTrace.trace("abort", {});
   CHAT.abort.abort();
   pushChat("meta", "stopping the agent…");
 }
@@ -1210,10 +1358,13 @@ async function runAgent() {
         setChatText(draft.contentLine, finalContent);
       }
       if (turn.finish_reason === "length") {
+        RebotTrace.trace("turn_truncated", { finish_reason: turn.finish_reason });
         pushChat("error", "the model hit its output limit; the reply above may be cut "
           + "off. Raise REBOT_LLM_MAX_TOKENS, raise the endpoint's context window, or "
           + "ask for a shorter answer.");
       } else if (turn.complete === false) {
+        RebotTrace.trace("turn_truncated", { finish_reason: turn.finish_reason,
+                                             complete: false });
         pushChat("error", "the model stream ended before it reported a finish; the "
           + "reply above may be incomplete.");
       }
@@ -1250,7 +1401,12 @@ async function runAgent() {
         });
       }
       CHAT.history.push(assistant);
-      if (!rawCalls.length) return;
+      if (!rawCalls.length) {
+        RebotTrace.trace("task_end", { final_text: contentText, turns: step + 1,
+                                       exhausted: false });
+        addFeedback(draft.contentLine);
+        return;
+      }
 
       let wantsFrame = false;
       for (const call of assistant.tool_calls) {
@@ -1288,19 +1444,36 @@ async function runAgent() {
               { type: "image_url", image_url: { url: frame.url } },
             ],
           });
+          RebotTrace.traceFrame("frame_delivered",
+            { width: frame.width, height: frame.height, reason: "capture_view" },
+            frame.url);
           pushChat("meta", "sent a fresh frame to the model");
         }
       }
     }
-    if (signal.aborted) pushChat("meta", "stopped");
-    else pushChat("meta", "stopped after " + CHAT.maxTurns + " model turns");
+    if (signal.aborted) {
+      RebotTrace.trace("abort", {});
+      pushChat("meta", "stopped");
+    } else {
+      const last = CHAT.history.slice().reverse().find((m) => m.role === "assistant");
+      RebotTrace.trace("task_end", { final_text: (last && last.content) || "",
+                                     turns: CHAT.maxTurns, exhausted: true });
+      const agentLines = chatLog.querySelectorAll(".msg.agent");
+      addFeedback(agentLines[agentLines.length - 1]);
+      pushChat("meta", "stopped after " + CHAT.maxTurns + " model turns");
+    }
   } catch (error) {
     if (thinkingLine) {
       thinkingLine.remove();
       thinkingLine = null;
     }
-    if (isAbort(error)) pushChat("meta", "stopped");
-    else pushChat("error", String((error && error.message) || error));
+    if (isAbort(error)) {
+      RebotTrace.trace("abort", {});
+      pushChat("meta", "stopped");
+    } else {
+      RebotTrace.trace("stream_error", { error: String((error && error.message) || error) });
+      pushChat("error", String((error && error.message) || error));
+    }
   } finally {
     if (thinkingLine) thinkingLine.remove();
     CHAT.abort = null;
@@ -1319,6 +1492,11 @@ async function sendChat() {
   const content = [{ type: "text", text: text }];
   const frame = grabFrame();
   if (frame) content.push({ type: "image_url", image_url: { url: frame.url } });
+  // The frame is traced here, before any pruning can drop it: this is the
+  // exact image the model was shown for this task (§4.3).
+  RebotTrace.traceFrame("user_message",
+    { text: text, width: frame ? frame.width : null, height: frame ? frame.height : null },
+    frame ? frame.url : null);
   CHAT.history.push({ role: "user", content: content });
   await runAgent();
 }
@@ -1364,8 +1542,12 @@ function pinStream() {
   const width = Number(video.videoWidth) || 0;
   const height = Number(video.videoHeight) || 0;
   streamPin = width && height ? { width: width, height: height } : null;
+  if (streamPin) {
+    RebotTrace.trace("stream_geometry", { width: width, height: height, event: "pin" });
+  }
 }
 
+let lastTracedMismatch = "";
 function streamMismatch() {
   if (!streamPin) return "";
   const width = Number(video.videoWidth) || 0;
@@ -1381,12 +1563,21 @@ function streamMismatch() {
     : -1;
   if (shape === 0) {
     streamPin = { width: width, height: height };
+    RebotTrace.trace("stream_geometry", { width: width, height: height, event: "repin" });
     return "";
   }
-  return "the stream changed from " + streamPin.width + "x" + streamPin.height
+  const problem = "the stream changed from " + streamPin.width + "x" + streamPin.height
     + " to " + width + "x" + height + " since it connected, and that is not a "
     + "proportional resize; disconnect and connect again, and refit the intrinsics "
     + "if the field of view changed";
+  // checkStream runs on every resize and tool call; trace a mismatch once per
+  // distinct problem, not once per poll.
+  if (problem !== lastTracedMismatch) {
+    lastTracedMismatch = problem;
+    RebotTrace.trace("stream_geometry", { width: width, height: height,
+                                          event: "mismatch" });
+  }
+  return problem;
 }
 
 let streamWarned = "";
@@ -1518,6 +1709,8 @@ clearButton.addEventListener("click", () => {
 });
 
 initToken();
+RebotTrace.init({ session: CHAT.sessionId, token: () => state.token });
+RebotTrace.trace("session_start", { page: location.pathname });
 applyTapMode();
 renderAgent();
 healthLoop();
