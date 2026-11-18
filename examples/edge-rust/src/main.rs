@@ -2176,6 +2176,50 @@ struct LogFile<'a> {
     control_hz: u32,
     speed: f64,
     samples: &'a [LogSample],
+    // v2 additions, flattened so a v1 reader sees the same top-level shape and
+    // ignores what it does not know. Each field is present only when it happened.
+    #[serde(flatten)]
+    notes: &'a LogNotes,
+}
+
+/// What went wrong (or how the ticks ran), collected during playback and
+/// written after it -- never on the realtime loop.
+#[derive(Serialize, Default)]
+struct LogNotes {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    abort: Option<LogAbort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gripper_stall: Option<LogGripperStall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tick: Option<LogTick>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    follow_error_max: Option<LogFollowError>,
+}
+
+#[derive(Serialize)]
+struct LogAbort {
+    t: f64,
+    reason: String,
+}
+
+#[derive(Serialize)]
+struct LogGripperStall {
+    t: f64,
+    commanded: f64,
+    measured: f64,
+}
+
+#[derive(Serialize)]
+struct LogTick {
+    mean_ms: f64,
+    p95_ms: f64,
+    max_ms: f64,
+}
+
+#[derive(Serialize)]
+struct LogFollowError {
+    motor: u8,
+    rad: f64,
 }
 
 fn write_log(
@@ -2185,10 +2229,11 @@ fn write_log(
     kp: &BTreeMap<String, f64>,
     kd: &BTreeMap<String, f64>,
     samples: &[LogSample],
+    notes: &LogNotes,
 ) -> Result<()> {
     let payload = LogFile {
         format: "rebot-trajectory-log",
-        version: 1,
+        version: 2,
         created: utc_timestamp(),
         trajectory: trajectory.path.display().to_string(),
         ids: &trajectory.ids,
@@ -2197,6 +2242,7 @@ fn write_log(
         control_hz: trajectory.hz,
         speed: args.speed.clamp(0.1, 5.0),
         samples,
+        notes,
     };
     let text = serde_json::to_string(&payload)?;
     fs::write(path, text)
@@ -2295,6 +2341,7 @@ fn play<T: Transport>(
     trajectory: &Trajectory,
     args: &Args,
     logged: &mut Vec<LogSample>,
+    notes: &mut LogNotes,
 ) -> Result<i32> {
     let speed = args.speed.clamp(0.1, 5.0);
     let sample_at: BTreeSet<usize> = if args.track {
@@ -2429,6 +2476,11 @@ fn play<T: Transport>(
                         // shut_down() then ramps the arm home and drops torque.
                         arm.start[gripper] = held[gripper];
                         arm.last[gripper] = held[gripper];
+                        notes.gripper_stall = Some(LogGripperStall {
+                            t: elapsed,
+                            commanded: targets[gripper],
+                            measured: held[gripper],
+                        });
                         abort_reason = Some(format!(
                             "gripper motor {} stalled: commanded {:+.3}, measured {:+.3} \
                              ({:.3} rad error, {:.3} rad/s); the jaws are blocked",
@@ -2462,6 +2514,18 @@ fn play<T: Transport>(
                 next_follow_check = elapsed + 1.0;
                 for joint in 0..arm.ids.len() {
                     let gap = (targets[joint] - held[joint]).abs();
+                    // The worst gap seen at any check, abort or not: the log's
+                    // follow_error_max is a measurement, not just a fault flag.
+                    if notes
+                        .follow_error_max
+                        .as_ref()
+                        .map_or(true, |worst| gap > worst.rad)
+                    {
+                        notes.follow_error_max = Some(LogFollowError {
+                            motor: arm.ids[joint],
+                            rad: gap,
+                        });
+                    }
                     if gap > args.max_follow_error {
                         abort_reason = Some(format!(
                             "motor {} is not following: commanded {:+.3}, measured {:+.3} ({:.2} rad behind)",
@@ -2496,6 +2560,10 @@ fn play<T: Transport>(
 
         let exit_code = if let Some(reason) = &abort_reason {
             println!("  ABORTED at t={last_elapsed:.2}s: {reason}");
+            notes.abort = Some(LogAbort {
+                t: last_elapsed,
+                reason: reason.clone(),
+            });
             1
         } else {
             println!(
@@ -2518,11 +2586,16 @@ fn play<T: Transport>(
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 let p95 =
                     sorted[((0.95 * (sorted.len() - 1) as f64) as usize).min(sorted.len() - 1)];
+                let max = gaps.iter().copied().fold(0.0_f64, f64::max);
                 let late = gaps.iter().filter(|gap| **gap > 1.5 * nominal).count();
+                notes.tick = Some(LogTick {
+                    mean_ms: mean,
+                    p95_ms: p95,
+                    max_ms: max,
+                });
                 println!(
-                    "  tick spacing: mean {mean:.1} ms, p95 {p95:.1} ms, max {:.1} ms \
+                    "  tick spacing: mean {mean:.1} ms, p95 {p95:.1} ms, max {max:.1} ms \
                      (target {nominal:.1} ms, {late} of {} ticks >1.5x target)",
-                    gaps.iter().copied().fold(0.0_f64, f64::max),
                     gaps.len()
                 );
             }
@@ -3037,6 +3110,18 @@ fn run_child(
         return (500, serde_json::json!({ "ok": false, "error": format!("cannot write {}: {error}", path.display()) }));
     }
 
+    // The structured log becomes the response's `telemetry` (§5.1). The child
+    // writes it after playback, off the realtime loop; the parent reads, thins
+    // and forwards it. --check never plays, so it gets no log.
+    let log_path = std::env::temp_dir().join(format!(
+        "rebot-play-log-{}-{}.json",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or(0)
+    ));
+
     let executable = match std::env::current_exe() {
         Ok(executable) => executable,
         Err(error) => {
@@ -3069,6 +3154,9 @@ fn run_child(
     if state.args.track {
         command.arg("--track");
     }
+    if !dry {
+        command.arg(format!("--log={}", log_path.display()));
+    }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let child = match command.spawn() {
@@ -3083,6 +3171,13 @@ fn run_child(
     let output = child.wait_with_output();
     state.child.store(0, Ordering::SeqCst);
     let _ = fs::remove_file(&path);
+    // Read the log even when the player aborted: the abort/stall fields are
+    // exactly what the caller needs then. A missing or torn log costs the
+    // telemetry, never the playback result.
+    let telemetry = if dry { None } else { read_play_log(&log_path) };
+    if !dry {
+        let _ = fs::remove_file(&log_path);
+    }
 
     let output = match output {
         Ok(output) => output,
@@ -3093,16 +3188,15 @@ fn run_child(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    if state.stopping.load(Ordering::SeqCst) {
+    let (status, mut payload) = if state.stopping.load(Ordering::SeqCst) {
         state.stopping.store(false, Ordering::SeqCst);
-        return (200, serde_json::json!({
+        (200, serde_json::json!({
             "ok": true,
             "stopped": true,
             "output": stdout,
             "note": "SIGTERM sent: the player ramps home and drops torque",
-        }));
-    }
-    if output.status.success() {
+        }))
+    } else if output.status.success() {
         (200, serde_json::json!({
             "ok": true,
             "executed": !dry,
@@ -3116,7 +3210,70 @@ fn run_child(
             "error": if stderr.trim().is_empty() { format!("the player exited with {code}") } else { stderr.trim().to_string() },
             "output": stdout,
         }))
+    };
+    if let Some(telemetry) = telemetry {
+        payload["telemetry"] = telemetry;
     }
+    (status, payload)
+}
+
+/// Parse the child's `rebot-trajectory-log` and thin its samples for the wire.
+/// None on any read/parse failure: telemetry is evidence, not a gate.
+fn read_play_log(path: &Path) -> Option<serde_json::Value> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut payload: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if let Some(samples) = payload.get("samples").and_then(|value| value.as_array()) {
+        let thinned = downsample_samples(samples, TELEMETRY_MAX_SAMPLES);
+        payload["samples"] = serde_json::Value::Array(thinned);
+    }
+    Some(payload)
+}
+
+/// The wire budget for /play telemetry. Hold-window samples are exempt: they
+/// are the measurement points the host's oracle averages (§5.1).
+const TELEMETRY_MAX_SAMPLES: usize = 2000;
+
+/// Keep every sample inside a hold window (cmd constant across consecutive
+/// samples) and thin the rest uniformly to `limit`. First and last survive for
+/// context. If the holds alone exceed the budget they still all survive: the
+/// budget yields to the evidence. Mirrors oracle.downsample on the host.
+fn downsample_samples(samples: &[serde_json::Value], limit: usize) -> Vec<serde_json::Value> {
+    let count = samples.len();
+    if count <= limit {
+        return samples.to_vec();
+    }
+    let mut keep = vec![false; count];
+    let mut start = 0;
+    for index in 1..=count {
+        let same = index < count
+            && samples[index].get("cmd").is_some()
+            && samples[index].get("cmd") == samples[index - 1].get("cmd");
+        if same {
+            continue;
+        }
+        if index - start >= 2 {
+            for slot in start..index {
+                keep[slot] = true;
+            }
+        }
+        start = index;
+    }
+    keep[0] = true;
+    keep[count - 1] = true;
+    let kept = keep.iter().filter(|flag| **flag).count();
+    if kept < limit {
+        let free: Vec<usize> = (0..count).filter(|index| !keep[*index]).collect();
+        let budget = limit - kept;
+        for step in 0..budget {
+            keep[free[step * free.len() / budget]] = true;
+        }
+    }
+    samples
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| keep[*index])
+        .map(|(_, sample)| sample.clone())
+        .collect()
 }
 
 fn stop(state: &ServerState) -> (u16, serde_json::Value) {
@@ -3279,11 +3436,13 @@ fn run() -> Result<i32> {
         .collect();
 
     let mut logged: Vec<LogSample> = Vec::new();
-    let outcome = play(&mut arm, &trajectory, &args, &mut logged);
+    let mut notes = LogNotes::default();
+    let outcome = play(&mut arm, &trajectory, &args, &mut logged, &mut notes);
 
     if let Some(path) = &args.log {
         if !logged.is_empty() {
-            if let Err(error) = write_log(path, &trajectory, &args, &kp_map, &kd_map, &logged) {
+            if let Err(error) = write_log(path, &trajectory, &args, &kp_map, &kd_map, &logged,
+                                          &notes) {
                 println!("  warning: cannot write the log: {error}");
             }
         }
@@ -3595,6 +3754,109 @@ mod tests {
         assert_eq!(args.log.as_deref(), Some(Path::new("run.json")));
     }
 
+    fn wire_sample(t: f64, cmd: f64) -> serde_json::Value {
+        serde_json::json!({"t": t, "cmd": [cmd], "meas": [cmd - 0.01]})
+    }
+
+    #[test]
+    fn downsample_keeps_every_hold_window_sample() {
+        // 5000 samples, two holds: [1000, 1100) and [3000, 3050).
+        let mut samples = Vec::new();
+        for index in 0..5000 {
+            let cmd = if (1000..1100).contains(&index) {
+                0.5
+            } else if (3000..3050).contains(&index) {
+                -0.25
+            } else {
+                index as f64 * 0.001
+            };
+            samples.push(wire_sample(index as f64 * 0.02, cmd));
+        }
+        let thinned = downsample_samples(&samples, 2000);
+        assert!(thinned.len() <= 2000, "{} samples", thinned.len());
+        let times: Vec<f64> = thinned
+            .iter()
+            .map(|sample| sample["t"].as_f64().unwrap())
+            .collect();
+        for index in (1000..1100).chain(3000..3050) {
+            let t = index as f64 * 0.02;
+            assert!(times.contains(&t), "hold sample {index} was dropped");
+        }
+        assert_eq!(times.first(), Some(&0.0));
+        assert_eq!(times.last(), Some(&(4999.0 * 0.02)));
+        assert!(times.windows(2).all(|pair| pair[0] < pair[1]), "order");
+    }
+
+    #[test]
+    fn downsample_leaves_a_small_log_alone() {
+        let samples: Vec<_> = (0..10).map(|i| wire_sample(i as f64, 0.0)).collect();
+        assert_eq!(downsample_samples(&samples, 2000), samples);
+    }
+
+    #[test]
+    fn downsample_holds_win_over_the_budget() {
+        // One hold longer than the whole budget: every sample still survives.
+        let samples: Vec<_> = (0..3000).map(|i| wire_sample(i as f64, 0.7)).collect();
+        let thinned = downsample_samples(&samples, 2000);
+        assert_eq!(thinned.len(), 3000);
+    }
+
+    #[test]
+    fn write_log_is_version_2_with_optional_fault_fields() {
+        let trajectory = parse_inline(
+            r#"{
+                "format": "rebot-joint-trajectory", "ids": [1], "control_hz": 30,
+                "waypoints": [
+                    {"t": 0.0, "q": [0.0]},
+                    {"t": 0.1, "q": [0.1]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let args = Args::default();
+        let samples = vec![LogSample { t: 0.0, cmd: vec![0.0], meas: vec![0.0] }];
+        let notes = LogNotes {
+            abort: Some(LogAbort { t: 0.1, reason: "motor 1 is not following".into() }),
+            gripper_stall: Some(LogGripperStall { t: 0.1, commanded: 0.5, measured: 0.1 }),
+            tick: Some(LogTick { mean_ms: 33.3, p95_ms: 35.0, max_ms: 40.0 }),
+            follow_error_max: Some(LogFollowError { motor: 1, rad: 0.42 }),
+        };
+        let path = std::env::temp_dir().join(format!("rebot-log-test-{}.json", std::process::id()));
+        write_log(&path, &trajectory, &args, &BTreeMap::new(), &BTreeMap::new(),
+                  &samples, &notes)
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(payload["format"], "rebot-trajectory-log");
+        assert_eq!(payload["version"], 2);
+        assert_eq!(payload["abort"]["reason"], "motor 1 is not following");
+        assert_eq!(payload["gripper_stall"]["commanded"], 0.5);
+        assert_eq!(payload["tick"]["p95_ms"], 35.0);
+        assert_eq!(payload["follow_error_max"]["motor"], 1);
+        assert_eq!(payload["samples"].as_array().unwrap().len(), 1);
+        // A clean run writes none of the optional fields: a v1 reader sees v1.
+        let clean = LogNotes::default();
+        let text = serde_json::to_string(&LogFile {
+            format: "rebot-trajectory-log",
+            version: 2,
+            created: utc_timestamp(),
+            trajectory: "inline.json".into(),
+            ids: &trajectory.ids,
+            kp: BTreeMap::new(),
+            kd: BTreeMap::new(),
+            control_hz: trajectory.hz,
+            speed: 1.0,
+            samples: &samples,
+            notes: &clean,
+        })
+        .unwrap();
+        assert!(!text.contains("abort"));
+        assert!(!text.contains("gripper_stall"));
+        assert!(!text.contains("tick"));
+        assert!(!text.contains("follow_error_max"));
+    }
+
     #[test]
     fn dump_subcommand_parses_channel_and_ids() {
         let command = parse_args(
@@ -3881,11 +4143,14 @@ mod tests {
         args.execute = true;
         args.log = Some(PathBuf::from("unused.json")); // enables per-waypoint logging
         let mut logged = Vec::new();
+        let mut notes = LogNotes::default();
 
-        let code = play(&mut arm, &trajectory, &args, &mut logged).unwrap();
+        let code = play(&mut arm, &trajectory, &args, &mut logged, &mut notes).unwrap();
 
         assert_eq!(code, 0);
         assert_eq!(logged.len(), 4);
+        assert!(notes.abort.is_none());
+        assert!(notes.tick.is_some(), "tick spacing is recorded for the log");
         let frames = arm.bus.frames.borrow();
         let last_joint_1 = frames.iter().rev().find(|frame| frame.device == 1).unwrap();
         let last_joint_2 = frames.iter().rev().find(|frame| frame.device == 2).unwrap();
@@ -3926,13 +4191,19 @@ mod tests {
         args.execute = true;
         args.gripper_stall = 0.3;
         let mut logged = Vec::new();
+        let mut notes = LogNotes::default();
 
-        let code = play(&mut arm, &trajectory, &args, &mut logged).unwrap();
+        let code = play(&mut arm, &trajectory, &args, &mut logged, &mut notes).unwrap();
 
         assert_eq!(code, 1, "the blocked gripper should abort playback");
         assert!((arm.start[1] - 4.00).abs() < 1e-3, "home should hold the blocked opening");
         assert!((arm.last[1] - 4.00).abs() < 1e-3, "the last gripper command should be the measured opening");
         assert!((arm.start[0] - 0.0).abs() < 1e-9);
+        let stall = notes.gripper_stall.expect("the stall is recorded for the log");
+        assert!((stall.measured - 4.00).abs() < 1e-3);
+        assert!(stall.commanded < 4.00);
+        let abort = notes.abort.expect("the abort is recorded for the log");
+        assert!(abort.reason.contains("stalled"));
     }
 
     // -- HTTP server ------------------------------------------------------- //

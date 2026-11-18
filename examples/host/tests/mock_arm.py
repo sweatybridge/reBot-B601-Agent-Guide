@@ -22,10 +22,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import sys
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "app"))
+
+import rebot_ik  # noqa: E402  - pure numpy FK, the same chain the gateway uses
 
 # The gateway's own floor. A refused plan says something an operator could act on.
 IK_REFUSAL = ("IK failed at target 1: the tool tip cannot reach "
@@ -46,6 +55,9 @@ class State:
         self.refusals = 0
         self.last_targets = []
         self.last_plan = ""
+        # Playback logs keyed by plan/move id, as the edge's /play telemetry
+        # (§5.1): a test seeds these before /execute to replay a recorded run.
+        self.telemetry = {}
         self.lock = threading.Lock()
 
     def snapshot(self) -> dict:
@@ -110,8 +122,28 @@ def execute_payload(body: dict, state: State):
         state.executes += 1
     if state.fail_execute:
         return 502, {"ok": False, "error": "mock edge: the trajectory was refused"}
-    return 200, {"ok": True, "id": plan_id, "executed": True,
-                 "log": "mock edge: played %s" % plan_id}
+    answer = {"ok": True, "id": plan_id, "executed": True,
+              "log": "mock edge: played %s" % plan_id}
+    telemetry = state.telemetry.get(plan_id)
+    if telemetry is not None:
+        answer["telemetry"] = telemetry
+    return 200, answer
+
+
+def fk_payload(body: dict):
+    """The gateway's /fk shape: rebot_ik is pure numpy, so the mock can answer."""
+    q = body.get("q")
+    if not isinstance(q, (list, tuple)) or len(q) != 7:
+        return 400, {"ok": False, "error": "'q' must be seven joint angles"}
+    try:
+        values = [float(value) for value in q]
+    except (TypeError, ValueError):
+        return 400, {"ok": False, "error": "'q' must be numeric"}
+    if not all(math.isfinite(value) for value in values):
+        return 400, {"ok": False, "error": "'q' must be finite"}
+    tool, links = rebot_ik.forward(np.asarray(values[:6], dtype=float), with_links=True)
+    return 200, {"ok": True, "tip_m": [float(v) for v in tool[:3, 3]],
+                 "joint_points": [[float(v) for v in frame[:3, 3]] for frame in links]}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -146,6 +178,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "pose": {"ids": [1, 2, 3, 4, 5, 6, 7],
                                                   "q": [0.0] * 7}})
             return
+        if self.path.startswith("/telemetry/"):
+            entry_id = self.path[len("/telemetry/"):]
+            telemetry = self.state.telemetry.get(entry_id)
+            if telemetry is None:
+                self._send(404, {"ok": False, "error": "no telemetry %s" % entry_id})
+            else:
+                self._send(200, {"ok": True, "id": entry_id, "telemetry": telemetry})
+            return
         self._send(404, {"ok": False, "error": "no such route"})
 
     def do_POST(self):  # noqa: N802 - stdlib signature
@@ -161,6 +201,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/move":
             status, answer = 200, {"ok": True, "id": "mock-move", "moved": True,
                                    "log": "mock edge: moved"}
+        elif path == "/fk":
+            status, answer = fk_payload(body)
         else:
             status, answer = 404, {"ok": False, "error": "no such route"}
         self._send(status, answer)

@@ -19,9 +19,11 @@ routes.
 
     GET  /health              what is configured, and whether the edge answers
     GET  /pose                proxy of the edge's pose
+    GET  /telemetry/{id}      the persisted playback log of one execution
     POST /plan                {targets, tip_offset_m, gripper, pose?, options?}
     POST /execute             {id, kp?, kd?} -> POST /play on the edge
     POST /move                {q, seconds?, gripper?} -> joint-space move, no IK
+    POST /fk                  {q: [7 floats]} -> tool tip and joint origins, read-only
 
 The compact planner contract is tip-space only: `targets` is a list of
 `{tip: [x, y, z]}` objects (optional `pixel`/`tap`/`capture` provenance),
@@ -64,6 +66,10 @@ import traj  # noqa: E402
 
 ROOT = HERE.parent
 OUT_DIR = Path(os.environ.get("REBOT_OUT", str(ROOT / "state" / "out")))
+# The edge's structured playback logs, one per execution (§5.2). The capture
+# server's oracle reads them back after /execute; the 4000-char stdout tail in
+# the response stays for humans.
+TELEMETRY_DIR = Path(os.environ.get("REBOT_TELEMETRY", str(ROOT / "state" / "telemetry")))
 EDGE_URL = os.environ.get("REBOT_EDGE_URL", "http://raspberrypi:8081").rstrip("/")
 EDGE_TOKEN = os.environ.get("REBOT_EDGE_TOKEN", "")
 TOKEN = os.environ.get("REBOT_PLANNER_TOKEN", "")
@@ -116,6 +122,65 @@ def dump_pose():
     if "ids" not in payload or "q" not in payload:
         raise GatewayError("the edge's pose has no ids/q", 502)
     return payload
+
+
+def new_id() -> str:
+    """One id scheme for plans and moves: stamp-hex6, like the capture server."""
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
+
+
+def save_telemetry(entry_id, telemetry):
+    """Persist the edge's playback log; §8.4: a full disk never fails a move.
+
+    The block is stored exactly as the edge sent it (samples already thinned to
+    the wire budget, hold windows intact); GET /telemetry/{id} reads it back.
+    """
+    if not isinstance(telemetry, dict):
+        return None
+    try:
+        TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
+        path = TELEMETRY_DIR / ("%s.json" % entry_id)
+        path.write_text(json.dumps(telemetry, separators=(",", ":")), encoding="utf-8")
+        return path
+    except OSError as error:
+        logging.warning("cannot write telemetry for %s: %s", entry_id, error)
+        return None
+
+
+def read_telemetry(entry_id):
+    path = TELEMETRY_DIR / ("%s.json" % entry_id)
+    if not path.is_file():
+        raise GatewayError("no telemetry %s on disk" % entry_id, 404)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise GatewayError("telemetry %s cannot be read: %s" % (entry_id, error), 500) from error
+
+
+def fk_one(body):
+    """Forward kinematics of a measured pose: the tool tip and the joint origins.
+
+    Read-only and offline-safe: rebot_ik is pure numpy (no Pinocchio), so the
+    capture server can ask for FK of telemetry joints without an arm or a
+    planner image. Motor 7 is the gripper and not part of the chain; it is
+    accepted and ignored, exactly as the player treats it.
+    """
+    q = body.get("q")
+    if not isinstance(q, (list, tuple)) or len(q) != 7:
+        raise GatewayError("'q' must be seven joint angles (motor 7 is the gripper)")
+    try:
+        values = [float(value) for value in q]
+    except (TypeError, ValueError) as error:
+        raise GatewayError("'q' must be numeric") from error
+    if not all(math.isfinite(value) for value in values):
+        raise GatewayError("'q' must be finite")
+    tool, links = rebot_ik.forward(np.asarray(values[:6], dtype=float), with_links=True)
+    return {
+        "ok": True,
+        "tip_m": [float(v) for v in tool[:3, 3]],
+        # link1..link6 origins plus gripper_end: seven points, the last is the tip.
+        "joint_points": [[float(v) for v in frame[:3, 3]] for frame in links],
+    }
 
 
 def request_tip_offset(body):
@@ -250,6 +315,9 @@ def move_one(body):
     """
     if not EXECUTE:
         raise GatewayError("execution is disabled on this host (REBOT_EXECUTE=1 to allow it)", 403)
+    # Moves are taped too (§5.2): the calibration sweeps are executions, and
+    # their holds are the oracle's measurement points just like a plan's.
+    move_id = new_id()
     requested = body.get("targets")
     if requested is None:
         q = body.get("q")
@@ -368,8 +436,13 @@ def move_one(body):
     # answers it from the poses recorded during the holds.
     logging.info("moved through %d pose(s), %.1f s of motion, held %.1f s each, "
                  "sag compensation %s mrad", len(targets), sum(seconds), hold, applied)
-    return {"ok": True, "seconds": round(sum(seconds), 2), "hold": hold,
-            "poses": len(targets), "sag_mrad": applied, "pose": dump_pose()}
+    telemetry = payload.get("telemetry")
+    save_telemetry(move_id, telemetry)
+    answer = {"ok": True, "id": move_id, "seconds": round(sum(seconds), 2), "hold": hold,
+              "poses": len(targets), "sag_mrad": applied, "pose": dump_pose()}
+    if telemetry is not None:
+        answer["telemetry"] = telemetry
+    return answer
 
 
 def execute_one(body):
@@ -396,12 +469,19 @@ def execute_one(body):
         raise GatewayError(payload.get("error", "the edge refused the trajectory"), 502)
 
     logging.info("edge played %s: executed=%s", plan_id, payload.get("executed"))
-    return {
+    # The full log as the edge sent it goes to disk for the oracle; the same
+    # (already downsampled) block rides in the response next to executed/log.
+    telemetry = payload.get("telemetry")
+    save_telemetry(plan_id, telemetry)
+    answer = {
         "ok": True,
         "id": plan_id,
         "executed": bool(payload.get("executed", True)),
         "log": str(payload.get("output", ""))[-4000:],
     }
+    if telemetry is not None:
+        answer["telemetry"] = telemetry
+    return answer
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -450,10 +530,21 @@ class Handler(BaseHTTPRequestHandler):
                     "execute": EXECUTE,
                     "edge": edge,
                     "out": str(OUT_DIR),
+                    "telemetry": str(TELEMETRY_DIR),
                     "plans": len(list(OUT_DIR.glob("*.json"))) if OUT_DIR.is_dir() else 0,
                 })
             elif self.path == "/pose":
                 self._send(200, {"ok": True, "pose": dump_pose()})
+            elif self.path.startswith("/telemetry/"):
+                # GET is open on the other routes, but a playback log carries
+                # the whole motion record: the token is checked here explicitly.
+                if not self._authorised():
+                    raise GatewayError("missing or wrong X-Rebot-Token", 401)
+                entry_id = self.path[len("/telemetry/"):]
+                if not PLAN_ID.match(entry_id):
+                    raise GatewayError("not a plan or move id", 404)
+                self._send(200, {"ok": True, "id": entry_id,
+                                 "telemetry": read_telemetry(entry_id)})
             else:
                 self._send(404, {"ok": False, "error": "no such route"})
         except GatewayError as error:
@@ -472,6 +563,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, execute_one(self._body()))
             elif self.path == "/move":
                 self._send(200, move_one(self._body()))
+            elif self.path == "/fk":
+                self._send(200, fk_one(self._body()))
             else:
                 self._send(404, {"ok": False, "error": "no such route"})
         except GatewayError as error:
