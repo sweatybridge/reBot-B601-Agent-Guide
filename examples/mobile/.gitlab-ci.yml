@@ -1,0 +1,74 @@
+# Two layers of verification:
+#
+# 1. core-tests — the Swift port of the page's math, cross-validated against
+#    fixtures generated from the REAL web JS of the guide repo (Node runs
+#    aruco.js / geometry.js / arm-model.js / locate.js to produce expected
+#    outputs). Pure Foundation + XCTest, so it runs on any Linux runner with a
+#    Swift toolchain. No iOS SDK needed.
+#
+# 2. ios-sdk-tests — builds the FULL app (SwiftUI + AVFoundation + WebRTC) for
+#    the iOS simulator SDK and runs the same suite as an Xcode test bundle
+#    (RebotCaptureTests). Needs a macOS runner with Xcode 15+:
+#      - GitLab SaaS hosted macOS runners (Premium/Ultimate): the
+#        `saas-macos-medium-m1` tag below works as-is.
+#      - Self-hosted Mac: register a runner and change the tag (e.g. `macos`).
+#    The job is allow_failure so a missing macOS runner never blocks the
+#    pipeline; the Linux core tests remain the required gate.
+#
+# Test fixtures (.gray renders + expected JSON) are generated, not committed:
+# tools/gen_fixtures.js writes them from the guide repo before tests run.
+
+stages:
+  - core
+  - ios
+
+variables:
+  GUIDE_REPO: https://github.com/sweatybridge/reBot-B601-Agent-Guide.git
+
+core-tests:
+  stage: core
+  image: swift:6.0
+  tags:
+    - saas-linux-small-amd64
+  script:
+    - swift --version
+    - apt-get update -qq && apt-get install -y -qq nodejs >/dev/null
+    - git clone --depth 1 "$GUIDE_REPO" /tmp/guide
+    - node tools/gen_fixtures.js RebotCore/Tests/RebotCoreTests/Fixtures /tmp/guide
+    - cd RebotCore
+    - swift test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+ios-sdk-tests:
+  stage: ios
+  tags:
+    - saas-macos-medium-m1
+  allow_failure: true
+  variables:
+    CLONED_SOURCE_PACKAGES_DIR_PATH: "$CI_PROJECT_DIR/.spm"
+  cache:
+    key: spm-packages
+    paths:
+      - .spm
+  script:
+    - xcodebuild -version
+    - command -v node || brew install node
+    - command -v xcodegen || brew install xcodegen
+    - git clone --depth 1 "$GUIDE_REPO" /tmp/guide
+    - node tools/gen_fixtures.js RebotCore/Tests/RebotCoreTests/Fixtures /tmp/guide
+    - xcodegen generate
+    # Pick the first available iPhone simulator on this runner's Xcode.
+    - DEVICE=$(xcrun simctl list devices available | grep -m1 -E "iPhone" | sed -E 's/^ *([^(]+) *\(.*$/\1/' | xargs)
+    - 'echo "Testing on iOS Simulator: $DEVICE"'
+    - xcodebuild -resolvePackageDependencies -project RebotCapture.xcodeproj -scheme RebotCapture -clonedSourcePackagesDirPath "$CLONED_SOURCE_PACKAGES_DIR_PATH"
+    - xcodebuild test -project RebotCapture.xcodeproj -scheme RebotCapture -destination "platform=iOS Simulator,name=$DEVICE" -configuration Debug -clonedSourcePackagesDirPath "$CLONED_SOURCE_PACKAGES_DIR_PATH" CODE_SIGNING_ALLOWED=NO -resultBundlePath build/RebotCapture.xcresult
+  artifacts:
+    when: on_failure
+    paths:
+      - build/RebotCapture.xcresult
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
