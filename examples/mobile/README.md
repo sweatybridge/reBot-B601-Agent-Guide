@@ -100,8 +100,8 @@ open RebotCapture.xcodeproj
 
 1. Select your signing team for the `RebotCapture` target.
 2. Let Swift Package Manager resolve `WebRTC` (first fetch downloads a ~100 MB
-   binary framework; `branch: main` is used — pin it to a release tag in
-   `project.yml` if you prefer reproducibility).
+   binary framework; pinned to release `157.0.0` in `project.yml` for
+   reproducibility — bump the pin to upgrade).
 3. Run on the iPhone.
 
 The project was generated from `project.yml` with [XcodeGen](https://github.com/yonaskolb/XcodeGen);

@@ -42,7 +42,7 @@ jobs:
     container: swift:6.0
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Show Swift version
         run: swift --version
       - name: Install Node
@@ -64,7 +64,7 @@ jobs:
     env:
       CLONED_SOURCE_PACKAGES_DIR_PATH: ${{ github.workspace }}/examples/mobile/.spm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Show Xcode version
         run: xcodebuild -version
       - name: Install XcodeGen
@@ -99,7 +99,7 @@ jobs:
           -resultBundlePath build/RebotCapture.xcresult
       - name: Upload result bundle on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: RebotCapture.xcresult
           path: examples/mobile/build/RebotCapture.xcresult

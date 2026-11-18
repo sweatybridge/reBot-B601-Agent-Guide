@@ -10,7 +10,7 @@ packages:
     path: RebotCore
   WebRTC:
     url: https://github.com/stasel/WebRTC
-    branch: main
+    version: 157.0.0
 
 targets:
   RebotCapture:
