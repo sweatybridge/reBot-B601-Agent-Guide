@@ -149,21 +149,22 @@ RebotCapture/         the SwiftUI + ARKit app
 tools/gen_fixtures.js  regenerates test fixtures from the guide repo's web JS
 ```
 
-## Continuous Integration (GitLab)
+## Continuous Integration (GitHub Actions)
 
-`.gitlab-ci.yml` defines two jobs:
+[`.github/workflows/mobile.yml`](../../.github/workflows/mobile.yml) defines two
+jobs, run on pushes and pull requests that touch `examples/mobile`, the web JS
+it is validated against (`examples/host/web`), or the workflow itself:
 
 | job | runner | what it proves |
 |---|---|---|
-| `core-tests` | Linux, `swift:6.0` image | the ported math matches the page's JS (fixtures are regenerated from the guide repo each run, so they never go stale) |
-| `ios-sdk-tests` | macOS with Xcode 15+ | the **full app compiles against the iOS SDK** (simulator) and the same suite passes as an Xcode test bundle (`RebotCaptureTests`) |
+| `core-tests` | Linux, `swift:6.0` container | the ported math matches the page's JS (fixtures are regenerated from the checked-out commit each run, so they never go stale) |
+| `ios-sdk-tests` | GitHub-hosted `macos-15` (Xcode 16) | the **full app compiles against the iOS SDK** (simulator) and the same suite passes as an Xcode test bundle (`RebotCaptureTests`) |
 
-The iOS job uses the GitLab SaaS macOS runner tag `saas-macos-medium-m1`
-(hosted macOS runners require Premium/Ultimate). On a self-hosted Mac, register
-a runner and change the tag (e.g. `macos`). The job is `allow_failure: true` so
-a missing macOS runner never blocks the pipeline — `core-tests` is the
-required gate. SPM checkouts (including the WebRTC binary framework) are cached
-between runs.
+The iOS job is `continue-on-error: true` (the GitLab original used
+`allow_failure`) so the macOS layer never blocks the pipeline — `core-tests`
+is the required gate. SPM checkouts (including the WebRTC binary framework) are
+cached between runs, and the `.xcresult` bundle is uploaded as an artifact when
+the job fails.
 
 Run the iOS layer locally the same way CI does:
 
@@ -198,9 +199,8 @@ cd RebotCore && swift test
 ```
 
 The app layer (ARKit, SwiftUI, WebRTC) targets the iOS SDK and needs Xcode to
-build; it was not compiled in the environment that produced this source drop.
-The `ios-sdk-tests` CI job is the compile gate for that layer once a macOS
-runner is available.
+build; the `ios-sdk-tests` CI job on the GitHub-hosted macOS runner is the
+compile gate for that layer.
 
 ## Fidelity notes
 
