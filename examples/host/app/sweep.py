@@ -26,7 +26,10 @@ sends anything to the board.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+from pathlib import Path
 
 import numpy as np
 
@@ -260,7 +263,7 @@ def gravity_sag(q, kp, limit=SAG_LIMIT_RAD):
     return np.clip(sag, -limit, limit)
 
 
-def aim(q, kp, iterations=3):
+def aim(q, kp, iterations=3, extra_sag=None):
     """The command that makes the arm *hold* `q` instead of settling off it.
 
     This arm settles as `held = command - sag`, where `sag = tau_g / kp` -- the
@@ -270,12 +273,105 @@ def aim(q, kp, iterations=3):
     consistent with `held = command - sag`. So holding `q` means asking for
     `q + sag`: a fixed point, solved by substitution, since the sag depends only
     weakly on the pose.
+
+    `extra_sag` is the learned residual-map term (§7.3b, identify.sag_correction):
+    what the gravity model did not explain, per joint. The *total* compensation
+    stays clipped by SAG_LIMIT_RAD, so a bad or stale map can never command a
+    large excursion -- the model term alone already saturates that bound.
     """
     target = np.asarray(q, dtype=float).reshape(6)
-    command = target + gravity_sag(target, kp)
+    extra = (np.zeros(6) if extra_sag is None else
+             np.clip(np.asarray(extra_sag, dtype=float).reshape(6),
+                     -SAG_LIMIT_RAD, SAG_LIMIT_RAD))
+    command = target + np.clip(gravity_sag(target, kp) + extra, -SAG_LIMIT_RAD, SAG_LIMIT_RAD)
     for _ in range(max(0, int(iterations) - 1)):
-        command = target + gravity_sag(command, kp)
+        command = target + np.clip(gravity_sag(command, kp) + extra,
+                                   -SAG_LIMIT_RAD, SAG_LIMIT_RAD)
     return command
+
+
+# --------------------------------------------------------------------------- #
+# The learned sag residual map (§7.3b): keying and application.
+#
+# identify.py FITS the map from telemetry; these pure functions decide whether
+# a fitted map may be trusted for a command. They live here, not in identify,
+# because planner_server applies the map on /move and cannot import identify
+# (which pulls OpenCV through auto_calibrate, and the planner image has none).
+# --------------------------------------------------------------------------- #
+
+def zeros_key(joint_zeros):
+    """The joint-zeros identity a sag map is keyed by (a zero change invalidates)."""
+    if joint_zeros is None:
+        return "none"
+    blob = json.dumps([round(float(v), 6) for v in np.asarray(joint_zeros, float)])
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+def sag_map_path(calib_dir, rig_fingerprint):
+    return Path(calib_dir) / ("sag-%s.json" % rig_fingerprint)
+
+
+def load_sag_map(calib_dir, rig_fingerprint, kp_key, zeros_key="none"):
+    """Load the map for this rig, or None when any key changed (§7.3b)."""
+    path = sag_map_path(calib_dir, rig_fingerprint)
+    if not path.is_file():
+        return None
+    try:
+        map_doc = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if str(map_doc.get("kp_key")) != str(kp_key) or \
+            str(map_doc.get("zeros_key", "none")) != str(zeros_key):
+        return None
+    return map_doc
+
+
+def sag_correction(q, sag_map, kp_key=None, rig_fingerprint=None, zeros_key="none"):
+    """The additive term for aim(), or zeros when the map cannot be trusted.
+
+    Any key change (rig fingerprint, kp, zeros) or a pose outside the explored
+    envelope invalidates the map: it interpolates what was measured, and says
+    nothing about the rest of the workspace.
+    """
+    zeros = np.zeros(6)
+    if not sag_map:
+        return zeros
+    if kp_key is not None and str(sag_map.get("kp_key")) != str(kp_key):
+        return zeros
+    if rig_fingerprint is not None and str(sag_map.get("rig_fingerprint")) != str(rig_fingerprint):
+        return zeros
+    if str(sag_map.get("zeros_key", "none")) != str(zeros_key):
+        return zeros
+    q = np.asarray(q, dtype=float).reshape(6)
+    envelope = sag_map.get("envelope") or {}
+    q_min = np.asarray(envelope.get("q_min", [-math.inf] * 6), dtype=float)
+    q_max = np.asarray(envelope.get("q_max", [math.inf] * 6), dtype=float)
+    if np.any(q < q_min - 1e-9) or np.any(q > q_max + 1e-9):
+        return zeros
+    tau = rebot_ik.gravity_torques(q)
+    extra = np.asarray([sag_map["per_motor"][str(j + 1)]["a"] * tau[j]
+                        + sag_map["per_motor"][str(j + 1)]["b"] for j in range(6)])
+    return np.clip(extra, -SAG_LIMIT_RAD, SAG_LIMIT_RAD)
+
+
+def active_sag_extra(q, kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
+    """The learned term for the live /move path: the active rig's keyed map.
+
+    The rig file beside the map names the fingerprint and zeros the map was
+    fitted under; a missing or torn rig file means no map, never an exception
+    into the move. The total compensation stays clipped inside aim().
+    """
+    try:
+        rig_doc = json.loads((Path(calib_dir) / rig_name).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return np.zeros(6)
+    fingerprint = str(rig_doc.get("fingerprint") or "")
+    if not fingerprint:
+        return np.zeros(6)
+    key = zeros_key(rig_doc.get("joint_zeros"))
+    map_doc = load_sag_map(calib_dir, fingerprint, kp_key=kp_spec, zeros_key=key)
+    return sag_correction(q, map_doc, kp_key=kp_spec, rig_fingerprint=fingerprint,
+                          zeros_key=key)
 
 
 def seconds_for(a, b, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SECONDS):

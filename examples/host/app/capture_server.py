@@ -49,6 +49,7 @@ import base_marker
 import camera as camera_mod
 import calib as calib_mod
 import extrinsics
+import identify as identify_mod
 import locate_target as locator
 import mediamtx
 import oracle as oracle_mod
@@ -576,7 +577,21 @@ async def handle_health(request: web.Request) -> web.Response:
             "sessions": _trace_session_count(app),
             "retention_days": app.get("trace_retention_days", 30),
         },
+        # The measured accuracy envelope (§7.4): what fraction of the explored
+        # grid has been validated by oracle holds.
+        "accuracy": _accuracy_health(app),
     })
+
+
+def _accuracy_health(app):
+    try:
+        map_doc = identify_mod.load_accuracy_map(app["accuracy_map_path"])
+    except Exception:  # noqa: BLE001 - health must survive a broken map file
+        return {"cells": 0, "validated": 0, "validated_fraction": 0.0}
+    cells = map_doc.get("cells") or {}
+    validated = sum(1 for cell in cells.values() if cell.get("validated_at"))
+    return {"cells": len(cells), "validated": validated,
+            "validated_fraction": round(identify_mod.validated_fraction(map_doc), 4)}
 
 
 def _trace_session_count(app) -> int:
@@ -1068,6 +1083,20 @@ async def handle_sequence(request: web.Request) -> web.Response:
     logging.info("sequence plan %s: %s markers at [%s] mm tap height",
                  payload.get("id"), (payload.get("summary") or {}).get("markers"),
                  ", ".join("%.0f" % (height * 1000) for height in tap_heights))
+    # §7.4: targets in unvalidated accuracy cells get a WARNING in the plan
+    # summary -- visible to the agent and the panel. The hard refusals (reach
+    # band, min_z, IK) stay where they are; a missing or broken map degrades to
+    # no warning, never to a failed plan (§8.4).
+    try:
+        map_doc = identify_mod.load_accuracy_map(app["accuracy_map_path"])
+        warnings = identify_mod.accuracy_warnings(map_doc, tips)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("accuracy map read failed: %s", exc)
+        warnings = []
+    if warnings and isinstance(payload.get("summary"), dict):
+        existing = payload["summary"].get("warnings")
+        payload["summary"]["warnings"] = (list(existing) if isinstance(existing, list)
+                                          else []) + warnings
     return web.json_response({
         "ok": True,
         "plan": payload,
@@ -1953,6 +1982,17 @@ async def oracle_finish(app, prep, sid):
         await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=doc["verdict"],
                           holds=len(doc["holds"]),
                           telemetry=bool(telemetry), error=None)
+        # §7.4/§7.1: the oracle's holds populate the accuracy envelope, and the
+        # monitor watches them for identification proposals. Both are strictly
+        # additive (§8.4): a failure here never touches the doc or the execution.
+        try:
+            identify_mod.update_accuracy_map(app["accuracy_map_path"], doc, rig=rig)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("accuracy map update for %s failed: %s", plan_id, exc)
+        try:
+            app["identify_monitor"].observe(doc, rig=app.get("rig"))
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("identify monitor for %s failed: %s", plan_id, exc)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - the oracle never fails /execute
@@ -2162,6 +2202,196 @@ async def handle_calibrate_status(request: web.Request) -> web.Response:
         "marker": app["marker"],
         "rig": (None if app["rig"] is None else app["rig"].provenance()),
     })
+
+
+def run_identify(app, camera_url, calibration_path, body):
+    """One identification climb, off the loop -- the same shape as run_sweep.
+
+    The arm moves only through auto_calibrate.run -> the gateway's /move check
+    chain; the climb adds consent, single-flight and verify-before-hot-load on
+    top (§8.1). The current rig seeds the detection, so no tap is needed.
+    """
+    def note(pose, phase):
+        app["progress"] = {"pose": int(pose), "of": app.get("identify_of", 0),
+                           "phase": phase, "started": app["calibration_started"]}
+
+    eye = camera_mod.open_source(camera_url, latency=0.0)
+    try:
+        probe = eye.read()
+        base = calib_mod.load(calibration_path)
+        turn = stream_turn(app, base)
+        probe, calibration, turn = locator.upright_frame(calibration_path, probe, turn)
+        if turn:
+            eye = UprightEye(eye, turn)
+        options = auto_calibrate.Options(
+            plane_z=float(body.get("plane_z", app["plane_z"])),
+            settle_s=float(body.get("settle", 0.5)),
+            background="median",
+        )
+        arm = auto_calibrate.ArmGateway(app["planner"], app["planner_token"])
+        path = mediamtx.path_from_camera(camera_url)
+        if not path:
+            raise auto_calibrate.AutoError(
+                "the climb is recorded by MediaMTX, so REBOT_CAMERA must be its RTSP path "
+                "(rtsp://mediamtx:8554/phone); %r cannot be recorded" % camera_url)
+        recorder = mediamtx.Recorder(app["mediamtx_api"], path=path,
+                                     recordings=app["recordings"])
+        top_k = int(body.get("top_k", 6))
+        holdout = int(body.get("holdout", 2))
+        app["identify_of"] = top_k + holdout
+        return identify_mod.climb_session(
+            arm, eye, calibration, options, app["captures"], recorder,
+            current_rig=app["rig"], calib_dir=app["calib"], progress=note,
+            top_k=top_k, holdout=holdout,
+            gate_mm=float(body.get("gate_mm", identify_mod.SIGMA_GATE_MM)),
+            seed=int(body.get("seed", 11)), mount="fixed")
+    finally:
+        eye.close()
+
+
+async def handle_identify_run(request: web.Request) -> web.Response:
+    """`POST /identify/run` -- the gated hillclimb excursion (§7.1, §7.3a).
+
+    Same gates as /calibrate/extrinsics (execute on, explicit confirm, the
+    calibrating single-flight) plus a fitted rig to refine. A trigger only
+    PROPOSES; this route is the only way a climb starts, and it never runs
+    without the confirm. Candidates are verified before the hot-load below.
+    """
+    app = request.app
+    if not app["execute"]:
+        raise web.HTTPForbidden(text="the identification climb moves the arm: start the capture "
+                                    "server with REBOT_EXECUTE=1 and the edge with "
+                                    "--allow-execute")
+    if not app["camera"]:
+        raise web.HTTPUnprocessableEntity(text="no camera: set REBOT_CAMERA or pass camera=")
+    try:
+        body = await request.json()
+    except json.JSONDecodeError as exc:
+        raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
+    if body.get("confirm") is not True:
+        raise web.HTTPBadRequest(text='send {"confirm": true}: this moves the arm through an '
+                                      "identification sweep")
+    if app["rig"] is None:
+        raise web.HTTPUnprocessableEntity(
+            text="the climb refines an existing rig: run /calibrate/extrinsics or capture the "
+                 "base marker first")
+    if app["calibrating"]:
+        return web.json_response({"ok": False,
+                                  "error": "a calibration or identification sweep is already "
+                                           "running"}, status=409)
+
+    calibration_path = resolve_calibration(app, body.get("calib"))
+    camera_url = body.get("camera") or app["camera"]
+    app["calibrating"] = True
+    app["progress"] = {"pose": 0, "of": 0, "phase": "starting", "started": time.time()}
+    app["calibration_started"] = app["progress"]["started"]
+    app["identify_last"] = {"state": "running", "started": utc_now(), "camera": camera_url}
+    try:
+        payload = await asyncio.to_thread(run_identify, app, camera_url, calibration_path, body)
+    except (identify_mod.IdentifyError, auto_calibrate.AutoError, camera_mod.CameraError,
+            extrinsics.ExtrinsicsError) as error:
+        logging.warning("identification refused: %s", error)
+        app["identify_last"] = {"state": "failed", "error": str(error), "at": utc_now()}
+        return web.json_response({"ok": False, "error": str(error)}, status=422)
+    except Exception as error:      # noqa: BLE001 - a climb must not kill the server
+        logging.exception("identification crashed")
+        app["identify_last"] = {"state": "failed", "at": utc_now(),
+                                "error": "%s: %s" % (type(error).__name__, error)}
+        return web.json_response({"ok": False, "error": "%s: %s"
+                                  % (type(error).__name__, error)}, status=500)
+    finally:
+        app["calibrating"] = False
+        app["progress"] = None
+
+    state = "ok" if payload["ok"] else ("partial" if payload.get("partial") else "refused")
+    app["identify_last"] = {"state": state, "at": utc_now(),
+                            "verification": payload.get("verification"),
+                            "identifiability": payload.get("identifiability")}
+    if payload["ok"] and payload.get("written"):
+        # The candidate passed verify + hold-out: hot-load it exactly as the
+        # commissioning sweep's rig is hot-loaded, so the next tap uses it now.
+        try:
+            rig = extrinsics.load_rig(payload["written"])
+        except extrinsics.ExtrinsicsError as error:
+            logging.warning("identification wrote %s but it could not be loaded: %s",
+                            payload["written"], error)
+        else:
+            app["rig"] = rig
+            app["extrinsics_path"] = payload["written"]
+            try:
+                app["witness"] = witness.load_for(rig, Path(payload["written"]).parent)
+            except witness.WitnessError as error:
+                logging.warning("the identified rig has no usable witness: %s", error)
+                app["witness"] = None
+        logging.info("identification wrote %s", payload.get("written"))
+    return web.json_response(payload, status=200 if payload["ok"] else 422)
+
+
+async def handle_identify_status(request: web.Request) -> web.Response:
+    """`GET /identify` -- proposals, progress and the last climb (§7.1).
+
+    Same shape as GET /calibrate. The proposals are the monitor's evidence;
+    nothing here starts a session -- that takes POST /identify/run {confirm}.
+    """
+    app = request.app
+    monitor = app["identify_monitor"]
+    proposals = list(monitor.proposals)
+    for proposal in monitor.rig_proposals(app.get("rig")):
+        if proposal["kind"] not in {p["kind"] for p in proposals}:
+            proposals.append(proposal)
+    return web.json_response({
+        "ok": True,
+        "running": bool(app["calibrating"]),
+        "progress": app["progress"],
+        "camera": app["camera"],
+        "execute": app["execute"],
+        "last": app["identify_last"],
+        "proposals": proposals,
+        "rig": (None if app["rig"] is None else app["rig"].provenance()),
+        "accuracy": _accuracy_health(app),
+    })
+
+
+async def handle_identify_sag(request: web.Request) -> web.Response:
+    """`POST /identify/sag` -- fit the residual map from recorded telemetry (§7.3b).
+
+    No arm motion: the holds come from executions that already happened, so
+    this needs the write token but not the execute gate. The map is stored
+    keyed by the active rig's fingerprint, kp and zeros; /move applies it only
+    while those keys match and the pose stays inside the explored envelope,
+    and fit_sag_map's hold-out validation is what lets it be stored at all.
+    """
+    app = request.app
+    if app["rig"] is None:
+        raise web.HTTPUnprocessableEntity(
+            text="the sag map is keyed by a fitted rig: run /calibrate/extrinsics first")
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    kp_spec = str(body.get("kp") or sweep.KP_DEFAULT)
+    docs = []
+    for directory in (app["telemetry_dir"], app["oracle_dir"]):
+        if directory.is_dir():
+            for path in sorted(directory.glob("*.json")):
+                try:
+                    docs.append(json.loads(path.read_text(encoding="utf-8")))
+                except (OSError, json.JSONDecodeError):
+                    continue  # a torn log costs evidence, never the fit
+    try:
+        holds = identify_mod.sag_holds(docs, kp=sweep.kp_vector(kp_spec))
+        result = identify_mod.fit_sag_map(
+            holds, kp_key=kp_spec, rig_fingerprint=app["rig"].fingerprint,
+            zeros_key=identify_mod.zeros_key(app["rig"]))
+    except Exception as error:  # noqa: BLE001 - a fit must not kill the server
+        logging.warning("sag fit failed: %s", error)
+        return web.json_response({"ok": False, "error": str(error)}, status=500)
+    if result["ok"]:
+        identify_mod.save_sag_map(app["calib"], result["map"])
+    return web.json_response(dict(result, holds=len(holds)),
+                             status=200 if result["ok"] else 422)
 
 
 def measure_stream_turn(app, calibration, frame=None):
@@ -2605,7 +2835,13 @@ def build_app(args) -> web.Application:
     # Deriving from --captures keeps a test workdir entirely self-contained.
     app["out_dir"] = app["captures"].parent / "out"
     app["oracle_dir"] = app["captures"].parent / "oracle"
+    app["telemetry_dir"] = app["captures"].parent / "telemetry"
     app["oracle_tasks"] = set()
+    # The hillclimb (§7): the monitor only proposes; the accuracy map is the
+    # measured envelope /sequence warns from and /health reports.
+    app["identify_monitor"] = identify_mod.TriggerMonitor()
+    app["identify_last"] = None
+    app["accuracy_map_path"] = app["calib"] / "accuracy-map.json"
 
     app.router.add_get("/", handle_index)
     app.router.add_get("/live", handle_live)
@@ -2624,6 +2860,9 @@ def build_app(args) -> web.Application:
     app.router.add_get("/pose", handle_pose)
     app.router.add_post("/calibrate/extrinsics", handle_calibrate)
     app.router.add_get("/calibrate", handle_calibrate_status)
+    app.router.add_post("/identify/run", handle_identify_run)
+    app.router.add_post("/identify/sag", handle_identify_sag)
+    app.router.add_get("/identify", handle_identify_status)
     app.router.add_post("/capture/pose", handle_capture_pose)
     app.router.add_get("/viewer.js", handle_viewer_js)
     app.router.add_get("/reach.js", handle_reach_js)

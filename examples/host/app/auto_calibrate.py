@@ -794,7 +794,7 @@ def _tick_progress(note, seconds, stop):
 
 
 def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="fixed",
-        progress=None) -> RunResult:
+        progress=None, poses=None, seed_T=None) -> RunResult:
     """The whole sweep: record, move, pick the frames, detect, fit twice.
 
     `recorder` is the media server's recorder (`mediamtx.Recorder`): it is asked
@@ -804,6 +804,13 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
     "extracting", "moving" or "fitting", and `pose` is 1-based (0 outside the
     sweep). It exists for the API's status route: a three-minute sweep behind one
     POST needs to say where it is.
+
+    `poses` overrides the visited pose list (default `sweep.POSES`); the identify
+    climb (§7.3a) passes its scored candidates. Legs are still timed by
+    `sweep.seconds_for`, so the speed cap is unchanged. `seed_T` starts the
+    detection from a known rig instead of a tap/marker bootstrap -- the climb
+    refines a rig it already has, and re-searching the seed family would only
+    add a way to fail.
     """
     def note(pose, phase):
         if progress is None:
@@ -816,6 +823,7 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
     started = time.time()
     captures_dir = Path(captures_dir)
     captures_dir.mkdir(parents=True, exist_ok=True)
+    pose_list = (tuple(np.asarray(p, dtype=float) for p in poses) if poses else sweep.POSES)
 
     start = arm.pose()
     q_start = np.asarray(start["q"][:6], dtype=float)
@@ -850,8 +858,14 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
         log.start()
         # One trajectory for the whole pass: the arm visits every pose and the
         # board walks it back to park once, at the end. That is one enable/disable
-        # cycle instead of eight, and no return leg between poses.
-        plan = sweep.legs(park)
+        # cycle instead of eight, and no return leg between poses. The legs are
+        # built from the (possibly overridden) pose list, timed by the same
+        # seconds_for policy the fixed sweep uses.
+        plan = []
+        previous = park
+        for pose in pose_list:
+            plan.append((pose, sweep.seconds_for(previous, pose)))
+            previous = pose
         targets = [target for target, _ in plan]
         seconds = [value for _, value in plan]
         # Both the recording and the pose log must stop whatever happens, and the
@@ -893,7 +907,7 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
     note(0, "extracting")
     try:
         segments = recorder.segments(since=record_from)
-        picked = sweep_video.extract(segments, recording, sweep.POSES,
+        picked = sweep_video.extract(segments, recording, pose_list,
                                      min_seconds=sweep_video.MIN_HOLD_SECONDS)
     except (sweep_video.SweepVideoError, mediamtx.MediaMtxError) as error:
         raise AutoError(str(error)) from error
@@ -911,9 +925,10 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
             % (size[0], size[1], calibration.image_size[0], calibration.image_size[1]))
 
     K, dist = calibration.K, calibration.dist
-    bootstrap(options)
-    T_guess = None
-    if options.marker:
+    T_guess = None if seed_T is None else np.asarray(seed_T, dtype=float)
+    if seed_T is None:
+        bootstrap(options)
+    if options.marker and seed_T is None:
         # The marker gives the camera outright; there is nothing to search. The
         # sweep then only verifies, and the tip detector's projection lands on
         # the gripper instead of hunting for it.
