@@ -72,7 +72,7 @@ struct ContentView: View {
                     Chip(text: "60 fps", plain: true)
                     Chip(text: "ARKit", plain: true)
                     let tracking = model.trackingStatus
-                    Chip(text: "tracking: " + tracking, plain: tracking == "normal", warn: tracking != "normal")
+                    Chip(text: "tracking: " + tracking, warn: tracking != "normal", plain: tracking == "normal")
                     if model.cameraMode == "handheld" {
                         Chip(text: model.anchor == nil ? "Anchor: none" : "Re-anchor",
                              on: model.anchor != nil, warn: model.anchor == nil,
