@@ -158,7 +158,7 @@ it is validated against (`examples/host/web`), or the workflow itself:
 | job | runner | what it proves |
 |---|---|---|
 | `core-tests` | Linux, `swift:6.0` container | the ported math matches the page's JS (fixtures are regenerated from the checked-out commit each run, so they never go stale) |
-| `ios-sdk-tests` | GitHub-hosted `macos-15` (Xcode 16) | the **full app compiles against the iOS SDK** (simulator) and the same suite passes as an Xcode test bundle (`RebotCaptureTests`) |
+| `ios-sdk-tests` | GitHub-hosted `macos-15-intel` (Xcode 16) | the **full app compiles against the iOS SDK** (simulator) and the same suite passes as an Xcode test bundle (`RebotCaptureTests`) |
 
 The iOS job is `continue-on-error: true` (the GitLab original used
 `allow_failure`) so the macOS layer never blocks the pipeline — `core-tests`
