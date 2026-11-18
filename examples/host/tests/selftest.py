@@ -40,6 +40,7 @@ import calib as calib_mod  # noqa: E402
 import calibrate_extrinsics as extrinsics_cli  # noqa: E402
 import calibrate_intrinsics as calib_cli  # noqa: E402
 import extrinsics  # noqa: E402
+import identify  # noqa: E402
 import locate_target as locate  # noqa: E402
 import rebot_ik  # noqa: E402
 import mediamtx  # noqa: E402
@@ -3738,6 +3739,545 @@ def test_marker_rig(workdir: Path):
 
 
 # --------------------------------------------------------------------------- #
+# Phase 4: the hillclimb (§7, §9) -- synthetic fits and telemetry, no arm motion
+# --------------------------------------------------------------------------- #
+
+def test_identify_gate(workdir: Path):
+    print("\nidentify: triggers, identifiability gate, candidate scoring")
+    K, dist, T_true, tip, observations = synthetic_rig()
+    options = extrinsics.FitOptions(plane_z=0.0, image_size=(1600, 1200))
+    fit = extrinsics.fit(observations, K, dist, options)
+
+    # The monitor proposes; it never runs anything (it has no arm to run).
+    monitor = identify.TriggerMonitor()
+    proposals = monitor.observe({"witness": {"drift_px": 5.0, "scale": 1.0},
+                                 "holds": [{"pixel_error_mm": 15.0}] * 4}, rig=None)
+    kinds = {p["kind"] for p in proposals}
+    check("witness drift proposes a session", "stale-rig" in kinds, str(kinds))
+    check("pixel-error EWMA over threshold proposes", "pixel-drift" in kinds)
+    check("a missing rig proposes", "missing-rig" in kinds)
+    clean = identify.TriggerMonitor()
+    check("a clean oracle proposes nothing",
+          clean.observe({"holds": [{"pixel_error_mm": 2.0}],
+                         "witness": {"drift_px": 0.5, "scale": 1.0}}, rig=fit.rig) == [])
+    growth = identify.TriggerMonitor()
+    growth.observe({"tag_reprojection_px": 1.0}, rig=fit.rig)
+    check("tag reprojection growth proposes",
+          any(p["kind"] == "tag-growth"
+              for p in growth.observe({"tag_reprojection_px": 5.0}, rig=fit.rig)))
+
+    # A well-excited synthetic fit is fully identifiable.
+    report = identify.identifiability(fit)
+    check("a well-excited fit is fully identifiable",
+          report["status"] == "ok" and not report["flagged"],
+          report["weakest"].get("direction", ""))
+
+    # A fit whose tz/rz directions are weak: flagged, and dropped from the free
+    # set -- never updated. The covariance is crafted on a real fit so the gate
+    # is tested on the same object the solver produces.
+    cov = fit.covariance.copy()
+    for name in ("tz", "rz"):
+        k = fit.free.index(extrinsics.NAMES.index(name))
+        cov[k, k] = 0.200 ** 2                     # 200 mm sigma: far above the gate
+    weak = extrinsics.FitResult(rig=fit.rig, residuals_px=fit.residuals_px,
+                                weights=fit.weights, covariance=cov, free=list(fit.free),
+                                sigma=fit.sigma, weakest=fit.weakest,
+                                predicted=fit.predicted, iterations=fit.iterations,
+                                converged=True)
+    weak_report = identify.identifiability(weak)
+    check("weak tz/rz are flagged, not hidden",
+          {f["name"] for f in weak_report["flagged"]} >= {"tz", "rz"}
+          and weak_report["status"] == "partial", str(weak_report["flagged"]))
+    free, flagged = identify.select_free(weak)
+    check("the gate drops tz/rz from the free set",
+          extrinsics.NAMES.index("tz") not in free
+          and extrinsics.NAMES.index("rz") not in free
+          and {f["name"] for f in flagged} >= {"tz", "rz"})
+
+    # The gated update itself: with the exploratory fit reporting weak tz/rz,
+    # the refit must hold those two at the prior rig's values while the other
+    # directions stay free. The explorer is swapped for the crafted weak fit;
+    # the LM machinery that follows is the real one.
+    prior = fit.rig
+    real_fit = extrinsics.fit
+    extrinsics.fit = lambda *a, **k: weak
+    try:
+        gated = identify.gated_fit(observations, K, dist, options, prior_rig=prior)
+    finally:
+        extrinsics.fit = real_fit
+    prior_cam = extrinsics.invert(np.asarray(prior.T_base_cam, dtype=float))
+    gated_cam = extrinsics.invert(np.asarray(gated["rig"].T_base_cam, dtype=float))
+    check("a weak tz is held at its prior value",
+          abs(float(gated_cam[2, 3]) - float(prior_cam[2, 3])) < 1e-9,
+          "%.6f vs %.6f" % (gated_cam[2, 3], prior_cam[2, 3]))
+    check("a weak rz is held at its prior value",
+          abs(float(extrinsics.log_so3(gated_cam[:3, :3])[2])
+              - float(extrinsics.log_so3(prior_cam[:3, :3])[2])) < 1e-9)
+    check("the gated update reports PARTIAL, never success",
+          gated["report"]["status"] == "partial"
+          and 2 not in gated["free"] and 5 not in gated["free"])
+
+    # With nothing above the gate the update is a normal fit and reports ok.
+    gated_ok = identify.gated_fit(observations, K, dist, options, prior_rig=prior)
+    check("an identifiable update reports ok", gated_ok["report"]["status"] == "ok"
+          and gated_ok["converged"])
+    # A gate below every sigma flags everything: the update is the prior itself.
+    frozen = identify.gated_fit(observations, K, dist, options, prior_rig=prior,
+                                gate_mm=1e-6)
+    check("nothing identifiable means nothing moves",
+          np.allclose(frozen["rig"].T_base_cam, prior.T_base_cam, atol=1e-12)
+          and frozen["free"] == [] and frozen["report"]["status"] == "partial")
+
+    # refine_zeros stays off without arm-independent anchors, and j1/j6 are
+    # gauges even when anchors allow the other zeros.
+    K10, dist10, _T10, _tip10, obs10 = synthetic_rig(seed=8, poses=10)
+    no_anchor = identify.gated_fit(obs10, K10, dist10,
+                                   extrinsics.FitOptions(refine_zeros=True,
+                                                         image_size=(1600, 1200)))
+    check("refine_zeros refuses without anchors", no_anchor["rig"].joint_zeros is None)
+    anchored = [extrinsics.Observation(q=o.q, uv=o.uv,
+                                       label="base-marker" if i == 0 else "tool")
+                for i, o in enumerate(obs10)]
+    with_anchor = identify.gated_fit(anchored, K10, dist10,
+                                     extrinsics.FitOptions(refine_zeros=True,
+                                                           image_size=(1600, 1200)))
+    check("anchors allow the j2-j5 zeros", with_anchor["rig"].joint_zeros is not None)
+    check("j1 and j6 are never fitted",
+          9 not in with_anchor["free"] and 14 not in with_anchor["free"])
+
+    # Candidate scoring: legal, path-safe, speed-capped, deterministic, top-k.
+    chosen = identify.candidate_poses(np.zeros(6), fit, K, dist, tip, top_k=6)
+    check("the climb picks top-k candidates", len(chosen) == 6)
+    check("every candidate is a legal pose", all(sweep.pose_ok(q) for q in chosen))
+    chain = [np.zeros(6)] + chosen
+    check("the candidate chain is path-safe from the current pose",
+          all(sweep.path_safe(a, b) for a, b in zip(chain, chain[1:])))
+    peaks = [(math.pi / 2.0) * float(np.max(np.abs(b - a))) / sweep.seconds_for(a, b)
+             for a, b in zip(chain, chain[1:])]
+    check("climb legs stay under the speed cap", max(peaks) <= sweep.PEAK_SPEED + 1e-9,
+          "worst %.3f rad/s" % max(peaks))
+    again = identify.candidate_poses(np.zeros(6), fit, K, dist, tip, top_k=6)
+    check("candidate scoring is deterministic",
+          all(np.allclose(a, b) for a, b in zip(chosen, again)))
+
+
+def test_sag_map(workdir: Path):
+    print("\nidentify: sag residual map from telemetry, no extra motion")
+    kp = sweep.kp_vector()
+    rng = np.random.default_rng(5)
+    a_true = [0.10 / float(kp[j]) for j in range(6)]     # the measured 10% model gap
+    b_true = [0.001 + 0.0003 * j for j in range(6)]
+
+    # 40 holds at spread command poses, each a 1.1 s constant-command window in
+    # a telemetry log. The arm settles as meas = cmd - gravity_sag(cmd) - r, with
+    # r affine in the gravity torque at the *command* pose -- exactly the
+    # relation sag_holds extracts (it evaluates the model at q_cmd).
+    docs = []
+    for i in range(40):
+        cmd = np.array([rng.uniform(lo, hi) for lo, hi in rebot_ik.LIMITS])
+        tau = rebot_ik.gravity_torques(cmd)
+        residual = np.array([a_true[j] * tau[j] + b_true[j] for j in range(6)])
+        meas = cmd - sweep.gravity_sag(cmd, kp) - residual + rng.normal(0.0, 0.0003, 6)
+        samples = [{"t": i * 3.0 + k * 0.1,
+                    "cmd": [float(v) for v in cmd] + [0.0],
+                    "meas": [float(v) for v in meas] + [0.0]} for k in range(12)]
+        docs.append({"samples": samples,
+                     "kp": {str(m): float(kp[m - 1]) for m in range(1, 7)}})
+    holds = identify.sag_holds(docs)
+    check("holds are extracted from telemetry windows", len(holds) == 40,
+          "%d holds" % len(holds))
+
+    result = identify.fit_sag_map(holds, kp_key=sweep.KP_DEFAULT, rig_fingerprint="abc123def456")
+    check("the sag map fits with enough spread holds", result["ok"],
+          "; ".join(result.get("reasons", [])))
+    if result["ok"]:
+        per = result["map"]["per_motor"]
+        a_err = max(abs(per[str(j + 1)]["a"] - a_true[j]) for j in (1, 2, 3, 4))
+        b_err = max(abs(per[str(j + 1)]["b"] - b_true[j]) for j in range(6))
+        check("the injected a_j is recovered", a_err < 0.10 * max(a_true[1:5]),
+              "worst %.2e" % a_err)
+        check("the injected b_j is recovered", b_err < 0.001, "worst %.4f mrad"
+              % (1000.0 * b_err))
+        check("rms is reported in mrad and mm at the tool",
+              result["map"]["rms_mrad"] >= 0.0 and result["map"]["validated_mm"] >= 0.0,
+              "%.2f mrad, %.2f mm" % (result["map"]["rms_mrad"],
+                                      result["map"]["validated_mm"]))
+        map_doc = result["map"]
+    else:
+        map_doc = None
+
+    check("fewer than 30 holds are refused",
+          not identify.fit_sag_map(holds[:20], kp_key=sweep.KP_DEFAULT,
+                                   rig_fingerprint="abc123def456")["ok"])
+    check("holds that do not span the workspace are refused",
+          not identify.fit_sag_map([holds[0]] * 40, kp_key=sweep.KP_DEFAULT,
+                                   rig_fingerprint="abc123def456")["ok"])
+    # Overfit: the held-out split (every fifth hold) carries a large residual
+    # the train set never saw -- validation must reject the map.
+    overfit = [dict(h) for h in holds]
+    for i in range(4, len(overfit), 5):
+        overfit[i]["r"] = overfit[i]["r"] + rng.normal(0.0, 0.05, 6)
+    rejected = identify.fit_sag_map(overfit, kp_key=sweep.KP_DEFAULT,
+                                    rig_fingerprint="abc123def456")
+    check("hold-out validation rejects an overfit map", not rejected["ok"],
+          "; ".join(rejected.get("reasons", []))[:60])
+
+    if map_doc is not None:
+        q_in = holds[0]["q"]
+        keys = {"kp_key": sweep.KP_DEFAULT, "rig_fingerprint": "abc123def456"}
+        extra = identify.sag_correction(q_in, map_doc, **keys)
+        check("the correction applies inside the envelope",
+              float(np.max(np.abs(extra))) > 0.0)
+        q_out = q_in.copy()
+        q_out[1] = map_doc["envelope"]["q_max"][1] + 0.5
+        check("no correction outside the explored envelope",
+              np.all(identify.sag_correction(q_out, map_doc, **keys) == 0.0))
+        check("a kp change invalidates the map",
+              np.all(identify.sag_correction(q_in, map_doc, kp_key="50",
+                                             rig_fingerprint="abc123def456") == 0.0))
+        check("a rig change invalidates the map",
+              np.all(identify.sag_correction(q_in, map_doc, kp_key=sweep.KP_DEFAULT,
+                                             rig_fingerprint="other") == 0.0))
+        check("a zero change invalidates the map",
+              np.all(identify.sag_correction(q_in, map_doc, zeros_key="changed",
+                                             **keys) == 0.0))
+        identify.save_sag_map(workdir, map_doc)
+        loaded = identify.load_sag_map(workdir, "abc123def456", kp_key=sweep.KP_DEFAULT)
+        check("the map round-trips keyed by rig fingerprint", loaded is not None)
+        check("loading refuses a kp change",
+              identify.load_sag_map(workdir, "abc123def456", kp_key="50") is None)
+        check("loading refuses a zero change",
+              identify.load_sag_map(workdir, "abc123def456", kp_key=sweep.KP_DEFAULT,
+                                    zeros_key="changed") is None)
+
+        # The live /move path (§7.3b wiring): the planner reads the active rig's
+        # identity from the calib dir and applies the keyed map through aim().
+        live_dir = workdir / "sag-live-calib"
+        live_dir.mkdir(parents=True, exist_ok=True)
+        rig_file = live_dir / "extrinsics-fixed.json"
+        rig_file.write_text(json.dumps({"fingerprint": "abc123def456",
+                                        "joint_zeros": None}), encoding="utf-8")
+        identify.save_sag_map(live_dir, map_doc)
+        check("the live move path applies the keyed map",
+              np.allclose(sweep.active_sag_extra(q_in, sweep.KP_DEFAULT, live_dir),
+                          extra, atol=1e-12))
+        check("the live path refuses a kp change",
+              np.all(sweep.active_sag_extra(q_in, "50", live_dir) == 0.0))
+        rig_file.write_text("{torn", encoding="utf-8")
+        check("a torn rig file means no map, never an exception",
+              np.all(sweep.active_sag_extra(q_in, sweep.KP_DEFAULT, live_dir) == 0.0))
+        rig_file.unlink()
+        check("no active rig means no map",
+              np.all(sweep.active_sag_extra(q_in, sweep.KP_DEFAULT, live_dir) == 0.0))
+
+    # The additive term in sweep.aim stays clipped by SAG_LIMIT_RAD, however
+    # large the map's correction -- a bad map can never command an excursion.
+    huge = np.full(6, 10.0)
+    aimed = sweep.aim(sweep.POSES[0], kp, extra_sag=huge)
+    check("the additive sag term stays clipped by SAG_LIMIT_RAD",
+          float(np.max(np.abs(aimed - np.asarray(sweep.POSES[0]))))
+          <= sweep.SAG_LIMIT_RAD + 1e-9,
+          "%.0f mrad" % (1000.0 * float(np.max(np.abs(aimed - np.asarray(sweep.POSES[0]))))))
+    plain = sweep.aim(sweep.POSES[0], kp)
+    check("aim without a map is unchanged",
+          np.allclose(plain, sweep.aim(sweep.POSES[0], kp, extra_sag=None), atol=1e-12))
+
+
+def test_identify_api(workdir: Path):
+    print("\nidentify API: gates, verify-before-hotload, single-flight")
+    from dataclasses import replace
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import camera as camera_mod
+    import capture_server
+
+    K, dist, T_true, _tip, observations = synthetic_rig()
+    calibration = calib_mod.Calib(path=workdir / "id-calib.json", K=K, dist=dist,
+                                  image_size=(1600, 1200), device="synthetic")
+    options = auto_calibrate.Options(plane_z=0.0)
+    fit = extrinsics.fit(observations, K, dist, extrinsics.FitOptions(image_size=(1600, 1200)))
+
+    # The verification gate itself: auto_calibrate.verify plus hold-out poses.
+    good = identify.verify_candidate(fit.rig, observations[:6], observations[6:],
+                                     calibration, options, True)
+    check("a good candidate passes verify plus hold-out",
+          good["ok"] and len(good["holdout_px"]) == 2, "; ".join(good["reasons"]))
+    moved_T = np.asarray(fit.rig.T_base_cam, dtype=float).copy()
+    moved_T[:3, 3] += [0.05, 0.03, 0.0]
+    bad_rig = replace(fit.rig, T_base_cam=moved_T)
+    bad = identify.verify_candidate(bad_rig, observations[:6], observations[6:],
+                                    calibration, options, True)
+    check("a candidate the hold-out rejects is refused", not bad["ok"] and bad["reasons"],
+          "; ".join(bad["reasons"])[:60])
+    check("no hold-out poses is itself a refusal",
+          not identify.verify_candidate(fit.rig, observations, [], calibration,
+                                        options, True)["ok"])
+
+    captures = workdir / "identify-captures"
+    calib_dir = workdir / "identify-calib"
+    calib_dir.mkdir(parents=True, exist_ok=True)
+    (calib_dir / "synthetic.json").write_text(json.dumps({
+        "format": "rebot-camera-calib", "version": 1, "device": "synthetic",
+        "image_size": [1600, 1200], "K": K.tolist(), "dist": dist.tolist(), "rms": 0.2,
+    }), encoding="utf-8")
+    background = cv2.cvtColor(textured_frame(), cv2.COLOR_GRAY2BGR)
+    arm = FakeArm()
+    eye = FakeEye(background, arm, T_true, K, dist)
+
+    def args_for(execute, token=""):
+        return SimpleNamespace(
+            host="127.0.0.1", port=0, captures=str(captures), cert="", key="",
+            token=token, mediamtx="http://127.0.0.1:9", whip_path="phone", no_whip=True,
+            max_mb=4, quiet=True, planner="http://127.0.0.1:9", planner_token="",
+            execute=execute, calib_dir=str(calib_dir), calib="",
+            marker_at="", marker_size=0.08,
+            hover="1", hover_m=0.10, tip_mm=35.0,
+            plane_z=0.0, tool_axis="z-", yaw=0.0,
+            extrinsics="", witness_max_px=2.0, camera="rtsp://fake/stream",
+            mediamtx_api="http://127.0.0.1:9", recordings=str(calib_dir.parent / "recordings"),
+            traces_dir=str(workdir / "identify-traces"),
+        )
+
+    def exact_detect(frames, poses, K_, dist_, T_base_cam, t_tip, options_, size, **kwargs):
+        found = []
+        for index, q in enumerate(poses):
+            T = rebot_ik.forward(np.asarray(q, dtype=float))
+            point = T[:3, :3] @ np.array([0.0, 0.0, 0.035]) + T[:3, 3]
+            u, v = extrinsics.pixel(point, K_, dist_, extrinsics.invert(T_true))
+            found.append(auto_calibrate.Detection(u=u, v=v, offset_px=0.0, area=0.0,
+                                                  pose=index + 1))
+        return found
+
+    def bad_holdout_detect(frames, poses, K_, dist_, T_base_cam, t_tip, options_, size,
+                           **kwargs):
+        # Exact correspondences for the fit poses, a 30 px lie on the hold-out
+        # pose: the fit looks tidy, and only the held-out gate can catch it.
+        found = exact_detect(frames, poses, K_, dist_, T_base_cam, t_tip, options_, size)
+        found[-1].u += 25.0
+        found[-1].v -= 18.0
+        return found
+
+    original_gateway = auto_calibrate.ArmGateway
+    original_source = camera_mod.open_source
+    original_detect = auto_calibrate.detect_all
+    original_green = auto_calibrate.detect_all_green
+    original_recorder = mediamtx.Recorder
+    auto_calibrate.ArmGateway = lambda *a, **k: arm
+    camera_mod.open_source = lambda *a, **k: eye
+    recorder_dir = calib_dir.parent / "recordings"
+    mediamtx.Recorder = lambda *a, **k: FakeRecorder(eye, recorder_dir)
+    try:
+        async def scenarios():
+            off = capture_server.build_app(args_for(False))
+            async with TestClient(TestServer(off)) as client:
+                answer = await client.post("/identify/run", json={"confirm": True})
+                check("identify refuses to move the arm with execution off",
+                      answer.status == 403)
+                answer = await client.post("/identify/sag", json={})
+                check("the sag fit needs a fitted rig", answer.status == 422)
+
+            tokened = capture_server.build_app(args_for(True, token="id-token"))
+            async with TestClient(TestServer(tokened)) as client:
+                answer = await client.post("/identify/run", json={"confirm": True})
+                check("identify needs the write token", answer.status == 401)
+                answer = await client.post("/identify/sag", json={})
+                check("the sag fit needs the write token", answer.status == 401)
+
+            app = capture_server.build_app(args_for(True))
+            app["rig"] = fit.rig
+            async with TestClient(TestServer(app)) as client:
+                answer = await client.post("/identify/run", json={})
+                check("identify needs an explicit confirm", answer.status == 400)
+
+                app["calibrating"] = True
+                answer = await client.post("/identify/run", json={"confirm": True})
+                check("identify is single-flight with the calibration flag",
+                      answer.status == 409)
+                app["calibrating"] = False
+
+                status = await (await client.get("/identify")).json()
+                check("GET /identify reports idle progress and proposals",
+                      status.get("running") is False and status.get("progress") is None
+                      and isinstance(status.get("proposals"), list))
+
+                # §7.3b: /identify/sag fits the map from the telemetry corpus
+                # and stores it keyed by the running rig. No motion, so no
+                # execute gate -- but the map only applies after the hold-out
+                # validation inside fit_sag_map.
+                telemetry_dir = captures.parent / "telemetry"
+                telemetry_dir.mkdir(parents=True, exist_ok=True)
+                rng = np.random.default_rng(5)
+                kp_vec = sweep.kp_vector()
+                for i in range(40):
+                    cmd = np.array([rng.uniform(lo, hi) for lo, hi in rebot_ik.LIMITS])
+                    tau = rebot_ik.gravity_torques(cmd)
+                    residual = np.array([0.10 / float(kp_vec[j]) * tau[j] + 0.001
+                                         for j in range(6)])
+                    meas = cmd - sweep.gravity_sag(cmd, kp_vec) - residual
+                    samples = [{"t": i * 3.0 + k * 0.1,
+                                "cmd": [float(v) for v in cmd] + [0.0],
+                                "meas": [float(v) for v in meas] + [0.0]}
+                               for k in range(12)]
+                    (telemetry_dir / ("move-%02d.json" % i)).write_text(
+                        json.dumps({"samples": samples}), encoding="utf-8")
+                answer = await client.post("/identify/sag", json={})
+                body = await answer.json()
+                check("/identify/sag fits and stores the keyed map",
+                      answer.status == 200 and body.get("ok") is True
+                      and (calib_dir / ("sag-%s.json" % app["rig"].fingerprint)).is_file(),
+                      "status %s, %s" % (answer.status, str(body.get("reasons"))[:60]))
+
+                before = app["rig"].fingerprint
+                auto_calibrate.detect_all = bad_holdout_detect
+                auto_calibrate.detect_all_green = bad_holdout_detect
+                climb_body = {"confirm": True, "settle": 0.02, "top_k": 7, "holdout": 1}
+                answer = await client.post("/identify/run", json=climb_body)
+                body = await answer.json()
+                check("a candidate that fails verification is refused",
+                      answer.status == 422 and body.get("ok") is False,
+                      "status %s, %s" % (answer.status, str(body.get("error"))[:50]))
+                check("the running rig is untouched by a refused climb",
+                      app["rig"].fingerprint == before
+                      and not (calib_dir / "extrinsics-fixed.json").exists())
+                check("the refused candidate is kept as evidence",
+                      body.get("candidate")
+                      and Path(body["candidate"]).is_file())
+                check("the refusal carries the hold-out reason",
+                      any("hold-out" in r
+                          for r in (body.get("verification") or {}).get("reasons", [])),
+                      str((body.get("verification") or {}).get("reasons"))[:70])
+
+                auto_calibrate.detect_all = exact_detect
+                auto_calibrate.detect_all_green = exact_detect
+                answer = await client.post("/identify/run", json=climb_body)
+                body = await answer.json()
+                check("a verified climb writes and hot-loads the rig",
+                      answer.status == 200 and body.get("ok") is True
+                      and body.get("written")
+                      and (calib_dir / "extrinsics-fixed.json").is_file(),
+                      "status %s, %s" % (answer.status, str(body.get("error"))[:60]))
+                check("the hot-loaded rig is the new one",
+                      app["rig"].fingerprint != before)
+                check("the climb reports what was identifiable",
+                      (body.get("identifiability") or {}).get("status") == "ok"
+                      and (body.get("verification") or {}).get("holdout_px"))
+                loaded = extrinsics.load_rig(calib_dir / "extrinsics-fixed.json")
+                check("the committed rig has a witness", loaded.witness is not None)
+                status = await (await client.get("/identify")).json()
+                check("GET /identify reports the success",
+                      (status.get("last") or {}).get("state") == "ok")
+                check("the swept arm is back where it started",
+                      np.allclose(arm.q, sweep.HOME, atol=1e-6))
+
+        asyncio.run(scenarios())
+    finally:
+        auto_calibrate.ArmGateway = original_gateway
+        camera_mod.open_source = original_source
+        auto_calibrate.detect_all = original_detect
+        auto_calibrate.detect_all_green = original_green
+        mediamtx.Recorder = original_recorder
+
+
+def test_accuracy_map(workdir: Path):
+    print("\naccuracy envelope: validated cells, sequence warnings, health")
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import capture_server
+
+    map_path = workdir / "accuracy-map.json"
+    tip_a = [0.35, 0.05, 0.15]
+    tip_b = [0.55, -0.20, 0.30]
+
+    def hold(tip, error):
+        return {"pixel_error_mm": error, "tip_fk_cmd": tip}
+
+    cell_a = identify.accuracy_cell(tip_a)
+    doc = identify.update_accuracy_map(map_path, {"holds": [hold(tip_a, 4.0),
+                                                            hold(tip_a, 5.0)]})
+    check("two holds do not validate a cell",
+          doc["cells"][cell_a]["n"] == 2 and doc["cells"][cell_a]["validated_at"] is None)
+    doc = identify.update_accuracy_map(map_path, {"holds": [hold(tip_a, 3.0)]})
+    check("three good holds validate the cell",
+          doc["cells"][cell_a]["validated_at"] is not None)
+    doc = identify.update_accuracy_map(map_path, {"holds": [hold(tip_a, 15.0)]})
+    check("an over-threshold hold un-validates the cell",
+          doc["cells"][cell_a]["validated_at"] is None)
+    doc = identify.update_accuracy_map(map_path, {"holds": [hold(tip_a, 2.0),
+                                                            hold(tip_a, 3.0),
+                                                            hold(tip_a, 4.0),
+                                                            hold(tip_b, 5.0)]})
+    check("the envelope's validated fraction is reported",
+          abs(identify.validated_fraction(doc) - 0.5) < 1e-9,
+          "%.2f" % identify.validated_fraction(doc))
+    warnings = identify.accuracy_warnings(doc, [tip_a, tip_b])
+    check("only the unvalidated cell warns",
+          len(warnings) == 1 and "target 2" in warnings[0], str(warnings))
+
+    # The server consults the map: a warning in the plan summary, a fraction in
+    # /health, and a broken map degrades to neither failing nor warning.
+    K, dist, _T, _tip, _obs = synthetic_rig()
+    captures = workdir / "accuracy-captures"
+    calib_dir = workdir / "accuracy-calib"
+    calib_dir.mkdir(parents=True, exist_ok=True)
+    (calib_dir / "synthetic.json").write_text(json.dumps({
+        "format": "rebot-camera-calib", "version": 1, "device": "synthetic",
+        "image_size": [1600, 1200], "K": K.tolist(), "dist": dist.tolist(), "rms": 0.2,
+    }), encoding="utf-8")
+    args = SimpleNamespace(
+        host="127.0.0.1", port=0, captures=str(captures), cert="", key="",
+        token="acc-token", mediamtx="http://127.0.0.1:9", whip_path="phone", no_whip=True,
+        max_mb=4, quiet=True, planner="http://127.0.0.1:9", planner_token="",
+        execute=False, calib_dir=str(calib_dir), calib="",
+        marker_at="", marker_size=0.08,
+        hover="1", hover_m=0.10, tip_mm=35.0,
+        plane_z=0.0, tool_axis="z-", yaw=0.0,
+        extrinsics="", witness_max_px=2.0, camera="",
+        traces_dir=str(workdir / "accuracy-traces"),
+    )
+    app = capture_server.build_app(args)
+    app["accuracy_map_path"] = map_path
+
+    async def fake_planner_call(app_, path, body, timeout=120, method="POST", sid=None):
+        return 200, {"id": "fake-accuracy", "execute": False,
+                     "summary": {"markers": len(body.get("targets") or [])}}
+
+    real_planner_call = capture_server.planner_call
+    capture_server.planner_call = fake_planner_call
+    headers = {"X-Rebot-Token": "acc-token"}
+    try:
+        async def scenarios():
+            async with TestClient(TestServer(app)) as client:
+                answer = await client.post("/sequence",
+                                           json={"targets": [{"tip": tip_a}, {"tip": tip_b}]},
+                                           headers=headers)
+                body = await answer.json()
+                summary_warnings = ((body.get("plan") or {}).get("summary") or {}).get("warnings")
+                check("an unvalidated target warns in the plan summary",
+                      answer.status == 200 and summary_warnings
+                      and any("target 2" in w for w in summary_warnings),
+                      str(summary_warnings))
+                health = await (await client.get("/health")).json()
+                check("/health reports the validated fraction",
+                      abs((health.get("accuracy") or {}).get("validated_fraction", -1)
+                          - 0.5) < 1e-9
+                      and (health.get("accuracy") or {}).get("cells") == 2,
+                      str(health.get("accuracy")))
+                map_path.write_text("{not json", encoding="utf-8")
+                answer = await client.post("/sequence",
+                                           json={"targets": [{"tip": tip_a}]},
+                                           headers=headers)
+                check("a broken accuracy map never fails /sequence",
+                      answer.status == 200)
+                health = await (await client.get("/health")).json()
+                check("a broken accuracy map degrades health to zero",
+                      (health.get("accuracy") or {}).get("validated_fraction") == 0.0)
+        asyncio.run(scenarios())
+    finally:
+        capture_server.planner_call = real_planner_call
+
+
+# --------------------------------------------------------------------------- #
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Offline selftest for the capture pipeline.")
@@ -3777,6 +4317,10 @@ def main(argv=None):
     test_auto_sweep(workdir)
     test_calibrate_api(workdir)
     test_marker_rig(workdir)
+    test_identify_gate(workdir)
+    test_sag_map(workdir)
+    test_identify_api(workdir)
+    test_accuracy_map(workdir)
 
     failures = [name for name, ok, _ in RESULTS if not ok]
     print("\n%d checks, %d failed" % (len(RESULTS), len(failures)))

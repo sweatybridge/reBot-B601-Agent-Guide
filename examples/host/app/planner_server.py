@@ -70,6 +70,9 @@ OUT_DIR = Path(os.environ.get("REBOT_OUT", str(ROOT / "state" / "out")))
 # server's oracle reads them back after /execute; the 4000-char stdout tail in
 # the response stays for humans.
 TELEMETRY_DIR = Path(os.environ.get("REBOT_TELEMETRY", str(ROOT / "state" / "telemetry")))
+# The learned sag residual maps (§7.3b), keyed by rig fingerprint. The capture
+# server's /identify/sag fits them; /move applies the one the active rig names.
+CALIB_DIR = Path(os.environ.get("REBOT_CALIB", str(ROOT / "state" / "calib")))
 EDGE_URL = os.environ.get("REBOT_EDGE_URL", "http://raspberrypi:8081").rstrip("/")
 EDGE_TOKEN = os.environ.get("REBOT_EDGE_TOKEN", "")
 TOKEN = os.environ.get("REBOT_PLANNER_TOKEN", "")
@@ -375,11 +378,15 @@ def move_one(body):
     # away from its command. Command the offset so the arm *holds* the poses the
     # table was validated at -- it is the geometry that matters, not the number
     # in the file, and a 6 deg set-down is 60 mm at the tool.
-    kp = sweep.kp_vector(body.get("kp") or KP)
+    kp_spec = str(body.get("kp") or KP)
+    kp = sweep.kp_vector(kp_spec)
     commands = []
     applied = []
     for index, target in enumerate(targets):
-        command = sweep.aim(target, kp)
+        # The learned residual term (§7.3b), when a validated map exists for the
+        # active rig and these gains; zeros otherwise. aim() clips the total.
+        extra = sweep.active_sag_extra(target, kp_spec, CALIB_DIR)
+        command = sweep.aim(target, kp, extra_sag=extra)
         clipped = np.clip(command, rebot_ik.LIMITS[:, 0], rebot_ik.LIMITS[:, 1])
         if not np.allclose(clipped, command, atol=1e-9):
             logging.warning("pose %d is at a joint limit: %.0f mrad of sag cannot be "
