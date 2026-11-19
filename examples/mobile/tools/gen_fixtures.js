@@ -6,11 +6,14 @@
 "use strict";
 const fs = require("fs");
 const path = require("path");
-const REPO = process.argv[3] || process.env.REBOT_REPO;
-if (!REPO) {
+const REPO_ARG = process.argv[3] || process.env.REBOT_REPO;
+if (!REPO_ARG) {
   console.error("usage: node tools/gen_fixtures.js <out-dir> <reBot-B601-Agent-Guide repo>");
   process.exit(1);
 }
+// Resolve against the cwd so relative repo paths (e.g. ../..) work; require()
+// below would otherwise resolve them against this script's directory.
+const REPO = path.resolve(REPO_ARG);
 const WEB = path.join(REPO, "examples/host/web");
 const G = require(path.join(WEB, "geometry.js"));
 const A = require(path.join(WEB, "arm-model.js"));
