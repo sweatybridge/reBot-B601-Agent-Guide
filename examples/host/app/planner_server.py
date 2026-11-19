@@ -377,6 +377,16 @@ def move_one(body):
         q_from[:6] = np.clip(q_from[:6], lower, upper)
     gripper = float(body["gripper"]) if "gripper" in body else float(q_from[6])
 
+    # Startup peel, shared with plan_to_target's unpark: the parked arm rests j4's
+    # hinge on the j2 casing, and a wrist-driving first leg stalls motor 4 against
+    # that contact. Always prepend the elbow lift when starting from rest so the arm
+    # breaks contact before any such leg -- every /move from rest peels, exactly as
+    # the task planner does. A caller already off the stops gets no extra leg.
+    lift = sweep.unpark_pose(q_from[:6])
+    unparked = not np.allclose(lift, q_from[:6], atol=1e-9)
+    if unparked:
+        targets.insert(0, lift)
+
     # Every leg, not just the first: a chain is only as safe as its worst
     # interpolation, and the segments between poses are new ground. It is checked
     # on the *targets*, because that is where the arm will actually be: the
@@ -420,6 +430,10 @@ def move_one(body):
     chain = [q_from[:6]] + commands
     wanted = [sweep.seconds_for(start, end) for start, end in zip(chain, chain[1:])]
     given = body.get("seconds")
+    if unparked and isinstance(given, (list, tuple)):
+        # The caller's per-leg seconds describe its original targets; the peel leg
+        # the gateway prepended takes the policy duration.
+        given = [wanted[0]] + list(given)
     if given is None:
         seconds = list(wanted)
     elif isinstance(given, (list, tuple)):

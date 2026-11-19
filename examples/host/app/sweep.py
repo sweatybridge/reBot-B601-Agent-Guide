@@ -39,6 +39,14 @@ import rebot_ik
 # sweep. Not an observation -- the camera usually cannot see the tool there.
 HOME = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
+# The startup elbow peel, shared with plan_to_target's unpark (unpark_j3=8 deg).
+# At rest the arm's j4 hinge seats on the j2 casing; a wrist-driving first leg
+# stalls against that contact (motor 4 faults). Lifting j3 raises the forearm and
+# breaks the contact before any such leg. UNPARK_REST_J3 is the j3 angle below
+# which the arm is considered resting on the stop.
+UNPARK_J3_DEG = 8.0
+UNPARK_REST_J3 = 0.05
+
 # Eight poses, ordered. Generated from a seeded search and then checked by
 # `check()`; the comment on each line is the tool position it should reach.
 POSES = (
@@ -89,6 +97,22 @@ def command_ok(q):
     move.
     """
     return within_limits(q)
+
+
+def unpark_pose(q):
+    """The pose after the startup elbow peel, or `q` unchanged if already clear.
+
+    The parked arm rests j4's hinge on the j2 casing; lifting j3 by UNPARK_J3_DEG
+    (the same peel plan_to_target applies) raises the forearm off that contact so
+    the first wrist-driving leg does not stall motor 4. Only applied from rest
+    (j3 below UNPARK_REST_J3); the lift is clamped to j3's upper limit. Pure: the
+    planner gateway prepends this as the first leg of every /move from rest.
+    """
+    q = np.asarray(q, dtype=float).reshape(6).copy()
+    if q[2] >= UNPARK_REST_J3:
+        return q
+    q[2] = min(q[2] + math.radians(UNPARK_J3_DEG), float(rebot_ik.LIMITS[2, 1]))
+    return q
 
 
 def pose_ok(q):
