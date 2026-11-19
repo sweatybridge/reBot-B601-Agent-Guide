@@ -1310,6 +1310,31 @@ def test_oracle_rules():
     check("holds win over the budget when they exceed it",
           len(oracle.downsample(long_hold, 2000)) == 3000)
 
+    # A marker hold: joints 1-6 constant while the gripper (motor 7) ramps
+    # through the grasp cycle. Comparing all seven finds no holds at all in a
+    # pick sequence -- the accuracy map would never populate.
+    marker = []
+    t = 0.0
+    for i in range(41):
+        marker.append({"t": t, "q": [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0 + 0.05 * i]})
+        t += 0.033
+    windows = oracle.hold_windows(marker)
+    check("a gripper ramp inside an arm hold does not hide the hold",
+          len(windows) == 1 and windows[0]["q_cmd"][:6] == [0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+          str(windows)[:80])
+    ramp_samples = []
+    for index in range(5000):
+        if 1000 <= index < 1100:
+            cmd = [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0 + 0.01 * (index - 1000)]
+        else:
+            cmd = [index * 0.001, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0]
+        ramp_samples.append({"t": index * 0.02, "cmd": cmd, "meas": cmd})
+    thinned = oracle.downsample(ramp_samples, 2000)
+    times = [sample["t"] for sample in thinned]
+    check("downsample keeps hold samples through a gripper ramp",
+          len(thinned) <= 2000
+          and all(index * 0.02 in times for index in range(1000, 1100)))
+
     # Attribution: one synthetic document per residual-signature row (§5.4).
     def hold(**fields):
         base = {"hold_error_rad": [0.0] * 7, "tip_error_mm": 1.0,
@@ -3075,6 +3100,166 @@ class FakeRecorder:
         return [mediamtx.Segment(path=self.path, start=self.start)]
 
 
+def test_marker_still_commit_flag(workdir: Path):
+    print("\ntag solve: the oracle's pre-still is evidence, not a calibration")
+    import capture_server as cs
+    import auto_calibrate as ac
+    app = {"calibrating": False, "marker": {"at": [0.0, 0.0, 0.0]}, "plane_z": 0.0,
+           "calib": workdir, "captures": workdir / "caps"}
+    frame = np.zeros((100, 100, 3), np.uint8)
+    run = SimpleNamespace(
+        rig=SimpleNamespace(mount="fixed", describe=lambda: "camera line",
+                            provenance=lambda: {}),
+        verdict={"ok": True}, evidence={}, seconds=0.0, warnings=[])
+    committed = []
+    saved = (cs.resolve_calibration, cs.stream_turn, cs.locator.upright_frame,
+             cs.camera_mod.open_source, cs.calib_mod.load, ac.solve_marker, ac.commit_marker)
+    cs.resolve_calibration = lambda app, requested=None: workdir / "calib.json"
+    cs.stream_turn = lambda app, base: 0
+    cs.calib_mod.load = lambda path, **k: SimpleNamespace(K=None, dist=None)
+    cs.locator.upright_frame = lambda path, f, turn=None: (f, "CAL", 0)
+    cs.camera_mod.open_source = lambda *a, **k: SimpleNamespace(
+        read=lambda: frame, close=lambda: None)
+    ac.solve_marker = lambda *a, **k: run
+    ac.commit_marker = lambda *a, **k: (committed.append(1),
+                                        (run.rig, run.verdict,
+                                         workdir / "extrinsics-fixed.json"))[1]
+    try:
+        rep = cs.marker_from_still(app, frame, commit=False)
+        check("a non-committing tag solve reports but does not write",
+              rep["written"] is None and not committed
+              and rep["marker"]["detected"] is True)
+        payload = cs.grab_one(app, "rtsp://fake", commit=False)
+        check("grab_one passes the non-committing flag through",
+              payload.get("written") is None and not committed
+              and payload.get("ok") is True)
+        rep = cs.marker_from_still(app, frame)
+        check("the default tag solve still commits",
+              rep["written"] is not None and len(committed) == 1)
+    finally:
+        (cs.resolve_calibration, cs.stream_turn, cs.locator.upright_frame,
+         cs.camera_mod.open_source, cs.calib_mod.load, ac.solve_marker, ac.commit_marker) = saved
+
+
+def test_calib_dir_scanners(workdir: Path):
+    print("\ncalib dir: the learned maps are not intrinsics calibrations")
+    import capture_server
+    import calibrate_extrinsics as extrinsics_cli
+    folder = workdir / "calib-scan"
+    folder.mkdir()
+    device = folder / "4f68b7f34a702b1c043f44fcf805ac9a63e2a3d9.json"
+    device.write_text("{}", encoding="utf-8")
+    for name in ("extrinsics-fixed.json", "sag-5d9b446edf53.json", "accuracy-map.json"):
+        (folder / name).write_text("{}", encoding="utf-8")
+    app = {"calib": folder, "calib_file": ""}
+    check("resolve_calibration skips the rig and the learned maps",
+          capture_server.resolve_calibration(app) == device,
+          str(capture_server.resolve_calibration(app)))
+    check("the CLI's default calib skips them too",
+          extrinsics_cli.default_calib(folder) == device)
+
+
+def test_hold_detection_gappy_log(workdir: Path):
+    print("\nhold detection: a slow pose read must not shatter a hold")
+    pose = np.asarray(sweep.POSES[0], dtype=float)
+
+    def still_run(start_t, q, n=23):
+        out = []
+        t = start_t
+        for _ in range(n):
+            out.append({"i": len(out), "t": t, "q": list(q)})
+            t += 1.0 / 15.0
+        return out, t
+
+    # A 3 s hold with a one-second /pose gap in the middle (the bus was busy
+    # playing back); the arm drifted 20 mrad across the gap -- 0.02 rad/s,
+    # well under the stillness speed. The hold must survive as one window.
+    entries, t = still_run(1000.0, pose)
+    drifted = pose + 0.02
+    entries.append({"i": len(entries), "t": t + 1.0, "q": list(drifted)})
+    more, _ = still_run(t + 1.0 + 1.0 / 15.0, drifted)
+    entries.extend(more)
+    chosen = sweep_video.select(entries, [pose])
+    check("a hold survives a one-second pose-log gap",
+          chosen[0].get("missed") is not True and chosen[0]["window_s"] >= 2.5,
+          str(chosen[0]))
+
+    # The same gap with real motion across it (0.3 rad/s) is not stillness:
+    # the window must end before the gap, not bridge it.
+    entries, t = still_run(1000.0, pose)
+    entries.append({"i": len(entries), "t": t + 1.0, "q": list(pose + 0.3)})
+    more, _ = still_run(t + 1.0 + 1.0 / 15.0, pose + 0.3)
+    entries.extend(more)
+    chosen = sweep_video.select(entries, [pose])
+    check("motion across a gap does not extend the hold",
+          chosen[0].get("missed") is not True and chosen[0]["window_s"] < 2.0,
+          str(chosen[0]))
+
+    # A gap longer than the cap hides too much: even with no drift at all it
+    # cannot be claimed as evidence the arm stood still through it.
+    entries, t = still_run(1000.0, pose)
+    entries.append({"i": len(entries), "t": t + 3.0, "q": list(pose)})
+    more, _ = still_run(t + 3.0 + 1.0 / 15.0, pose)
+    entries.extend(more)
+    chosen = sweep_video.select(entries, [pose])
+    check("a gap over the cap is not evidence of stillness",
+          chosen[0].get("missed") is not True and chosen[0]["window_s"] < 2.0,
+          str(chosen[0]))
+
+
+def test_auto_sweep_turned_stream(workdir: Path):
+    print("\nautomatic sweep: a turned stream is turned back before the fit")
+    K, dist, T_true, _tip, _observations = synthetic_rig()
+    calibration = calib_mod.Calib(path=workdir / "turned-calib.json", K=K, dist=dist,
+                                  image_size=(1600, 1200), device="synthetic")
+    background = cv2.cvtColor(textured_frame(), cv2.COLOR_GRAY2BGR)
+    q0 = np.array([0.4, 1.6, 0.9, 0.2, 1.1, 0.3])
+    tap = extrinsics.pixel(rebot_ik.forward(q0)[:3, 3], K, dist, extrinsics.invert(T_true))
+
+    arm = FakeArm()
+    upright = FakeEye(background, arm, T_true, K, dist)
+
+    class TurnedEye:
+        """The phone delivers the scene half a turn out; the recorder writes it
+        as delivered, exactly like MediaMTX records the raw stream."""
+
+        def read(self, retries=1):
+            return cv2.rotate(upright.read(), cv2.ROTATE_180)
+
+        def close(self):
+            upright.close()
+
+    eye = TurnedEye()
+    options = auto_calibrate.Options(
+        settle_s=0.0, plane_z=0.0, click={"q": q0.tolist(), "uv": tap},
+        detect=auto_calibrate.DetectOptions(walk=False))
+    fake = FakeRecorder(eye, workdir / "turned-recordings")
+    result = auto_calibrate.run(arm, eye, calibration, options, workdir / "turned-captures",
+                                recorder=fake, turn=2)
+    check("the turned sweep captured every pose", len(result.captures) == len(sweep.POSES))
+    check("the turned sweep still finds the tip in every pose",
+          all(d.offset_px < options.detect.max_offset_px for d in result.detections),
+          "worst %.0f px" % max(d.offset_px for d in result.detections))
+    rig = result.fit.rig
+    rotation_error = extrinsics.rotation_deg(rig.T_base_cam[:3, :3] @ T_true[:3, :3].T)
+    position_error = float(np.linalg.norm(rig.T_base_cam[:3, 3] - T_true[:3, 3]))
+    check("the turned-stream fit lands within 4 deg", rotation_error < 4.0,
+          "%.3f deg" % rotation_error)
+    check("the turned-stream fit lands within 80 mm", position_error < 0.080,
+          "%.1f mm" % (1000 * position_error))
+
+    # The stills kept as evidence must be on the calibration grid too, not the
+    # delivered one: re-render the first pose and compare both orientations.
+    arm.q = np.asarray(sweep.POSES[0], dtype=float)
+    expected = upright.read()
+    still = cv2.imread(str(result.captures[0]))
+    upright_diff = float(np.mean(cv2.absdiff(still, expected)))
+    turned_diff = float(np.mean(cv2.absdiff(still, cv2.rotate(expected, cv2.ROTATE_180))))
+    check("the saved stills are upright, not as delivered",
+          still is not None and upright_diff < turned_diff,
+          "upright diff %.1f, turned diff %.1f" % (upright_diff, turned_diff))
+
+
 def test_auto_sweep(workdir: Path):
     print("\nautomatic sweep: one tap, then the arm moves itself")
     K, dist, T_true, _tip, _observations = synthetic_rig()
@@ -3963,6 +4148,17 @@ def test_sag_map(workdir: Path):
                           extra, atol=1e-12))
         check("the live path refuses a kp change",
               np.all(sweep.active_sag_extra(q_in, "50", live_dir) == 0.0))
+        # The plan path (§7.3b wiring): one compensator per plan -- model sag
+        # plus the keyed learned term, resolved once instead of per waypoint.
+        compensate = sweep.sag_compensator(sweep.KP_DEFAULT, live_dir)
+        check("the plan compensator applies model sag plus the keyed map",
+              np.allclose(compensate(q_in), sweep.aim(q_in, kp, extra_sag=extra),
+                          atol=1e-12))
+        check("the plan compensator is model-only outside the envelope",
+              np.allclose(compensate(q_out), sweep.aim(q_out, kp), atol=1e-12))
+        check("the plan compensator is model-only with no calib dir",
+              np.allclose(sweep.sag_compensator(sweep.KP_DEFAULT, "")(q_in),
+                          sweep.aim(q_in, kp), atol=1e-12))
         rig_file.write_text("{torn", encoding="utf-8")
         check("a torn rig file means no map, never an exception",
               np.all(sweep.active_sag_extra(q_in, sweep.KP_DEFAULT, live_dir) == 0.0))
@@ -4314,6 +4510,10 @@ def main(argv=None):
     test_rotation(workdir, geometry)
     test_fixed_rig(workdir)
     test_base_marker()
+    test_marker_still_commit_flag(workdir)
+    test_calib_dir_scanners(workdir)
+    test_hold_detection_gappy_log(workdir)
+    test_auto_sweep_turned_stream(workdir)
     test_auto_sweep(workdir)
     test_calibrate_api(workdir)
     test_marker_rig(workdir)

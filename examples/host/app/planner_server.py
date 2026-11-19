@@ -261,6 +261,11 @@ def plan_targets(body):
 
     options = request_options(body)
     options.tip_m = request_tip_offset(body)
+    # The same sag policy as /move (§7.3b): model compensation at the gains the
+    # trajectory will be played at, plus the learned residual where a keyed map
+    # exists for the active rig.
+    options.kp_spec = str(body.get("kp") or KP)
+    options.calib_dir = str(CALIB_DIR)
 
     started = time.time()
     try:

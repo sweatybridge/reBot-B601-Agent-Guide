@@ -117,6 +117,31 @@ class Options:
     urdf: str = ""
     quiet: bool = False
     extra: dict = field(default_factory=dict)
+    # Sag compensation context (§7.3b): the gains the trajectory will be played
+    # at, and where the keyed learned map lives. Empty calib_dir = model only.
+    kp_spec: str = sweep.KP_DEFAULT
+    calib_dir: str = ""
+
+
+def compensate_waypoints(waypoints, options, model, n_arm, lower, upper):
+    """The emission pass: command the sag offset on every waypoint (§7.3b).
+
+    The controller has no integral term, so a loaded joint rests tau_g/kp below
+    its command; the learned residual applies where a keyed map exists for these
+    gains. Kinematic state stays uncompensated -- compensating at emission keeps
+    holds and gripper legs consistent without double-compensating the poses that
+    feed back into later legs. tau is recomputed at the command, and the command
+    is clipped to the joint limits the edge will re-check.
+    """
+    compensate = sweep.sag_compensator(options.kp_spec, options.calib_dir)
+    out = []
+    for wp in waypoints:
+        cmd = np.clip(compensate(wp["q"][:n_arm]), lower[:n_arm], upper[:n_arm])
+        gravity = compute_generalized_gravity(model=model,
+                                              q=pad_q_for_model(model, cmd, n_arm))
+        out.append(traj.waypoint(wp["t"], list(cmd) + [float(wp["q"][n_arm])],
+                                 [float(v) for v in gravity[:n_arm]] + [0.0]))
+    return out
 
 
 def ease(x):
@@ -466,6 +491,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
                  "lift %.0f mm%s" % (options.approach * 1000, point[0], point[1], point[2],
                                      options.grasp_q, options.lift * 1000,
                                      "" if options.no_return else ", return and open"))
+    waypoints = compensate_waypoints(waypoints, options, model, n_arm, lower, upper)
     payload = traj.build(
         waypoints, options.hz,
         [[float(lo), float(hi)] for lo, hi in zip(lower, upper)] + [[-0.1, 5.0]],
@@ -767,6 +793,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         "gripper": {"open": MOTOR7_OPEN, "half": MOTOR7_HALF,
                     "closed": MOTOR7_CLOSED},
     }
+    waypoints = compensate_waypoints(waypoints, options, model, n_arm, lower, upper)
     payload = traj.build(
         waypoints, options.hz,
         [[float(lo), float(hi)] for lo, hi in zip(lower, upper)] + [[-0.1, 5.0]],

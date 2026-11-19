@@ -44,6 +44,7 @@ import numpy as np
 
 import extrinsics as ex
 import base_marker
+import locate_target
 import mediamtx
 import rebot_ik
 import sweep
@@ -794,7 +795,7 @@ def _tick_progress(note, seconds, stop):
 
 
 def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="fixed",
-        progress=None, poses=None, seed_T=None) -> RunResult:
+        progress=None, poses=None, seed_T=None, turn=0) -> RunResult:
     """The whole sweep: record, move, pick the frames, detect, fit twice.
 
     `recorder` is the media server's recorder (`mediamtx.Recorder`): it is asked
@@ -811,6 +812,11 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
     detection from a known rig instead of a tap/marker bootstrap -- the climb
     refines a rig it already has, and re-searching the seed family would only
     add a way to fail.
+
+    `turn` is the stream's quarter-turn correction (`locate_target.turn_back`):
+    the recorder writes the stream as delivered, while the caller's probe and
+    `calibration` are already upright, so the extracted frames need the same
+    correction before anything measures them with `K`.
     """
     def note(pose, phase):
         if progress is None:
@@ -914,6 +920,14 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
     frames = [item["image"] for item in picked]
     poses = [np.asarray(item["q"], dtype=float) for item in picked]
     captures = [item["path"] for item in picked]
+
+    if turn:
+        # The recording is the raw stream; the probe was turned upright by the
+        # caller. Turn the picked frames (and the stills kept as evidence) onto
+        # the same grid, or the intrinsics measure an image they do not describe.
+        frames = [locate_target.rotate_image(frame, turn) for frame in frames]
+        for frame, path in zip(frames, captures):
+            cv2.imwrite(str(path), frame)
 
     size = (frames[0].shape[1], frames[0].shape[0])
     if any((frame.shape[1], frame.shape[0]) != size for frame in frames):

@@ -84,9 +84,11 @@ def display(path):
 
 
 def default_calib(folder):
-    """The newest intrinsics file, never the rig itself."""
+    """The newest intrinsics file, never the rig or the learned maps."""
     candidates = sorted(Path(folder).glob("*.json"))
-    candidates = [p for p in candidates if not p.name.startswith(("extrinsics-", "witness-"))]
+    candidates = [p for p in candidates
+                  if not p.name.startswith(("extrinsics-", "witness-", "sag-",
+                                            "accuracy-map"))]
     return candidates[-1] if candidates else None
 
 

@@ -40,9 +40,16 @@ CMD_TOL = 1e-9               # waypoints repeat a hold's command exactly
 
 
 def _same_cmd(a, b):
-    if a is None or b is None or len(a) != len(b):
+    """Whether two commands hold the same arm pose.
+
+    Only joints 1-6 define a hold: the gripper (motor 7) actuates right through
+    a marker hold -- that is the grasp cycle, not motion -- so comparing all
+    seven would find no holds at all in a pick sequence. Short lists (arm-only
+    logs) compare in full.
+    """
+    if a is None or b is None or len(a) != len(b) or not a:
         return False
-    return all(abs(float(x) - float(y)) <= CMD_TOL for x, y in zip(a, b))
+    return all(abs(float(x) - float(y)) <= CMD_TOL for x, y in zip(a[:6], b[:6]))
 
 
 def hold_windows(waypoints, min_s=HOLD_MIN_S):
