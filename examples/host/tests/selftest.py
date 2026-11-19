@@ -3827,16 +3827,31 @@ def test_marker_rig(workdir: Path):
 
     def verdicts():
         good = auto_calibrate.verify_marker(
-            {"rms_px": 0.7, "side_px": 60.0, "grazing_deg": 40.0, "id": 0})
+            {"rms_px": 0.7, "side_px": 90.0, "grazing_deg": 40.0, "id": 0})
         tiny = auto_calibrate.verify_marker(
             {"rms_px": 0.7, "side_px": 10.0, "grazing_deg": 40.0, "id": 0})
         edge = auto_calibrate.verify_marker(
-            {"rms_px": 0.7, "side_px": 60.0, "grazing_deg": 85.0, "id": 0})
+            {"rms_px": 0.7, "side_px": 90.0, "grazing_deg": 85.0, "id": 0})
+        # 33 px is where the mirror branch was measured to win: the tag detects,
+        # solves and reprojects at 0.36 px, and the camera still comes out 2.5 m
+        # away on the wrong side of the base plane. A clean solve is not evidence
+        # the branch is right, so the size gate has to carry that weight.
+        ambiguous = auto_calibrate.verify_marker(
+            {"rms_px": 0.2, "side_px": 33.0, "grazing_deg": 46.0, "id": 0})
         check("a readable tag is enough for a marker rig", good["ok"])
         check("a tiny tag is refused", not tiny["ok"]
               and "px across" in " ".join(tiny["reasons"]))
         check("a nearly edge-on tag is refused", not edge["ok"]
               and "edge-on" in " ".join(edge["reasons"]))
+        check("a mirror-ambiguous tag is refused despite solving cleanly",
+              not ambiguous["ok"] and "two PnP solutions" in " ".join(ambiguous["reasons"]),
+              " ".join(ambiguous["reasons"])[:90])
+        check("the size gate sits at or above the measured crossover",
+              auto_calibrate.MARKER_MIN_SIDE_PX >= 64.0
+              and auto_calibrate.verify_marker(
+                  {"rms_px": 0.2, "side_px": auto_calibrate.MARKER_MIN_SIDE_PX,
+                   "grazing_deg": 46.0, "id": 0})["ok"],
+              "%.0f px" % auto_calibrate.MARKER_MIN_SIDE_PX)
 
     verdicts()
 
@@ -4033,13 +4048,14 @@ def test_identify_gate(workdir: Path):
     # ---- §7.3a averaging repeated PnP estimates ----------------------------
     at = np.array([0.02, 0.01, 0.001])
     yaw_deg = -81.0                      # the tag's face turned toward the camera
-    # 8 cm, not the 4 cm standard: a planar tag solves to two mirror branches
+    # 12 cm, not the 4 cm standard: a planar tag solves to two mirror branches
     # when its angular size is small, and both reproject identically, so neither
-    # verify_marker nor a held-out capture can tell them apart. At 33 px across
-    # this synthetic camera picks the wrong branch and lands 2.5 m out; at 65 px
-    # it recovers to 38 mm. The bench's own tag solves at 94 px. The refit is
-    # tested in the well-conditioned regime it is meant for.
-    size_m = 0.08
+    # verify_marker nor a held-out capture can tell them apart. Measured at this
+    # grazing angle, a 33 px tag lands 2.5 m out on the wrong branch and a 65 px
+    # one recovers to 38 mm; MARKER_MIN_SIDE_PX now refuses the former. This
+    # renders at ~97 px, matching the bench's own 94 px solve, so the refit is
+    # tested in the regime it will actually run in and not on the gate's edge.
+    size_m = 0.12
     T_base_cam = np.asarray(T_true, dtype=float)
     T_base_marker = base_marker.base_from_marker(at, math.radians(yaw_deg), mode="vertical")
     T_cam_marker = np.linalg.inv(T_base_cam) @ T_base_marker
@@ -4365,10 +4381,9 @@ def test_identify_api(workdir: Path):
         "format": "rebot-camera-calib", "version": 1, "device": "synthetic",
         "image_size": [1600, 1200], "K": K.tolist(), "dist": dist.tolist(), "rms": 0.2,
     }), encoding="utf-8")
-    background = cv2.cvtColor(textured_frame(), cv2.COLOR_GRAY2BGR)
     at = np.array([0.02, 0.01, 0.001])
     yaw_deg = -81.0                       # the tag's face turned toward the camera
-    size_m = base_marker.SIZE_M
+    size_m = 0.12                         # ~97 px: clear of the mirror-branch gate
     marker_at = "%g,%g,%g,%g" % (at[0], at[1], at[2], yaw_deg)
     # Eight, not six: run_refit reads one probe frame to settle the calibration
     # and the stream turn before the session starts, so the route consumes one

@@ -62,10 +62,25 @@ class AutoError(Exception):
 CLOSE_PX = 40.0
 
 # The marker short path writes a rig from one still, so the only evidence it can
-# offer is the tag itself. A 4 cm tag at a metre is ~40 px across; these limits
-# accept that and refuse the two ways a PnP lies: a tiny tag and an edge-on one.
+# offer is the tag itself. These limits refuse the ways a PnP lies: a tag too
+# small, one seen edge-on, and one whose corners do not reproject.
+#
+# MIN_SIDE is a mirror-branch gate, not just "can we localise it". A planar
+# square has two PnP solutions that reproject IDENTICALLY, and which one wins is
+# decided by the perspective foreshortening signal -- the tag's angular size.
+# Measured on rendered tags at 40-53 deg grazing, the branch is a coin flip
+# below ~40 px: 17, 25 and 33 px tags each landed ~2.5 m out, on the wrong side
+# of the base plane, and which sizes failed varied with yaw. Across three yaws it
+# never flipped at >= 64 px, where the error fell to 12-40 mm. 64 px is also a
+# 4 cm tag at 1 m for a 1600 px focal -- the configuration the "~1% depth at 1 m"
+# tag prior is quoted for.
+#
+# Nothing downstream can catch the wrong branch: verify_marker's reprojection and
+# the refit's held-out capture both score the two solutions equally, because they
+# reproject equally. The size gate is the only defence, so it sits above the
+# measured crossover with margin rather than at the old "detectable" floor.
 MARKER_MAX_RMS_PX = 2.0
-MARKER_MIN_SIDE_PX = 16.0
+MARKER_MIN_SIDE_PX = 64.0
 MARKER_MAX_GRAZING_DEG = 75.0
 
 # The arm's lime covers in HSV, and how much of them has to be in frame before
@@ -1133,8 +1148,10 @@ def verify_marker(evidence):
         reasons.append("the tag's corners reproject %.1f px off the solve (limit %.0f)"
                        % (rms, MARKER_MAX_RMS_PX))
     if side < MARKER_MIN_SIDE_PX:
-        reasons.append("the tag is only %.0f px across in this still (limit %.0f): move the "
-                       "camera closer or print a larger tag" % (side, MARKER_MIN_SIDE_PX))
+        reasons.append("the tag is only %.0f px across in this still (limit %.0f): below that a "
+                       "planar tag has two PnP solutions that reproject identically and the "
+                       "wrong one can win, putting the camera metres out. Move the camera "
+                       "closer or print a larger tag" % (side, MARKER_MIN_SIDE_PX))
     if grazing > MARKER_MAX_GRAZING_DEG:
         reasons.append("the tag is seen at %.0f deg (limit %.0f): it is nearly edge-on"
                        % (grazing, MARKER_MAX_GRAZING_DEG))
