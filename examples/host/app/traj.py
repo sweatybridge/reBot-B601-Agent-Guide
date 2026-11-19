@@ -5,10 +5,16 @@
 `plan_to_target.py` runs in the Pinocchio container; this module is pure numpy so
 the same payload can be built and checked on the host, which is what
 `selftest.py` does. The checks mirror `examples/edge-rust/src/main.rs` (monotonic
-time, limits, the 0.5 rad step, `tau` on every waypoint or none) so a file that
-passes here is not going to be refused by `rebot-edge --check` for a schema
-reason. The player still re-checks everything: this is a convenience, not a
-replacement for the gate.
+time, limits, the 0.5 rad step, `tau` on every waypoint or none, `v` likewise)
+so a file that passes here is not going to be refused by `rebot-edge --check`
+for a schema reason. The player still re-checks everything: this is a
+convenience, not a replacement for the gate.
+
+`build` also derives the per-waypoint velocity feedforward `v` from the q/t
+series (central difference, one-sided at the ends). The MIT frame's kd term
+damps toward the commanded velocity: with v=0 it brakes the motion itself and
+the arm pulses at the waypoint rate. Deriving it here means every producer --
+joint moves, sequences, Cartesian plans -- carries it, with no per-caller opt-in.
 """
 
 from __future__ import annotations
@@ -41,6 +47,35 @@ def build(waypoints, control_hz, limits, steps, extra=None, hold_start=None, hol
         if point.get("tau") is not None:
             entry["tau"] = [float(v) for v in point["tau"]]
         cleaned.append(entry)
+
+    # Velocity feedforward, derived once for every producer: central difference
+    # inside the series, one-sided at the ends. For a cosine-eased leg this is
+    # the analytic derivative to O(period^2); for an IK leg it is the only honest
+    # estimate. Holds come out exactly zero. A repeated timestamp (degenerate,
+    # still schema-legal) gets zero rather than a division by zero.
+    if len(cleaned) >= 2:
+        for index, entry in enumerate(cleaned):
+            if index == 0:
+                ahead, behind = cleaned[1], entry
+            elif index == len(cleaned) - 1:
+                ahead, behind = entry, cleaned[-2]
+            else:
+                ahead, behind = cleaned[index + 1], cleaned[index - 1]
+            dt = ahead["t"] - behind["t"]
+            # A sample identical to either neighbour is at rest at that instant
+            # (the end of a cosine leg, every hold): the straddling difference
+            # would otherwise smear half a tick of motion into the hold.
+            q = np.asarray(entry["q"])
+            at_rest = any(
+                float(np.max(np.abs(q - np.asarray(other["q"])))) <= 1e-9
+                for other in (cleaned[index - 1] if index > 0 else None,
+                              cleaned[index + 1] if index + 1 < len(cleaned) else None)
+                if other is not None)
+            if dt <= 1e-9 or at_rest:
+                entry["v"] = [0.0] * len(entry["q"])
+            else:
+                entry["v"] = [round((a - b) / dt, 6)
+                              for a, b in zip(ahead["q"], behind["q"])]
 
     payload = {
         "format": FORMAT,
@@ -76,7 +111,9 @@ def joint_move(q_from, q_to, seconds, control_hz=30.0, hold_s=0.4, limits=None, 
     Cartesian plan: joint interpolation cannot fail to find a solution, cannot
     pass through a singularity, and the hold at the end is what makes a capture
     land on a still arm. No `tau` -- the player accepts a file without it, and a
-    slow move at the vendor gains does not need gravity feedforward.
+    slow move at the vendor gains does not need gravity feedforward. `build`
+    still derives the velocity feedforward `v`, so the kd term does not brake
+    the move itself.
     """
     q_from = np.asarray(q_from, dtype=float).reshape(-1)
     q_to = np.asarray(q_to, dtype=float).reshape(-1)
@@ -166,6 +203,9 @@ def validate(payload):
     has_tau = [point.get("tau") is not None for point in waypoints]
     if any(has_tau) and not all(has_tau):
         raise ValueError("'tau' must be on every waypoint or none")
+    has_v = [point.get("v") is not None for point in waypoints]
+    if any(has_v) and not all(has_v):
+        raise ValueError("'v' must be on every waypoint or none")
 
     times = []
     for index, point in enumerate(waypoints):
@@ -177,6 +217,12 @@ def validate(payload):
         if point.get("tau") is not None and len(point["tau"]) != len(ids):
             raise ValueError("waypoint %d has %d tau values for %d motors"
                              % (index, len(point["tau"]), len(ids)))
+        if point.get("v") is not None:
+            if len(point["v"]) != len(ids):
+                raise ValueError("waypoint %d has %d v values for %d motors"
+                                 % (index, len(point["v"]), len(ids)))
+            if not np.all(np.isfinite(point["v"])):
+                raise ValueError("waypoint %d has a non-finite velocity" % index)
         times.append(float(point["t"]))
     if not all(np.isfinite(times)):
         raise ValueError("a waypoint time is not finite")
@@ -209,11 +255,27 @@ def validate(payload):
     if not math.isfinite(hz):
         raise ValueError("control_hz is not finite")
 
+    # The velocity must agree with the step gate: the fastest motion 0.5 rad
+    # per waypoint permits at this rate is MAX_JOINT_STEP * hz (the player
+    # clamps hz to [MIN_HZ, MAX_HZ] first, so mirror that). A v that outruns
+    # the q series is corrupt, and the MIT frame would silently clip it.
+    # The 0.1% slack absorbs the six-decimal rounding of waypoint times.
+    if any(has_v):
+        ceiling = MAX_JOINT_STEP * max(MIN_HZ, min(MAX_HZ, hz)) * 1.001 + 1e-6
+        for index, point in enumerate(waypoints):
+            for joint, value in enumerate(point["v"]):
+                if abs(value) > ceiling:
+                    raise ValueError("joint %d at waypoint %d commands %+.3f rad/s, above the "
+                                     "%.3f rad/s the step gate permits at %.0f Hz"
+                                     % (ids[joint], index, value, ceiling, hz))
+
     return {
         "waypoints": len(waypoints),
         "duration_s": times[-1] - times[0],
         "peak_tau": max((abs(v) for point in waypoints if point.get("tau")
                          for v in point["tau"]), default=0.0),
+        "peak_v": max((abs(v) for point in waypoints if point.get("v")
+                       for v in point["v"]), default=0.0),
         "max_step_rad": max((max(abs(x - y) for x, y in zip(a["q"], b["q"]))
                              for a, b in zip(waypoints, waypoints[1:])), default=0.0),
     }
