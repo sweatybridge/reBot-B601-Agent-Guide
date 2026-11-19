@@ -3013,9 +3013,11 @@ def build_app(args) -> web.Application:
                          or os.environ.get("REBOT_TIP_MM", "35")) / 1000.0
     app["hover_m"] = float(getattr(args, "hover_m", 0.0)
                            or os.environ.get("REBOT_HOVER_M", "0.10"))
-    # The lowest tip z the planner will accept. It defaults to the default
-    # hover height, so a tap can never plan closer to the table than that.
-    app["min_z"] = app["hover_m"]
+    # The lowest tip z the planner will accept: the worktop plane plus the
+    # hover height above it -- the same sum the page's fallback and
+    # .env.example use -- so a tap can never plan closer to the table than the
+    # hover height, whatever plane the worktop sits at.
+    app["min_z"] = float(args.plane_z) + app["hover_m"]
     app["calibrating"] = False
     app["last_calibration"] = None
     app["progress"] = None
