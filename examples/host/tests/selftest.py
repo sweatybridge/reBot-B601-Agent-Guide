@@ -3827,30 +3827,38 @@ def test_marker_rig(workdir: Path):
 
     def verdicts():
         good = auto_calibrate.verify_marker(
-            {"rms_px": 0.7, "side_px": 90.0, "grazing_deg": 40.0, "id": 0})
+            {"rms_px": 0.7, "side_px": 60.0, "grazing_deg": 40.0, "id": 0})
         tiny = auto_calibrate.verify_marker(
             {"rms_px": 0.7, "side_px": 10.0, "grazing_deg": 40.0, "id": 0})
         edge = auto_calibrate.verify_marker(
-            {"rms_px": 0.7, "side_px": 90.0, "grazing_deg": 85.0, "id": 0})
-        # 33 px is where the mirror branch was measured to win: the tag detects,
-        # solves and reprojects at 0.36 px, and the camera still comes out 2.5 m
-        # away on the wrong side of the base plane. A clean solve is not evidence
-        # the branch is right, so the size gate has to carry that weight.
-        ambiguous = auto_calibrate.verify_marker(
-            {"rms_px": 0.2, "side_px": 33.0, "grazing_deg": 46.0, "id": 0})
+            {"rms_px": 0.7, "side_px": 60.0, "grazing_deg": 85.0, "id": 0})
+        # The mirror branch. This solve reprojects the tag at 0.04 px, is 78 px
+        # across and only 21 deg from face-on -- it clears every pixel-space gate
+        # comfortably, and it is still 885 mm away from the truth, because a
+        # planar tag has two PnP solutions that reproject identically. Measured
+        # over 40 rendered solves, angular size does not separate them (a 77.7 px
+        # tag took the wrong branch, a 13.2 px tag the right one); where the
+        # camera lands does, perfectly.
+        mirror = auto_calibrate.verify_marker(
+            {"rms_px": 0.04, "side_px": 78.0, "grazing_deg": 21.0, "id": 0},
+            camera_at=(0.20, -1.15, -0.435))
         check("a readable tag is enough for a marker rig", good["ok"])
         check("a tiny tag is refused", not tiny["ok"]
               and "px across" in " ".join(tiny["reasons"]))
         check("a nearly edge-on tag is refused", not edge["ok"]
               and "edge-on" in " ".join(edge["reasons"]))
-        check("a mirror-ambiguous tag is refused despite solving cleanly",
-              not ambiguous["ok"] and "two PnP solutions" in " ".join(ambiguous["reasons"]),
-              " ".join(ambiguous["reasons"])[:90])
-        check("the size gate sits at or above the measured crossover",
-              auto_calibrate.MARKER_MIN_SIDE_PX >= 64.0
-              and auto_calibrate.verify_marker(
-                  {"rms_px": 0.2, "side_px": auto_calibrate.MARKER_MIN_SIDE_PX,
-                   "grazing_deg": 46.0, "id": 0})["ok"],
+        check("a clean solve on the mirror branch is refused",
+              not mirror["ok"] and "mirror branch" in " ".join(mirror["reasons"]),
+              " ".join(mirror["reasons"])[:90])
+        check("the same solve above the base plane is accepted",
+              auto_calibrate.verify_marker(
+                  {"rms_px": 0.04, "side_px": 78.0, "grazing_deg": 21.0, "id": 0},
+                  camera_at=(0.20, -1.15, 0.470))["ok"])
+        check("the verdict reports the camera height it judged the branch on",
+              mirror["marker"]["camera_z_m"] == -0.435
+              and good["marker"]["camera_z_m"] is None)
+        check("the size gate stays a localisation gate, not a branch gate",
+              auto_calibrate.MARKER_MIN_SIDE_PX == 16.0,
               "%.0f px" % auto_calibrate.MARKER_MIN_SIDE_PX)
 
     verdicts()
@@ -4048,14 +4056,15 @@ def test_identify_gate(workdir: Path):
     # ---- §7.3a averaging repeated PnP estimates ----------------------------
     at = np.array([0.02, 0.01, 0.001])
     yaw_deg = -81.0                      # the tag's face turned toward the camera
-    # 12 cm, not the 4 cm standard: a planar tag solves to two mirror branches
-    # when its angular size is small, and both reproject identically, so neither
-    # verify_marker nor a held-out capture can tell them apart. Measured at this
-    # grazing angle, a 33 px tag lands 2.5 m out on the wrong branch and a 65 px
-    # one recovers to 38 mm; MARKER_MIN_SIDE_PX now refuses the former. This
-    # renders at ~97 px, matching the bench's own 94 px solve, so the refit is
-    # tested in the regime it will actually run in and not on the gate's edge.
+    # 12 cm, not the 4 cm standard. A planar tag has two PnP solutions that
+    # reproject identically; which one wins is not a function of angular size (a
+    # 77.7 px tag was measured on the wrong branch, a 13.2 px tag on the right
+    # one), but at this pose and grazing the 4 cm tag does land on the wrong
+    # branch, 2.5 m out. verify_marker now refuses that on the solved camera
+    # height, so the refit's success path renders a tag that solves correctly and
+    # the mirror case below is asserted to be refused rather than averaged.
     size_m = 0.12
+    mirror_size_m = base_marker.SIZE_M
     T_base_cam = np.asarray(T_true, dtype=float)
     T_base_marker = base_marker.base_from_marker(at, math.radians(yaw_deg), mode="vertical")
     T_cam_marker = np.linalg.inv(T_base_cam) @ T_base_marker
@@ -4167,6 +4176,45 @@ def test_identify_gate(workdir: Path):
     except identify.IdentifyError as error:
         check("solves that disagree are not averaged into a rig", "disagree" in str(error),
               str(error)[:90])
+
+    # The mirror branch, end to end. At this pose and grazing the 4 cm standard
+    # tag solves to the branch that puts the camera 1.2 m BELOW the base plane and
+    # 2.5 m from the truth, while reprojecting the tag's corners at 0.36 px. No
+    # pixel-space gate can see it; the solved camera height can.
+    mirror_marker = {"at": [float(v) for v in at], "yaw": math.radians(yaw_deg),
+                     "size_m": mirror_size_m}
+    mirror_stills = [render_marker(np.full((1200, 1600, 3), 210, np.uint8), T_base_cam,
+                                   K, dist, at, yaw_deg, mirror_size_m) for _ in range(6)]
+    solved = auto_calibrate.solve_marker(mirror_stills[0], calib, mirror_marker, plane_z=0.0)
+    mirror_z = float(np.asarray(solved.rig.T_base_cam, dtype=float)[:3, 3][2])
+    check("the mirror-branch solve really does put the camera underground",
+          mirror_z < 0.0 and not solved.verdict["ok"]
+          and "mirror branch" in " ".join(solved.verdict["reasons"]),
+          "camera z %+.3f m; %s" % (mirror_z, " ".join(solved.verdict["reasons"])[:70]))
+    check("the mirror-branch gate reports the height it judged on",
+          solved.verdict["marker"]["camera_z_m"] is not None
+          and solved.verdict["marker"]["camera_z_m"] < 0.0)
+    check("the mirror solve is otherwise clean, so only the branch gate catches it",
+          solved.evidence["rms_px"] < auto_calibrate.MARKER_MAX_RMS_PX
+          and solved.evidence["side_px"] >= auto_calibrate.MARKER_MIN_SIDE_PX
+          and solved.evidence["grazing_deg"] <= auto_calibrate.MARKER_MAX_GRAZING_DEG,
+          "rms %.2f px, %.0f px across, %.0f deg"
+          % (solved.evidence["rms_px"], solved.evidence["side_px"],
+             solved.evidence["grazing_deg"]))
+    kept = Path(report["written"]).read_bytes()
+    try:
+        identify.refit_session(TagEye(mirror_stills), calib, mirror_marker, calib_dir,
+                               captures=5, holdout=1, settle_s=0.0)
+        check("a refit of mirror-branch solves is refused", False)
+    except identify.IdentifyError as error:
+        check("a refit of mirror-branch solves is refused", "verify_marker" in str(error),
+              str(error)[:90])
+        check("a refused mirror-branch refit leaves the rig untouched",
+              Path(report["written"]).read_bytes() == kept)
+    mirror_gate = identify.rig_identifiability([solved.verdict] * 3)
+    check("the identifiability gate counts a mirror branch as refused, not usable",
+          mirror_gate["status"] == "refused" and not mirror_gate["usable"]
+          and len(mirror_gate["refused"]) == 3)
 
     # ---- §7.4 the tag prior, the grid, and the coverage poses --------------
     near = identify.tag_prior_mm(fit.rig, np.array([0.30, 0.0, 0.20]))
@@ -4383,7 +4431,7 @@ def test_identify_api(workdir: Path):
     }), encoding="utf-8")
     at = np.array([0.02, 0.01, 0.001])
     yaw_deg = -81.0                       # the tag's face turned toward the camera
-    size_m = 0.12                         # ~97 px: clear of the mirror-branch gate
+    size_m = 0.12                         # ~97 px: solves on the correct branch here
     marker_at = "%g,%g,%g,%g" % (at[0], at[1], at[2], yaw_deg)
     # Eight, not six: run_refit reads one probe frame to settle the calibration
     # and the stream turn before the session starts, so the route consumes one

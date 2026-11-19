@@ -63,25 +63,27 @@ CLOSE_PX = 40.0
 
 # The marker short path writes a rig from one still, so the only evidence it can
 # offer is the tag itself. These limits refuse the ways a PnP lies: a tag too
-# small, one seen edge-on, and one whose corners do not reproject.
+# small to localise, one seen edge-on, one whose corners do not reproject, and
+# one that solved to the mirror branch.
 #
-# MIN_SIDE is a mirror-branch gate, not just "can we localise it". A planar
-# square has two PnP solutions that reproject IDENTICALLY, and which one wins is
-# decided by the perspective foreshortening signal -- the tag's angular size.
-# Measured on rendered tags at 40-53 deg grazing, the branch is a coin flip
-# below ~40 px: 17, 25 and 33 px tags each landed ~2.5 m out, on the wrong side
-# of the base plane, and which sizes failed varied with yaw. Across three yaws it
-# never flipped at >= 64 px, where the error fell to 12-40 mm. 64 px is also a
-# 4 cm tag at 1 m for a 1600 px focal -- the configuration the "~1% depth at 1 m"
-# tag prior is quoted for.
+# The mirror branch is the dangerous one. A planar square has two PnP solutions
+# that reproject IDENTICALLY, so neither the rms gate nor a held-out capture can
+# separate them -- and `base_marker.solve`'s own "front" test passes both, since
+# it checks the tag's normal in the camera frame. Measured over 40 rendered
+# solves spanning 13-103 px and 21-47 deg grazing, the branch is not a function
+# of angular size at all: a 77.7 px tag solved to the wrong branch and a 13.2 px
+# tag to the right one. What separates them perfectly is where the camera lands:
+# all 10 wrong-branch solves put it 0.29-1.18 m BELOW the base plane, all 30
+# right-branch solves 0.39-1.24 m above it. MIN_CAMERA_Z is that boundary.
 #
-# Nothing downstream can catch the wrong branch: verify_marker's reprojection and
-# the refit's held-out capture both score the two solutions equally, because they
-# reproject equally. The size gate is the only defence, so it sits above the
-# measured crossover with margin rather than at the old "detectable" floor.
+# MIN_SIDE is therefore only a localisation gate -- a tag too small to place
+# precisely -- and stays at the spec's value. It must not be raised to chase the
+# mirror branch: it does not catch it, and at 64 px it refuses the bench's own
+# 31-45 px tag, which solves on the correct branch at 0.04-0.13 px rms.
 MARKER_MAX_RMS_PX = 2.0
-MARKER_MIN_SIDE_PX = 64.0
+MARKER_MIN_SIDE_PX = 16.0
 MARKER_MAX_GRAZING_DEG = 75.0
+MARKER_MIN_CAMERA_Z_M = 0.0
 
 # The arm's lime covers in HSV, and how much of them has to be in frame before
 # the colour detector is worth believing (a parked arm can be mostly hidden).
@@ -1133,12 +1135,19 @@ class MarkerRun:
     warnings: list = field(default_factory=list)
 
 
-def verify_marker(evidence):
+def verify_marker(evidence, camera_at=None):
     """Is this tag solve good enough to become a rig? The caller decides.
 
     The sweep can cross-check the camera against the arm; a tag solve cannot, so
     the gate is the tag's own geometry: a PnP that does not reproject, a tag too
     small to localise, or one seen edge-on is refused rather than written.
+
+    `camera_at` is the solved camera centre in the base frame, and it carries the
+    one check that actually separates the planar PnP's two mirror branches. Both
+    reproject the tag's corners identically, so no pixel-space gate can tell them
+    apart -- but the wrong branch puts the camera below the base plane, which no
+    real mount does. Callers that only have the evidence dict still get every
+    other gate; they just cannot be told the branch is wrong.
     """
     rms = float(evidence.get("rms_px", float("inf")))
     side = float(evidence.get("side_px", 0.0))
@@ -1148,10 +1157,14 @@ def verify_marker(evidence):
         reasons.append("the tag's corners reproject %.1f px off the solve (limit %.0f)"
                        % (rms, MARKER_MAX_RMS_PX))
     if side < MARKER_MIN_SIDE_PX:
-        reasons.append("the tag is only %.0f px across in this still (limit %.0f): below that a "
-                       "planar tag has two PnP solutions that reproject identically and the "
-                       "wrong one can win, putting the camera metres out. Move the camera "
-                       "closer or print a larger tag" % (side, MARKER_MIN_SIDE_PX))
+        reasons.append("the tag is only %.0f px across in this still (limit %.0f): move the "
+                       "camera closer or print a larger tag" % (side, MARKER_MIN_SIDE_PX))
+    if camera_at is not None and float(np.asarray(camera_at, dtype=float).reshape(3)[2]) \
+            < MARKER_MIN_CAMERA_Z_M:
+        reasons.append("the tag solve put the camera %.3f m BELOW the base plane: that is the "
+                       "planar PnP's mirror branch, which reprojects the tag identically to the "
+                       "real one. Re-shoot with the tag larger or more face-on"
+                       % float(np.asarray(camera_at, dtype=float).reshape(3)[2]))
     if grazing > MARKER_MAX_GRAZING_DEG:
         reasons.append("the tag is seen at %.0f deg (limit %.0f): it is nearly edge-on"
                        % (grazing, MARKER_MAX_GRAZING_DEG))
@@ -1168,6 +1181,8 @@ def verify_marker(evidence):
             "id": evidence.get("id"),
             "side_px": round(side, 1),
             "grazing_deg": round(grazing, 1),
+            "camera_z_m": (None if camera_at is None else
+                           round(float(np.asarray(camera_at, dtype=float).reshape(3)[2]), 4)),
         },
     }
 
@@ -1192,7 +1207,7 @@ def solve_marker(frame, calibration, marker, plane_z=0.0, mount="fixed"):
                    else base_marker.MARKER_ID),
         # The standard placement is upright on the side of the column.
         mode="vertical")
-    verdict = verify_marker(evidence)
+    verdict = verify_marker(evidence, camera_at=matrix[:3, 3])
     size = (int(frame.shape[1]), int(frame.shape[0]))
     rig = ex.Rig(
         T_base_cam=matrix,
