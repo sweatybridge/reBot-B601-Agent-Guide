@@ -86,17 +86,17 @@ are intentionally not part of the phone client.
 Requirements: macOS with Xcode 15+ and an iOS 16+ device with an A9+ chip (the
 camera, ARKit and WebRTC do not work in the simulator).
 
-From a fresh clone, generate the Xcode project and the test fixtures once:
+From a fresh clone of the guide repo, generate the Xcode project and the test
+fixtures once (the web JS they are generated from lives in the same repo, at
+`examples/host/web`):
 
 ```bash
+cd examples/mobile
 brew install xcodegen node
 xcodegen generate
-git clone --depth 1 https://github.com/sweatybridge/reBot-B601-Agent-Guide /tmp/guide
-node tools/gen_fixtures.js RebotCore/Tests/RebotCoreTests/Fixtures /tmp/guide
+node tools/gen_fixtures.js RebotCore/Tests/RebotCoreTests/Fixtures ../..
 open RebotCapture.xcodeproj
 ```
-
-(The release zip ships with the project and fixtures already generated.)
 
 1. Select your signing team for the `RebotCapture` target.
 2. Let Swift Package Manager resolve `WebRTC` (first fetch downloads a ~100 MB
@@ -223,7 +223,7 @@ to agree:
 Run them (macOS or Linux, no Xcode needed; generate fixtures first if absent):
 
 ```bash
-node tools/gen_fixtures.js RebotCore/Tests/RebotCoreTests/Fixtures /path/to/reBot-B601-Agent-Guide
+node tools/gen_fixtures.js RebotCore/Tests/RebotCoreTests/Fixtures ../..
 cd RebotCore && swift test
 ```
 
