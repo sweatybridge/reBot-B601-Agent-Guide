@@ -1,0 +1,11 @@
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+Package.resolved
+# Generated: xcodegen generate (CI does this too)
+RebotCapture.xcodeproj/
+RebotCapture/Info.plist
+# Generated: node tools/gen_fixtures.js <dir> <guide-repo>
+RebotCore/Tests/RebotCoreTests/Fixtures/
