@@ -1659,6 +1659,24 @@ def test_planner_offline(workdir: Path):
             check("a large start excursion is still refused", True)
         pose_q[0] = [0.0] * 7
 
+        # The mandatory startup peel: a /move from rest prepends the elbow lift
+        # (j3 +8 deg) so the arm breaks the j4-hinge-on-j2-casing contact before
+        # any wrist-driving leg. From a pose already off the stops, no extra leg.
+        peel_id = planner.new_id()
+        dry = planner.move_one({"q": list(sweep.POSES[0]), "hold": 2.0,
+                                "id": peel_id, "dry_run": True})
+        peel_wps = json.loads(
+            (planner.OUT_DIR / ("%s.json" % peel_id)).read_text(encoding="utf-8"))["waypoints"]
+        has_lift = any(0.12 <= w["q"][2] <= 0.25 for w in peel_wps)
+        check("a move from rest peels the elbow before the first pose",
+              dry["dry_run"] is True and dry["poses"] == 2 and has_lift)
+        pose_q[0] = [0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0]  # already off the stops
+        nopeel_id = planner.new_id()
+        dry2 = planner.move_one({"q": list(sweep.POSES[0]), "hold": 2.0,
+                                 "id": nopeel_id, "dry_run": True})
+        check("a move already off the stops adds no peel leg", dry2["poses"] == 1)
+        pose_q[0] = [0.0] * 7
+
         # An aborted playback still carries its log (§5.1): the host must
         # persist it before raising, or the fault evidence dies with the error
         # and the abort becomes undiagnosable.
@@ -3302,6 +3320,46 @@ def test_hold_detection_gappy_log(workdir: Path):
           str(chosen[0]))
 
 
+def test_unpark_peel(workdir: Path):
+    print("\nstartup peel: lift the elbow off the rest stops before driving the wrist")
+    rest = np.zeros(6)
+    lifted = sweep.unpark_pose(rest)
+    check("the peel lifts j3 by 8 deg from rest",
+          abs(lifted[2] - math.radians(sweep.UNPARK_J3_DEG)) < 1e-9)
+    check("the peel only changes j3",
+          np.allclose(np.delete(lifted, 2), np.delete(rest, 2)))
+    already = np.array([0.0, 0.5, 0.5, 0.0, 0.0, 0.0])
+    check("a pose already off the stops is unchanged",
+          np.allclose(sweep.unpark_pose(already), already))
+    check("the peel is clamped to j3's upper limit",
+          sweep.unpark_pose(rest)[2] <= rebot_ik.LIMITS[2, 1])
+
+    # The sweep matches holds to poses by nearest, so the extra peel hold window
+    # (j3 ~ 0.14, nowhere near a sweep pose) goes unclaimed and every pose still
+    # extracts. Pin that against a future switch to index-based matching.
+    pose = np.asarray(sweep.POSES[0], dtype=float)
+    peel_q = sweep.unpark_pose(np.zeros(6))
+    entries = []
+    t = 0.0
+
+    def hold(q, n=30):
+        nonlocal t
+        for _ in range(n):
+            entries.append({"i": len(entries), "t": t, "q": list(q)})
+            t += 1.0 / 15.0
+
+    hold(peel_q)                                   # the peel hold comes first
+    for k in range(1, 10):                         # transit to the pose
+        entries.append({"i": len(entries), "t": t,
+                        "q": list(peel_q + (pose - peel_q) * k / 10.0)})
+        t += 1.0 / 15.0
+    hold(pose)                                     # the measurement pose hold
+    chosen = sweep_video.select(entries, [pose])
+    check("the sweep ignores the peel hold and still finds the pose",
+          chosen[0].get("missed") is not True
+          and abs(chosen[0]["q"][2] - pose[2]) < 0.05, str(chosen[0]))
+
+
 def test_auto_sweep_turned_stream(workdir: Path):
     print("\nautomatic sweep: a turned stream is turned back before the fit")
     K, dist, T_true, _tip, _observations = synthetic_rig()
@@ -4902,6 +4960,7 @@ def main(argv=None):
     test_marker_still_commit_flag(workdir)
     test_calib_dir_scanners(workdir)
     test_hold_detection_gappy_log(workdir)
+    test_unpark_peel(workdir)
     test_auto_sweep_turned_stream(workdir)
     test_auto_sweep(workdir)
     test_calibrate_api(workdir)

@@ -864,7 +864,9 @@ def coverage_poses(current_q, map_doc, tip, seed=11, top_k=COVERAGE_MAX_POSES,
         pool.append(pose + rng.normal(0.0, 0.12, 6) * mask)
 
     tip = np.asarray(tip, dtype=float).reshape(3)
-    safe, previous = [], np.asarray(current_q, dtype=float).reshape(6)
+    # The gateway peels from rest before the first measurement leg, so the chain
+    # the poses must be safe along starts at the lifted pose, not the parked one.
+    safe, previous = [], sweep.unpark_pose(current_q)
     for pose in pool:
         if not sweep.pose_ok(pose) or not sweep.path_safe(previous, pose):
             continue
@@ -893,7 +895,7 @@ def coverage_poses(current_q, map_doc, tip, seed=11, top_k=COVERAGE_MAX_POSES,
 
     # Re-check the chain in score order: picking the best cells must not reorder
     # the legs into a path the capsule model never approved.
-    ordered, previous = [], np.asarray(current_q, dtype=float).reshape(6)
+    ordered, previous = [], sweep.unpark_pose(current_q)
     for entry in chosen:
         if not sweep.path_safe(previous, entry["q"]):
             continue
