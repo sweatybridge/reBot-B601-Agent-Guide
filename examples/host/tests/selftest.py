@@ -1553,9 +1553,11 @@ def test_planner_offline(workdir: Path):
     played = (200, {"ok": True, "executed": True, "output": "played",
                     "telemetry": telemetry})
 
+    pose_q = [[0.0] * 7]
+
     def fake_edge(method, path, body=None, timeout=30):
         if path == "/pose":
-            return 200, {"ids": [1, 2, 3, 4, 5, 6, 7], "q": [0.0] * 7}
+            return 200, {"ids": [1, 2, 3, 4, 5, 6, 7], "q": pose_q[0]}
         if path == "/health":
             return 200, {"can_up": True}
         if path.startswith("/play"):
@@ -1634,6 +1636,59 @@ def test_planner_offline(workdir: Path):
               and (planner.TELEMETRY_DIR / ("%s.json" % named)).is_file())
         check("an ordinary move still persists its trajectory",
               (planner.OUT_DIR / ("%s.json" % move_id)).is_file())
+
+        # A torque-off joint sagging a few mrad past its limit at park must not
+        # block every move: the start is clamped into the envelope (the edge's
+        # align leg ramps from the measured pose to it). A large excursion is a
+        # fault symptom, not sag, and is still refused.
+        sagged = [0.0] * 7
+        sagged[1] = -0.0022  # j2 rests just below its 0.0 lower limit
+        pose_q[0] = sagged
+        sag_id = planner.new_id()
+        dry = planner.move_one({"q": [0.0] * 6, "hold": 2.0, "id": sag_id, "dry_run": True})
+        sag_plan = json.loads(
+            (planner.OUT_DIR / ("%s.json" % sag_id)).read_text(encoding="utf-8"))
+        check("a small start sag is clamped into the envelope",
+              dry["dry_run"] is True
+              and sag_plan["waypoints"][0]["q"][1] >= 0.0)
+        pose_q[0] = [0.0, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0]  # 100 mrad: a fault, not sag
+        try:
+            planner.move_one({"q": [0.0] * 6, "hold": 2.0, "dry_run": True})
+            check("a large start excursion is still refused", False)
+        except planner.GatewayError:
+            check("a large start excursion is still refused", True)
+        pose_q[0] = [0.0] * 7
+
+        # An aborted playback still carries its log (§5.1): the host must
+        # persist it before raising, or the fault evidence dies with the error
+        # and the abort becomes undiagnosable.
+        played = (500, {"ok": False, "exit_code": 1,
+                        "error": "motor id 4 reported a fault frame: 1040000000000000",
+                        "output": "ABORTED at t=5.86s",
+                        "telemetry": dict(telemetry, abort={"t": 5.86, "reason": "fault"})})
+        abort_id = planner.new_id()
+        try:
+            planner.move_one({"q": [0.0] * 6, "hold": 2.0, "id": abort_id})
+            check("an aborted move raises", False)
+        except planner.GatewayError as error:
+            check("an aborted move raises with the edge's reason",
+                  "fault frame" in str(error))
+        abort_log = planner.TELEMETRY_DIR / ("%s.json" % abort_id)
+        check("an aborted move's telemetry is persisted, not discarded",
+              abort_log.is_file()
+              and json.loads(abort_log.read_text(encoding="utf-8"))["abort"]["t"] == 5.86)
+        abort_plan = planner.new_id()
+        (planner.OUT_DIR / ("%s.json" % abort_plan)).write_text(
+            json.dumps(trajectory), encoding="utf-8")
+        try:
+            planner.execute_one({"id": abort_plan})
+            check("an aborted execution raises", False)
+        except planner.GatewayError:
+            check("an aborted execution raises", True)
+        check("an aborted execution's telemetry is persisted too",
+              (planner.TELEMETRY_DIR / ("%s.json" % abort_plan)).is_file())
+        played = (200, {"ok": True, "executed": True, "output": "played",
+                        "telemetry": telemetry})
 
         # The HTTP surface: token-gated GET /telemetry/{id}, POST /fk.
         from http.server import ThreadingHTTPServer

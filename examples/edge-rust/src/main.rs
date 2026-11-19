@@ -916,17 +916,42 @@ impl CanBus {
     /// normally arrived by the next tick, and a missing joint keeps its cached
     /// value. No `poll(2)` wait is involved.
     fn poll_available(&self, ids: &[u8], models: &[Model]) -> Result<Vec<Option<State>>> {
+        self.poll_available_inner(ids, models, false)
+    }
+
+    /// Same drain, but a fault frame is reported and skipped instead of
+    /// aborting. Only the shutdown ramp uses this: a faulted motor may keep
+    /// emitting fault frames, and bailing on each one would strand the arm
+    /// wherever the playback stopped (§ module doc: every exit ramps home).
+    fn poll_available_tolerant(&self, ids: &[u8], models: &[Model]) -> Result<Vec<Option<State>>> {
+        self.poll_available_inner(ids, models, true)
+    }
+
+    fn poll_available_inner(
+        &self,
+        ids: &[u8],
+        models: &[Model],
+        tolerate_faults: bool,
+    ) -> Result<Vec<Option<State>>> {
         let mut found: Vec<Option<State>> = vec![None; ids.len()];
         for _ in 0..128 {
             let Some(frame) = self.recv_nowait()? else {
                 break;
             };
             if frame.comm() == COMM_FAULT_REPORT {
-                bail!(
-                    "motor id {} reported a fault frame: {}",
+                if !tolerate_faults {
+                    bail!(
+                        "motor id {} reported a fault frame: {}",
+                        frame.status_device(),
+                        hex(&frame.data)
+                    );
+                }
+                println!(
+                    "  fault frame during the return ramp: motor id {} {} (skipped)",
                     frame.status_device(),
                     hex(&frame.data)
                 );
+                continue;
             }
             if frame.comm() != COMM_OPERATION_STATUS && frame.comm() != COMM_ACTIVE_REPORT {
                 continue;
@@ -1016,6 +1041,12 @@ impl CanBus {
         self.reader
             .as_ref()
             .and_then(|reader| reader.telemetry.fault())
+    }
+
+    fn clear_reader_fault(&self) {
+        if let Some(reader) = &self.reader {
+            reader.telemetry.clear_fault();
+        }
     }
 
     /// Enable/disable Type-24 active reporting. Reports arrive as Type-24 frames
@@ -1112,6 +1143,16 @@ impl Telemetry {
         }
         self.fault.lock().ok().and_then(|fault| fault.clone())
     }
+
+    /// Drop the latched fault. Only the shutdown ramp may call this: the
+    /// interlock exists to stop trajectory playback, not to strand the arm
+    /// mid-workspace. A fresh fault frame re-latches immediately.
+    fn clear_fault(&self) {
+        if let Ok(mut fault) = self.fault.lock() {
+            *fault = None;
+        }
+        self.fault_flag.store(false, Ordering::SeqCst);
+    }
 }
 
 fn reader_loop(bus: CanBus, telemetry: Arc<Telemetry>, stop: Arc<AtomicBool>) {
@@ -1155,6 +1196,12 @@ trait Transport {
         self.poll_states(ids, models, Duration::ZERO)
     }
 
+    /// Shutdown-ramp variant: fault frames are skipped, not fatal. Test doubles
+    /// without fault frames can keep the strict path.
+    fn poll_available_tolerant(&self, ids: &[u8], models: &[Model]) -> Result<Vec<Option<State>>> {
+        self.poll_available(ids, models)
+    }
+
     /// Start a background receiver. The real bus returns true; test doubles
     /// keep the synchronous path and return false.
     fn start_reader(&mut self, _ids: &[u8], _models: &[Model]) -> Result<bool> {
@@ -1170,6 +1217,8 @@ trait Transport {
     fn reader_fault(&self) -> Option<String> {
         None
     }
+
+    fn clear_reader_fault(&self) {}
 
     fn set_active_report(&mut self, _id: u8, _enabled: bool) -> Result<()> {
         Ok(())
@@ -1206,6 +1255,10 @@ impl Transport for CanBus {
         CanBus::poll_available(self, ids, models)
     }
 
+    fn poll_available_tolerant(&self, ids: &[u8], models: &[Model]) -> Result<Vec<Option<State>>> {
+        CanBus::poll_available_tolerant(self, ids, models)
+    }
+
     fn start_reader(&mut self, ids: &[u8], models: &[Model]) -> Result<bool> {
         CanBus::start_reader(self, ids, models)?;
         Ok(true)
@@ -1221,6 +1274,10 @@ impl Transport for CanBus {
 
     fn reader_fault(&self) -> Option<String> {
         CanBus::reader_fault(self)
+    }
+
+    fn clear_reader_fault(&self) {
+        CanBus::clear_reader_fault(self)
     }
 
     fn set_active_report(&mut self, id: u8, enabled: bool) -> Result<()> {
@@ -1410,6 +1467,7 @@ impl<T: Transport> Arm<T> {
         label: &str,
         track: bool,
         honor_interrupt: bool,
+        tolerate_faults: bool,
     ) -> Result<()> {
         let begin: Vec<f64> = self.last[..targets.len()].to_vec();
         let t0 = Instant::now();
@@ -1430,12 +1488,12 @@ impl<T: Transport> Arm<T> {
                 break;
             }
             if !self.telemetry_active {
-                for (joint, state) in self
-                    .bus
-                    .poll_available(&self.ids, &self.models)?
-                    .iter()
-                    .enumerate()
-                {
+                let states = if tolerate_faults {
+                    self.bus.poll_available_tolerant(&self.ids, &self.models)?
+                } else {
+                    self.bus.poll_available(&self.ids, &self.models)?
+                };
+                for (joint, state) in states.iter().enumerate() {
                     if let Some(state) = state {
                         latest[joint] = Some(*state);
                     }
@@ -1502,6 +1560,16 @@ impl<T: Transport> Arm<T> {
         if !self.enabled {
             return Ok(());
         }
+        // A fault abort leaves the reader's fault latched, and command() refuses
+        // to send while it is set. The return ramp is the documented exception
+        // (module doc: every exit ramps home), so drop the latch for the ramp
+        // only. A fresh fault frame re-latches and stops the ramp; the disable
+        // below still runs either way.
+        if let Some(fault) = self.bus.reader_fault() {
+            println!("  fault latched during playback: {fault}");
+            println!("  clearing the latch for the return ramp");
+            self.bus.clear_reader_fault();
+        }
         println!("  returning to the start pose...");
         // All joints, including the gripper, return to the pose measured before
         // playback. The ramp is capped at 1.05 rad/s so an open jaw closes in
@@ -1512,10 +1580,12 @@ impl<T: Transport> Arm<T> {
 
         // Ramp home first, then hold; attempt the disable even if the ramp fails,
         // so a bad status frame cannot leave torque on by accident. The ramp is
-        // timed by the distance it has to cover, not by a constant.
+        // timed by the distance it has to cover, not by a constant. Fault frames
+        // on the bus are skipped, not fatal: a faulted motor may keep emitting
+        // them, and bailing on each one would strand the arm at the abort pose.
         let duration = shutdown_ramp_duration(&self.last, &home);
         let ramp = self
-            .move_leg(&home, duration, "home", track, false)
+            .move_leg(&home, duration, "home", track, false, true)
             .and_then(|_| self.hold(&home, 0.5, false));
 
         if stay_enabled {
@@ -2222,6 +2292,13 @@ struct LogFollowError {
     rad: f64,
 }
 
+/// A fault frame already queued at bring-up aborts the first poll, before any
+/// sample is logged. The abort note is still the evidence the caller needs:
+/// write the log whenever there is something to record, not only samples.
+fn log_has_evidence(samples: &[LogSample], notes: &LogNotes) -> bool {
+    !samples.is_empty() || notes.abort.is_some() || notes.gripper_stall.is_some()
+}
+
 fn write_log(
     path: &Path,
     trajectory: &Trajectory,
@@ -2364,6 +2441,7 @@ fn play<T: Transport>(
         }
     }
 
+    let mut last_elapsed = 0.0_f64;
     let result = (|| -> Result<i32> {
         let drift = trajectory
             .start
@@ -2380,6 +2458,7 @@ fn play<T: Transport>(
                 "align",
                 args.track,
                 true,
+                false,
             )?;
             if interrupted() {
                 println!("Interrupted - ramping home before disabling.");
@@ -2431,7 +2510,6 @@ fn play<T: Transport>(
         let gripper = arm.ids.iter().position(|id| *id == GRIPPER_ID);
         let mut gripper_stall_since: Option<Instant> = None;
         let logging = args.log.is_some();
-        let mut last_elapsed = 0.0_f64;
 
         for (index, waypoint) in trajectory.raw.waypoints.iter().enumerate() {
             if interrupted() {
@@ -2614,6 +2692,20 @@ fn play<T: Transport>(
 
         Ok(exit_code)
     })();
+
+    // Fault frames and bus errors propagate as Err, bypassing the abort_reason
+    // machinery inside the loop. Record them in the log too: an abort without a
+    // timestamp and reason is exactly the evidence gap that makes a fault
+    // undiagnosable after the temp log is gone.
+    if let Err(error) = &result {
+        if notes.abort.is_none() {
+            notes.abort = Some(LogAbort {
+                t: last_elapsed,
+                reason: error.to_string(),
+            });
+        }
+        println!("  ABORTED at t={last_elapsed:.2}s: {error}");
+    }
 
     if args.active_report {
         arm.stop_active_reports();
@@ -3204,6 +3296,10 @@ fn run_child(
         }))
     } else {
         let code = output.status.code().unwrap_or(-1);
+        // The child's output is piped, so without this the journal has no
+        // record of the fault at all. Print it: the abort line, the return
+        // ramp and any cleanup warning are the bench's evidence trail.
+        println!("player failed (exit {code}); output follows:\n{stdout}{stderr}");
         (500, serde_json::json!({
             "ok": false,
             "exit_code": code,
@@ -3455,7 +3551,7 @@ fn run() -> Result<i32> {
     let outcome = play(&mut arm, &trajectory, &args, &mut logged, &mut notes);
 
     if let Some(path) = &args.log {
-        if !logged.is_empty() {
+        if log_has_evidence(&logged, &notes) {
             if let Err(error) = write_log(path, &trajectory, &args, &kp_map, &kd_map, &logged,
                                           &notes) {
                 println!("  warning: cannot write the log: {error}");
@@ -4022,6 +4118,11 @@ mod tests {
         assert!(telemetry.fault().is_none());
         telemetry.set_fault("boom".into());
         assert_eq!(telemetry.fault().as_deref(), Some("boom"));
+        // The shutdown ramp clears the latch; a fresh fault re-latches it.
+        telemetry.clear_fault();
+        assert!(telemetry.fault().is_none());
+        telemetry.set_fault("again".into());
+        assert_eq!(telemetry.fault().as_deref(), Some("again"));
     }
 
     #[test]
@@ -4063,6 +4164,14 @@ mod tests {
         enabled: RefCell<BTreeSet<u8>>,
         frames: RefCell<Vec<MockFrame>>,
         blocked: RefCell<Option<(u8, f64)>>,
+        /// Latch a fault once this many operation frames have been sent,
+        /// mimicking the reader thread's fault latch.
+        fault_after: RefCell<Option<(u8, usize)>>,
+        latched_fault: RefCell<Option<String>>,
+        reader_mode: bool,
+        /// A fault frame sitting in the receive queue, mimicking the
+        /// synchronous bus path (no reader thread).
+        queued_fault: RefCell<Option<String>>,
     }
 
     impl MockBus {
@@ -4072,11 +4181,26 @@ mod tests {
                 enabled: RefCell::new(BTreeSet::new()),
                 frames: RefCell::new(Vec::new()),
                 blocked: RefCell::new(None),
+                fault_after: RefCell::new(None),
+                latched_fault: RefCell::new(None),
+                reader_mode: false,
+                queued_fault: RefCell::new(None),
             }
         }
 
         fn blocked(self, id: u8, at: f64) -> Self {
             *self.blocked.borrow_mut() = Some((id, at));
+            self
+        }
+
+        fn faults_after(mut self, id: u8, frames: usize) -> Self {
+            *self.fault_after.borrow_mut() = Some((id, frames));
+            self.reader_mode = true;
+            self
+        }
+
+        fn queued_fault(self, message: &str) -> Self {
+            *self.queued_fault.borrow_mut() = Some(message.to_string());
             self
         }
 
@@ -4118,6 +4242,15 @@ mod tests {
                         torque,
                     });
                     self.positions.borrow_mut().insert(device, position);
+                    let fault_trigger = *self.fault_after.borrow();
+                    if let Some((fault_id, at)) = fault_trigger {
+                        if self.frames.borrow().len() >= at {
+                            *self.latched_fault.borrow_mut() = Some(format!(
+                                "motor id {fault_id} reported a fault frame: 1040000000000000"
+                            ));
+                            *self.fault_after.borrow_mut() = None;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -4142,7 +4275,33 @@ mod tests {
             _models: &[Model],
             _timeout: Duration,
         ) -> Result<Vec<Option<State>>> {
+            if let Some(fault) = self.queued_fault.borrow().clone() {
+                bail!("{fault}");
+            }
             Ok(ids.iter().map(|id| Some(self.state(*id))).collect())
+        }
+
+        fn poll_available_tolerant(
+            &self,
+            ids: &[u8],
+            _models: &[Model],
+        ) -> Result<Vec<Option<State>>> {
+            // The ramp skips the queued fault frame; consume it so the
+            // following ticks see a clean queue.
+            *self.queued_fault.borrow_mut() = None;
+            Ok(ids.iter().map(|id| Some(self.state(*id))).collect())
+        }
+
+        fn start_reader(&mut self, _ids: &[u8], _models: &[Model]) -> Result<bool> {
+            Ok(self.reader_mode)
+        }
+
+        fn reader_fault(&self) -> Option<String> {
+            self.latched_fault.borrow().clone()
+        }
+
+        fn clear_reader_fault(&self) {
+            *self.latched_fault.borrow_mut() = None;
         }
     }
 
@@ -4248,6 +4407,179 @@ mod tests {
         assert!(stall.commanded < 4.00);
         let abort = notes.abort.expect("the abort is recorded for the log");
         assert!(abort.reason.contains("stalled"));
+    }
+
+    #[test]
+    fn fault_abort_is_recorded_in_the_log() {
+        // A fault frame propagates as Err out of the play loop, bypassing the
+        // abort_reason machinery. The log must still carry the abort timestamp
+        // and reason -- on the bench this was the evidence that got discarded.
+        let mut waypoints = Vec::new();
+        for step in 0..31 {
+            let t = f64::from(step) / 30.0;
+            let q = 0.1 + 0.4 * (f64::from(step) / 30.0);
+            waypoints.push(format!("{{\"t\":{t:.4},\"q\":[0.0,{q:.5}]}}"));
+        }
+        let text = format!(
+            "{{\"format\":\"{TRAJECTORY_FORMAT}\",\"ids\":[1,2],\"control_hz\":30,\
+             \"waypoints\":[{}]}}",
+            waypoints.join(",")
+        );
+        let trajectory = parse_trajectory(Path::new("fault.json"), &text).unwrap();
+        let mock = MockBus::new(&[(1, 0.0), (2, 0.1)]).faults_after(2, 10);
+        let mut arm = Arm::new(
+            mock,
+            trajectory.ids.clone(),
+            vec![model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0],
+            vec![3.0, 3.0],
+            trajectory.hz,
+        );
+        let mut args = Args::default();
+        args.execute = true;
+        args.active_report = true;
+        // serve always sets a log path for /play; sample logging is gated on it.
+        args.log = Some(PathBuf::from("fault-log.json"));
+        let mut logged = Vec::new();
+        let mut notes = LogNotes::default();
+
+        let outcome = play(&mut arm, &trajectory, &args, &mut logged, &mut notes);
+
+        let error = outcome.expect_err("the fault frame must abort playback");
+        assert!(error.to_string().contains("fault frame"), "{error}");
+        let abort = notes.abort.expect("the fault abort is recorded for the log");
+        assert!(abort.t > 0.0, "the abort carries the playback timestamp");
+        assert!(abort.reason.contains("fault frame"));
+        assert!(!logged.is_empty(), "the samples up to the fault survive");
+    }
+
+    #[test]
+    fn fault_before_the_first_sample_still_leaves_evidence() {
+        // The bench's second fault: motor 4's fault frame was already queued at
+        // bring-up, so the first command aborted before any sample was logged.
+        // The log must still be written -- the abort note alone is the evidence.
+        let mut waypoints = Vec::new();
+        for step in 0..31 {
+            let t = f64::from(step) / 30.0;
+            let q = 0.1 + 0.4 * (f64::from(step) / 30.0);
+            waypoints.push(format!("{{\"t\":{t:.4},\"q\":[0.0,{q:.5}]}}"));
+        }
+        let text = format!(
+            "{{\"format\":\"{TRAJECTORY_FORMAT}\",\"ids\":[1,2],\"control_hz\":30,\
+             \"waypoints\":[{}]}}",
+            waypoints.join(",")
+        );
+        let trajectory = parse_trajectory(Path::new("fault0.json"), &text).unwrap();
+        let mock = MockBus::new(&[(1, 0.0), (2, 0.1)]).faults_after(2, 1);
+        let mut arm = Arm::new(
+            mock,
+            trajectory.ids.clone(),
+            vec![model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0],
+            vec![3.0, 3.0],
+            trajectory.hz,
+        );
+        // Latch the fault before playback, exactly like a fault frame queued
+        // during bring-up: the first play-loop command then refuses to send.
+        arm.bring_up().unwrap();
+        arm.telemetry_active = true;
+        arm.command(&[0.0, 0.1], None, false).unwrap();
+        assert!(arm.bus.reader_fault().is_some());
+
+        let mut args = Args::default();
+        args.execute = true;
+        args.active_report = true;
+        args.log = Some(PathBuf::from("fault0-log.json"));
+        let mut logged = Vec::new();
+        let mut notes = LogNotes::default();
+
+        let outcome = play(&mut arm, &trajectory, &args, &mut logged, &mut notes);
+
+        let error = outcome.expect_err("the latched fault must abort playback");
+        assert!(error.to_string().contains("fault frame"), "{error}");
+        assert!(logged.is_empty(), "the fault hit before the first sample");
+        let abort = notes.abort.as_ref().expect("the abort is recorded even with no samples");
+        assert!(abort.reason.contains("fault frame"));
+        assert!(
+            log_has_evidence(&logged, &notes),
+            "an abort with zero samples is still worth writing"
+        );
+    }
+
+    #[test]
+    fn log_write_gate_needs_samples_or_a_note() {
+        let notes = LogNotes::default();
+        assert!(!log_has_evidence(&[], &notes), "nothing to record");
+        let sample = LogSample { t: 0.0, cmd: vec![0.0], meas: vec![0.0] };
+        assert!(log_has_evidence(&[sample], &notes), "samples are evidence");
+        let mut aborted = LogNotes::default();
+        aborted.abort = Some(LogAbort { t: 0.0, reason: "fault frame".into() });
+        assert!(log_has_evidence(&[], &aborted), "an abort alone is evidence");
+    }
+
+    #[test]
+    fn shutdown_ramp_home_survives_a_latched_fault() {
+        // With the reader's fault latched, command() refuses to send. The
+        // shutdown ramp is the documented exception: it clears the latch,
+        // returns to the start pose, and only then drops torque.
+        let mock = MockBus::new(&[(1, 0.0), (2, 0.1)]).faults_after(2, 2);
+        let mut arm = Arm::new(
+            mock,
+            vec![1, 2],
+            vec![model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0],
+            vec![3.0, 3.0],
+            30,
+        );
+        arm.bring_up().unwrap();
+        arm.telemetry_active = true;
+        arm.command(&[0.3, 0.4], None, false).unwrap();
+        assert!(arm.bus.reader_fault().is_some(), "the fault is latched");
+        assert!(
+            arm.command(&[0.35, 0.45], None, false).is_err(),
+            "the interlock still refuses playback commands after a fault"
+        );
+
+        arm.shut_down(false, false).unwrap();
+
+        assert!((arm.last[0] - 0.0).abs() < 1e-3, "joint 1 ramped home");
+        assert!((arm.last[1] - 0.1).abs() < 1e-3, "joint 2 ramped home");
+        assert!(!arm.enabled);
+        assert!(arm.bus.enabled.borrow().is_empty(), "torque dropped after the ramp");
+    }
+
+    #[test]
+    fn shutdown_ramp_tolerates_queued_fault_frames() {
+        // The synchronous bus path (the bench's mode): a faulted motor keeps
+        // emitting fault frames, and the strict poll bails on each one. The
+        // return ramp must skip them instead of stranding the arm at the abort
+        // pose.
+        let mock = MockBus::new(&[(1, 0.0), (2, 0.1)])
+            .queued_fault("motor id 2 reported a fault frame: 1040000000000000");
+        let mut arm = Arm::new(
+            mock,
+            vec![1, 2],
+            vec![model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0],
+            vec![3.0, 3.0],
+            30,
+        );
+        arm.bring_up().unwrap();
+        arm.command(&[0.3, 0.4], None, false).unwrap();
+        assert!(
+            arm.bus.poll_available(&arm.ids, &arm.models).is_err(),
+            "the strict poll still aborts on a fault frame"
+        );
+        // Re-queue the fault for the ramp itself.
+        *arm.bus.queued_fault.borrow_mut() =
+            Some("motor id 2 reported a fault frame: 1040000000000000".into());
+
+        arm.shut_down(false, false).unwrap();
+
+        assert!((arm.last[0] - 0.0).abs() < 1e-3, "joint 1 ramped home");
+        assert!((arm.last[1] - 0.1).abs() < 1e-3, "joint 2 ramped home");
+        assert!(!arm.enabled);
+        assert!(arm.bus.enabled.borrow().is_empty(), "torque dropped after the ramp");
     }
 
     // -- HTTP server ------------------------------------------------------- //
