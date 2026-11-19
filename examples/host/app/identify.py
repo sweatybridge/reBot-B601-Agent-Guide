@@ -198,7 +198,8 @@ def rig_identifiability(verdicts):
         verdict = verdict or {}
         marker = verdict.get("marker") or {}
         entry = {"capture": index, "rms_px": verdict.get("rms_px"),
-                 "side_px": marker.get("side_px"), "grazing_deg": marker.get("grazing_deg")}
+                 "side_px": marker.get("side_px"), "grazing_deg": marker.get("grazing_deg"),
+                 "camera_z_m": marker.get("camera_z_m")}
         if verdict.get("ok"):
             usable.append(entry)
         else:
@@ -457,7 +458,7 @@ def refit_session(eye, calibration, marker, calib_dir, plane_z=0.0, mount="fixed
         "grazing_deg": float(np.mean([float(e["run"].evidence["grazing_deg"]) for e in usable])),
         "id": usable[0]["run"].evidence.get("id"),
     }
-    verdict = auto_calibrate.verify_marker(evidence)
+    verdict = auto_calibrate.verify_marker(evidence, camera_at=T_base_cam[:3, 3])
     candidate = replace(usable[0]["run"].rig, T_base_cam=T_base_cam,
                         rms_px=evidence["rms_px"], max_px=evidence["rms_px"],
                         fitted=_stamp(), observations=[], method="base-marker")
