@@ -3,8 +3,10 @@
 //! A single-file, dependency-light player. It reads the trajectory JSON
 //! produced by `host/app/plan_with_pinocchio.py`, re-checks it against the
 //! file's own limits, and streams MIT frames at the file's control rate.
-//! Planning stays on the workstation; the board only sends joint angles and
-//! the optional gravity feedforward.
+//! Planning stays on the workstation; the board only sends joint angles, the
+//! optional gravity feedforward, and the optional velocity feedforward (the
+//! MIT frame's kd term damps toward the commanded velocity; with v=0 it brakes
+//! the motion itself).
 //!
 //! Safety model:
 //!
@@ -184,6 +186,11 @@ struct Waypoint {
     q: Vec<f64>,
     #[serde(default)]
     tau: Option<Vec<f64>>,
+    /// Velocity feedforward, rad/s. The MIT frame's kd term damps toward this
+    /// velocity; without it (v=0) kd brakes the motion itself and the arm
+    /// pulses at the waypoint rate. Optional: older files play with v=0.
+    #[serde(default)]
+    v: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +207,8 @@ struct Trajectory {
     hz: u32,
     has_tau: bool,
     peak_tau: f64,
+    has_v: bool,
+    peak_v: f64,
     start: Vec<f64>,
     last_t: f64,
     duration_s: f64,
@@ -282,6 +291,23 @@ fn parse_trajectory(path: &Path, text: &str) -> Result<Trajectory> {
                 );
             }
         }
+        if let Some(v) = &waypoint.v {
+            if v.len() != ids.len() {
+                bail!(
+                    "{}: waypoint {} has {} v values for {} motors",
+                    path.display(),
+                    index,
+                    v.len(),
+                    ids.len()
+                );
+            }
+            if v.iter().any(|value| !value.is_finite()) {
+                bail!(
+                    "{}: waypoint {index} has a non-finite velocity",
+                    path.display()
+                );
+            }
+        }
     }
 
     let times: Vec<f64> = raw.waypoints.iter().map(|waypoint| waypoint.t).collect();
@@ -324,11 +350,49 @@ fn parse_trajectory(path: &Path, text: &str) -> Result<Trajectory> {
         .flat_map(|tau| tau.iter())
         .fold(0.0_f64, |peak, value| peak.max(value.abs()));
 
+    let has_v = raw.waypoints.iter().any(|waypoint| waypoint.v.is_some());
+    if has_v && raw.waypoints.iter().any(|waypoint| waypoint.v.is_none()) {
+        bail!(
+            "{}: 'v' is present on some waypoints but not all; add it everywhere or nowhere",
+            path.display()
+        );
+    }
+    let peak_v = raw
+        .waypoints
+        .iter()
+        .filter_map(|waypoint| waypoint.v.as_ref())
+        .flat_map(|v| v.iter())
+        .fold(0.0_f64, |peak, value| peak.max(value.abs()));
+
     let hz = raw.control_hz.unwrap_or(20.0);
     if !hz.is_finite() {
         bail!("{}: 'control_hz' is not a finite number", path.display());
     }
     let hz = hz.clamp(MIN_HZ, MAX_HZ) as u32;
+
+    // The velocity must agree with the step gate: the fastest motion 0.5 rad
+    // per waypoint permits at this rate is MAX_JOINT_STEP * hz. A v that
+    // outruns the q series is corrupt, and the MIT frame would silently clip
+    // it. The 0.1% slack absorbs the planner's six-decimal time rounding.
+    if has_v {
+        let ceiling = MAX_JOINT_STEP * f64::from(hz) * 1.001 + 1e-6;
+        for (index, waypoint) in raw.waypoints.iter().enumerate() {
+            if let Some(v) = &waypoint.v {
+                for (joint, value) in v.iter().enumerate() {
+                    if value.abs() > ceiling {
+                        bail!(
+                            "{}: joint {} at waypoint {} commands {:+.3} rad/s, above the \
+                             {ceiling:.3} rad/s the step gate permits at {hz} Hz",
+                            path.display(),
+                            ids[joint],
+                            index,
+                            value
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     let last_t = raw
         .waypoints
@@ -346,6 +410,8 @@ fn parse_trajectory(path: &Path, text: &str) -> Result<Trajectory> {
         hz,
         has_tau,
         peak_tau,
+        has_v,
+        peak_v,
         start: raw.waypoints[0].q.clone(),
         last_t,
         duration_s,
@@ -1439,7 +1505,13 @@ impl<T: Transport> Arm<T> {
         Ok(())
     }
 
-    fn command(&mut self, targets: &[f64], torques: Option<&[f64]>, drain: bool) -> Result<()> {
+    fn command(
+        &mut self,
+        targets: &[f64],
+        torques: Option<&[f64]>,
+        velocities: Option<&[f64]>,
+        drain: bool,
+    ) -> Result<()> {
         debug_assert_eq!(targets.len(), self.ids.len());
         if self.telemetry_active {
             if let Some(fault) = self.bus.reader_fault() {
@@ -1448,13 +1520,14 @@ impl<T: Transport> Arm<T> {
         }
         for joint in 0..self.ids.len() {
             let torque = torques.map_or(0.0, |values| values[joint]);
+            let velocity = velocities.map_or(0.0, |values| values[joint]);
             let (id, data) = mit_frame(
                 self.models[joint],
                 self.ids[joint],
                 targets[joint],
                 self.kp[joint],
                 self.kd[joint],
-                0.0,
+                velocity,
                 torque,
             );
             self.bus.send(id, &data)?;
@@ -1494,6 +1567,11 @@ impl<T: Transport> Arm<T> {
             BTreeSet::new()
         };
         let mut latest: Vec<Option<State>> = vec![None; self.ids.len()];
+        // Analytic derivative of the cosine ease: v = delta * (pi / 2T) * sin(pi * step / steps),
+        // zero at both ends. Feeding it to the MIT frame keeps the kd term from
+        // braking the leg itself (with v=0 the arm pulses at the tick rate).
+        let velocity_scale =
+            (std::f64::consts::PI / 2.0) / (f64::from(steps) * self.period.as_secs_f64());
 
         for step in 0..=steps {
             if honor_interrupt && interrupted() {
@@ -1517,8 +1595,14 @@ impl<T: Transport> Arm<T> {
                 .zip(targets)
                 .map(|(from, to)| from + (to - from) * fraction)
                 .collect();
+            let phase = std::f64::consts::PI * f64::from(step) / f64::from(steps);
+            let velocities: Vec<f64> = begin
+                .iter()
+                .zip(targets)
+                .map(|(from, to)| (to - from) * velocity_scale * phase.sin())
+                .collect();
             let is_sample = sample_at.contains(&step);
-            self.command(&command, None, false)?;
+            self.command(&command, None, Some(&velocities), false)?;
 
             if is_sample {
                 let percent = (100.0 * f64::from(step) / f64::from(steps)).round() as i32;
@@ -1562,7 +1646,7 @@ impl<T: Transport> Arm<T> {
             if honor_interrupt && interrupted() {
                 break;
             }
-            self.command(targets, None, true)?;
+            self.command(targets, None, None, true)?;
             thread::sleep(self.period);
         }
         Ok(())
@@ -2161,6 +2245,12 @@ fn banner(
             trajectory.peak_tau
         );
     }
+    if trajectory.has_v {
+        println!(
+            "  velocity  : feedforward on every waypoint, peak {:.2} rad/s",
+            trajectory.peak_v
+        );
+    }
     println!(
         "  models    : {}",
         models
@@ -2490,7 +2580,7 @@ fn play<T: Transport>(
                     println!("Interrupted - ramping home before disabling.");
                     return Ok(130);
                 }
-                arm.command(&trajectory.start, None, true)?;
+                arm.command(&trajectory.start, None, None, true)?;
                 let remaining = deadline
                     .saturating_duration_since(Instant::now())
                     .as_secs_f64()
@@ -2590,7 +2680,7 @@ fn play<T: Transport>(
             let sample = args.track && sample_at.contains(&index);
             let check_due = args.max_follow_error > 0.0 && elapsed >= next_follow_check;
             let torques = waypoint.tau.as_deref();
-            arm.command(&targets, torques, false)?;
+            arm.command(&targets, torques, waypoint.v.as_deref(), false)?;
 
             if logging {
                 logged.push(LogSample {
@@ -3721,6 +3811,8 @@ mod tests {
         assert_eq!(trajectory.hz, 30);
         assert!(trajectory.has_tau);
         assert!((trajectory.peak_tau - 0.5).abs() < 1e-12);
+        assert!(trajectory.has_v);
+        assert!((trajectory.peak_v - 0.5).abs() < 1e-12);
         assert_eq!(trajectory.raw.waypoints.len(), 4);
         assert!((trajectory.start[0] - 0.0).abs() < 1e-12);
         assert!((trajectory.last_t - 0.3).abs() < 1e-12);
@@ -4171,6 +4263,7 @@ mod tests {
         device: u8,
         position: f64,
         torque: f64,
+        velocity: f64,
     }
 
     struct MockBus {
@@ -4268,9 +4361,12 @@ mod tests {
                 }
                 COMM_OPERATION_CONTROL if data.len() == 8 => {
                     let position_u16 = u16::from_be_bytes([data[0], data[1]]);
+                    let velocity_u16 = u16::from_be_bytes([data[2], data[3]]);
                     let torque_u16 = ((id >> 8) & 0xFFFF) as u16;
                     let mut position =
                         (f64::from(position_u16) / 0x7FFF as f64 - 1.0) * MIT_POSITION_LIMIT;
+                    // Every test arm uses rs-00 models: +-50 rad/s velocity range.
+                    let velocity = (f64::from(velocity_u16) / 0x7FFF as f64 - 1.0) * 50.0;
                     let torque = (f64::from(torque_u16) / 0x7FFF as f64 - 1.0) * 17.0;
                     if let Some((blocked_id, blocked_at)) = *self.blocked.borrow() {
                         if device == blocked_id && position < blocked_at {
@@ -4281,6 +4377,7 @@ mod tests {
                         device,
                         position,
                         torque,
+                        velocity,
                     });
                     self.positions.borrow_mut().insert(device, position);
                     let fault_trigger = *self.fault_after.borrow();
@@ -4453,6 +4550,124 @@ mod tests {
         assert!((last_joint_2.position - 0.25).abs() < 1e-3);
         assert!((last_joint_1.torque - 0.3).abs() < 1e-3);
         assert!((last_joint_2.torque - 0.2).abs() < 1e-3);
+        // The fixture's velocity feedforward reaches the MIT frame's v field.
+        assert!((last_joint_1.velocity - 0.5).abs() < 2e-3);
+        assert!((last_joint_2.velocity - 0.5).abs() < 2e-3);
+    }
+
+    #[test]
+    fn playback_without_velocity_streams_zero() {
+        // An older file without 'v' still plays, with the kd term damping
+        // toward zero exactly as before.
+        let json = r#"{
+            "format": "rebot-joint-trajectory", "ids": [1, 2], "control_hz": 30,
+            "waypoints": [
+                {"t": 0.0, "q": [0.0, 0.1]},
+                {"t": 0.033333, "q": [0.02, 0.12]},
+                {"t": 0.066667, "q": [0.04, 0.14]}
+            ]
+        }"#;
+        let trajectory = parse_inline(json).unwrap();
+        assert!(!trajectory.has_v);
+        let mock = MockBus::new(&[(1, 0.0), (2, 0.1)]);
+        let mut arm = Arm::new(
+            mock,
+            trajectory.ids.clone(),
+            vec![model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0],
+            vec![3.0, 3.0],
+            trajectory.hz,
+        );
+        let mut args = Args::default();
+        args.execute = true;
+        let mut logged = Vec::new();
+        let mut notes = LogNotes::default();
+
+        let code = play(&mut arm, &trajectory, &args, &mut logged, &mut notes).unwrap();
+
+        assert_eq!(code, 0);
+        let frames = arm.bus.frames.borrow();
+        assert!(!frames.is_empty());
+        assert!(frames.iter().all(|frame| frame.velocity.abs() < 1e-9));
+    }
+
+    #[test]
+    fn rejects_bad_velocity_feedforward() {
+        let base = r#"{
+            "format": "rebot-joint-trajectory", "ids": [1, 2], "control_hz": 30,
+            "waypoints": [
+                {"t": 0.0, "q": [0.0, 0.0], "v": [0.0, 0.0]},
+                {"t": 0.1, "q": [0.01, 0.01], "v": [0.1, 0.1]},
+                {"t": 0.2, "q": [0.02, 0.02], "v": [0.1, 0.1]}
+            ]
+        }"#;
+        assert!(parse_inline(base).unwrap().has_v);
+
+        let partial = base.replace(
+            r#"{"t": 0.2, "q": [0.02, 0.02], "v": [0.1, 0.1]}"#,
+            r#"{"t": 0.2, "q": [0.02, 0.02]}"#,
+        );
+        assert!(parse_inline(&partial)
+            .unwrap_err()
+            .to_string()
+            .contains("'v' is present on some"));
+
+        let short = base.replace(r#""v": [0.0, 0.0]}"#, r#""v": [0.0]}"#);
+        assert!(parse_inline(&short)
+            .unwrap_err()
+            .to_string()
+            .contains("1 v values for 2 motors"));
+
+        // A velocity that outruns the step gate is corrupt: 0.5 rad per
+        // waypoint at 30 Hz permits at most ~15 rad/s, not 20.
+        let runaway = base.replace(r#""v": [0.1, 0.1]}"#, r#""v": [20.0, 0.1]}"#);
+        assert!(parse_inline(&runaway)
+            .unwrap_err()
+            .to_string()
+            .contains("the step gate permits"));
+
+        // The boundary itself is legal: 0.5 rad per tick at 30 Hz, v = 15.
+        let boundary = r#"{
+            "format": "rebot-joint-trajectory", "ids": [1, 2], "control_hz": 30,
+            "waypoints": [
+                {"t": 0.0, "q": [0.0, 0.0], "v": [15.0, 0.0]},
+                {"t": 0.033333, "q": [0.5, 0.0], "v": [15.0, 0.0]},
+                {"t": 0.066667, "q": [1.0, 0.0], "v": [15.0, 0.0]}
+            ]
+        }"#;
+        assert!(parse_inline(boundary).unwrap().has_v);
+    }
+
+    #[test]
+    fn move_leg_commands_the_cosine_velocity() {
+        // The internally generated legs (align, /move, return home) carry the
+        // analytic derivative of the cosine ease: zero at both ends, peak
+        // delta * pi / (2T) at the midpoint.
+        let mock = MockBus::new(&[(1, 0.0), (2, 0.0)]);
+        let mut arm = Arm::new(
+            mock,
+            vec![1, 2],
+            vec![model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0],
+            vec![3.0, 3.0],
+            100,
+        );
+        arm.bring_up().unwrap();
+
+        arm.move_leg(&[0.2, 0.4], 0.3, "test", false, false, false).unwrap();
+
+        let frames = arm.bus.frames.borrow();
+        let joint2: Vec<&MockFrame> = frames.iter().filter(|frame| frame.device == 2).collect();
+        assert_eq!(joint2.len(), 31, "one frame per tick, steps 0..=30");
+        assert!(joint2[0].velocity.abs() < 2e-3, "the leg starts at rest");
+        assert!(joint2[30].velocity.abs() < 2e-3, "the leg ends at rest");
+        let peak = 0.4 * std::f64::consts::PI / (2.0 * 0.3);
+        assert!(
+            (joint2[15].velocity - peak).abs() < 2e-3,
+            "midpoint velocity {} should be {peak}",
+            joint2[15].velocity
+        );
+        assert!(joint2.iter().all(|frame| frame.velocity > -2e-3));
     }
 
     #[test]
@@ -4575,7 +4790,7 @@ mod tests {
         // during bring-up: the first play-loop command then refuses to send.
         arm.bring_up().unwrap();
         arm.telemetry_active = true;
-        arm.command(&[0.0, 0.1], None, false).unwrap();
+        arm.command(&[0.0, 0.1], None, None, false).unwrap();
         assert!(arm.bus.reader_fault().is_some());
 
         let mut args = Args::default();
@@ -4625,10 +4840,10 @@ mod tests {
         );
         arm.bring_up().unwrap();
         arm.telemetry_active = true;
-        arm.command(&[0.3, 0.4], None, false).unwrap();
+        arm.command(&[0.3, 0.4], None, None, false).unwrap();
         assert!(arm.bus.reader_fault().is_some(), "the fault is latched");
         assert!(
-            arm.command(&[0.35, 0.45], None, false).is_err(),
+            arm.command(&[0.35, 0.45], None, None, false).is_err(),
             "the interlock still refuses playback commands after a fault"
         );
 
@@ -4660,7 +4875,7 @@ mod tests {
         // the queue at bring-up is a different case (bring_up must disable).
         *arm.bus.queued_fault.borrow_mut() =
             Some("motor id 2 reported a fault frame: 1040000000000000".into());
-        arm.command(&[0.3, 0.4], None, false).unwrap();
+        arm.command(&[0.3, 0.4], None, None, false).unwrap();
         assert!(
             arm.bus.poll_available(&arm.ids, &arm.models).is_err(),
             "the strict poll still aborts on a fault frame"

@@ -319,6 +319,26 @@ def test_schema():
     check("a multi-pose file holds at each pose",
           sweep_stats["duration_s"] > 3 * 0.5 + 2 * 0.3, "%.2f s" % sweep_stats["duration_s"])
 
+    # Velocity feedforward: build derives v for every producer, so the MIT
+    # frame's kd term damps toward the motion instead of braking it.
+    check("build derives v on every waypoint",
+          all(len(point.get("v") or []) == 7 for point in payload["waypoints"]))
+    move_wps = move["waypoints"]
+    hold_count = int(round(0.4 * 30))
+    check("a joint move holds at zero velocity",
+          all(v == 0.0 for point in move_wps[-hold_count:] for v in point["v"]))
+    # Cosine ease peak speed: travel * pi / (2T); travel 0.4 rad over 1 s.
+    expect_peak = 0.4 * math.pi / 2.0
+    check("a joint move's peak v matches the cosine ease",
+          abs(move_stats["peak_v"] - expect_peak) < 0.02 * expect_peak,
+          "%.4f vs %.4f rad/s" % (move_stats["peak_v"], expect_peak))
+    check("a joint move starts near rest",
+          abs(move_wps[0]["v"][2]) < 0.1 * move_stats["peak_v"])
+    seq_holds = [point for point in sweep_motion["waypoints"]
+                 if all(q == 0.2 for q in point["q"][:6])]
+    check("a sequence holds at zero velocity",
+          seq_holds and all(v == 0.0 for point in seq_holds for v in point["v"]))
+
     def rejects(name, mutate):
         broken = json.loads(json.dumps(payload))
         mutate(broken)
@@ -330,6 +350,12 @@ def test_schema():
 
     rejects("rejects non-monotonic time", lambda p: p["waypoints"][1].update(t=-1.0))
     rejects("rejects tau on only some waypoints", lambda p: p["waypoints"][2].pop("tau"))
+    rejects("rejects v on only some waypoints", lambda p: p["waypoints"][2].pop("v"))
+    rejects("rejects a short v", lambda p: p["waypoints"][1].update(v=[0.0] * 6))
+    rejects("rejects a non-finite v",
+            lambda p: p["waypoints"][1]["v"].__setitem__(0, float("nan")))
+    rejects("rejects a v above the step gate",
+            lambda p: p["waypoints"][1]["v"].__setitem__(0, 100.0))
     rejects("rejects a joint outside its limit",
             lambda p: p["waypoints"][0]["q"].__setitem__(1, 2.9))
     rejects("rejects a 0.5 rad jump",
