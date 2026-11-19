@@ -1386,11 +1386,20 @@ impl<T: Transport> Arm<T> {
     }
 
     fn bring_up(&mut self) -> Result<()> {
+        // Every failure path below attempts disable_all: earlier joints in the
+        // loop are already enabled, and a previous process may have left torque
+        // on. `enabled` is still false here, so shut_down() would no-op.
         for joint in 0..self.ids.len() {
-            self.write_mode_mit(self.ids[joint])?;
+            if let Err(error) = self.write_mode_mit(self.ids[joint]) {
+                let _ = self.disable_all();
+                return Err(error);
+            }
         }
         thread::sleep(Duration::from_millis(100));
-        self.bus.drain(64)?;
+        if let Err(error) = self.bus.drain(64) {
+            let _ = self.disable_all();
+            return Err(error);
+        }
 
         for joint in 0..self.ids.len() {
             let id = self.ids[joint];
@@ -1421,7 +1430,10 @@ impl<T: Transport> Arm<T> {
                 "  motor {:<2} start={:+.4} rad (vel={:+.3}, tq={:+.2}, {:.1} C)",
                 id, state.position, state.velocity, state.torque, state.temperature
             );
-            self.bus.drain(64)?;
+            if let Err(error) = self.bus.drain(64) {
+                let _ = self.disable_all();
+                return Err(error);
+            }
         }
         self.enabled = true;
         Ok(())
@@ -3560,12 +3572,14 @@ fn run() -> Result<i32> {
     }
 
     let shutdown = arm.shut_down(args.stay_enabled, args.track);
-    if let Err(error) = shutdown {
+    if let Err(error) = &shutdown {
         println!("  warning: cleanup did not finish: {error}");
     }
     println!("Disconnected.");
 
-    outcome
+    // A failed cleanup owns the exit status when playback itself succeeded:
+    // systemd/scripting must not see success with torque possibly still on.
+    outcome.and_then(|code| shutdown.map(|_| code))
 }
 
 // --------------------------------------------------------------------------- //
@@ -4172,6 +4186,11 @@ mod tests {
         /// A fault frame sitting in the receive queue, mimicking the
         /// synchronous bus path (no reader thread).
         queued_fault: RefCell<Option<String>>,
+        /// Queue a fault frame right after this motor is enabled: a motor
+        /// that reports a fault as it comes up, mid bring-up.
+        fault_after_enable: RefCell<Option<(u8, String)>>,
+        /// Refuse torque-disable frames: a bus that cannot drop torque.
+        disable_fails: RefCell<bool>,
     }
 
     impl MockBus {
@@ -4185,6 +4204,8 @@ mod tests {
                 latched_fault: RefCell::new(None),
                 reader_mode: false,
                 queued_fault: RefCell::new(None),
+                fault_after_enable: RefCell::new(None),
+                disable_fails: RefCell::new(false),
             }
         }
 
@@ -4201,6 +4222,16 @@ mod tests {
 
         fn queued_fault(self, message: &str) -> Self {
             *self.queued_fault.borrow_mut() = Some(message.to_string());
+            self
+        }
+
+        fn faults_after_enable(self, id: u8, message: &str) -> Self {
+            *self.fault_after_enable.borrow_mut() = Some((id, message.to_string()));
+            self
+        }
+
+        fn with_disable_failure(self) -> Self {
+            *self.disable_fails.borrow_mut() = true;
             self
         }
 
@@ -4221,8 +4252,18 @@ mod tests {
             match communication_type {
                 COMM_ENABLE => {
                     self.enabled.borrow_mut().insert(device);
+                    let trigger = self.fault_after_enable.borrow().clone();
+                    if let Some((fault_id, message)) = trigger {
+                        if device == fault_id {
+                            *self.queued_fault.borrow_mut() = Some(message);
+                            *self.fault_after_enable.borrow_mut() = None;
+                        }
+                    }
                 }
                 COMM_DISABLE => {
+                    if *self.disable_fails.borrow() {
+                        bail!("the bus refused the disable frame");
+                    }
                     self.enabled.borrow_mut().remove(&device);
                 }
                 COMM_OPERATION_CONTROL if data.len() == 8 => {
@@ -4258,6 +4299,11 @@ mod tests {
         }
 
         fn drain(&self, _budget: usize) -> Result<()> {
+            // The synchronous bus reads the queue here; a fault frame in it
+            // is an error, exactly as the bench's motor-4 fault surfaced.
+            if let Some(fault) = self.queued_fault.borrow().clone() {
+                bail!("{fault}");
+            }
             Ok(())
         }
 
@@ -4323,6 +4369,52 @@ mod tests {
         assert!((arm.start[0] - 0.25).abs() < 1e-12);
         assert!((arm.start[1] + 0.5).abs() < 1e-12);
         assert!((arm.last[0] - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bring_up_fault_disables_every_motor() {
+        // A fault frame arriving mid bring-up (the bench's motor-4 case) must
+        // not leave the already-enabled joints holding torque: `enabled` is
+        // still false when bring_up fails, so shut_down() would no-op.
+        let mock = MockBus::new(&[(1, 0.1), (2, 0.2), (3, 0.3)])
+            .faults_after_enable(2, "motor id 2 reported a fault frame: 1040000000000000");
+        let mut arm = Arm::new(
+            mock,
+            vec![1, 2, 3],
+            vec![model("rs-00"), model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0, 50.0],
+            vec![3.0, 3.0, 3.0],
+            30,
+        );
+
+        assert!(arm.bring_up().is_err(), "the fault frame must abort bring-up");
+        assert!(!arm.enabled);
+        assert!(
+            arm.bus.enabled.borrow().is_empty(),
+            "torque must be off on every motor, including the ones already enabled"
+        );
+    }
+
+    #[test]
+    fn shutdown_disable_failure_is_an_error_not_a_warning() {
+        // A failed torque-disable must reach the caller: run() turns it into a
+        // non-zero exit, so systemd/scripting cannot see success with torque
+        // possibly still on.
+        let mock = MockBus::new(&[(1, 0.1), (2, 0.2)]).with_disable_failure();
+        let mut arm = Arm::new(
+            mock,
+            vec![1, 2],
+            vec![model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0],
+            vec![3.0, 3.0],
+            30,
+        );
+        arm.bring_up().unwrap();
+
+        let result = arm.shut_down(false, false);
+
+        assert!(result.is_err(), "a failed torque-disable must not report success");
+        assert!(!arm.enabled, "the enabled flag clears even when the bus refuses");
     }
 
     #[test]
@@ -4554,8 +4646,7 @@ mod tests {
         // emitting fault frames, and the strict poll bails on each one. The
         // return ramp must skip them instead of stranding the arm at the abort
         // pose.
-        let mock = MockBus::new(&[(1, 0.0), (2, 0.1)])
-            .queued_fault("motor id 2 reported a fault frame: 1040000000000000");
+        let mock = MockBus::new(&[(1, 0.0), (2, 0.1)]);
         let mut arm = Arm::new(
             mock,
             vec![1, 2],
@@ -4565,6 +4656,10 @@ mod tests {
             30,
         );
         arm.bring_up().unwrap();
+        // The fault arrives during playback, not bring-up: a fault frame in
+        // the queue at bring-up is a different case (bring_up must disable).
+        *arm.bus.queued_fault.borrow_mut() =
+            Some("motor id 2 reported a fault frame: 1040000000000000".into());
         arm.command(&[0.3, 0.4], None, false).unwrap();
         assert!(
             arm.bus.poll_available(&arm.ids, &arm.models).is_err(),

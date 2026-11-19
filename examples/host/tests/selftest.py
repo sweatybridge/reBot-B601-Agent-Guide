@@ -389,6 +389,12 @@ async def test_server(workdir: Path, geometry):
               abs(float(health.get("min_z", -1)) - 0.10) < 1e-9
               and abs(float(health.get("tip_m", -1)) - 0.035) < 1e-9,
               "min_z %s, tip_m %s" % (health.get("min_z"), health.get("tip_m")))
+        raised = SimpleNamespace(**vars(args))
+        raised.plane_z = 0.15
+        raised_app = capture_server.build_app(raised)
+        check("the flange minimum rises with the worktop plane (plane_z + hover_m)",
+              abs(float(raised_app["min_z"]) - 0.25) < 1e-9,
+              "min_z %s" % raised_app["min_z"])
         check("serves the phone page", (await client.get("/")).status == 200)
 
         reach = await (await client.get("/reach.json")).json()
@@ -2771,7 +2777,7 @@ def test_base_marker():
     # of depth -- about a centimetre. That is ample: this is a *seed*, and the
     # tip detector needs a few centimetres.
     check("the marker's pose is recovered from one frame",
-          angle_error < 1.5 and distance_error < 25.0,
+          angle_error < 1.5 and distance_error < 0.025,
           "%.2f deg, %.1f mm" % (angle_error, 1000.0 * distance_error))
     check("the tag solve reports the evidence it was judged on",
           evidence["rms_px"] < 1.0 and evidence["side_px"] > 20.0
@@ -2781,7 +2787,11 @@ def test_base_marker():
 
     recovered = base_marker.camera_pose(warped, K, dist, at, yaw, size_m=size_m)
     camera_error = float(np.linalg.norm(recovered[:3, 3] - T_base_cam[:3, 3]))
-    check("the composition gives the camera in the base frame", camera_error < 3.0,
+    # The composition inherits the seed's error (16 mm of depth plus the ~1 deg
+    # rotation's lever arm -> ~23 mm here). The bound is metres, like the
+    # quantity: it catches a gross composition failure -- a mirror-branch solve
+    # is metres off -- not the seed's pixel-quantization floor.
+    check("the composition gives the camera in the base frame", camera_error < 0.030,
           "%.1f mm" % (1000.0 * camera_error))
 
     try:
