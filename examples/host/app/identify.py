@@ -1,40 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Physical hillclimb: identify what the data constrains, then climb only that.
+"""Continuous calibration: refit the tag rig, learn the sag map, cover the envelope.
 
-Phase 4 of the trace-collector spec (§7). The oracle corpus says *where* the
-loop is wrong; this module decides what may be updated about the rig and the
-sag model, and drives the one gated excursion that could fix it. Three rules
-from the spec are hard constraints, not preferences:
+Phase 4 of the trace-collector spec (§7). The oracle corpus says *where* the loop
+is wrong; this module decides what may be updated, and drives the two gated
+sessions that could fix it. Three rules from the spec are hard constraints, not
+preferences:
 
 * **Propose, never auto-run.** `TriggerMonitor` watches witness drift, the EWMA
-  of oracle pixel error, tag reprojection growth and rig staleness, and returns
-  proposals. Running a session needs `POST /identify/run {confirm: true}` with
-  the execute gate on and the `calibrating` single-flight flag clear.
-* **Fit only what the data constrains (§7.2).** A direction whose 1-sigma is
-  above `SIGMA_GATE_MM` is held at its prior value and flagged for excitation;
-  it is never "updated" by a climb. `refine_zeros` stays off unless the
-  observations carry arm-independent anchors (a base-marker or second-view
-  label), and j1/j6 are gauges that are never fitted at all. A converged fit
-  with a weak direction is reported PARTIAL, never success.
+  of oracle pixel error, tag reprojection growth, zero drift and rig staleness,
+  and returns proposals. Running a session needs `POST /identify/run
+  {confirm: true}` with the execute gate on and the `calibrating` single-flight
+  flag clear.
+* **The rig is arm-independent by construction (§7.2).** Camera extrinsics come
+  from the base tag's PnP, which observes the camera against a printed square on
+  the base -- never against the arm. So extrinsics are not coupled to joint zeros
+  or the URDF, and the *"model becomes part of the calibration"* trap cannot
+  open. The gate is the tag solve's own geometry (`verify_marker`: rms, side,
+  grazing); a weak solve is REFUSED, not averaged in. Joint zeros are fixed at
+  deployment and are never climbed from camera data: the oracle flags zero drift
+  for re-zeroing, and nothing here absorbs it into the rig.
 * **Verify before hot-load (§7.3a).** The candidate rig is written beside the
-  live one as `extrinsics-candidate-<ts>.json` and only committed after
-  `auto_calibrate.verify`'s gates *plus* hold-out poses the fit never saw. A
-  refusal leaves the running rig untouched.
+  live one as `extrinsics-candidate-<ts>.json` and only committed after every
+  contributing solve passed `verify_marker` *plus* a held-out capture's tag
+  reprojection. A refusal leaves the running rig untouched.
 
-The sag/gain residual map (§7.3b) is learned from execution telemetry alone --
-no extra motion -- and applied inside `sweep.aim` as an additive term that is
-still clipped by `SAG_LIMIT_RAD`. It is keyed by rig fingerprint, kp and joint
-zeros, and is not trusted outside the envelope it was fitted in.
+`refit_session` (§7.3a) takes repeated stills of the tag and averages the PnP
+estimates. It moves nothing: no arm, no recorder, no sweep. The sag/gain residual
+map (§7.3b) is learned from execution telemetry alone, and applied inside the
+gravity-sag fixed point `sweep.aim` as an additive term still clipped by
+`SAG_LIMIT_RAD`; it is keyed by rig fingerprint, kp and joint zeros, and is not
+trusted outside the envelope it was fitted in.
+
+`coverage_session` (§7.4) is the only arm motion here. It is controlled motion to
+GATHER MEASUREMENTS -- a safe pose grid chosen for the accuracy cells nobody has
+validated yet -- not a rig-fit procedure, and it never writes a rig. It goes
+through `ArmGateway.move_sequence` -> the gateway's existing `/move` check chain
+(command_ok, path_safe, speed clamp, edge aborts), and its holds are measured by
+the same oracle that measures a task execution. No new execute path, no gate
+changes.
+
+The sag map and the accuracy map are the learned quantities, and both need
+excitation: a sag direction with too few holds, or a cell nobody has measured, is
+reported UNLEARNED (`unlearned`) and never extrapolated.
 
 `plane_z` / surface probing (§7.3c) is DEFERRED: it is the only component that
 intentionally contacts the environment and needs its own clearance review. No
 contact probing is implemented here; do not add one without that review.
-
-Everything pure is unit-testable offline; the only arm motion is
-`climb_session`, which goes through `auto_calibrate.run` -> `ArmGateway.
-move_sequence` -> the gateway's existing `/move` check chain (command_ok,
-path_safe, speed clamp, edge aborts). No new execute path, no gate changes.
 """
 
 from __future__ import annotations
@@ -50,6 +62,7 @@ from pathlib import Path
 import numpy as np
 
 import auto_calibrate
+import base_marker
 import extrinsics as ex
 import oracle
 import rebot_ik
@@ -57,17 +70,19 @@ import sweep
 
 
 class IdentifyError(Exception):
-    """The climb cannot run, or the update is not identifiable; the message is for the operator."""
+    """The session cannot run, or the update is not identifiable; the message is for the operator."""
 
 
 # --------------------------------------------------------------------------- #
 # Gates -- one block, like oracle.py's thresholds.
 # --------------------------------------------------------------------------- #
-SIGMA_GATE_MM = 8.0          # a direction pinned worse than this is flagged, not updated
-HOLDOUT_MAX_PX = 6.0         # same bound verify() uses for leave-one-out
 RIG_MAX_AGE_DAYS = 30.0      # a rig older than this is stale even without drift
 TAG_GROWTH_PX = 2.0          # tag reprojection growth over the session baseline
 EWMA_ALPHA = 0.3             # weight of the newest oracle pixel error
+MARKER_MIN_USABLE = 3        # §7.3a: fewer good solves than this is not an average
+MARKER_SPREAD_MAX_MM = 6.0   # solves disagreeing by more than this are not one camera
+HOLDOUT_MAX_PX = 3.0         # §7.3a: the held-out capture's tag reprojection bound
+TAG_PRIOR_DEPTH = 0.01       # §7.3a: ~1% of range is a 4 cm tag's depth error at 1 m
 SAG_MIN_HOLDS = 30           # §7.3b: fewer holds cannot span the workspace
 SAG_HUBER_RAD = 0.010        # 10 mrad: a stall is an outlier, not a measurement
 SAG_VALIDATE_MAX_MRAD = 15.0 # hold-out rms above this is not a usable map
@@ -78,25 +93,13 @@ ACCURACY_MIN_N = 3           # §7.4: a cell validates only with 3 good holds
 ACCURACY_RADIUS_EDGES = (0.10, 0.20, 0.30, 0.40, 0.50, 0.60)
 ACCURACY_HEIGHT_EDGES = (0.00, 0.10, 0.20, 0.30, 0.40)
 ACCURACY_SECTORS = 8
-# Observation labels that count as arm-independent anchors (§7.2): a base-tag
-# solve or a second view breaks the camera/zeros gauge that tip-only data has.
-ANCHOR_LABELS = ("base-marker", "anchor", "second-view")
+COVERAGE_MAX_POSES = 12      # §7.4: one trajectory's worth of measurement poses
+COVERAGE_HOLD_S = 2.0        # long enough for the oracle's two grabs at the middle
+COVERAGE_PERTURBATIONS = 24  # extra poses around sweep.POSES, to reach more cells
 
 
 def _stamp():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _rig_theta(rig):
-    """The solver vector of a rig: camera (as T_cam<-base), tip, zeros."""
-    T_cam_base = ex.invert(np.asarray(rig.T_base_cam, dtype=float))
-    theta = np.zeros(15)
-    theta[0:3] = ex.log_so3(T_cam_base[:3, :3])
-    theta[3:6] = T_cam_base[:3, 3]
-    theta[6:9] = np.asarray(rig.tip_offset, dtype=float)
-    if rig.joint_zeros is not None:
-        theta[9:15] = np.asarray(rig.joint_zeros, dtype=float)
-    return theta
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +156,13 @@ class TriggerMonitor:
                                             % (self.tag_baseline, tag)})
 
         proposals.extend(self.rig_proposals(rig))
+        # §7.2: zero drift is a re-zeroing job, not a rig refit. It is proposed
+        # separately so an operator is never sent to recalibrate a camera for an
+        # error the arm's zeros caused.
+        drift = zero_drift(doc)
+        if drift is not None:
+            proposals.append({"kind": drift["kind"], "reason": drift["detail"],
+                              "action": drift["action"]})
         self.proposals = proposals
         return proposals
 
@@ -169,283 +179,348 @@ class TriggerMonitor:
 # §7.2 The identifiability gate
 # --------------------------------------------------------------------------- #
 
-def has_anchors(observations):
-    return any(str(o.label).startswith(ANCHOR_LABELS) for o in observations)
+def rig_identifiability(verdicts):
+    """Which tag solves may become a rig, and which are refused (§7.2).
 
+    `verdicts` is one `verify_marker` result per capture. A weak solve -- a tag
+    too small to localise, or one seen nearly edge-on -- is REFUSED, not averaged
+    in: averaging a bad solve with good ones does not cancel it, it spreads it
+    through the rig. The report carries each solve's reprojection rms, tag side
+    and grazing angle, so a marginal rig is visible rather than silent.
 
-def select_free(fit_result, gate_mm=SIGMA_GATE_MM):
-    """(free indices, flagged directions) under the sigma gate.
-
-    j1 and j6 (indices 9 and 14) are exact gauges -- the fit machinery already
-    excludes them, and this excludes them again so a crafted free list can
-    never sneak them in.
+    The second half of the report is what this gate can never say. The tag is
+    arm-independent, so it constrains the camera and nothing else: joint zeros
+    and the tool offset are not observable from it, and claiming otherwise is the
+    "model becomes part of the calibration" trap §7.2 exists to close.
     """
-    free, flagged = [], []
-    for k, j in enumerate(fit_result.free):
-        if j in (9, 14):
-            continue
-        sigma_mm = 1000.0 * math.sqrt(max(0.0, float(fit_result.covariance[k, k])))
-        if sigma_mm > float(gate_mm):
-            flagged.append({"name": ex.NAMES[j], "sigma_mm": round(sigma_mm, 2)})
+    usable, refused = [], []
+    for index, verdict in enumerate(verdicts or [], start=1):
+        verdict = verdict or {}
+        marker = verdict.get("marker") or {}
+        entry = {"capture": index, "rms_px": verdict.get("rms_px"),
+                 "side_px": marker.get("side_px"), "grazing_deg": marker.get("grazing_deg")}
+        if verdict.get("ok"):
+            usable.append(entry)
         else:
-            free.append(j)
-    return free, flagged
-
-
-def identifiability(fit_result, gate_mm=SIGMA_GATE_MM):
-    """What this fit may update, and what it must leave alone (§7.2)."""
-    free, flagged = select_free(fit_result, gate_mm)
-    weakest = fit_result.weakest or {}
-    partial = bool(flagged) or float(weakest.get("sigma_mm", 0.0)) > float(gate_mm)
+            refused.append(dict(entry, reasons=list(verdict.get("reasons") or [])))
     return {
-        "status": "partial" if partial else "ok",
-        "identifiable": [ex.NAMES[j] for j in free],
-        "flagged": flagged,
-        "weakest": weakest,
-        "gate_mm": float(gate_mm),
+        "status": "ok" if len(usable) >= MARKER_MIN_USABLE else "refused",
+        "captures": len(verdicts or []),
+        "usable": usable,
+        "refused": refused,
+        "min_usable": MARKER_MIN_USABLE,
+        "identifiable": ["camera extrinsics (T_base_cam)"],
+        "not_identifiable": [
+            "joint zeros: fixed at deployment; the tag cannot observe them",
+            "tip offset: a known tool parameter (REBOT_TIP_MM), not fitted",
+        ],
     }
 
 
-def gated_fit(observations, K, dist, options=None, prior_rig=None, gate_mm=SIGMA_GATE_MM,
-              calib_fingerprint="", device="", mount="fixed"):
-    """Fit only in the directions the data constrains.
+def zero_drift(oracle_doc):
+    """§7.2: joint-zero drift is FLAGGED FOR RE-ZEROING, never absorbed.
 
-    An exploratory fit (the same machinery `auto_calibrate.run` uses, with the
-    degeneracy gate lifted) measures what is observable. The update itself then
-    runs Levenberg-Marquardt from the *prior* rig with only the identifiable
-    parameters free, so a weak direction keeps the value it had -- it is
-    flagged for excitation, not bent to match noisy clicks. `refine_zeros` is
-    honoured only when the observations carry arm-independent anchors.
+    The oracle's attribution already separates a constant per-joint bias across
+    poses (`joint-zeros`) from a load-dependent one (`sag`). This turns that
+    verdict into the operator-facing flag. Nothing in this module writes
+    joint_zeros -- the tag rig carries none -- so a zero error cannot hide in the
+    extrinsics, which is the whole point of an arm-independent rig.
     """
-    options = options or ex.FitOptions()
-    observations = list(observations)
-    anchors = has_anchors(observations)
-    options = replace(options, refine_zeros=bool(options.refine_zeros and anchors),
-                      max_weak_mm=1e9)
-    exploratory = ex.fit(observations, K, dist, options,
-                         calib_fingerprint=calib_fingerprint, device=device, mount=mount)
-    report = identifiability(exploratory, gate_mm)
-    free, _flagged = select_free(exploratory, gate_mm)
+    problems = ((oracle_doc or {}).get("verdict") or {}).get("problems") or []
+    flagged = [problem for problem in problems if problem.get("kind") == "joint-zeros"]
+    if not flagged:
+        return None
+    return {"kind": "zero-drift",
+            "layer": flagged[0].get("layer"),
+            "detail": flagged[0].get("detail"),
+            "action": "re-zero the arm (the deployment zero-calibration); refitting the rig "
+                      "cannot fix this and must not be tried"}
 
-    if not free:
-        # Nothing is identifiable: the update is the prior itself, and the
-        # report says which directions need excitation before another climb.
-        rig = prior_rig if prior_rig is not None else exploratory.rig
-        return {"rig": rig, "report": report, "converged": exploratory.converged,
-                "free": [], "iterations": exploratory.iterations}
 
-    theta0 = _rig_theta(prior_rig) if prior_rig is not None else _rig_theta(exploratory.rig)
-    model = ex._Model(observations, K, dist, options)
-    model.free = free
-    theta, residuals, weights, jacobian, iterations, converged = \
-        ex._levenberg_marquardt(model, theta0, options)
-    covariance, _variance = ex._covariance(model, residuals, weights, jacobian)
-    sigma = {ex.NAMES[j]: math.sqrt(max(0.0, float(covariance[k, k])))
-             for k, j in enumerate(free)}
-    weakest = ex._conditioning(covariance, free)
-    predicted = ex.predicted_error(theta, covariance, free, K, dist,
-                                   options.plane_z, options)
+def unlearned(sag_map=None, map_doc=None):
+    """§7.2: what is NOT learned yet -- reported as a gap, never extrapolated.
 
-    T_base_cam = ex.invert(ex.transform(ex.rodrigues(theta[0:3]), theta[3:6]))
-    # The same physical sanity gates fit() applies before a rig can be written.
+    The sag map and the accuracy map are the only learned quantities here, and
+    both need excitation. A map fitted from too few holds, and cells nobody has
+    measured, are stated as gaps so no caller can mistake silence for coverage.
+    """
+    gaps = []
+    if not sag_map:
+        gaps.append({"quantity": "sag-map", "state": "unlearned",
+                     "reason": "no residual map is fitted for this rig/kp/zeros key"})
+    else:
+        samples = int(sag_map.get("samples") or 0)
+        if samples < SAG_MIN_HOLDS:
+            gaps.append({"quantity": "sag-map", "state": "partial",
+                         "reason": "%d holds, %d needed to span the workspace"
+                                   % (samples, SAG_MIN_HOLDS)})
+    cells = (map_doc or {}).get("cells") or {}
+    total = ((len(ACCURACY_RADIUS_EDGES) - 1) * (len(ACCURACY_HEIGHT_EDGES) - 1)
+             * ACCURACY_SECTORS)
+    measured = sum(1 for cell in cells.values() if int(cell.get("n") or 0) > 0)
+    validated = sum(1 for cell in cells.values() if cell.get("validated_at"))
+    if validated < total:
+        gaps.append({"quantity": "accuracy-map", "state": "unlearned",
+                     "reason": "%d of %d cells validated (%d measured at all): accuracy "
+                               "outside them is not guaranteed" % (validated, total, measured),
+                     "validated": validated, "measured": measured, "cells": total})
+    return gaps
+
+
+# --------------------------------------------------------------------------- #
+# §7.3a Camera rig refit: tag PnP, averaged, no arm motion
+# --------------------------------------------------------------------------- #
+
+def _rotation_to_quaternion(R):
+    """wxyz quaternion from a rotation matrix, on the numerically safe branch."""
+    R = np.asarray(R, dtype=float)
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        q = np.array([0.25 * s, (R[2, 1] - R[1, 2]) / s,
+                      (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s])
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        q = np.array([(R[2, 1] - R[1, 2]) / s, 0.25 * s,
+                      (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s])
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        q = np.array([(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s,
+                      0.25 * s, (R[1, 2] + R[2, 1]) / s])
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        q = np.array([(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s,
+                      (R[1, 2] + R[2, 1]) / s, 0.25 * s])
+    return q / np.linalg.norm(q)
+
+
+def _quaternion_to_rotation(q):
+    w, x, y, z = (float(v) for v in q)
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=float)
+
+
+def average_pnp(matrices):
+    """The geodesic mean of several `T_cam_marker` estimates (§7.3a).
+
+    Repeated stills of a static tag differ by corner-detection noise alone, so
+    averaging cuts it. Rotation is averaged as quaternions by Markley's
+    eigenvector method -- the exact geodesic mean. A component-wise average of
+    rotation matrices is not a rotation, and an average of axis-angle vectors is
+    not the geodesic mean, so neither is used here.
+    """
+    matrices = [np.asarray(T, dtype=float) for T in matrices]
+    if len(matrices) == 1:
+        return matrices[0].copy()
+    quaternions = []
+    for matrix in matrices:
+        q = _rotation_to_quaternion(matrix[:3, :3])
+        # q and -q are the same rotation. Flipping into the first one's hemisphere
+        # stops the outer-product average from cancelling a cluster that happens
+        # to straddle the sign.
+        if quaternions and float(q @ quaternions[0]) < 0.0:
+            q = -q
+        quaternions.append(q)
+    Q = np.asarray(quaternions, dtype=float)
+    _values, vectors = np.linalg.eigh(Q.T @ Q)
+    mean = vectors[:, -1]
+    if float(mean @ Q[0]) < 0.0:
+        mean = -mean
+    out = np.eye(4)
+    out[:3, :3] = _quaternion_to_rotation(mean / np.linalg.norm(mean))
+    out[:3, 3] = np.mean([matrix[:3, 3] for matrix in matrices], axis=0)
+    return out
+
+
+def pnp_spread_mm(matrices):
+    """How far the individual tag solves disagree, in mm (§7.3a).
+
+    A static camera and a static tag give one answer plus noise. A spread beyond
+    MARKER_SPREAD_MAX_MM means something moved mid-session -- the bracket, the
+    tag, or the phone -- and averaging would hide it, so the session refuses.
+    """
+    if len(matrices) < 2:
+        return 0.0
+    centres = np.asarray([np.asarray(T, dtype=float)[:3, 3] for T in matrices])
+    return float(1000.0 * np.max(np.linalg.norm(centres - centres.mean(axis=0), axis=1)))
+
+
+def marker_reprojection(T_base_cam, corners, K, dist, marker):
+    """Where a rig puts the tag's corners, against where they were detected.
+
+    The tag's base placement is known, so a rig implies where its four corners
+    must land in ANY still. Measured on a capture the average never saw, this is
+    the check that averaging did not drift the camera (§7.3a's held-out gate).
+    """
+    import cv2
+
+    T_base_marker = base_marker.base_from_marker(
+        marker["at"], float(marker.get("yaw", 0.0)), mode="vertical")
+    T_cam_marker = ex.invert(np.asarray(T_base_cam, dtype=float)) @ T_base_marker
+    rvec, _jacobian = cv2.Rodrigues(T_cam_marker[:3, :3])
+    points = base_marker.object_points(float(marker.get("size_m", base_marker.SIZE_M)))
+    projected, _jacobian = cv2.projectPoints(
+        points, rvec, T_cam_marker[:3, 3].reshape(3, 1),
+        np.asarray(K, dtype=float), np.asarray(dist, dtype=float).reshape(-1))
+    errors = np.linalg.norm(projected.reshape(-1, 2)
+                            - np.asarray(corners, dtype=float).reshape(-1, 2), axis=1)
+    return {"rms_px": round(float(np.sqrt(np.mean(errors ** 2))), 2),
+            "worst_px": round(float(np.max(errors)), 2)}
+
+
+def tag_prior_mm(rig, point):
+    """The tag rig's own accuracy prior at a point, in mm (§7.3a, §7.4).
+
+    A 4 cm tag solves to roughly 1% of range in depth (§7.3a), so the prior
+    scales with the camera-to-point distance and nothing else. It is a PRIOR, not
+    a measurement: the accuracy map's measured layer is what validates a cell,
+    and the oracle catches a rig error regardless of how confident this looks.
+    """
+    if rig is None:
+        return None
+    camera = np.asarray(rig.T_base_cam, dtype=float)[:3, 3]
+    range_m = float(np.linalg.norm(np.asarray(point, dtype=float).reshape(3) - camera))
+    return round(TAG_PRIOR_DEPTH * range_m * 1000.0, 2)
+
+
+def refit_session(eye, calibration, marker, calib_dir, plane_z=0.0, mount="fixed",
+                  captures=5, holdout=1, settle_s=0.4, progress=None, q=None):
+    """§7.3a: refit the camera rig from the base tag. NO ARM MOTION.
+
+    Repeated stills of the tag, each gated by `verify_marker`; the survivors are
+    averaged into a candidate rig written as `extrinsics-candidate-<ts>.json`.
+    The candidate is committed only if a capture the average never saw still
+    reprojects the tag within HOLDOUT_MAX_PX. A refusal leaves the running rig
+    untouched and the candidate on disk as evidence; the caller (capture_server)
+    does the hot-load, exactly as it does for /capture/pose.
+
+    The tip offset is a known tool parameter and joint zeros come from the
+    deployment zero-calibration (§7.2) -- neither is fitted here, and the tag
+    could not observe them if it were.
+    """
+    if not isinstance(marker, dict) or marker.get("at") is None:
+        raise IdentifyError("the base marker has no placement: set REBOT_MARKER_AT to its centre "
+                            "and heading (see docs/base-marker.md)")
+    captures, holdout = max(int(captures), 1), max(int(holdout), 0)
+    started = time.time()
+    solved, refused = [], []
+    for index in range(captures + holdout):
+        if progress is not None:
+            progress(index + 1, "capture")
+        if index:
+            time.sleep(float(settle_s))
+        frame = eye.read()
+        if frame is None:
+            refused.append({"capture": index + 1, "reasons": ["the camera returned no frame"]})
+            continue
+        try:
+            run = auto_calibrate.solve_marker(frame, calibration, marker,
+                                              plane_z=plane_z, mount=mount)
+        except (auto_calibrate.AutoError, base_marker.MarkerError) as error:
+            refused.append({"capture": index + 1, "reasons": [str(error)]})
+            continue
+        solved.append({"capture": index + 1, "run": run, "frame": frame})
+
+    pool = [entry for entry in solved if entry["capture"] <= captures]
+    held = [entry for entry in solved if entry["capture"] > captures]
+    gate = rig_identifiability([entry["run"].verdict for entry in pool])
+    usable = [entry for entry in pool if entry["run"].verdict["ok"]]
+    if len(usable) < MARKER_MIN_USABLE:
+        reasons = [reason for entry in gate["refused"] for reason in entry["reasons"]]
+        reasons += [reason for entry in refused for reason in entry["reasons"]]
+        raise IdentifyError("only %d of %d tag solves passed verify_marker (%d needed): %s"
+                            % (len(usable), len(pool), MARKER_MIN_USABLE,
+                               "; ".join(dict.fromkeys(reasons)) or "the tag was never detected"))
+
+    matrices = [entry["run"].evidence["T_cam_marker"] for entry in usable]
+    spread = pnp_spread_mm(matrices)
+    if spread > MARKER_SPREAD_MAX_MM:
+        raise IdentifyError("the tag solves disagree by %.1f mm (limit %.0f): the camera, the "
+                            "bracket or the tag moved during the session, so there is no single "
+                            "rig to average" % (spread, MARKER_SPREAD_MAX_MM))
+
+    T_base_marker = base_marker.base_from_marker(
+        marker["at"], float(marker.get("yaw", 0.0)), mode="vertical")
+    T_base_cam = T_base_marker @ np.linalg.inv(average_pnp(matrices))
     if float(np.linalg.norm(T_base_cam[:3, 3])) > ex.MAX_CAMERA_M:
-        raise IdentifyError("the gated fit ran away: the camera came out %.1f m from the base"
-                            % float(np.linalg.norm(T_base_cam[:3, 3])))
-    if float(np.linalg.norm(theta[6:9])) > ex.MAX_TIP_M:
-        raise IdentifyError("the gated fit put the tip %.0f mm from the flange"
-                            % (1000.0 * float(np.linalg.norm(theta[6:9]))))
+        raise IdentifyError("the averaged solve put the camera %.1f m from the base (limit %.0f)"
+                            % (float(np.linalg.norm(T_base_cam[:3, 3])), ex.MAX_CAMERA_M))
 
-    per_pose = np.linalg.norm(residuals.reshape(-1, 2), axis=1)
-    rms_px = float(np.sqrt(np.mean(per_pose ** 2)))
-    ranges = [float(np.linalg.norm(T_base_cam[:3, 3] - model.tip_in_base(
-                  i, theta[6:9], theta[9:15] if options.refine_zeros else None)))
-              for i in range(len(observations))]
-    focal = float(np.mean([np.asarray(K, float)[0, 0], np.asarray(K, float)[1, 1]]))
-    metres_per_pixel = float(np.mean(ranges)) / focal if focal else 0.0
-    rig = ex.Rig(
-        T_base_cam=T_base_cam, calib_fingerprint=str(calib_fingerprint),
-        image_size=tuple(int(v) for v in (options.image_size or (0, 0))),
-        plane_z=float(options.plane_z), tip_offset=np.asarray(theta[6:9], dtype=float),
-        joint_zeros=(np.asarray(theta[9:15], dtype=float) if options.refine_zeros else None),
-        rms_px=rms_px, rms_mm=rms_px * metres_per_pixel * 1000.0,
-        max_px=float(np.max(per_pose)), observations=observations, sigma=sigma,
-        weakest=weakest, predicted=predicted, device=str(device), mount=str(mount),
-        fitted=_stamp(), iterations=int(iterations), converged=bool(converged),
-    )
-    # The report stays the exploratory one: removing the weak directions from
-    # the free set makes the *update's* covariance look healthy by construction,
-    # but the data still does not constrain them -- that is what must be said.
-    return {"rig": rig, "report": report,
-            "converged": bool(converged), "free": list(free), "iterations": int(iterations)}
+    # The averaged rig's own evidence: the mean of what went into it. Gated again,
+    # because a mean of marginal solves can still be marginal.
+    evidence = {
+        "rms_px": float(np.mean([float(e["run"].evidence["rms_px"]) for e in usable])),
+        "side_px": float(np.mean([float(e["run"].evidence["side_px"]) for e in usable])),
+        "grazing_deg": float(np.mean([float(e["run"].evidence["grazing_deg"]) for e in usable])),
+        "id": usable[0]["run"].evidence.get("id"),
+    }
+    verdict = auto_calibrate.verify_marker(evidence)
+    candidate = replace(usable[0]["run"].rig, T_base_cam=T_base_cam,
+                        rms_px=evidence["rms_px"], max_px=evidence["rms_px"],
+                        fitted=_stamp(), observations=[], method="base-marker")
 
-
-# --------------------------------------------------------------------------- #
-# §7.3a Active extrinsics climb: candidate scoring
-# --------------------------------------------------------------------------- #
-
-def candidate_poses(current_q, fit_result, K, dist, tip, seed=11, perturbations=24, top_k=8):
-    """The top-k poses that most reduce the fit's weakest directions.
-
-    Pool = sweep.POSES plus seeded perturbations, filtered by `pose_ok` and a
-    `path_safe` chain from where the arm is now. Each survivor is scored by the
-    covariance reduction its tip observation would add, projected onto the
-    weakest eigendirections of the current fit, with a small D-optimality
-    (log-det information) term to break ties -- task residuals alone are not
-    persistently exciting, so the climb goes where the *uncertainty* is.
-    """
-    rng = np.random.default_rng(seed)
-    base = [np.asarray(p, dtype=float) for p in sweep.POSES]
-    pool = list(base)
-    for _ in range(int(perturbations)):
-        q = base[int(rng.integers(len(base)))]
-        mask = rng.random(6) < 0.5
-        pool.append(q + rng.normal(0.0, 0.12, 6) * mask)
-
-    rig = fit_result.rig
-    T_cam_base = ex.invert(np.asarray(rig.T_base_cam, dtype=float))
-    safe = []
-    previous = np.asarray(current_q, dtype=float).reshape(6)
-    for q in pool:
-        if not sweep.pose_ok(q) or not sweep.path_safe(previous, q):
-            continue
-        T = rebot_ik.forward(q)
-        point = T[:3, :3] @ np.asarray(tip, dtype=float) + T[:3, 3]
-        if ex.pixel(point, K, dist, T_cam_base) is None:
-            continue        # behind the lens: no observation, no information
-        safe.append(q)
-        previous = q
-
-    theta = _rig_theta(rig)
-    free = [j for j in fit_result.free if j not in (9, 14)]
-    covariance = np.asarray(fit_result.covariance, dtype=float)
-    values, vectors = np.linalg.eigh(covariance)
-    weak_dirs = vectors[:, np.argsort(-values)[:3]]
-    information = np.linalg.pinv(covariance)
-    logdet0 = float(np.linalg.slogdet(information)[1])
-    fit_options = ex.FitOptions(refine_tip=True, refine_zeros=any(j >= 10 for j in free))
-
-    scored = []
-    for q in safe:
-        model = ex._Model([ex.Observation(q=q, uv=(0.0, 0.0))], K, dist, fit_options)
-        model.free = list(free)
-        J = model.jacobian(theta)             # 2 x n_free, pixel per parameter
-        added = information + J.T @ J         # ~1 px click noise
-        C_new = np.linalg.pinv(added)
-        reduction = sum(float(d @ (covariance - C_new) @ d) for d in weak_dirs.T)
-        dopt = float(np.linalg.slogdet(added)[1]) - logdet0
-        scored.append((reduction + 1e-3 * dopt, q))
-    scored.sort(key=lambda item: -item[0])
-
-    # Re-check the chain in score order: picking the top-k must not reorder the
-    # legs into a path the capsule model never approved.
-    chosen = []
-    previous = np.asarray(current_q, dtype=float).reshape(6)
-    for _score, q in scored:
-        if len(chosen) >= int(top_k):
-            break
-        if not sweep.path_safe(previous, q):
-            continue
-        chosen.append(q)
-        previous = q
-    return chosen
-
-
-def verify_candidate(rig, fit_observations, holdout_observations, calibration, options,
-                     converged=True):
-    """auto_calibrate.verify's gates PLUS poses the fit never saw (§7.3a)."""
-    verdict = auto_calibrate.verify(rig, fit_observations, calibration, options, converged)
-    reasons = list(verdict["reasons"])
-    K, dist = calibration.K, calibration.dist
-    holdout_px = []
-    for observation in holdout_observations:
-        T = rebot_ik.forward(np.asarray(observation.q, dtype=float))
-        point = T[:3, :3] @ np.asarray(rig.tip_offset, dtype=float) + T[:3, 3]
-        seen = ex.pixel(point, K, dist, ex.invert(np.asarray(rig.T_base_cam, dtype=float)))
-        holdout_px.append(float("inf") if seen is None else
-                          math.hypot(seen[0] - observation.uv[0], seen[1] - observation.uv[1]))
-    if not holdout_observations:
-        reasons.append("no hold-out poses: the climb must verify on poses the fit never saw")
-    elif float(np.max(holdout_px)) > HOLDOUT_MAX_PX:
-        reasons.append("the worst hold-out pose reprojects %.1f px (limit %.0f)"
-                       % (float(np.max(holdout_px)), HOLDOUT_MAX_PX))
-    return dict(verdict, ok=not reasons, reasons=reasons,
-                holdout_px=[round(float(v), 2) for v in holdout_px])
-
-
-def climb_session(arm, eye, calibration, options, captures_dir, recorder, current_rig,
-                  calib_dir, progress=None, top_k=6, holdout=2, gate_mm=SIGMA_GATE_MM,
-                  seed=11, mount="fixed", turn=0):
-    """One gated identification excursion. Returns a report; never hot-loads.
-
-    The arm moves only through `auto_calibrate.run` (one `/move` trajectory with
-    holds, video + PoseLog exactly as the commissioning sweep), whose legs are
-    timed by `sweep.seconds_for` and re-checked by the gateway. The candidate is
-    written as `extrinsics-candidate-<ts>.json` and committed to the standard
-    rig path only if verification passes *and* every direction was identifiable;
-    a partial or refused climb leaves the running rig untouched. The caller
-    (capture_server) does the hot-load, exactly as it does for /calibrate.
-    """
-    if current_rig is None or not current_rig.observations:
-        raise IdentifyError("the climb refines an existing rig: fit one first (a sweep or the "
-                            "base marker); there is nothing to score candidates against")
-    K, dist = calibration.K, calibration.dist
-    start = arm.pose()
-    q_start = np.asarray(start["q"][:6], dtype=float)
-    fit_options = ex.FitOptions(plane_z=float(options.plane_z),
-                                image_size=tuple(int(v) for v in calibration.image_size),
-                                work_radius=float(options.work_radius), max_weak_mm=1e9)
-    base_fit = ex.fit(current_rig.observations, K, dist, fit_options,
-                      calib_fingerprint=calibration.fingerprint, device=calibration.device)
-    chosen = candidate_poses(q_start, base_fit, K, dist, current_rig.tip_offset,
-                             seed=seed, top_k=int(top_k) + int(holdout))
-    if len(chosen) < ex.MIN_POSES + int(holdout):
-        raise IdentifyError("only %d safe, visible candidate poses from here: park the arm and "
-                            "try again (need %d)" % (len(chosen), ex.MIN_POSES + int(holdout)))
-    fit_poses = chosen[:int(top_k)]
-    holdout_poses = chosen[int(top_k):]
-
-    result = auto_calibrate.run(arm, eye, calibration, options, captures_dir,
-                                recorder=recorder, mount=mount, progress=progress,
-                                poses=fit_poses + holdout_poses,
-                                seed_T=np.asarray(current_rig.T_base_cam, dtype=float),
-                                turn=turn)
-    fit_obs = result.observations[:int(top_k)]
-    holdout_obs = result.observations[int(top_k):]
-    gated = gated_fit(fit_obs, K, dist, fit_options, prior_rig=current_rig, gate_mm=gate_mm,
-                      calib_fingerprint=calibration.fingerprint, device=calibration.device,
-                      mount=mount)
-    candidate = gated["rig"]
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     candidate_path = Path(calib_dir) / ("extrinsics-candidate-%s.json" % stamp)
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
     ex.save_rig(candidate, candidate_path)
 
-    verdict = verify_candidate(candidate, fit_obs, holdout_obs, calibration, options,
-                               gated["converged"])
-    partial = gated["report"]["status"] != "ok"
-    ok = bool(verdict["ok"]) and not partial
+    # The held-out gate: a capture the average never saw must still reproject the
+    # tag under the averaged rig. This is what catches an average that drifted.
+    holdout_px, warnings = [], []
+    for entry in held:
+        try:
+            corners = base_marker.detect(entry["frame"],
+                                         marker_id=(int(marker["id"]) if marker.get("id") is not None
+                                                    else base_marker.MARKER_ID))
+        except base_marker.MarkerError as error:
+            warnings.append("held-out capture %d could not be checked (%s)"
+                            % (entry["capture"], error))
+            continue
+        measured = marker_reprojection(T_base_cam, corners, calibration.K, calibration.dist,
+                                       marker)
+        holdout_px.append(measured)
+    if not holdout_px:
+        verdict = dict(verdict, ok=False,
+                       reasons=list(verdict["reasons"]) + [
+                           "no held-out capture could be checked: the refit must verify on a "
+                           "still the average never saw"])
+    elif max(entry["worst_px"] for entry in holdout_px) > HOLDOUT_MAX_PX:
+        worst = max(entry["worst_px"] for entry in holdout_px)
+        verdict = dict(verdict, ok=False,
+                       reasons=list(verdict["reasons"]) + [
+                           "the held-out capture's tag reprojects %.1f px off the averaged rig "
+                           "(limit %.0f)" % (worst, HOLDOUT_MAX_PX)])
+
     report = {
-        "ok": ok,
-        "partial": partial,
-        "poses": len(chosen),
-        "holdout": len(holdout_obs),
-        "seconds": round(result.seconds, 1),
+        "ok": bool(verdict["ok"]),
+        "method": "base-marker",
+        "motion": False,
+        "captures": captures + holdout,
+        "usable": len(usable),
+        "held_out": len(holdout_px),
+        "spread_mm": round(spread, 2),
+        "seconds": round(time.time() - started, 1),
         "rig": candidate.provenance(),
         "verification": verdict,
-        "identifiability": gated["report"],
+        "identifiability": gate,
+        "holdout_px": holdout_px,
         "candidate": str(candidate_path),
         "written": None,
-        "warnings": list(result.warnings),
+        "warnings": warnings,
     }
-    if partial:
-        report["error"] = ("partial identification: %s flagged for excitation, not updated"
-                           % ", ".join(f["name"] for f in gated["report"]["flagged"]))
-    if not ok:
-        return report                       # old rig stays; the candidate is evidence
+    if not report["ok"]:
+        return report                          # old rig stays; the candidate is evidence
 
     rig_path = Path(calib_dir) / ("extrinsics-%s.json" % mount)
-    auto_calibrate.attach_witness(candidate, result, calibration, rig_path)
-    ex.save_rig(candidate, rig_path)
-    report["written"] = str(rig_path)
+    run = auto_calibrate.MarkerRun(rig=candidate, verdict=verdict, evidence=evidence,
+                                   seconds=report["seconds"], warnings=list(warnings))
+    _rig, _verdict, written = auto_calibrate.commit_marker(
+        run, calibration, rig_path, frame=usable[-1]["frame"], q=q)
+    report["written"] = str(written) if written else None
+    report["warnings"] = list(run.warnings)
     return report
 
 
@@ -621,6 +696,24 @@ def save_sag_map(calib_dir, map_doc):
     return path
 
 
+def active_sag_map(calib_dir, kp_spec, rig_name="extrinsics-fixed.json"):
+    """The sag map keyed to the active rig, or None (§7.2's unlearned report).
+
+    The same keying `sweep.active_sag_extra` applies the map under, so what this
+    reports is what the live /move path would actually use: a map fitted under a
+    different rig, kp or zeros is None here exactly as it is inert there.
+    """
+    try:
+        rig_doc = json.loads((Path(calib_dir) / rig_name).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    fingerprint = str(rig_doc.get("fingerprint") or "")
+    if not fingerprint:
+        return None
+    return sweep.load_sag_map(calib_dir, fingerprint, kp_key=kp_spec,
+                              zeros_key=sweep.zeros_key(rig_doc.get("joint_zeros")))
+
+
 # --------------------------------------------------------------------------- #
 # §7.4 The accuracy envelope
 # --------------------------------------------------------------------------- #
@@ -650,9 +743,11 @@ def update_accuracy_map(path, oracle_doc, rig=None, threshold_mm=oracle.PIXEL_ER
 
     A cell validates only with ACCURACY_MIN_N measured holds under threshold;
     a later over-threshold hold un-validates it, because the envelope is a
-    measured claim and must stay honest. predicted_mm is the fit covariance's
-    conservative corner bound -- per-cell prediction is not identifiable from
-    holds alone, so the whole-grid bound is what is reported.
+    measured claim and must stay honest. predicted_mm is the TAG-RIG PRIOR at
+    that cell's tip (§7.4): ~1% of range for a 4 cm tag, floored by the rig's own
+    reprojection error. It is a prior, not a measurement -- the measured layer is
+    what validates, and a cell with no measured holds stays unvalidated however
+    confident the prior looks.
     """
     path = Path(path)
     try:
@@ -660,7 +755,6 @@ def update_accuracy_map(path, oracle_doc, rig=None, threshold_mm=oracle.PIXEL_ER
     except (json.JSONDecodeError, OSError):
         doc = {"version": 1, "cells": {}}
     cells = doc.setdefault("cells", {})
-    predicted = (rig.predicted or {}).get("corner_mm") if rig is not None else None
     for hold in (oracle_doc or {}).get("holds") or []:
         error = hold.get("pixel_error_mm")
         tip = hold.get("tip_fk_cmd") or hold.get("tip_fk_meas")
@@ -672,6 +766,7 @@ def update_accuracy_map(path, oracle_doc, rig=None, threshold_mm=oracle.PIXEL_ER
         cell["n"] += 1
         error = float(error)
         cell["measured_mm"] = round(max(cell["measured_mm"] or 0.0, error), 2)
+        predicted = tag_prior_mm(rig, tip)
         if predicted is not None:
             cell["predicted_mm"] = predicted
         if error <= float(threshold_mm):
@@ -710,3 +805,129 @@ def validated_fraction(map_doc):
         return 0.0
     validated = sum(1 for cell in cells.values() if cell.get("validated_at"))
     return validated / len(cells)
+
+
+def coverage_cells(map_doc):
+    """Every cell of the grid, with how badly it still needs measuring (§7.4).
+
+    need 3 = nobody has measured it at all; 2 = measured but fewer than
+    ACCURACY_MIN_N holds; 1 = enough holds but at least one was over threshold,
+    so it un-validated; 0 = validated. The grid is enumerated rather than read
+    from the map's keys, because an absent cell and a never-visited one are the
+    same gap and must both be reachable.
+    """
+    cells = (map_doc or {}).get("cells") or {}
+    out = []
+    for ri in range(len(ACCURACY_RADIUS_EDGES) - 1):
+        for hi in range(len(ACCURACY_HEIGHT_EDGES) - 1):
+            for sector in range(ACCURACY_SECTORS):
+                key = "r%d-h%d-s%d" % (ri, hi, sector)
+                cell = cells.get(key) or {}
+                n = int(cell.get("n") or 0)
+                if cell.get("validated_at"):
+                    need = 0
+                elif n >= ACCURACY_MIN_N:
+                    need = 1
+                elif n:
+                    need = 2
+                else:
+                    need = 3
+                out.append({"cell": key, "need": need, "n": n,
+                            "measured_mm": cell.get("measured_mm"),
+                            "radius_m": [ACCURACY_RADIUS_EDGES[ri], ACCURACY_RADIUS_EDGES[ri + 1]],
+                            "height_m": [ACCURACY_HEIGHT_EDGES[hi], ACCURACY_HEIGHT_EDGES[hi + 1]]})
+    return out
+
+
+def coverage_poses(current_q, map_doc, tip, seed=11, top_k=COVERAGE_MAX_POSES,
+                   perturbations=COVERAGE_PERTURBATIONS, per_cell=2):
+    """The safe poses whose tip lands in the least-covered cells (§7.4).
+
+    Pool = `sweep.POSES` plus seeded perturbations, filtered by `pose_ok` and a
+    `path_safe` chain from where the arm is now -- the same filters the sweep
+    uses, so a coverage pose is a pose the bench already considers safe. Each
+    survivor is scored by `coverage_cells`' need for the cell its tip falls in.
+
+    This is coverage OF THE GRID, not excitation of a fit: the score says which
+    cells are empty, never which parameter directions are weak. There is no
+    covariance and no Jacobian here, and a coverage session writes no rig -- it
+    exists to give the oracle holds to measure, so the accuracy map's measured
+    layer grows in the places nobody has been.
+    """
+    rng = np.random.default_rng(int(seed))
+    base = [np.asarray(pose, dtype=float) for pose in sweep.POSES]
+    pool = list(base)
+    for _ in range(int(perturbations)):
+        pose = base[int(rng.integers(len(base)))]
+        mask = rng.random(6) < 0.5
+        pool.append(pose + rng.normal(0.0, 0.12, 6) * mask)
+
+    tip = np.asarray(tip, dtype=float).reshape(3)
+    safe, previous = [], np.asarray(current_q, dtype=float).reshape(6)
+    for pose in pool:
+        if not sweep.pose_ok(pose) or not sweep.path_safe(previous, pose):
+            continue
+        T = rebot_ik.forward(pose)
+        point = T[:3, :3] @ tip + T[:3, 3]
+        safe.append({"q": pose, "tip": point, "cell": accuracy_cell(point)})
+        previous = pose
+
+    need = {entry["cell"]: entry["need"] for entry in coverage_cells(map_doc)}
+    for entry in safe:
+        entry["need"] = int(need.get(entry["cell"], 3))
+    # Best-covered first would waste the trajectory on cells that are already
+    # done; sort by need, then spread across cells so one trajectory measures as
+    # many distinct gaps as it can reach.
+    safe.sort(key=lambda entry: (-entry["need"], entry["cell"]))
+    chosen, taken = [], {}
+    for entry in safe:
+        if len(chosen) >= int(top_k):
+            break
+        if taken.get(entry["cell"], 0) >= int(per_cell):
+            continue
+        if entry["need"] <= 0:
+            continue        # already validated: measuring it again teaches nothing
+        chosen.append(entry)
+        taken[entry["cell"]] = taken.get(entry["cell"], 0) + 1
+
+    # Re-check the chain in score order: picking the best cells must not reorder
+    # the legs into a path the capsule model never approved.
+    ordered, previous = [], np.asarray(current_q, dtype=float).reshape(6)
+    for entry in chosen:
+        if not sweep.path_safe(previous, entry["q"]):
+            continue
+        ordered.append(entry)
+        previous = entry["q"]
+    return ordered
+
+
+def coverage_plan(current_q, poses, gripper=0.0, hold_s=COVERAGE_HOLD_S):
+    """The `/move` request a coverage session makes, and the cells it measures.
+
+    Pure: the leg durations come from `sweep.seconds_for`, the same speed policy
+    the gateway applies as its floor, so asking for exactly the policy value
+    means the gateway cannot raise it and the oracle's hold windows are the ones
+    this plan predicts. Nothing here moves the arm.
+
+    The caller (capture_server) owns the orchestration, because the oracle hooks
+    it needs are async: build the trajectory with a dry run, prepare the oracle
+    from the REAL windows the gateway persisted, move, then finish. This module
+    stays pure policy so both halves are unit-testable offline.
+    """
+    targets = [[float(v) for v in entry["q"]] for entry in poses]
+    chain = [np.asarray(current_q, dtype=float).reshape(6)] + \
+            [np.asarray(target, dtype=float) for target in targets]
+    seconds = [sweep.seconds_for(start, end) for start, end in zip(chain, chain[1:])]
+    return {
+        "targets": targets,
+        "seconds": [round(float(value), 3) for value in seconds],
+        "hold": float(hold_s),
+        "gripper": float(gripper),
+        "cells": [entry["cell"] for entry in poses],
+        "needs": [entry["need"] for entry in poses],
+        "tips": [[float(v) for v in entry["tip"]] for entry in poses],
+        "motion_s": round(float(sum(seconds)) + float(hold_s) * len(targets), 1),
+        # §7.4: what this motion is for, stated so nobody mistakes it for a fit.
+        "writes_rig": False,
+        "purpose": "measure the unvalidated accuracy cells; the oracle validates them",
+    }

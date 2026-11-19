@@ -325,7 +325,12 @@ def move_one(body):
         raise GatewayError("execution is disabled on this host (REBOT_EXECUTE=1 to allow it)", 403)
     # Moves are taped too (§5.2): the calibration sweeps are executions, and
     # their holds are the oracle's measurement points just like a plan's.
-    move_id = new_id()
+    # A caller that measures those holds afterwards needs to know the id the
+    # telemetry lands under, so it may name the move itself (§7.4 coverage).
+    requested_id = str(body.get("id") or "")
+    if requested_id and not PLAN_ID.match(requested_id):
+        raise GatewayError("'id' must look like %s, got %r" % (PLAN_ID.pattern, requested_id))
+    move_id = requested_id or new_id()
     requested = body.get("targets")
     if requested is None:
         q = body.get("q")
@@ -432,6 +437,21 @@ def move_one(body):
                                              label="%d poses, one pass" % len(targets))
     except ValueError as error:
         raise GatewayError(str(error), 422) from error
+
+    # Persist the trajectory beside the telemetry it is about to produce, exactly
+    # as /plan persists a plan. The oracle reads the hold windows out of this
+    # file, so a move's holds are measurable the same way a plan's are (§5.2) --
+    # and a dry run lets the caller read the REAL windows before the arm moves,
+    # which is what schedules the coverage session's hold grabs (§7.4).
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUT_DIR / ("%s.json" % move_id)
+    path.write_text(json.dumps(trajectory, separators=(",", ":")), encoding="utf-8")
+    if body.get("dry_run"):
+        return {"ok": True, "id": move_id, "dry_run": True, "path": str(path),
+                "bytes": path.stat().st_size, "poses": len(targets),
+                "seconds": [round(float(value), 3) for value in seconds], "hold": hold,
+                "waypoints": len(trajectory["waypoints"]),
+                "duration_s": trajectory.get("duration_s")}
 
     query = urllib.parse.urlencode({
         "kp": str(body.get("kp") or KP),

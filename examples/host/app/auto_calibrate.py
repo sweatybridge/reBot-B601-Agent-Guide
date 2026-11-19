@@ -130,20 +130,49 @@ class ArmGateway:
             raise AutoError(payload.get("error", "the gateway refused the move"))
         return payload
 
-    def move_sequence(self, targets, seconds, hold=0.0):
+    def move_sequence(self, targets, seconds, hold=0.0, gripper=None, plan_id=None):
         """Walk through `targets` in one trajectory and wait for the whole pass.
 
         The board returns the arm to the pose it started from when the file ends,
         so this is one round trip for the sweep: out through every pose with a hold
         at each, and back to park once.
+
+        `plan_id` names the move for the gateway's telemetry store, so a caller
+        that measures the holds afterwards (the oracle, §7.4) can find them; the
+        gateway generates one when it is absent. `gripper` holds the hand where it
+        already is unless a pose needs it somewhere else.
         """
         body = {"targets": [[float(v) for v in target] for target in targets],
                 "seconds": [float(value) for value in seconds],
                 "hold": float(hold)}
+        if gripper is not None:
+            body["gripper"] = float(gripper)
+        if plan_id:
+            body["id"] = str(plan_id)
         total = float(sum(body["seconds"])) + float(hold) * len(body["targets"])
         status, payload = self._call("POST", "/move", body, timeout=max(600.0, 4.0 * total))
         if status != 200:
             raise AutoError(payload.get("error", "the gateway refused the sweep"))
+        return payload
+
+    def build_sequence(self, targets, seconds, hold=0.0, gripper=None, plan_id=None):
+        """Ask the gateway to BUILD (and persist) a trajectory without playing it.
+
+        The coverage session needs the real hold windows before the arm moves, so
+        the oracle can grab a still at each hold's midpoint (§7.4). This is the
+        same `/move` gate with `dry_run`: it reads the pose and builds the file,
+        and never reaches the bus.
+        """
+        body = {"targets": [[float(v) for v in target] for target in targets],
+                "seconds": [float(value) for value in seconds],
+                "hold": float(hold), "dry_run": True}
+        if gripper is not None:
+            body["gripper"] = float(gripper)
+        if plan_id:
+            body["id"] = str(plan_id)
+        status, payload = self._call("POST", "/move", body, timeout=120.0)
+        if status != 200:
+            raise AutoError(payload.get("error", "the gateway refused to build the trajectory"))
         return payload
 
 
@@ -806,12 +835,11 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
     sweep). It exists for the API's status route: a three-minute sweep behind one
     POST needs to say where it is.
 
-    `poses` overrides the visited pose list (default `sweep.POSES`); the identify
-    climb (§7.3a) passes its scored candidates. Legs are still timed by
-    `sweep.seconds_for`, so the speed cap is unchanged. `seed_T` starts the
-    detection from a known rig instead of a tap/marker bootstrap -- the climb
-    refines a rig it already has, and re-searching the seed family would only
-    add a way to fail.
+    `poses` overrides the visited pose list (default `sweep.POSES`). Legs are
+    still timed by `sweep.seconds_for`, so the speed cap is unchanged. `seed_T`
+    starts the detection from a known rig instead of a tap/marker bootstrap:
+    re-fitting a rig the operator already has should not re-search the seed
+    family, which would only add a way to fail.
 
     `turn` is the stream's quarter-turn correction (`locate_target.turn_back`):
     the recorder writes the stream as delivered, while the caller's probe and

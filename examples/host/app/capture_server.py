@@ -2210,15 +2210,21 @@ async def handle_calibrate_status(request: web.Request) -> web.Response:
     })
 
 
-def run_identify(app, camera_url, calibration_path, body):
-    """One identification climb, off the loop -- the same shape as run_sweep.
+def new_plan_id():
+    """An id in the gateway's plan shape, so its telemetry store accepts it."""
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
 
-    The arm moves only through auto_calibrate.run -> the gateway's /move check
-    chain; the climb adds consent, single-flight and verify-before-hot-load on
-    top (§8.1). The current rig seeds the detection, so no tap is needed.
+
+def run_refit(app, camera_url, calibration_path, body):
+    """One tag-rig refit, off the loop (§7.3a). NO ARM MOTION, no recorder.
+
+    Repeated stills of the base tag, each gated by `verify_marker`; the survivors
+    are averaged into a candidate that a held-out capture must still reproject.
+    The camera is the only thing this session touches, so it needs no execute
+    gate and no MediaMTX recording -- the arm pose is read once, for the witness.
     """
-    def note(pose, phase):
-        app["progress"] = {"pose": int(pose), "of": app.get("identify_of", 0),
+    def note(index, phase):
+        app["progress"] = {"pose": int(index), "of": app.get("identify_of", 0),
                            "phase": phase, "started": app["calibration_started"]}
 
     eye = camera_mod.open_source(camera_url, latency=0.0)
@@ -2229,93 +2235,168 @@ def run_identify(app, camera_url, calibration_path, body):
         probe, calibration, turn = locator.upright_frame(calibration_path, probe, turn)
         if turn:
             eye = UprightEye(eye, turn)
-        options = auto_calibrate.Options(
-            plane_z=float(body.get("plane_z", app["plane_z"])),
-            settle_s=float(body.get("settle", 0.5)),
-            background="median",
-        )
-        arm = auto_calibrate.ArmGateway(app["planner"], app["planner_token"])
-        path = mediamtx.path_from_camera(camera_url)
-        if not path:
-            raise auto_calibrate.AutoError(
-                "the climb is recorded by MediaMTX, so REBOT_CAMERA must be its RTSP path "
-                "(rtsp://mediamtx:8554/phone); %r cannot be recorded" % camera_url)
-        recorder = mediamtx.Recorder(app["mediamtx_api"], path=path,
-                                     recordings=app["recordings"])
-        top_k = int(body.get("top_k", 6))
-        holdout = int(body.get("holdout", 2))
-        app["identify_of"] = top_k + holdout
-        return identify_mod.climb_session(
-            arm, eye, calibration, options, app["captures"], recorder,
-            current_rig=app["rig"], calib_dir=app["calib"], progress=note,
-            top_k=top_k, holdout=holdout,
-            gate_mm=float(body.get("gate_mm", identify_mod.SIGMA_GATE_MM)),
-            seed=int(body.get("seed", 11)), mount="fixed", turn=turn)
+        captures = int(body.get("captures", 5))
+        holdout = int(body.get("holdout", 1))
+        app["identify_of"] = captures + holdout
+        q = None
+        try:
+            arm = auto_calibrate.ArmGateway(app["planner"], app["planner_token"])
+            q = arm.pose().get("q")       # for the mount witness, not for motion
+        except auto_calibrate.AutoError as error:
+            logging.warning("the refit has no arm pose for its witness: %s", error)
+        return identify_mod.refit_session(
+            eye, calibration, app["marker"], app["calib"],
+            plane_z=float(body.get("plane_z", app["plane_z"])), mount="fixed",
+            captures=captures, holdout=holdout,
+            settle_s=float(body.get("settle", 0.4)), progress=note, q=q)
     finally:
         eye.close()
 
 
-async def handle_identify_run(request: web.Request) -> web.Response:
-    """`POST /identify/run` -- the gated hillclimb excursion (§7.1, §7.3a).
+async def run_coverage(app, body, sid):
+    """One gated coverage excursion (§7.4): motion to MEASURE, never to fit.
 
-    Same gates as /calibrate/extrinsics (execute on, explicit confirm, the
-    calibrating single-flight) plus a fitted rig to refine. A trigger only
-    PROPOSES; this route is the only way a climb starts, and it never runs
-    without the confirm. Candidates are verified before the hot-load below.
+    The oracle hooks are async and the motion is blocking, so the orchestration
+    lives here rather than in identify.py (which stays pure policy). The order
+    matters: a dry run makes the gateway build and persist the trajectory, so
+    `oracle_prepare` reads the REAL hold windows and schedules each grab at a
+    window's midpoint -- the same latency argument `sweep_video.select` makes.
+    Only then does the arm move, through the gateway's existing /move check chain.
+
+    A run whose oracle cannot prepare is refused: motion without measurement
+    teaches nothing, and the point of coverage is the measurements.
+    """
+    rig = app["rig"]
+    if rig is None:
+        raise identify_mod.IdentifyError("coverage measures against a rig: capture the base "
+                                         "marker first")
+    arm = auto_calibrate.ArmGateway(app["planner"], app["planner_token"])
+    map_doc = identify_mod.load_accuracy_map(app["accuracy_map_path"])
+    tip = _oracle_tool_tip(app, rig)
+    start = await asyncio.to_thread(arm.pose)
+    q = np.asarray(start["q"], dtype=float).reshape(-1)
+    current_q, gripper = q[:6], (float(q[6]) if q.size > 6 else 0.0)
+    poses = identify_mod.coverage_poses(
+        current_q, map_doc, tip, seed=int(body.get("seed", 11)),
+        top_k=int(body.get("poses", identify_mod.COVERAGE_MAX_POSES)))
+    if not poses:
+        raise identify_mod.IdentifyError(
+            "no safe pose from here reaches an unvalidated cell: the accuracy map is covered, "
+            "or park the arm somewhere else first")
+    plan = identify_mod.coverage_plan(
+        current_q, poses, gripper=gripper,
+        hold_s=float(body.get("hold", identify_mod.COVERAGE_HOLD_S)))
+    app["identify_of"] = len(plan["targets"])
+
+    plan_id = new_plan_id()
+    await asyncio.to_thread(arm.build_sequence, plan["targets"], plan["seconds"],
+                            plan["hold"], plan["gripper"], plan_id)
+    prep = await oracle_prepare(app, plan_id)
+    if prep is None:
+        raise identify_mod.IdentifyError(
+            "the oracle could not prepare for this coverage run (no hold windows, or no "
+            "camera): the arm would move and nothing would be measured")
+    started = time.time()
+    try:
+        answer = await asyncio.to_thread(arm.move_sequence, plan["targets"], plan["seconds"],
+                                         plan["hold"], plan["gripper"], plan_id)
+    finally:
+        await oracle_finish(app, prep, sid)
+    return dict(plan, ok=True, mode="coverage", motion=True,
+                poses=len(plan["targets"]), plan_id=plan_id,
+                move_id=(answer or {}).get("id"),
+                leg_seconds=plan["seconds"],
+                seconds=round(time.time() - started, 1),
+                telemetry=bool((answer or {}).get("telemetry")))
+
+
+async def handle_identify_run(request: web.Request) -> web.Response:
+    """`POST /identify/run` -- the two gated identification sessions (§7.1).
+
+    `mode: "refit"` (the default) is §7.3a: repeated stills of the base tag,
+    averaged into a candidate rig, verified against a held-out capture before it
+    hot-loads. It moves NOTHING, so it needs the confirm but not the execute gate
+    -- it is strictly less authority than /capture/pose, which already writes a
+    rig from one still.
+
+    `mode: "coverage"` is §7.4: one trajectory through the accuracy cells nobody
+    has validated, so the oracle can measure them. That moves the arm, so it
+    needs the execute gate on top. It writes no rig, ever -- it is coverage of
+    the grid, not a fit.
+
+    Both share the gates: an explicit confirm, the `calibrating` single-flight,
+    and a camera. A trigger only PROPOSES; this route is the only way a session
+    starts. Candidates are verified before the hot-load below.
     """
     app = request.app
-    if not app["execute"]:
-        raise web.HTTPForbidden(text="the identification climb moves the arm: start the capture "
-                                    "server with REBOT_EXECUTE=1 and the edge with "
-                                    "--allow-execute")
-    if not app["camera"]:
-        raise web.HTTPUnprocessableEntity(text="no camera: set REBOT_CAMERA or pass camera=")
     try:
         body = await request.json()
     except json.JSONDecodeError as exc:
         raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
+    mode = str(body.get("mode") or "refit").strip().lower()
+    if mode not in ("refit", "coverage"):
+        raise web.HTTPBadRequest(text='mode must be "refit" (tag stills, no motion) or '
+                                      '"coverage" (measure the accuracy cells)')
+    if not app["camera"]:
+        raise web.HTTPUnprocessableEntity(text="no camera: set REBOT_CAMERA or pass camera=")
     if body.get("confirm") is not True:
-        raise web.HTTPBadRequest(text='send {"confirm": true}: this moves the arm through an '
-                                      "identification sweep")
-    if app["rig"] is None:
-        raise web.HTTPUnprocessableEntity(
-            text="the climb refines an existing rig: run /calibrate/extrinsics or capture the "
-                 "base marker first")
+        raise web.HTTPBadRequest(
+            text='send {"confirm": true}: this %s'
+                 % ("moves the arm through the unvalidated accuracy cells" if mode == "coverage"
+                    else "refits the camera rig from the base tag"))
+    if mode == "coverage":
+        if not app["execute"]:
+            raise web.HTTPForbidden(text="coverage moves the arm: start the capture server with "
+                                         "REBOT_EXECUTE=1 and the edge with --allow-execute")
+        if app["rig"] is None:
+            raise web.HTTPUnprocessableEntity(
+                text="coverage measures against a rig: capture the base marker first")
     if app["calibrating"]:
         return web.json_response({"ok": False,
-                                  "error": "a calibration or identification sweep is already "
+                                  "error": "a calibration or identification session is already "
                                            "running"}, status=409)
 
     calibration_path = resolve_calibration(app, body.get("calib"))
     camera_url = body.get("camera") or app["camera"]
+    sid = request.headers.get("X-Rebot-Session", "")
     app["calibrating"] = True
     app["progress"] = {"pose": 0, "of": 0, "phase": "starting", "started": time.time()}
     app["calibration_started"] = app["progress"]["started"]
-    app["identify_last"] = {"state": "running", "started": utc_now(), "camera": camera_url}
+    app["identify_last"] = {"state": "running", "started": utc_now(), "camera": camera_url,
+                            "mode": mode}
     try:
-        payload = await asyncio.to_thread(run_identify, app, camera_url, calibration_path, body)
+        if mode == "coverage":
+            payload = await run_coverage(app, body, sid)
+        else:
+            payload = await asyncio.to_thread(run_refit, app, camera_url, calibration_path, body)
     except (identify_mod.IdentifyError, auto_calibrate.AutoError, camera_mod.CameraError,
-            extrinsics.ExtrinsicsError) as error:
-        logging.warning("identification refused: %s", error)
-        app["identify_last"] = {"state": "failed", "error": str(error), "at": utc_now()}
-        return web.json_response({"ok": False, "error": str(error)}, status=422)
-    except Exception as error:      # noqa: BLE001 - a climb must not kill the server
-        logging.exception("identification crashed")
-        app["identify_last"] = {"state": "failed", "at": utc_now(),
+            base_marker.MarkerError, extrinsics.ExtrinsicsError) as error:
+        logging.warning("identification (%s) refused: %s", mode, error)
+        app["identify_last"] = {"state": "failed", "mode": mode,
+                                "error": str(error), "at": utc_now()}
+        return web.json_response({"ok": False, "mode": mode, "error": str(error)}, status=422)
+    except Exception as error:      # noqa: BLE001 - a session must not kill the server
+        logging.exception("identification (%s) crashed", mode)
+        app["identify_last"] = {"state": "failed", "mode": mode, "at": utc_now(),
                                 "error": "%s: %s" % (type(error).__name__, error)}
-        return web.json_response({"ok": False, "error": "%s: %s"
+        return web.json_response({"ok": False, "mode": mode, "error": "%s: %s"
                                   % (type(error).__name__, error)}, status=500)
     finally:
         app["calibrating"] = False
         app["progress"] = None
 
-    state = "ok" if payload["ok"] else ("partial" if payload.get("partial") else "refused")
-    app["identify_last"] = {"state": state, "at": utc_now(),
+    await trace_event(app, sid, "identify", mode=mode, ok=payload.get("ok"),
+                      poses=payload.get("poses"), usable=payload.get("usable"),
+                      cells=payload.get("cells"), written=payload.get("written"),
+                      error=payload.get("error"))
+    state = "ok" if payload["ok"] else "refused"
+    app["identify_last"] = {"state": state, "mode": mode, "at": utc_now(),
                             "verification": payload.get("verification"),
-                            "identifiability": payload.get("identifiability")}
+                            "identifiability": payload.get("identifiability"),
+                            "cells": payload.get("cells")}
     if payload["ok"] and payload.get("written"):
-        # The candidate passed verify + hold-out: hot-load it exactly as the
-        # commissioning sweep's rig is hot-loaded, so the next tap uses it now.
+        # The candidate passed verify_marker and the held-out capture: hot-load it
+        # exactly as /capture/pose's rig is hot-loaded, so the next tap uses it now.
         try:
             rig = extrinsics.load_rig(payload["written"])
         except extrinsics.ExtrinsicsError as error:
@@ -2329,15 +2410,18 @@ async def handle_identify_run(request: web.Request) -> web.Response:
             except witness.WitnessError as error:
                 logging.warning("the identified rig has no usable witness: %s", error)
                 app["witness"] = None
-        logging.info("identification wrote %s", payload.get("written"))
+        logging.info("identification (%s) wrote %s", mode, payload.get("written"))
     return web.json_response(payload, status=200 if payload["ok"] else 422)
 
 
 async def handle_identify_status(request: web.Request) -> web.Response:
-    """`GET /identify` -- proposals, progress and the last climb (§7.1).
+    """`GET /identify` -- proposals, progress, the last session, the gaps (§7.1).
 
     Same shape as GET /calibrate. The proposals are the monitor's evidence;
     nothing here starts a session -- that takes POST /identify/run {confirm}.
+    `unlearned` is §7.2's other half: what the sag and accuracy maps do not know
+    yet, reported rather than extrapolated, so the panel can show the envelope's
+    real boundary instead of implying coverage it does not have.
     """
     app = request.app
     monitor = app["identify_monitor"]
@@ -2345,6 +2429,13 @@ async def handle_identify_status(request: web.Request) -> web.Response:
     for proposal in monitor.rig_proposals(app.get("rig")):
         if proposal["kind"] not in {p["kind"] for p in proposals}:
             proposals.append(proposal)
+    try:
+        gaps = identify_mod.unlearned(
+            identify_mod.active_sag_map(app["calib"], sweep.KP_DEFAULT),
+            identify_mod.load_accuracy_map(app["accuracy_map_path"]))
+    except Exception as exc:  # noqa: BLE001 - a report never fails the route
+        logging.warning("the unlearned report failed: %s", exc)
+        gaps = []
     return web.json_response({
         "ok": True,
         "running": bool(app["calibrating"]),
@@ -2353,6 +2444,9 @@ async def handle_identify_status(request: web.Request) -> web.Response:
         "execute": app["execute"],
         "last": app["identify_last"],
         "proposals": proposals,
+        "modes": {"refit": "averaged tag stills; no arm motion, no execute gate (§7.3a)",
+                  "coverage": "measure the unvalidated accuracy cells; moves the arm (§7.4)"},
+        "unlearned": gaps,
         "rig": (None if app["rig"] is None else app["rig"].provenance()),
         "accuracy": _accuracy_health(app),
     })
