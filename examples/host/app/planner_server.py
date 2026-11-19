@@ -363,6 +363,18 @@ def move_one(body):
     q_from = np.asarray([float(v) for v in current["q"]], dtype=float)
     if q_from.size < 7:
         q_from = np.append(q_from, 0.0)
+    # A torque-off joint can sag a few mrad past its limit at park (j2 rests just
+    # below 0). Command the clamped start so every waypoint stays in the envelope;
+    # the edge's align leg ramps from the measured pose to it. Only a small sag is
+    # clamped -- a large excursion is a fault symptom, and validate must refuse it
+    # rather than silently ramp the arm back from an abnormal pose. The task path
+    # clamps its start the same way (plan_to_target).
+    lower, upper = rebot_ik.LIMITS[:, 0], rebot_ik.LIMITS[:, 1]
+    excursion = float(np.max(np.maximum(lower - q_from[:6], q_from[:6] - upper)))
+    if 0.0 < excursion <= 0.02:
+        logging.info("start pose sagged %.1f mrad past a limit: clamped to the envelope",
+                     1000.0 * excursion)
+        q_from[:6] = np.clip(q_from[:6], lower, upper)
     gripper = float(body["gripper"]) if "gripper" in body else float(q_from[6])
 
     # Every leg, not just the first: a chain is only as safe as its worst
@@ -461,6 +473,12 @@ def move_one(body):
     status, payload = edge_request("POST", "/play?" + query, body=trajectory,
                                    timeout=max(600.0, 4.0 * total))
     if status != 200:
+        # The edge attaches the playback log even on abort (§5.1): the abort
+        # timestamp and the per-sample cmd/meas pairs are exactly the evidence
+        # a fault needs. Persist it before raising, or the record dies with the
+        # error and the fault becomes undiagnosable.
+        save_telemetry(move_id, payload.get("telemetry"))
+        logging.warning("edge aborted move %s: %s", move_id, payload.get("error"))
         raise GatewayError(payload.get("error", "the edge refused the move"), 502)
 
     # The arm is back at q_from now: that is the board's one-shot semantics, not
@@ -498,6 +516,9 @@ def execute_one(body):
     })
     status, payload = edge_request("POST", "/play?" + query, body=trajectory, timeout=600)
     if status != 200:
+        # Same rule as /move: an aborted playback's log is evidence, not noise.
+        save_telemetry(plan_id, payload.get("telemetry"))
+        logging.warning("edge aborted plan %s: %s", plan_id, payload.get("error"))
         raise GatewayError(payload.get("error", "the edge refused the trajectory"), 502)
 
     logging.info("edge played %s: executed=%s", plan_id, payload.get("executed"))
