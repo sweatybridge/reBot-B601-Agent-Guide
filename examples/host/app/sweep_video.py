@@ -31,8 +31,13 @@ import numpy as np
 LOG_HZ = 15.0
 # A sample this close to the one before it is the arm standing still, not moving
 # through: at 15 Hz, 0.008 rad per sample is 0.12 rad/s, well under the 0.35 rad/s
-# the sweep moves at and well over encoder noise.
+# the sweep moves at and well over encoder noise. The test is a *rate*: the log
+# aims for 15 Hz, but a /pose read can lag a second or more while the bus is
+# playing back, and a hold must not shatter across the gaps that leaves.
 STILL_RAD = 0.008
+# A step across a gap longer than this is no evidence of stillness: too much
+# could have happened between the two samples to call the arm stopped.
+MAX_GAP_S = 2.0
 # A window shorter than this is the arm passing through the pose, not holding it.
 MIN_HOLD_SECONDS = 0.5
 # How far a held pose may sit from the one that was commanded. The servo holds a
@@ -127,7 +132,12 @@ def _holds(times, poses, still_rad=STILL_RAD, min_seconds=MIN_HOLD_SECONDS):
     """
     still = np.zeros(len(poses), dtype=bool)
     for index in range(1, len(poses)):
-        still[index] = float(np.max(np.abs(poses[index] - poses[index - 1]))) <= still_rad
+        dt = float(times[index] - times[index - 1])
+        step = float(np.max(np.abs(poses[index] - poses[index - 1])))
+        # Burst samples (dt under the nominal period) keep the per-sample
+        # floor; across a gap the same speed limit applies to the average.
+        still[index] = (dt <= MAX_GAP_S
+                        and step <= still_rad * max(1.0, dt * LOG_HZ))
     windows = []
     for start, end in _runs(still):
         begin = max(0, start - 1)

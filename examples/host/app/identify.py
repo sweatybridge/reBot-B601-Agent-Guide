@@ -374,7 +374,7 @@ def verify_candidate(rig, fit_observations, holdout_observations, calibration, o
 
 def climb_session(arm, eye, calibration, options, captures_dir, recorder, current_rig,
                   calib_dir, progress=None, top_k=6, holdout=2, gate_mm=SIGMA_GATE_MM,
-                  seed=11, mount="fixed"):
+                  seed=11, mount="fixed", turn=0):
     """One gated identification excursion. Returns a report; never hot-loads.
 
     The arm moves only through `auto_calibrate.run` (one `/move` trajectory with
@@ -407,7 +407,8 @@ def climb_session(arm, eye, calibration, options, captures_dir, recorder, curren
     result = auto_calibrate.run(arm, eye, calibration, options, captures_dir,
                                 recorder=recorder, mount=mount, progress=progress,
                                 poses=fit_poses + holdout_poses,
-                                seed_T=np.asarray(current_rig.T_base_cam, dtype=float))
+                                seed_T=np.asarray(current_rig.T_base_cam, dtype=float),
+                                turn=turn)
     fit_obs = result.observations[:int(top_k)]
     holdout_obs = result.observations[int(top_k):]
     gated = gated_fit(fit_obs, K, dist, fit_options, prior_rig=current_rig, gate_mm=gate_mm,

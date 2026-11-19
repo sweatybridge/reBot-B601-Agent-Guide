@@ -374,6 +374,35 @@ def active_sag_extra(q, kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
                           zeros_key=key)
 
 
+def sag_compensator(kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
+    """A per-pose command compensator for a whole plan (§7.3b): model sag plus
+    the learned residual where a keyed map exists.
+
+    The rig and map are read once, not per waypoint; a missing or torn file
+    means model-only compensation, never an exception into the plan. The total
+    stays clipped inside aim(); the caller clips to the joint limits.
+    """
+    kp = kp_vector(kp_spec)
+    rig_doc = {}
+    if calib_dir:
+        try:
+            rig_doc = json.loads((Path(calib_dir) / rig_name).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            rig_doc = {}
+    fingerprint = str(rig_doc.get("fingerprint") or "")
+    key = zeros_key(rig_doc.get("joint_zeros"))
+    map_doc = (load_sag_map(calib_dir, fingerprint, kp_key=kp_spec, zeros_key=key)
+               if calib_dir and fingerprint else None)
+
+    def compensate(q):
+        q = np.asarray(q, dtype=float).reshape(6)
+        extra = sag_correction(q, map_doc, kp_key=kp_spec, rig_fingerprint=fingerprint,
+                               zeros_key=key)
+        return aim(q, kp, extra_sag=extra)
+
+    return compensate
+
+
 def seconds_for(a, b, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SECONDS):
     """How long a leg should take, from the furthest-travelling joint.
 

@@ -3233,10 +3233,11 @@ fn read_play_log(path: &Path) -> Option<serde_json::Value> {
 /// are the measurement points the host's oracle averages (§5.1).
 const TELEMETRY_MAX_SAMPLES: usize = 2000;
 
-/// Keep every sample inside a hold window (cmd constant across consecutive
-/// samples) and thin the rest uniformly to `limit`. First and last survive for
-/// context. If the holds alone exceed the budget they still all survive: the
-/// budget yields to the evidence. Mirrors oracle.downsample on the host.
+/// Keep every sample inside a hold window (arm command constant across
+/// consecutive samples) and thin the rest uniformly to `limit`. First and last
+/// survive for context. If the holds alone exceed the budget they still all
+/// survive: the budget yields to the evidence. Mirrors oracle.downsample on
+/// the host.
 fn downsample_samples(samples: &[serde_json::Value], limit: usize) -> Vec<serde_json::Value> {
     let count = samples.len();
     if count <= limit {
@@ -3246,8 +3247,7 @@ fn downsample_samples(samples: &[serde_json::Value], limit: usize) -> Vec<serde_
     let mut start = 0;
     for index in 1..=count {
         let same = index < count
-            && samples[index].get("cmd").is_some()
-            && samples[index].get("cmd") == samples[index - 1].get("cmd");
+            && same_arm_cmd(samples[index].get("cmd"), samples[index - 1].get("cmd"));
         if same {
             continue;
         }
@@ -3274,6 +3274,21 @@ fn downsample_samples(samples: &[serde_json::Value], limit: usize) -> Vec<serde_
         .filter(|(index, _)| keep[*index])
         .map(|(_, sample)| sample.clone())
         .collect()
+}
+
+/// A hold is constant in joints 1-6: the gripper (motor 7) actuates right
+/// through a marker hold -- the grasp cycle, not motion -- so comparing all
+/// seven would find no holds at all in a pick sequence. Short commands
+/// (arm-only logs) compare in full. Mirrors oracle._same_cmd on the host.
+fn same_arm_cmd(a: Option<&serde_json::Value>, b: Option<&serde_json::Value>) -> bool {
+    let (a, b) = match (a.and_then(|v| v.as_array()), b.and_then(|v| v.as_array())) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
+    if a.len() != b.len() || a.is_empty() {
+        return false;
+    }
+    a.iter().zip(b.iter()).take(6).all(|(x, y)| x == y)
 }
 
 fn stop(state: &ServerState) -> (u16, serde_json::Value) {
@@ -3799,6 +3814,35 @@ mod tests {
         let samples: Vec<_> = (0..3000).map(|i| wire_sample(i as f64, 0.7)).collect();
         let thinned = downsample_samples(&samples, 2000);
         assert_eq!(thinned.len(), 3000);
+    }
+
+    #[test]
+    fn downsample_keeps_holds_through_a_gripper_ramp() {
+        // A marker hold: joints 1-6 constant while motor 7 (the gripper) ramps
+        // through the grasp cycle. The hold samples must survive the budget.
+        let mut samples = Vec::new();
+        for index in 0..5000 {
+            let mut cmd = vec![serde_json::json!(index as f64 * 0.001); 7];
+            if (1000..1100).contains(&index) {
+                for slot in cmd.iter_mut().take(6) {
+                    *slot = serde_json::json!(0.5);
+                }
+                cmd[6] = serde_json::json!(2.0 + 0.01 * (index - 1000) as f64);
+            }
+            samples.push(serde_json::json!({
+                "t": index as f64 * 0.02, "cmd": cmd, "meas": cmd,
+            }));
+        }
+        let thinned = downsample_samples(&samples, 2000);
+        assert!(thinned.len() <= 2000, "{} samples", thinned.len());
+        let times: Vec<f64> = thinned
+            .iter()
+            .map(|sample| sample["t"].as_f64().unwrap())
+            .collect();
+        for index in 1000..1100 {
+            let t = index as f64 * 0.02;
+            assert!(times.contains(&t), "hold sample {index} was dropped");
+        }
     }
 
     #[test]

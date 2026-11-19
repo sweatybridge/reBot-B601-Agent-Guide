@@ -537,7 +537,8 @@ async def handle_health(request: web.Request) -> web.Response:
         "planner": app["planner"],
         "execute": app["execute"],
         "calib": sorted(p.name for p in app["calib"].glob("*.json")
-                        if not p.name.startswith(("extrinsics-", "witness-"))),
+                        if not p.name.startswith(("extrinsics-", "witness-", "sag-",
+                                                  "accuracy-map"))),
         "mode": effective_mode(app),
         "rig": (None if app["rig"] is None else
                 dict(app["rig"].provenance(), path=str(app["extrinsics_path"]),
@@ -873,8 +874,12 @@ def resolve_calibration(app, requested=None) -> Path:
         candidate = Path(app["calib_file"])
         if candidate.is_file():
             return candidate
+    # The calib dir also holds the rig, the witness, the learned sag map and
+    # the accuracy envelope: none of them is an intrinsics calibration, and
+    # "the newest json" must not hand one of those to calib.load.
     options = sorted(p for p in folder.glob("*.json")
-                     if not p.name.startswith(("extrinsics-", "witness-"))) \
+                     if not p.name.startswith(("extrinsics-", "witness-", "sag-",
+                                               "accuracy-map"))) \
         if folder.is_dir() else []
     if not options:
         raise web.HTTPUnprocessableEntity(
@@ -1718,7 +1723,7 @@ async def oracle_prepare(app, plan_id):
         windows = oracle_mod.hold_windows(trajectory.get("waypoints") or [])
         if not windows:
             return None
-        pre = await asyncio.to_thread(grab_one, app, app["camera"])
+        pre = await asyncio.to_thread(grab_one, app, app["camera"], False)
         frame_path = app["captures"] / pre["id"] / "frame.jpg"
         pre_bytes = await asyncio.to_thread(frame_path.read_bytes)
         directory = app["oracle_dir"] / plan_id
@@ -2092,7 +2097,8 @@ def run_sweep(app, camera_url, calibration_path, body):
         recorder = mediamtx.Recorder(app["mediamtx_api"], path=path,
                                      recordings=app["recordings"])
         result = auto_calibrate.run(arm, eye, calibration, options, app["captures"],
-                                    recorder=recorder, mount="fixed", progress=note)
+                                    recorder=recorder, mount="fixed", progress=note,
+                                    turn=turn)
     finally:
         eye.close()
 
@@ -2244,7 +2250,7 @@ def run_identify(app, camera_url, calibration_path, body):
             current_rig=app["rig"], calib_dir=app["calib"], progress=note,
             top_k=top_k, holdout=holdout,
             gate_mm=float(body.get("gate_mm", identify_mod.SIGMA_GATE_MM)),
-            seed=int(body.get("seed", 11)), mount="fixed")
+            seed=int(body.get("seed", 11)), mount="fixed", turn=turn)
     finally:
         eye.close()
 
@@ -2487,7 +2493,7 @@ def stream_turn(app, calibration):
     return int(round((float(angle) - float(calib_deg)) / 90.0)) % 4
 
 
-def marker_from_still(app, frame, q=None):
+def marker_from_still(app, frame, q=None, commit=True):
     """Solve the fixed camera from the base tag in one still, and write the rig.
 
     This is the short path: the tag is a PnP, so a still that sees it needs no
@@ -2498,6 +2504,10 @@ def marker_from_still(app, frame, q=None):
     to the grid the checkerboard was shot on, and a landscape frame is a quarter
     turn of a portrait calibration. The direction comes from the orientation the
     phone published (`POST /orientation`); without it the shape decides.
+
+    `commit=False` solves and reports without writing: the oracle's pre-still is
+    evidence, not a calibration -- rewriting the rig there would change its
+    fingerprint under every keyed sag map and accuracy cell (§7.3b).
     """
     if app.get("calibrating"):
         return {"marker": {"detected": None,
@@ -2521,9 +2531,12 @@ def marker_from_still(app, frame, q=None):
     except auto_calibrate.AutoError as error:
         return {"marker": {"detected": None, "error": str(error)}}
 
-    rig_path = app["calib"] / ("extrinsics-%s.json" % run.rig.mount)
-    _rig, _verdict, written = auto_calibrate.commit_marker(
-        run, calibration, rig_path, frame=frame, q=q)
+    if commit:
+        rig_path = app["calib"] / ("extrinsics-%s.json" % run.rig.mount)
+        _rig, _verdict, written = auto_calibrate.commit_marker(
+            run, calibration, rig_path, frame=frame, q=q)
+    else:
+        written = None
     report = auto_calibrate.marker_report(run, written)
     report["turns"] = turn                    # what the solve had to undo
     if turn:
@@ -2552,13 +2565,14 @@ class UprightEye:
         self.eye.close()
 
 
-def grab_one(app, camera_url):
+def grab_one(app, camera_url, commit=True):
     """One still from the fixed camera, plus the pose the click path needs.
 
     The base tag is solved before the arm is touched: a PnP needs no motor read,
     so a CAN fault must not stop a tag calibration. The two `/pose` reads -- and
     the "arm held still" check they enable -- only happen when the still is
-    actually going to seed a tap.
+    actually going to seed a tap. `commit=False` keeps the tag solve as evidence
+    without rewriting the rig (the oracle's pre-still).
     """
     import cv2
 
@@ -2588,8 +2602,9 @@ def grab_one(app, camera_url):
     marker_payload = None
     if app.get("marker"):
         # The tag path first: no arm pose, no motor read, no sweep.
-        marker_payload = marker_from_still(app, frame, q=None)
-        if marker_payload.get("written"):
+        marker_payload = marker_from_still(app, frame, q=None, commit=commit)
+        if marker_payload.get("written") or (
+                not commit and (marker_payload.get("marker") or {}).get("detected")):
             capture_id = save_capture(None)
             payload = {"ok": True, "id": capture_id,
                        "image_url": "/captures/%s/frame.jpg" % capture_id,
