@@ -1723,6 +1723,10 @@ async def oracle_prepare(app, plan_id):
         windows = oracle_mod.hold_windows(trajectory.get("waypoints") or [])
         if not windows:
             return None
+        # A marker sequence records each target's point and raw IK solution in
+        # its provenance; the oracle matches holds to them to measure the IK
+        # residual (§7.4). /move plans have no such list -- empty, not an error.
+        targets = ((trajectory.get("capture") or {}).get("targets")) or []
         pre = await asyncio.to_thread(grab_one, app, app["camera"], False)
         frame_path = app["captures"] / pre["id"] / "frame.jpg"
         pre_bytes = await asyncio.to_thread(frame_path.read_bytes)
@@ -1732,6 +1736,7 @@ async def oracle_prepare(app, plan_id):
         prep = {
             "plan_id": plan_id,
             "windows": windows,
+            "targets": targets,
             "pre_capture": pre["id"],
             "pre_frame_path": str(frame_path),
             "pre_blob": await trace_blob(app, pre_bytes),
@@ -1886,9 +1891,11 @@ async def oracle_finish(app, prep, sid):
             except (KeyError, TypeError, ValueError):
                 pass
 
-        for window in prep["windows"]:
+        matched = oracle_mod.match_hold_targets(prep["windows"], prep.get("targets"))
+        for position, window in enumerate(prep["windows"]):
             hold = {"index": window["index"], "t_start": window["t_start"],
                     "t_end": window["t_end"]}
+            target = matched[position] if position < len(matched) else None
             inside = [s for s in samples
                       if window["t_start"] - 1e-6 <= float(s.get("t", -1))
                       <= window["t_end"] + 1e-6]
@@ -1915,6 +1922,27 @@ async def oracle_finish(app, prep, sid):
                 if tip_cmd and tip_meas:
                     hold["tip_error_mm"] = round(1000.0 * float(np.linalg.norm(
                         np.asarray(tip_meas) - np.asarray(tip_cmd))), 3)
+                # The FK bridge (§7.4): with the marker's raw IK solution on
+                # tape, the solver's residual and the net placement are measured
+                # against the REQUESTED point, separately from the hold error.
+                if target is not None:
+                    hold["target_point"] = target.get("point")
+                    flange_point = target.get("flange_point")
+                    hold["flange_point"] = flange_point
+                    q_ik = target.get("q_ik")
+                    if isinstance(q_ik, (list, tuple)) and len(q_ik) >= 6:
+                        hold["q_ik"] = [float(v) for v in q_ik[:6]]
+                        fk_ik = await planner_call(app, "/fk",
+                                                   {"q": hold["q_ik"] + [0.0]},
+                                                   timeout=30, sid=sid)
+                        tip_ik = (fk_ik[1].get("tip_m") if fk_ik[0] == 200 else None)
+                        hold["tip_fk_ik"] = tip_ik
+                        if tip_ik and flange_point:
+                            hold["ik_residual_mm"] = round(1000.0 * float(np.linalg.norm(
+                                np.asarray(tip_ik) - np.asarray(flange_point))), 3)
+                        if tip_meas and flange_point:
+                            hold["placement_mm"] = round(1000.0 * float(np.linalg.norm(
+                                np.asarray(tip_meas) - np.asarray(flange_point))), 3)
             shot = prep["holds"].get(window["index"])
             if shot and rig is not None and tip_meas:
                 frame = cv2.imread(shot["path"])
@@ -2310,8 +2338,121 @@ async def run_coverage(app, body, sid):
                 telemetry=bool((answer or {}).get("telemetry")))
 
 
+async def run_cartesian_coverage(app, body, sid):
+    """Cartesian coverage (§7.4): the task planner, run exactly as a tap sequence.
+
+    The joint-space form (`run_coverage`) visits safe poses and FKs them into
+    cells; this one aims AT the unvalidated cells' centres and lets the task
+    planner's IK decide whether the arm can hold there. Same /plan -> /execute
+    path as /sequence, so the peel, the capsule checks, the sag emission pass
+    and the edge's aborts are the task path's own -- nothing reimplemented.
+
+    The planner is also the screen: the sequence grows one candidate at a time
+    and a candidate stays only while the whole trajectory plans, so one
+    unreachable cell cannot kill the session and no proxy feasibility test can
+    disagree with the real plan. The oracle prepares from the persisted plan's
+    real hold windows, and the plan's per-marker q_ik lets it measure the IK
+    residual separately from sag (the FK bridge).
+
+    Writes no rig, ever. A run whose oracle cannot prepare is refused before
+    any motion: coverage exists for the measurements.
+    """
+    rig = app["rig"]
+    if rig is None:
+        raise identify_mod.IdentifyError("coverage measures against a rig: capture the base "
+                                         "marker first")
+    map_doc = identify_mod.load_accuracy_map(app["accuracy_map_path"])
+    wanted = int(body.get("poses", identify_mod.COVERAGE_MAX_POSES))
+    # Screen the whole grid, keep the first `wanted` survivors. The need-then-
+    # cell order puts the inner band first, and whole rings can be unreachable
+    # with the tool down; the screen must walk past them to the cells that solve.
+    candidates, skipped = identify_mod.cartesian_targets(
+        map_doc, top_k=len(identify_mod.coverage_cells(map_doc)),
+        min_z=float(app["min_z"]))
+    if not candidates:
+        raise identify_mod.IdentifyError(
+            "no unvalidated cell is reachable as a Cartesian target: the map is covered, "
+            "or the remaining gaps are below the safety floor / beyond reach "
+            "(skipped: %s)" % skipped)
+
+    # The planner IS the screen: grow the sequence one candidate at a time and
+    # keep it only while the whole trajectory plans. No proxy -- a single-target
+    # plan would test every cell as marker 1 (Cartesian approach from park),
+    # but markers 2+ arrive by joint-space legs with a seed fallback, so a cell
+    # that fails alone can still be reachable in sequence. Each trial is exactly
+    # the trajectory shape that will run, peel and joint return included; the
+    # last successful trial is the plan that gets executed.
+    accepted, refused = [], []
+    plan_payload = None
+    for entry in candidates:
+        if len(accepted) >= wanted:
+            break
+        trial = accepted + [entry]
+        status, payload = await planner_call(app, "/plan", {
+            "targets": [{"tip": item["point"]} for item in trial],
+            "tip_offset_m": float(app["tip_m"]),
+            "gripper": "alternate",
+            "options": {"tool_axis": app["tool_axis"], "min_z": float(app["min_z"])},
+        }, timeout=300, sid=sid)
+        if status == 200 and payload.get("ok"):
+            accepted, plan_payload = trial, payload
+        else:
+            refused.append({"cell": entry["cell"],
+                            "error": payload.get("error", "the planner refused the target")})
+    if not accepted:
+        raise identify_mod.IdentifyError(
+            "every candidate cell was refused by the planner: no Cartesian coverage "
+            "is possible from this pose (%d refused)" % len(refused))
+
+    plan_id = str(plan_payload["id"])
+    summary = plan_payload.get("summary") or {}
+    app["identify_of"] = len(accepted)
+    await trace_event(app, sid, "plan", plan_id=plan_id, mode="cartesian-coverage",
+                      status=200, ok=True, summary=summary,
+                      screened=len(accepted) + len(refused), refused=len(refused))
+
+    prep = await oracle_prepare(app, plan_id)
+    if prep is None:
+        raise identify_mod.IdentifyError(
+            "the oracle could not prepare for this coverage run (no hold windows, or no "
+            "camera): the arm would move and nothing would be measured")
+    started = time.time()
+    answer = {}
+    try:
+        status, answer = await planner_call(app, "/execute", {"id": plan_id},
+                                            timeout=360, sid=sid)
+        await trace_event(app, sid, "execute", plan_id=plan_id, mode="cartesian-coverage",
+                          status=status, ok=answer.get("ok"),
+                          executed=answer.get("executed"), error=answer.get("error"))
+        if status != 200 or not answer.get("ok") or not answer.get("executed"):
+            raise identify_mod.IdentifyError(
+                answer.get("error", "the gateway refused the coverage execution"))
+    finally:
+        # Even a refused/aborted execution is measured: the edge persists the
+        # abort log, and the oracle doc is exactly the evidence a fault needs.
+        await oracle_finish(app, prep, sid)
+    return {
+        "ok": True, "mode": "cartesian", "motion": True,
+        "plan_id": plan_id,
+        "poses": len(accepted),
+        "cells": [entry["cell"] for entry in accepted],
+        "needs": [entry["need"] for entry in accepted],
+        "targets": [entry["point"] for entry in accepted],
+        "skipped": skipped,
+        "refused": refused,
+        "worst_ik_m": summary.get("worst_ik_m"),
+        "duration_s": summary.get("duration_s"),
+        "waypoints": summary.get("waypoints"),
+        "seconds": round(time.time() - started, 1),
+        "telemetry": bool(answer.get("telemetry")),
+        "writes_rig": False,
+        "purpose": "measure the unvalidated accuracy cells through the task planner; "
+                   "the oracle validates them and attributes the IK residual",
+    }
+
+
 async def handle_identify_run(request: web.Request) -> web.Response:
-    """`POST /identify/run` -- the two gated identification sessions (§7.1).
+    """`POST /identify/run` -- the gated identification sessions (§7.1).
 
     `mode: "refit"` (the default) is §7.3a: repeated stills of the base tag,
     averaged into a candidate rig, verified against a held-out capture before it
@@ -2322,7 +2463,9 @@ async def handle_identify_run(request: web.Request) -> web.Response:
     `mode: "coverage"` is §7.4: one trajectory through the accuracy cells nobody
     has validated, so the oracle can measure them. That moves the arm, so it
     needs the execute gate on top. It writes no rig, ever -- it is coverage of
-    the grid, not a fit.
+    the grid, not a fit. `mode: "cartesian"` is the same job through the TASK
+    planner: cell-centre targets, IK + peel, per-marker IK residual on tape.
+    Same gates, same oracle, no rig.
 
     Both share the gates: an explicit confirm, the `calibrating` single-flight,
     and a camera. A trigger only PROPOSES; this route is the only way a session
@@ -2334,17 +2477,19 @@ async def handle_identify_run(request: web.Request) -> web.Response:
     except json.JSONDecodeError as exc:
         raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
     mode = str(body.get("mode") or "refit").strip().lower()
-    if mode not in ("refit", "coverage"):
-        raise web.HTTPBadRequest(text='mode must be "refit" (tag stills, no motion) or '
-                                      '"coverage" (measure the accuracy cells)')
+    if mode not in ("refit", "coverage", "cartesian"):
+        raise web.HTTPBadRequest(text='mode must be "refit" (tag stills, no motion), '
+                                      '"coverage" (joint-space cell measurement) or '
+                                      '"cartesian" (cell centres through the task planner)')
     if not app["camera"]:
         raise web.HTTPUnprocessableEntity(text="no camera: set REBOT_CAMERA or pass camera=")
     if body.get("confirm") is not True:
         raise web.HTTPBadRequest(
             text='send {"confirm": true}: this %s'
-                 % ("moves the arm through the unvalidated accuracy cells" if mode == "coverage"
+                 % ("moves the arm through the unvalidated accuracy cells"
+                    if mode in ("coverage", "cartesian")
                     else "refits the camera rig from the base tag"))
-    if mode == "coverage":
+    if mode in ("coverage", "cartesian"):
         if not app["execute"]:
             raise web.HTTPForbidden(text="coverage moves the arm: start the capture server with "
                                          "REBOT_EXECUTE=1 and the edge with --allow-execute")
@@ -2367,6 +2512,8 @@ async def handle_identify_run(request: web.Request) -> web.Response:
     try:
         if mode == "coverage":
             payload = await run_coverage(app, body, sid)
+        elif mode == "cartesian":
+            payload = await run_cartesian_coverage(app, body, sid)
         else:
             payload = await asyncio.to_thread(run_refit, app, camera_url, calibration_path, body)
     except (identify_mod.IdentifyError, auto_calibrate.AutoError, camera_mod.CameraError,
@@ -2445,7 +2592,10 @@ async def handle_identify_status(request: web.Request) -> web.Response:
         "last": app["identify_last"],
         "proposals": proposals,
         "modes": {"refit": "averaged tag stills; no arm motion, no execute gate (§7.3a)",
-                  "coverage": "measure the unvalidated accuracy cells; moves the arm (§7.4)"},
+                  "coverage": "measure the unvalidated accuracy cells in joint space; "
+                              "moves the arm (§7.4)",
+                  "cartesian": "cell centres through the task planner (IK + peel), with the "
+                               "IK residual attributed; moves the arm (§7.4)"},
         "unlearned": gaps,
         "rig": (None if app["rig"] is None else app["rig"].provenance()),
         "accuracy": _accuracy_health(app),

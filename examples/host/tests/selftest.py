@@ -1373,6 +1373,9 @@ def test_oracle_rules():
          {"holds": [hold()], "placement": {"error_mm": [2.0, 1.0, 40.0],
                                             "object_height_mm": 40.0}},
          "limitation", "one-plane"),
+        ("ik-residual: the command misses its target while the arm holds it",
+         {"holds": [hold(ik_residual_mm=15.0, tip_error_mm=2.0)]},
+         "ik", "ik-residual"),
         ("execution fault: abort and gripper stall in telemetry",
          {"holds": [hold()], "telemetry": {"abort": {"t": 3.0, "reason": "not following"},
                                             "gripper_stall": {"t": 3.0, "commanded": 2.4,
@@ -1392,6 +1395,44 @@ def test_oracle_rules():
           and oracle.attribute({})["layer"] == "none")
     check("attribute: an aborted run is medium confidence",
           oracle.attribute(rows[-1][1])["confidence"] == "medium")
+
+    # The FK bridge's separation: a large IK residual with a large hold error
+    # is NOT the solver's signature alone -- the arm is not holding its command,
+    # so the motor layer owns it. A small residual never fires.
+    verdict = oracle.attribute({"holds": [hold(ik_residual_mm=15.0, tip_error_mm=20.0)]})
+    kinds = [problem["kind"] for problem in verdict["problems"]]
+    check("attribute: ik residual with a bad hold is not an ik problem",
+          "ik-residual" not in kinds and "tip-error" in kinds, str(kinds))
+    check("attribute: a residual inside the planner's acceptance is silent",
+          oracle.attribute({"holds": [hold(ik_residual_mm=5.0)]})["problems"] == [])
+
+    # Hold -> target matching: by the plan's own declared hold spans, not by
+    # index (the start hold exists only when the gripper started closed) and
+    # not by joint proximity (a marker near park would confuse that).
+    targets = [
+        {"point": [0.30, 0.00, 0.20], "q_ik": [0.10] * 6,
+         "hold_t_start": 5.0, "hold_t_end": 6.3},
+        {"point": [0.40, 0.10, 0.25], "q_ik": [0.20] * 6,
+         "hold_t_start": 9.0, "hold_t_end": 10.3},
+    ]
+    windows = [
+        {"t_start": 0.0, "t_end": 0.83, "q_cmd": [0.0] * 7},          # start hold
+        {"t_start": 5.03, "t_end": 6.3, "q_cmd": [0.10] * 6 + [2.45]},
+        {"t_start": 9.03, "t_end": 10.3, "q_cmd": [0.20] * 6 + [4.9]},
+    ]
+    matched = oracle.match_hold_targets(windows, targets)
+    check("match_hold_targets leaves the start hold unmatched", matched[0] is None)
+    check("match_hold_targets matches holds by the plan's clock",
+          matched[1] is targets[0] and matched[2] is targets[1], str(matched))
+    check("match_hold_targets skips targets without hold spans (older plans)",
+          oracle.match_hold_targets(windows, [{"point": [0.3, 0.0, 0.2],
+                                               "q_ik": [0.1] * 6}]) == [None] * 3)
+    check("match_hold_targets handles empty inputs",
+          oracle.match_hold_targets([], targets) == []
+          and oracle.match_hold_targets(windows, []) == [None] * 3)
+    near_park = [{"t_start": 20.0, "t_end": 21.0, "q_cmd": [0.10] * 6 + [0.0]}]
+    check("a window outside every span stays unmatched even near a marker's pose",
+          oracle.match_hold_targets(near_park, targets) == [None])
 
 
 def test_trace_triage(workdir: Path):
@@ -4525,6 +4566,59 @@ def test_sag_map(workdir: Path):
           np.allclose(plain, sweep.aim(sweep.POSES[0], kp, extra_sag=None), atol=1e-12))
 
 
+def test_cartesian_targets(workdir: Path):
+    print("\ncartesian coverage: cell centres, reach band, need ordering (pure)")
+    import identify
+
+    # Empty map: every cell is a gap. The grid is 5 radius x 4 height x 8 sector
+    # = 160 cells; the h0 band's centre (z=0.05) is below the 0.10 m safety
+    # floor, so 40 of them are unreachable as Cartesian targets -- reported,
+    # never clamped up into a different cell.
+    chosen, skipped = identify.cartesian_targets({"cells": {}})
+    check("an empty map offers every reachable cell once",
+          len(chosen) == 12 and skipped == {"below_min_z": 40, "beyond_reach": 0},
+          "chosen %d skipped %s" % (len(chosen), skipped))
+    full, skipped_full = identify.cartesian_targets({"cells": {}}, top_k=200)
+    check("the full reachable grid is 120 cells, one point each",
+          len(full) == 120 and len({entry["cell"] for entry in full}) == 120
+          and skipped_full["below_min_z"] == 40,
+          "full %d" % len(full))
+    check("every centre round-trips to the cell it was chosen for",
+          all(identify.accuracy_cell(entry["point"]) == entry["cell"] for entry in full),
+          str([entry["cell"] for entry in full
+               if identify.accuracy_cell(entry["point"]) != entry["cell"]])[:80])
+    check("centres sit inside the reach band",
+          all(entry["point"][2] >= 0.10 - 1e-9
+              and math.hypot(entry["point"][0], entry["point"][1]) <= 0.75
+              for entry in full))
+    check("never-measured cells come before partially measured ones",
+          [entry["need"] for entry in full] == sorted((entry["need"] for entry in full),
+                                                      reverse=True))
+
+    # A validated cell is not a gap; a measured-but-unvalidated one still is.
+    cell = full[0]["cell"]
+    point = full[0]["point"]
+    map_doc = {"cells": {cell: {"validated_at": "2026-01-01T00:00:00Z", "n": 3}}}
+    chosen, _ = identify.cartesian_targets(map_doc, top_k=200)
+    check("a validated cell is not targeted again",
+          all(entry["cell"] != cell for entry in chosen) and len(chosen) == 119)
+    map_doc = {"cells": {cell: {"validated_at": None, "n": 1}}}
+    chosen, _ = identify.cartesian_targets(map_doc, top_k=200)
+    entry = next(item for item in chosen if item["cell"] == cell)
+    check("a partially measured cell keeps its need", entry["need"] == 2)
+
+    # The reach band is the planner's own: a higher floor or shorter reach
+    # excludes cells honestly instead of planning into them.
+    chosen, skipped = identify.cartesian_targets({"cells": {}}, top_k=200, min_z=0.20)
+    check("a higher safety floor excludes the h1 band too",
+          skipped["below_min_z"] == 80 and len(chosen) == 80, str(skipped))
+    chosen, skipped = identify.cartesian_targets({"cells": {}}, top_k=200, max_reach=0.35)
+    check("a shorter reach excludes the outer bands",
+          skipped["beyond_reach"] > 0 and len(chosen) + skipped["beyond_reach"] == 120,
+          str(skipped))
+    check("the top_k cap holds", len(identify.cartesian_targets({"cells": {}}, top_k=5)[0]) == 5)
+
+
 def test_identify_api(workdir: Path):
     print("\nidentify API: mode gates, verify-before-hotload, coverage")
     from aiohttp.test_utils import TestClient, TestServer
@@ -4635,6 +4729,10 @@ def test_identify_api(workdir: Path):
                                            json={"confirm": True, "mode": "coverage"})
                 check("coverage refuses to move the arm with execution off",
                       answer.status == 403)
+                answer = await client.post("/identify/run",
+                                           json={"confirm": True, "mode": "cartesian"})
+                check("cartesian coverage refuses to move the arm with execution off",
+                      answer.status == 403)
                 answer = await client.post("/identify/run", json={"confirm": True})
                 check("a refit needs no execute gate: it moves nothing (§7.3a)",
                       answer.status == 200, "status %s" % answer.status)
@@ -4668,8 +4766,8 @@ def test_identify_api(workdir: Path):
                 check("GET /identify reports idle progress and proposals",
                       status.get("running") is False and status.get("progress") is None
                       and isinstance(status.get("proposals"), list))
-                check("GET /identify names the two sessions and their gates",
-                      set(status.get("modes") or {}) == {"refit", "coverage"})
+                check("GET /identify names the sessions and their gates",
+                      set(status.get("modes") or {}) == {"refit", "coverage", "cartesian"})
                 check("GET /identify reports what is not learned yet (§7.2)",
                       {gap["quantity"] for gap in status.get("unlearned") or []}
                       >= {"accuracy-map"}, str(status.get("unlearned"))[:90])
@@ -4809,6 +4907,124 @@ def test_identify_api(workdir: Path):
                           (status.get("last") or {}).get("mode") == "coverage"
                           and (status.get("last") or {}).get("state") == "ok")
                 finally:
+                    capture_server.oracle_prepare = original_prepare
+                    capture_server.oracle_finish = original_finish
+
+                # ---- §7.4 cartesian coverage: the task planner, exactly -----
+                # The route grows the sequence through planner_call /plan (the
+                # same call /sequence makes) and executes the last plan that
+                # worked. The fake answers them; the oracle hooks stay the
+                # coverage section's fakes.
+                planner_calls = []
+                screen = {"refuse_all": False, "points": set()}
+
+                async def fake_planner_call(app_, path, body, timeout=120,
+                                            method="POST", sid=None):
+                    planner_calls.append((path, body))
+                    if path == "/plan":
+                        targets = body.get("targets") or []
+                        if (screen["refuse_all"]
+                                or any(tuple(t["tip"]) in screen["points"] for t in targets)):
+                            return 422, {"ok": False,
+                                         "error": "IK failed at the marker: out of reach"}
+                        return 200, {"ok": True, "id": "cart-seq-%d" % len(planner_calls),
+                                     "summary": {"markers": len(targets),
+                                                 "worst_ik_m": 0.0012,
+                                                 "duration_s": 42.0, "waypoints": 1300},
+                                     "execute": True}
+                    if path == "/execute":
+                        return 200, {"ok": True, "id": body.get("id"), "executed": True,
+                                     "telemetry": {"samples": []}}
+                    return 404, {"ok": False, "error": "no such route"}
+
+                original_planner_call = capture_server.planner_call
+                capture_server.planner_call = fake_planner_call
+                capture_server.oracle_prepare = fake_prepare
+                capture_server.oracle_finish = fake_finish
+                try:
+                    calls.clear()
+                    planner_calls.clear()
+                    rig_before = app["rig"].fingerprint
+                    answer = await client.post("/identify/run",
+                                               json={"confirm": True, "mode": "cartesian",
+                                                     "poses": 6})
+                    body = await answer.json()
+                    check("cartesian coverage runs the task planner's sequence",
+                          answer.status == 200 and body.get("ok") is True
+                          and body.get("mode") == "cartesian",
+                          "status %s, %s" % (answer.status, str(body.get("error"))[:80]))
+                    plans = [b for p, b in planner_calls if p == "/plan"]
+                    executes = [b for p, b in planner_calls if p == "/execute"]
+                    check("cartesian grows the sequence one candidate at a time",
+                          len(plans) == 6 and all(p.get("gripper") == "alternate" for p in plans)
+                          and [len(p["targets"]) for p in plans] == [1, 2, 3, 4, 5, 6]
+                          and len(executes) == 1,
+                          "plans %d executes %d" % (len(plans), len(executes)))
+                    check("cartesian executes the last plan that worked",
+                          executes[0].get("id") == "cart-seq-6", str(executes))
+                    check("cartesian prepares before it executes, then measures",
+                          [name for name, _id in calls] == ["prepare", "finish"]
+                          and calls[0][1] == calls[1][1] == executes[0].get("id"),
+                          str(calls))
+                    check("cartesian targets round-trip to the cells they name",
+                          len(body.get("cells") or []) == body.get("poses") == 6
+                          and len(body.get("targets") or []) == 6
+                          and all(identify.accuracy_cell(t) == c
+                                  for t, c in zip(body["targets"], body["cells"])),
+                          str(body.get("cells")))
+                    check("cartesian reports the unreachable gaps honestly",
+                          (body.get("skipped") or {}).get("below_min_z") == 40,
+                          str(body.get("skipped")))
+                    check("cartesian writes no rig (§7.4)",
+                          body.get("writes_rig") is False
+                          and app["rig"].fingerprint == rig_before)
+
+                    # One candidate the IK cannot reach: every trial containing
+                    # it fails, the rest still grow into a full session.
+                    planner_calls.clear()
+                    calls.clear()
+                    first_tip = tuple(body["targets"][0])
+                    screen["points"].add(first_tip)
+                    answer = await client.post("/identify/run",
+                                               json={"confirm": True, "mode": "cartesian",
+                                                     "poses": 6})
+                    body = await answer.json()
+                    check("an unreachable candidate is screened out, not fatal",
+                          answer.status == 200 and len(body.get("refused") or []) == 1
+                          and body.get("poses") == 6,
+                          "status %s refused %s" % (answer.status, body.get("refused")))
+                    sequence = [b for p, b in planner_calls if p == "/plan"][-1]
+                    check("the executed sequence skips the refused cell",
+                          all(tuple(t["tip"]) != first_tip for t in sequence["targets"]))
+                    screen["points"].clear()
+
+                    # Every candidate unreachable: refused before any motion.
+                    planner_calls.clear()
+                    screen["refuse_all"] = True
+                    answer = await client.post("/identify/run",
+                                               json={"confirm": True, "mode": "cartesian"})
+                    body = await answer.json()
+                    check("a fully unreachable grid is refused without motion",
+                          answer.status == 422
+                          and not any(p == "/execute" for p, _b in planner_calls),
+                          "status %s" % answer.status)
+                    screen["refuse_all"] = False
+
+                    # No oracle, no motion: same rule as the joint-space form.
+                    planner_calls.clear()
+                    capture_server.oracle_prepare = no_prepare
+                    try:
+                        answer = await client.post("/identify/run",
+                                                   json={"confirm": True, "mode": "cartesian"})
+                        body = await answer.json()
+                        check("cartesian refuses when the oracle cannot measure",
+                              answer.status == 422
+                              and not any(p == "/execute" for p, _b in planner_calls),
+                              "status %s" % answer.status)
+                    finally:
+                        capture_server.oracle_prepare = fake_prepare
+                finally:
+                    capture_server.planner_call = original_planner_call
                     capture_server.oracle_prepare = original_prepare
                     capture_server.oracle_finish = original_finish
 
@@ -4968,6 +5184,7 @@ def main(argv=None):
     test_identify_gate(workdir)
     test_sag_map(workdir)
     test_identify_api(workdir)
+    test_cartesian_targets(workdir)
     test_accuracy_map(workdir)
 
     failures = [name for name, ok, _ in RESULTS if not ok]

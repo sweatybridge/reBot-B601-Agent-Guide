@@ -37,6 +37,10 @@ REACH_FRACTION = 0.9         # "near the boundary" for the reach-model signature
 PLACEMENT_XY_MM = 10.0       # x/y small enough to call a placement error z-only
 PLACEMENT_Z_TOL_MM = 5.0     # z matches the object height within this
 CMD_TOL = 1e-9               # waypoints repeat a hold's command exactly
+IK_RESIDUAL_MM = 10.0        # the sequence planner's own acceptance bound: a
+                             # solver residual above it missed its own gate
+HOLD_TIME_TOL = 1e-6         # plan-clock slack matching a hold window to its
+                             # marker's declared hold span
 
 
 def _same_cmd(a, b):
@@ -75,6 +79,35 @@ def hold_windows(waypoints, min_s=HOLD_MIN_S):
                                 "q_cmd": [float(v) for v in waypoints[start]["q"]]})
         start = index
     return windows
+
+
+def match_hold_targets(windows, targets, time_tol=HOLD_TIME_TOL):
+    """Which planned target each hold window belongs to, by the plan's clock.
+
+    A marker sequence records each marker's hold span (`hold_t_start`/
+    `hold_t_end`) as it builds it; a hold window lies inside exactly one such
+    span. Matching by time is exact -- joint proximity would confuse a marker
+    near the park pose with the gripper-opening start hold, and indexing would
+    depend on whether that start hold exists at all. A target without a hold
+    span (an older plan) is skipped; the start hold matches nothing.
+
+    Pure: returns one entry per window -- the target dict, or None.
+    """
+    usable = [target for target in (targets or [])
+              if target.get("hold_t_start") is not None
+              and target.get("hold_t_end") is not None]
+    matched = []
+    for window in windows or []:
+        t0 = float(window.get("t_start", 0.0))
+        t1 = float(window.get("t_end", 0.0))
+        best = None
+        for target in usable:
+            if (float(target["hold_t_start"]) - time_tol <= t0
+                    and t1 <= float(target["hold_t_end"]) + time_tol):
+                best = target
+                break
+        matched.append(best)
+    return matched
 
 
 def downsample(samples, limit=MAX_SAMPLES):
@@ -239,6 +272,21 @@ def attribute(oracle_doc):
             problems.append(_problem("tip-error", "arm-motor",
                                      "%d hold(s) with tip error > %.0f mm"
                                      % (len(tip_bad), TIP_ERROR_MM)))
+
+    # The FK bridge (§7.4, Cartesian coverage): the plan records each marker's
+    # raw IK solution, so the solver's residual |FK(q_ik) - flange_point| is
+    # measurable separately from the arm's hold error. A command that misses
+    # its target while the arm holds that command faithfully is an IK/model
+    # problem, not a motor problem -- the sign pattern that separates them.
+    ik_bad = [hold for hold in holds
+              if hold.get("ik_residual_mm") is not None
+              and float(hold["ik_residual_mm"]) > IK_RESIDUAL_MM]
+    if ik_bad and all(hold.get("tip_error_mm") is not None
+                      and float(hold["tip_error_mm"]) <= TIP_ERROR_MM for hold in ik_bad):
+        problems.append(_problem("ik-residual", "ik",
+                                 "%d hold(s) where the IK solution misses its target by "
+                                 "> %.0f mm while the arm held within %.0f mm: solver / model"
+                                 % (len(ik_bad), IK_RESIDUAL_MM, TIP_ERROR_MM)))
 
     # Row 7: z-only placement error the size of the object is the one-plane
     # assumption -- a limitation to report, never a bug ticket.
