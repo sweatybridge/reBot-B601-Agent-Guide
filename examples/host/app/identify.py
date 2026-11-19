@@ -33,12 +33,22 @@ gravity-sag fixed point `sweep.aim` as an additive term still clipped by
 trusted outside the envelope it was fitted in.
 
 `coverage_session` (§7.4) is the only arm motion here. It is controlled motion to
-GATHER MEASUREMENTS -- a safe pose grid chosen for the accuracy cells nobody has
-validated yet -- not a rig-fit procedure, and it never writes a rig. It goes
-through `ArmGateway.move_sequence` -> the gateway's existing `/move` check chain
-(command_ok, path_safe, speed clamp, edge aborts), and its holds are measured by
-the same oracle that measures a task execution. No new execute path, no gate
-changes.
+GATHER MEASUREMENTS -- not a rig-fit procedure, and it never writes a rig. Two
+complementary forms, because they cover different things:
+
+* joint-space (`coverage_poses`): safe poses from the sweep pool, chosen for the
+  cells their tip lands in. The wrist diversity is what makes geometry
+  observable, and every leg passes the sweep's own pose_ok/path_safe chain. It
+  goes through `ArmGateway.move_sequence` -> the gateway's `/move` check chain.
+* Cartesian (`cartesian_targets`): the unvalidated cells' centre points, planned
+  and executed by the TASK planner exactly as a tap sequence is (/plan ->
+  /execute, IK + peel + capsule checks). It targets cells directly instead of
+  hoping a joint pose lands in one, and the plan records each marker's raw IK
+  solution so the oracle can separate solver error from sag (the FK bridge:
+  |target - FK(q_ik)| is the solver's, |FK(q_meas) - FK(q_cmd)| is the arm's).
+
+Both forms' holds are measured by the same oracle that measures a task
+execution. No new execute path, no gate changes.
 
 The sag map and the accuracy map are the learned quantities, and both need
 excitation: a sag direction with too few holds, or a cell nobody has measured, is
@@ -96,6 +106,10 @@ ACCURACY_SECTORS = 8
 COVERAGE_MAX_POSES = 12      # §7.4: one trajectory's worth of measurement poses
 COVERAGE_HOLD_S = 2.0        # long enough for the oracle's two grabs at the middle
 COVERAGE_PERTURBATIONS = 24  # extra poses around sweep.POSES, to reach more cells
+# Mirrors plan_to_target.Options.max_reach. Duplicated, not imported: identify.py
+# runs in the capture image, which has no Pinocchio; the planner re-checks reach
+# with its own value when it plans, so this only pre-filters obvious misses.
+COVERAGE_MAX_REACH_M = 0.75
 
 
 def _stamp():
@@ -934,3 +948,57 @@ def coverage_plan(current_q, poses, gripper=0.0, hold_s=COVERAGE_HOLD_S):
         "writes_rig": False,
         "purpose": "measure the unvalidated accuracy cells; the oracle validates them",
     }
+
+
+def cartesian_targets(map_doc, top_k=COVERAGE_MAX_POSES, min_z=0.10,
+                      max_reach=COVERAGE_MAX_REACH_M):
+    """The centre points of the least-covered cells, as Cartesian targets (§7.4).
+
+    The complement of `coverage_poses`: instead of FK-ing joint poses and hoping
+    the tip lands in a gap, this aims AT the gap -- one point per unvalidated
+    cell, at the cell's mid radius, mid height and mid sector angle, so
+    `accuracy_cell(point)` round-trips to the cell it was chosen for. The task
+    planner's IK then decides whether the arm can actually hold there; this
+    function only applies the same reach band the planner enforces (min_z floor,
+    max_reach) so obviously impossible cells are reported, not planned into.
+
+    Returns (chosen, skipped): `chosen` is sorted by need (never-measured first)
+    and capped at `top_k`, one point per cell; `skipped` counts the unvalidated
+    cells the reach band excludes, so a session can say honestly which gaps it
+    cannot reach from a Cartesian approach (the joint-space form may still reach
+    some of them -- /move has no min_z floor, only the capsule check).
+
+    Pure: no IK, no motion, no rig. A cell centre below the safety floor is
+    NEVER clamped up into reach -- that would measure a different cell than the
+    one the map says is unvalidated.
+    """
+    chosen, taken = [], set()
+    skipped = {"below_min_z": 0, "beyond_reach": 0}
+    entries = []
+    for entry in coverage_cells(map_doc):
+        if entry["need"] <= 0:
+            continue        # validated: measuring it again teaches nothing
+        r0, r1 = entry["radius_m"]
+        h0, h1 = entry["height_m"]
+        sector = int(entry["cell"].rsplit("-s", 1)[1])
+        radius = 0.5 * (float(r0) + float(r1))
+        height = 0.5 * (float(h0) + float(h1))
+        angle = (sector + 0.5) * (2.0 * math.pi / ACCURACY_SECTORS)
+        point = [radius * math.cos(angle), radius * math.sin(angle), height]
+        if height < float(min_z) - 1e-9:
+            skipped["below_min_z"] += 1
+            continue
+        if radius > float(max_reach):
+            skipped["beyond_reach"] += 1
+            continue
+        entries.append({"cell": entry["cell"], "need": int(entry["need"]),
+                        "point": [float(v) for v in point]})
+    entries.sort(key=lambda item: (-item["need"], item["cell"]))
+    for entry in entries:
+        if len(chosen) >= int(top_k):
+            break
+        if entry["cell"] in taken:
+            continue
+        chosen.append(entry)
+        taken.add(entry["cell"])
+    return chosen, skipped

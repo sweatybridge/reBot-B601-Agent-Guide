@@ -717,6 +717,14 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     current_place = p0.copy()
     current_rotation = R0.copy()
     yaw_degrees = []
+    # Each marker's RAW IK solution, before the emission pass compensates sag.
+    # The oracle compares FK(q_ik) against the requested flange point to measure
+    # the solver's own residual, separately from the arm's hold error (§7.4).
+    marker_q_ik = []
+    # Each marker's hold span on the plan's own clock. The oracle matches hold
+    # windows to targets by these times -- exact, where joint proximity would
+    # confuse a marker near the park pose with the start hold.
+    marker_holds = []
     for index, point in enumerate(points, start=1):
         place = flange_points[index - 1]
         yaw_deg = math.degrees(math.atan2(float(point[1]), float(point[0])))
@@ -727,6 +735,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             # handle: from the arm's pose to the first marker.
             seed = cartesian(current_place, place, current_rotation, R_marker,
                              options.approach_s, 0.4, seed, "marker 1", gripper)
+            marker_q_ik.append([float(v) for v in seed[:n_arm]])
         else:
             # Between markers, a straight Cartesian line can leave the annulus
             # the arm can reach with the tool down. Solve the marker pose, then
@@ -735,6 +744,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                 target = ik_to(place, R_marker, seed, "marker %d" % index)
             except PlanError:
                 target = ik_to(place, R_marker, start_seed, "marker %d" % index)
+            marker_q_ik.append([float(v) for v in target[:n_arm]])
             current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
             if not sweep.path_safe(current_q, target[:n_arm]):
                 raise PlanError(
@@ -745,12 +755,14 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                 current_q,
                 {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
                 options.approach_s, "marker %d" % index, gripper)
+        hold_t0 = state["t"]
         hold(0.25, gripper)
         next_gripper = MOTOR7_HALF if index % 2 == 1 else MOTOR7_OPEN
         if abs(next_gripper - gripper) > 1e-6:
             gripper_leg(next_gripper, max(0.8, options.hold_s))
         gripper = next_gripper
         hold(0.25, gripper)
+        marker_holds.append((hold_t0, state["t"]))
         current_place = place
         current_rotation = R_marker
 
@@ -784,7 +796,14 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
              "tap_height_m": targets[index].get("tap_height_m"),
              "capture": targets[index].get("capture"),
              "source": targets[index].get("source"),
-             "tap": targets[index].get("tap")}
+             "tap": targets[index].get("tap"),
+             # The raw IK solution at this marker, pre-compensation: the oracle
+             # measures |FK(q_ik) - flange_point| as the solver's residual.
+             "q_ik": marker_q_ik[index],
+             # The marker's hold span on the plan clock: the oracle matches its
+             # hold window to this target by time, exactly.
+             "hold_t_start": marker_holds[index][0],
+             "hold_t_end": marker_holds[index][1]}
             for index, point in enumerate(points)
         ],
         "tool_axis": sequence_axis,
@@ -814,6 +833,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         "markers": len(points),
         "targets": [[float(v) for v in point] for point in points],
         "flange_points": [[float(v) for v in point] for point in flange_points],
+        "q_ik": marker_q_ik,
         "radii": [float(np.linalg.norm(point[:2])) for point in points],
         "hover_m": float(options.hover_m),
         "hovers_m": [float(value) for value in hovers],
