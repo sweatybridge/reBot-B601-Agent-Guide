@@ -248,8 +248,13 @@ def still_for(case: dict) -> Path:
 
 
 def default_calibration() -> Path:
+    # The calib dir holds the intrinsics beside three things that are not
+    # intrinsics: rigs (extrinsics-*/witness-*), the learned sag map (sag-*) and
+    # the accuracy envelope (accuracy-map). Picking the newest *.json without
+    # excluding them hands a caller a sag map and asks it for K.
     files = sorted(p for p in (STATE / "calib").glob("*.json")
-                   if not p.name.startswith(("extrinsics-", "witness-")))
+                   if not p.name.startswith(("extrinsics-", "witness-", "sag-",
+                                             "accuracy-map")))
     if not files:
         raise EvalError("no calibration in %s" % (STATE / "calib"))
     return files[-1]
