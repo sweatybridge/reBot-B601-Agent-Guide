@@ -32,6 +32,11 @@ MAX_SAMPLES = 2000           # wire budget for telemetry samples
 WITNESS_DRIFT_PX = 2.0       # the capture path's own refusal limit
 WITNESS_SCALE_TOL = 0.05     # focus/zoom changes the field of view
 SAG_CORRELATION = 0.8        # |cos(hold_error, tau_g/kp)| to call it sag
+TIP_VECTOR_COHERENCE = 0.8   # mean resultant length of the pixel-error directions:
+                             # a rig/turns shift moves every hold the same way in
+                             # camera space; a detector picking wrong blob ends at
+                             # rotated wrists scatters. Below this, the pixel layer
+                             # is a perception limitation, not a geometry ticket.
 ZERO_BIAS_SPREAD_RAD = 0.005 # per-joint bias this constant across poses = zeros
 REACH_FRACTION = 0.9         # "near the boundary" for the reach-model signature
 PLACEMENT_XY_MM = 10.0       # x/y small enough to call a placement error z-only
@@ -225,17 +230,39 @@ def attribute(oracle_doc):
                  if hold.get("pixel_error_mm") is not None
                  and float(hold["pixel_error_mm"]) > PIXEL_ERROR_MM]
     if pixel_bad:
-        # Row 1: the arm held what it was told, the camera disagrees.
-        if all(hold.get("tip_error_mm") is not None
-               and float(hold["tip_error_mm"]) <= TIP_ERROR_MM for hold in pixel_bad):
+        # A rig / K / turns error is a common camera-space shift: the error
+        # vectors agree in direction. The green-tip heuristic at rotated wrists
+        # picks different blob ends per pose and scatters -- that is perception,
+        # labelled as a limitation (§7.5), never a geometry ticket.
+        vectors = []
+        for hold in pixel_bad:
+            det, pred = hold.get("detected_tip_px"), hold.get("predicted_tip_px")
+            if det and pred:
+                dx, dy = float(det[0]) - float(pred[0]), float(det[1]) - float(pred[1])
+                norm = math.hypot(dx, dy)
+                if norm > 1e-6:
+                    vectors.append((dx / norm, dy / norm))
+        coherence = (math.hypot(sum(v[0] for v in vectors), sum(v[1] for v in vectors))
+                     / len(vectors)) if len(vectors) >= 2 else 1.0
+        # Row 1: the arm held what it was told, the camera disagrees coherently.
+        if coherence >= TIP_VECTOR_COHERENCE and all(
+                hold.get("tip_error_mm") is not None
+                and float(hold["tip_error_mm"]) <= TIP_ERROR_MM for hold in pixel_bad):
             problems.append(_problem("rig-mismatch", "camera-arm",
                                      "%d hold(s) with pixel error > %.0f mm while the tip "
                                      "held within %.0f mm: rig / K / turns"
                                      % (len(pixel_bad), PIXEL_ERROR_MM, TIP_ERROR_MM)))
-        # Row 2: a turns correction that was never measured (shape fallback),
-        # or an error that only shows in landscape, is the quarter-turn sign.
+        elif coherence < TIP_VECTOR_COHERENCE:
+            problems.append(_problem("tip-detector", "perception",
+                                     "%d hold(s) with pixel error > %.0f mm but scattered "
+                                     "directions (coherence %.2f): the green-tip heuristic "
+                                     "at rotated wrists, not a rig shift"
+                                     % (len(pixel_bad), PIXEL_ERROR_MM, coherence)))
+        # Row 2: a turns correction that was never measured (shape fallback) is
+        # the quarter-turn sign. A turn measured against the base tag is not a
+        # guess, so landscape alone does not indict it.
         source = (doc.get("stream_turn") or {}).get("source")
-        if source == "shape" or doc.get("landscape"):
+        if source != "measured" and (source == "shape" or doc.get("landscape")):
             problems.append(_problem("turns-correction", "camera-arm",
                                      "pixel error with stream_turn source %r%s"
                                      % (source, " in landscape" if doc.get("landscape") else "")))

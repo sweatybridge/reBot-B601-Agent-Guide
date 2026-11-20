@@ -1477,6 +1477,35 @@ def test_oracle_rules():
               "layer=%s kinds=%s" % (verdict["layer"], kinds))
     check("attribute: a clean run has no problems",
           oracle.attribute({"holds": [hold(), hold()]})["problems"] == [])
+    # Pixel-layer honesty: scattered error directions at rotated wrists are the
+    # green-tip heuristic picking different blob ends, not a rig shift; and a
+    # turn measured against the base tag is not a guess, so landscape alone
+    # does not indict it (coverage run 20261120T064648Z cried wolf on both).
+    scattered = {"holds": [
+        hold(pixel_error_mm=30.0, tip_error_mm=2.0,
+             predicted_tip_px=[100.0, 100.0], detected_tip_px=[140.0, 100.0]),
+        hold(pixel_error_mm=30.0, tip_error_mm=2.0,
+             predicted_tip_px=[100.0, 100.0], detected_tip_px=[100.0, 140.0]),
+        hold(pixel_error_mm=30.0, tip_error_mm=2.0,
+             predicted_tip_px=[100.0, 100.0], detected_tip_px=[60.0, 100.0])],
+        "stream_turn": {"source": "measured", "turns": 1, "error_px": 1.8},
+        "landscape": True}
+    kinds = [p["kind"] for p in oracle.attribute(scattered)["problems"]]
+    check("attribute: scattered pixel error is perception, not rig or turns",
+          "tip-detector" in kinds and "rig-mismatch" not in kinds
+          and "turns-correction" not in kinds, str(kinds))
+    coherent = {"holds": [
+        hold(pixel_error_mm=30.0, tip_error_mm=2.0,
+             predicted_tip_px=[100.0, 100.0], detected_tip_px=[140.0, 102.0]),
+        hold(pixel_error_mm=30.0, tip_error_mm=2.0,
+             predicted_tip_px=[200.0, 150.0], detected_tip_px=[240.0, 152.0]),
+        hold(pixel_error_mm=30.0, tip_error_mm=2.0,
+             predicted_tip_px=[300.0, 250.0], detected_tip_px=[340.0, 252.0])],
+        "stream_turn": {"source": "measured", "turns": 1, "error_px": 1.8},
+        "landscape": True}
+    kinds = [p["kind"] for p in oracle.attribute(coherent)["problems"]]
+    check("attribute: coherent pixel shift with a measured turn is rig-mismatch",
+          "rig-mismatch" in kinds and "turns-correction" not in kinds, str(kinds))
     check("attribute: no evidence is low confidence, not a pass",
           oracle.attribute({})["confidence"] == "low"
           and oracle.attribute({})["layer"] == "none")
@@ -5585,6 +5614,39 @@ def test_identify_cad_plan_execute(workdir: Path):
           and Path(log_path).is_file())
 
 
+def test_oracle_detect(workdir: Path):
+    """The oracle's tip pixel is green evidence or nothing -- never background."""
+    import capture_server as cs
+
+    print("\noracle: tip detection is green or nothing")
+    size = (640, 480)
+    K, dist = synthetic_camera(*size, f=600.0)
+    T = look_at((0.5, 0.95, 0.45), (0.3, 0.0, 0.25))
+    q = np.asarray(sweep.POSES[0], float)
+    t_tip = np.array([0.0, 0.0, -0.035])
+    wrist, tip, j6 = auto_calibrate._tool_pixels(q, K, dist, T, t_tip)
+    direction = np.asarray(tip, float) - np.asarray(j6 or wrist, float)
+    direction = direction / np.linalg.norm(direction)
+    frame = np.full((480, 640, 3), 200, np.uint8)
+
+    def paint(centre, half):
+        u, v = int(centre[0]), int(centre[1])
+        frame[v - half:v + half, u - half:u + half] = (0, 200, 0)
+
+    # A sliver nearest the tip (below the blob gate) and the substantial cover
+    # farther along the tool axis: the plain green call refuses the sliver.
+    paint(np.asarray(tip) + 52 * direction, 9)
+    paint(np.asarray(tip) + 95 * direction, 24)
+    found = cs._oracle_detect(frame, q, K, dist, T, t_tip)
+    check("oracle detect: fragment-cleaned retry measures the cover, not the sliver",
+          found is not None and found["detector"] == "green"
+          and np.hypot(found["uv"][0] - tip[0], found["uv"][1] - tip[1]) > 60.0,
+          str(found))
+    blank = np.full((480, 640, 3), 200, np.uint8)
+    check("oracle detect: background-only frame is None, never a guess",
+          cs._oracle_detect(blank, q, K, dist, T, t_tip) is None)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Offline selftest for the capture pipeline.")
     parser.add_argument("--keep", action="store_true", help="keep the work directory")
@@ -5605,6 +5667,7 @@ def main(argv=None):
     geometry = test_tag_geometry(workdir)
     test_schema()
     test_oracle_rules()
+    test_oracle_detect(workdir)
     test_trace_triage(workdir)
     test_planner_offline(workdir)
     test_mock_tape(workdir)
