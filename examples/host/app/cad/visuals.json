@@ -1,0 +1,566 @@
+{
+ "source": "https://raw.githubusercontent.com/Seeed-Projects/reBotArmController_ROS2/main/src/rebotarm_bringup/description/RS/",
+ "visuals": [
+  {
+   "link": "base_link",
+   "mesh": "meshes/shared/base_link.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link1",
+   "mesh": "meshes/shared/link1.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link2",
+   "mesh": "meshes/visual/motor_2_3.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link2",
+   "mesh": "meshes/visual/cnc2.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link2",
+   "mesh": "meshes/visual/pla2_black.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link2",
+   "mesh": "meshes/visual/pla2_green.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link3",
+   "mesh": "meshes/visual/cnc3.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link3",
+   "mesh": "meshes/visual/motor_4.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link3",
+   "mesh": "meshes/visual/pla3_black_without_seeed_badge.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link3",
+   "mesh": "meshes/visual/pla3_seeed_badge_with_counters.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link3",
+   "mesh": "meshes/visual/pla3_seeed_wordmark_backing.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link3",
+   "mesh": "meshes/visual/pla3_green.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link4",
+   "mesh": "meshes/visual/motor_5.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link4",
+   "mesh": "meshes/visual/cnc4.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link5",
+   "mesh": "meshes/visual/motor_6.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link5",
+   "mesh": "meshes/visual/cnc5.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link5",
+   "mesh": "meshes/visual/pla5_green.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "link6",
+   "mesh": "meshes/shared/link6.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "gripper_end",
+   "mesh": "meshes/visual/pla7_green.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "gripper_end",
+   "mesh": "meshes/visual/cnc7.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "gripper_end",
+   "mesh": "meshes/visual/motor_7.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "gripper_left",
+   "mesh": "meshes/visual/pla_left.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "gripper_left",
+   "mesh": "meshes/visual/cnc_left.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "gripper_right",
+   "mesh": "meshes/visual/pla_right.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "link": "gripper_right",
+   "mesh": "meshes/visual/cnc_right.STL",
+   "xyz": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  }
+ ],
+ "joints": [
+  {
+   "name": "joint1",
+   "type": "revolute",
+   "parent": "base_link",
+   "child": "link1",
+   "xyz": [
+    -0.00034283,
+    -0.00098683,
+    0.075
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    -1.0
+   ],
+   "lower": -2.8,
+   "upper": 2.8
+  },
+  {
+   "name": "joint2",
+   "type": "revolute",
+   "parent": "link1",
+   "child": "link2",
+   "xyz": [
+    0.020343,
+    0.027237,
+    0.07
+   ],
+   "rpy": [
+    -1.5708,
+    0.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "lower": 0.0,
+   "upper": 3.14
+  },
+  {
+   "name": "joint3",
+   "type": "revolute",
+   "parent": "link2",
+   "child": "link3",
+   "xyz": [
+    -0.236,
+    0.0,
+    0.0
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    -1.0
+   ],
+   "lower": 0.0,
+   "upper": 3.14
+  },
+  {
+   "name": "joint4",
+   "type": "revolute",
+   "parent": "link3",
+   "child": "link4",
+   "xyz": [
+    0.228,
+    -0.072746,
+    0.0045
+   ],
+   "rpy": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    -1.0
+   ],
+   "lower": -1.57,
+   "upper": 1.57
+  },
+  {
+   "name": "joint5",
+   "type": "revolute",
+   "parent": "link4",
+   "child": "link5",
+   "xyz": [
+    0.087,
+    -0.048,
+    -0.03075
+   ],
+   "rpy": [
+    -1.5708,
+    0.0,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    -1.0
+   ],
+   "lower": -1.57,
+   "upper": 1.57
+  },
+  {
+   "name": "joint6",
+   "type": "revolute",
+   "parent": "link5",
+   "child": "link6",
+   "xyz": [
+    0.0365,
+    0.0,
+    0.048
+   ],
+   "rpy": [
+    0.0,
+    1.5708,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    -1.0
+   ],
+   "lower": -3.14,
+   "upper": 3.14
+  },
+  {
+   "name": "j_gripper_end",
+   "type": "fixed",
+   "parent": "link6",
+   "child": "gripper_end",
+   "xyz": [
+    0.0,
+    0.0,
+    0.16621
+   ],
+   "rpy": [
+    3.1416,
+    -1.5708,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "lower": null,
+   "upper": null
+  },
+  {
+   "name": "gripper_joint1",
+   "type": "prismatic",
+   "parent": "gripper_end",
+   "child": "gripper_left",
+   "xyz": [
+    -0.041939,
+    -7.3385e-05,
+    0.0
+   ],
+   "rpy": [
+    1.5708,
+    -1.5708,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "lower": 0.0,
+   "upper": 0.05
+  },
+  {
+   "name": "gripper_joint2",
+   "type": "prismatic",
+   "parent": "gripper_end",
+   "child": "gripper_right",
+   "xyz": [
+    -0.041939,
+    7.3385e-05,
+    0.0
+   ],
+   "rpy": [
+    -1.5708,
+    -1.5708,
+    0.0
+   ],
+   "axis": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "lower": 0.0,
+   "upper": 0.05
+  }
+ ],
+ "mesh_dir": "meshes",
+ "failed": []
+}
