@@ -62,7 +62,7 @@ instead — which is unmistakable on the first tap.
 
 Every phone tap then: solves the tag in the page on the tapped frame, composes
 `T_base_cam` from those four numbers, and intersects the tap's ray with the
-plane at the selected height — **10 cm above the worktop** by default. The
+plane at the selected height — **4 cm above the worktop** by default. The
 intersection moves along the ray as the height changes. (The workstation's
 `/live` page is fixed-rig only and never uses the tag: it reads the constant
 `T_base_cam` from `/reach.json` and runs the identical step with the phone's own
@@ -123,14 +123,14 @@ witness; the tag-written rig still plans normally.
 2. Choose **Fixed camera** with the switch.
 
 From then on each tap projects through that rig: ray → plane at the selected
-height (10 cm above the worktop by default). Re-run the sweep if the bracket is
+height (4 cm above the worktop by default). Re-run the sweep if the bracket is
 bumped — or, before the sweep, try **Capture one pose** again if the tag is
 visible.
 
 ## What the two modes share
 
 The tap's metric meaning is the same in both: the pixel's ray meets the table
-plane (`REBOT_PLANE_Z`), and the arm goes to `REBOT_HOVER_M` above it — 10 cm by
+plane (`REBOT_PLANE_Z`), and the arm goes to `REBOT_HOVER_M` above it — 4 cm by
 default, adjustable per tap on the phone. The difference is only where the
 camera's pose came from.
 

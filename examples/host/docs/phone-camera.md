@@ -592,12 +592,12 @@ at that height. The height is frozen into each marker when it is tapped: **Move
 arm** sends every marker with its own tip point, so changing the badge later only
 affects new markers and the live band. The capture server adds the host's
 `tip_offset_m`, validates the tip against `min_z`, and posts the tip point to the
-planner. The default is 10 cm. There is no hold delay: the drag starts as soon as
+planner. The default is 4 cm. There is no hold delay: the drag starts as soon as
 the finger moves.
 
 The height is a **horizontal plane**, not a vertical lift: the browser intersects
 the tap ray with `plane_z + height`. At a slanted view, raising the height moves
-the tip along the ray, so its x/y shifts too (7 cm at a 54° view for 10 cm, less
+the tip along the ray, so its x/y shifts too (2.8 cm at a 54° view for 4 cm, less
 from steeper). The pin is drawn at that raised tip, under the tapped pixel.
 
 A pin is drawn at the **projection of the tip target**, not at the raw finger
@@ -766,18 +766,18 @@ Three numbers shape the band:
   whose *tip* can sit `hover_m` above the table. `--plane-z` moves it up or down
   with the worktop. Because the intersection is direct, x/y move along the ray as
   the height changes. The tap-and-drag gesture on either page changes `hover_m`
-  live (10 cm default, up to 60 cm; the lower bound is the tip floor above); the
+  live (4 cm default, up to 60 cm; the lower bound is the tip floor above); the
   band is redrawn for the new height, which is why its inner edge moves as the
   badge changes. A marker keeps the height it was tapped at, so the band describes
   the next marker while older pins keep their own heights in the plan.
 - **The tip has a floor.** The planner refuses a tip point below `min_z`, which
-  defaults to `REBOT_HOVER_M` (10 cm). The capture server checks the same value
+  defaults to `REBOT_HOVER_M` (4 cm). The capture server checks the same value
   before calling the gateway. On a worktop at `z = 0` the height badge therefore
-  stops at exactly 10 cm, matching the default tap; `tip_m` is only the flange
+  stops at exactly 4 cm, matching the default tap; `tip_m` is only the flange
   offset and does not lower the badge.
 - **The inner edge is real.** At the table the wrist cannot fold the tool down
-  closer than about 0.60 m from the base axis (0.48 m at the default 100 mm
-  hover). A tap inside it is refused by IK, not by an arbitrary radius gate.
+  closer than about 0.60 m from the base axis (0.48 m at a 100 mm hover). A tap
+  inside it is refused by IK, not by an arbitrary radius gate.
 - **The outer edge is the planner's gate.** The kinematic reach is a few
   centimetres wider than `--max-reach` (0.75 m); the overlay clips to the gate so
   it never promises a plan the gateway will reject. Joint 1 stops at +-2.8 rad,

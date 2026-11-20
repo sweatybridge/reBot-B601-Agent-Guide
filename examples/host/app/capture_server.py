@@ -3066,7 +3066,7 @@ def build_app(args) -> web.Application:
     app["tip_m"] = float(getattr(args, "tip_mm", 0.0)
                          or os.environ.get("REBOT_TIP_MM", "35")) / 1000.0
     app["hover_m"] = float(getattr(args, "hover_m", 0.0)
-                           or os.environ.get("REBOT_HOVER_M", "0.10"))
+                           or os.environ.get("REBOT_HOVER_M", str(sweep.DEFAULT_MIN_Z)))
     # The lowest tip z the planner will accept: the worktop plane plus the
     # hover height above it -- the same sum the page's fallback and
     # .env.example use -- so a tap can never plan closer to the table than the
@@ -3238,7 +3238,7 @@ def main(argv=None):
                         default=float(os.environ.get("REBOT_MARKER_SIZE", "0.04")),
                         help="the marker's printed side in metres (default 0.04)")
     parser.add_argument("--hover-m", type=float,
-                        default=float(os.environ.get("REBOT_HOVER_M", "0.10")),
+                        default=float(os.environ.get("REBOT_HOVER_M", str(sweep.DEFAULT_MIN_Z))),
                         help="height of the tap plane above the worktop, in metres; "
                              "also the lowest tip z the planner accepts")
     parser.add_argument("--extrinsics", default="",

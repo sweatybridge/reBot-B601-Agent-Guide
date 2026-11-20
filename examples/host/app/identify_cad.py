@@ -639,7 +639,7 @@ class Bench:
     def plan_run(self, tips, hold_s=1.5):
         body = {"targets": [{"tip": [float(v) for v in point]} for point in tips],
                 "gripper": "alternate", "tip_offset_m": self.tip_m,
-                "options": {"hold_s": float(hold_s), "tool_axis": "z-", "min_z": 0.10}}
+                "options": {"hold_s": float(hold_s), "tool_axis": "z-", "min_z": sweep.DEFAULT_MIN_Z}}
         status, payload = self.arm._call("POST", "/plan", body, timeout=120)
         if status != 200:
             raise IdentifyError("the planner refused the run: %s"

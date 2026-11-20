@@ -305,7 +305,7 @@ class MockEdge:
             # not this process's defaults (§6.3a). The tip offset has no flag
             # on the server -- it reads REBOT_TIP_MM.
             command += ["--plane-z", str(geometry.get("plane_z", 0.0)),
-                        "--hover-m", str(geometry.get("hover_m", 0.10))]
+                        "--hover-m", str(geometry.get("hover_m", 0.04))]
             environment = dict(os.environ, REBOT_TIP_MM=str(geometry.get("tip_mm", 35.0)))
         self.proc = subprocess.Popen(
             command,
@@ -1472,9 +1472,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="the tag's black square, metres")
     parser.add_argument("--plane-z", type=float, default=float(setting("REBOT_PLANE_Z", "0.0")),
                         help="worktop height in the base frame")
-    parser.add_argument("--hover-m", type=float, default=float(setting("REBOT_HOVER_M", "0.10")),
+    parser.add_argument("--hover-m", type=float, default=float(setting("REBOT_HOVER_M", "0.04")),
                         help="default approach height above the worktop")
-    parser.add_argument("--min-z", type=float, default=float(setting("REBOT_HOVER_M", "0.10")),
+    parser.add_argument("--min-z", type=float, default=float(setting("REBOT_HOVER_M", "0.04")),
                         help="lowest accepted tip z; the height floor is this minus plane_z")
     parser.add_argument("--tip-mm", type=float, default=float(setting("REBOT_TIP_MM", "35")),
                         help="the tool tip below the flange, millimetres")

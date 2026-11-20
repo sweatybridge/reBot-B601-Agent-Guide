@@ -152,7 +152,7 @@
   </div>
   <div class="chips" id="chips">
     <span class="chip plain">camera off</span>
-    <span class="height-badge" id="heightBadge" title="Drag up or down in the preview to set the arm height">10 cm</span>
+    <span class="height-badge" id="heightBadge" title="Drag up or down in the preview to set the arm height">4 cm</span>
   </div>
 </header>
 
@@ -189,8 +189,8 @@
           chip is how far above the worktop the arm ends. A tap still adds a marker; only a
           drag changes the height. Each marker keeps the height it was tapped at, so moving
           the badge later affects new markers and the Reach band, not markers already placed.
-          The arm refuses a tip below the default hover (10 cm by default), so the drag
-          stops at that floor. The default is 10 cm.</li>
+          The arm refuses a tip below the default hover (4 cm by default), so the drag
+          stops at that floor. The default is 4 cm.</li>
       <li><b>Move arm</b> plans and runs the markers in order. Amber odd markers half-close
           the gripper; green even markers open it, starting fully open. The pins are projected
           onto the worktop and follow it while Reach is on. The arm returns to where it began.
@@ -363,7 +363,7 @@ async function healthLoop() {
     if (heightControl) {
       // point.z is the tip. The lowest accepted tip is min_z, so the lowest tap
       // height is that minus the worktop only; the flange offset does not enter.
-      const minZ = Number(data.min_z ?? data.hover_m ?? 0.10);
+      const minZ = Number(data.min_z ?? data.hover_m ?? 0.04);
       const planeZ = Number(data.plane_z ?? 0);
       heightControl.setRange(Math.max(0, minZ - planeZ),
                              window.HeightControl.MAX);
@@ -896,7 +896,7 @@ const markersOverlay = MarkerSequence.create({
 const heightControl = window.HeightControl.create({
   stage: stage,
   badge: heightBadge,
-  initial: 0.10,
+  initial: 0.04,
   onTap: (x, y) => {
     const wrongFrame = checkGeometry();
     if (wrongFrame) {

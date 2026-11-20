@@ -5,7 +5,7 @@
 Eight poses, chosen once and checked in code rather than by hand:
 
 * every pose is inside the joint limits with margin, and puts the tool in front
-  of the base, 0.10-0.42 m above the worktop, within 0.6 m of the base axis;
+  of the base, DEFAULT_MIN_Z-0.42 m above the worktop, within 0.6 m of the base axis;
 * every *leg* between consecutive poses is checked with the capsule model from
   `manuals/_build/under_cabinet_probe.py`: no link centre passes within its own
   radius of the table, at any point of the interpolation, not just at the ends;
@@ -65,7 +65,11 @@ POSES = (
 RADII = (0.055, 0.055, 0.050, 0.045, 0.035, 0.030, 0.020)
 
 CLEARANCE = 0.012          # m above the worktop for a link's outer surface
-Z_MIN_TIP = 0.10
+# The single minimum tool-tip height above the worktop, and the default hover
+# height. The planner's min_z floor, the capture server's REBOT_HOVER_M default
+# and the sweep pose band all derive from this one number so they cannot drift.
+# CLEARANCE above is a different quantity (a link's outer surface, not the tip).
+DEFAULT_MIN_Z = 0.04
 X_MIN_TIP = 0.12
 RADIUS_MAX = 0.60          # the tip's distance from the base axis
 LINK_RADIUS_MAX = 0.85     # any link centre, for the interpolation check
@@ -122,7 +126,7 @@ def pose_ok(q):
     return (within_limits(q)
             and X_MIN_TIP < tip[0] < 0.50
             and abs(tip[1]) < 0.38
-            and Z_MIN_TIP < tip[2] < 0.42
+            and DEFAULT_MIN_Z < tip[2] < 0.42
             and math.hypot(tip[0], tip[1]) < RADIUS_MAX)
 
 

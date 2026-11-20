@@ -45,7 +45,7 @@
 
     let minHeight = MIN_HEIGHT;
     let maxHeight = MAX_HEIGHT;
-    let height = clampHeight(settings.initial == null ? 0.10 : settings.initial, 0.10,
+    let height = clampHeight(settings.initial == null ? 0.04 : settings.initial, 0.04,
                              minHeight, maxHeight);
     let touched = false;          // a drag has set the height; the host must not overwrite it
     let enabled = true;

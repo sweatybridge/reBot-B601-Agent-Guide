@@ -457,7 +457,7 @@ async def test_server(workdir: Path, geometry):
         check("health is ok", health.get("ok") is True and health.get("auth") is True)
         check("health reports the camera mode", health.get("mode") == "handheld"
               and health.get("rig") is None, str(health.get("mode")))
-        check("health reports the default hover height",
+        check("health reports the configured hover height",
               abs(float(health.get("hover_m", -1)) - 0.10) < 1e-9,
               str(health.get("hover_m")))
         check("health reports the flange minimum and tip offset",
@@ -2228,7 +2228,7 @@ def _phase3_record(workdir, geometry, sid, extra_rig=False):
     args = agent_eval.build_parser().parse_args([])
     args.calibration = str(calib_path)
     args.extrinsics = str(rig_path)
-    args.plane_z, args.tip_mm, args.min_z, args.hover_m = 0.0, 35.0, 0.10, 0.10
+    args.plane_z, args.tip_mm, args.min_z, args.hover_m = 0.0, 35.0, 0.04, 0.04
     args.session = sid
     mock = agent_eval.MockEdge(args)
     # The server's manifest copies the calib it actually planned with.
@@ -4807,24 +4807,24 @@ def test_cartesian_targets(workdir: Path):
     import identify
 
     # Empty map: every cell is a gap. The grid is 5 radius x 4 height x 8 sector
-    # = 160 cells; the h0 band's centre (z=0.05) is below the 0.10 m safety
-    # floor, so 40 of them are unreachable as Cartesian targets -- reported,
-    # never clamped up into a different cell.
+    # = 160 cells; every band centre (lowest z=0.05) clears the 0.04 m safety
+    # floor, so nothing is skipped by default -- a higher floor still reports
+    # gaps honestly, never clamped up into a different cell.
     chosen, skipped = identify.cartesian_targets({"cells": {}})
     check("an empty map offers every reachable cell once",
-          len(chosen) == 12 and skipped == {"below_min_z": 40, "beyond_reach": 0},
+          len(chosen) == 12 and skipped == {"below_min_z": 0, "beyond_reach": 0},
           "chosen %d skipped %s" % (len(chosen), skipped))
     full, skipped_full = identify.cartesian_targets({"cells": {}}, top_k=200)
-    check("the full reachable grid is 120 cells, one point each",
-          len(full) == 120 and len({entry["cell"] for entry in full}) == 120
-          and skipped_full["below_min_z"] == 40,
+    check("the full reachable grid is 160 cells, one point each",
+          len(full) == 160 and len({entry["cell"] for entry in full}) == 160
+          and skipped_full["below_min_z"] == 0,
           "full %d" % len(full))
     check("every centre round-trips to the cell it was chosen for",
           all(identify.accuracy_cell(entry["point"]) == entry["cell"] for entry in full),
           str([entry["cell"] for entry in full
                if identify.accuracy_cell(entry["point"]) != entry["cell"]])[:80])
     check("centres sit inside the reach band",
-          all(entry["point"][2] >= 0.10 - 1e-9
+          all(entry["point"][2] >= 0.04 - 1e-9
               and math.hypot(entry["point"][0], entry["point"][1]) <= 0.75
               for entry in full))
     check("never-measured cells come before partially measured ones",
@@ -4837,7 +4837,7 @@ def test_cartesian_targets(workdir: Path):
     map_doc = {"cells": {cell: {"validated_at": "2026-01-01T00:00:00Z", "n": 3}}}
     chosen, _ = identify.cartesian_targets(map_doc, top_k=200)
     check("a validated cell is not targeted again",
-          all(entry["cell"] != cell for entry in chosen) and len(chosen) == 119)
+          all(entry["cell"] != cell for entry in chosen) and len(chosen) == 159)
     map_doc = {"cells": {cell: {"validated_at": None, "n": 1}}}
     chosen, _ = identify.cartesian_targets(map_doc, top_k=200)
     entry = next(item for item in chosen if item["cell"] == cell)
@@ -4850,7 +4850,7 @@ def test_cartesian_targets(workdir: Path):
           skipped["below_min_z"] == 80 and len(chosen) == 80, str(skipped))
     chosen, skipped = identify.cartesian_targets({"cells": {}}, top_k=200, max_reach=0.35)
     check("a shorter reach excludes the outer bands",
-          skipped["beyond_reach"] > 0 and len(chosen) + skipped["beyond_reach"] == 120,
+          skipped["beyond_reach"] > 0 and len(chosen) + skipped["beyond_reach"] == 160,
           str(skipped))
     check("the top_k cap holds", len(identify.cartesian_targets({"cells": {}}, top_k=5)[0]) == 5)
 

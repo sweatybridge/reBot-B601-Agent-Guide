@@ -950,7 +950,7 @@ def coverage_plan(current_q, poses, gripper=0.0, hold_s=COVERAGE_HOLD_S):
     }
 
 
-def cartesian_targets(map_doc, top_k=COVERAGE_MAX_POSES, min_z=0.10,
+def cartesian_targets(map_doc, top_k=COVERAGE_MAX_POSES, min_z=sweep.DEFAULT_MIN_Z,
                       max_reach=COVERAGE_MAX_REACH_M):
     """The centre points of the least-covered cells, as Cartesian targets (§7.4).
 

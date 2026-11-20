@@ -146,7 +146,7 @@ class State:
 
     def plan_refusal(self, tip) -> str:
         if self.fail_mode == "below-floor":
-            return ("tip z %.3f m is below the minimum %.3f m" % (float(tip[2]), 0.10))
+            return ("tip z %.3f m is below the minimum %.3f m" % (float(tip[2]), 0.04))
         if self.fail_mode == "unreachable":
             return "target 1 is %.2f m from the base axis, past the 0.75 m reach" % (
                 (float(tip[0]) ** 2 + float(tip[1]) ** 2) ** 0.5)

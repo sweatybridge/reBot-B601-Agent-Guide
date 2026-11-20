@@ -57,12 +57,10 @@ from reBotArm_control_py.trajectory import IKParams
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sweep  # noqa: E402
 import traj  # noqa: E402
+from sweep import DEFAULT_MIN_Z  # noqa: E402  (single source; see sweep.py)
 
 MOTOR7_OPEN = 4.90
 MOTOR7_CLOSED = -0.015
-# The default minimum target z: the default hover height. It is also what the
-# capture server sends as min_z, so the two sides cannot drift.
-DEFAULT_MIN_Z = 0.10
 # Halfway between open and closed: the gesture the marker sequence makes on
 # odd-numbered markers.
 MOTOR7_HALF = (MOTOR7_OPEN + MOTOR7_CLOSED) / 2.0
@@ -94,7 +92,7 @@ class Options:
     # come back, because the board ends every move where it began). A tap that
     # only marks a place on the table wants this, not a grasp sequence.
     hover: bool = False
-    hover_m: float = 0.10
+    hover_m: float = DEFAULT_MIN_Z
     # Where the tool tip sits below `gripper_end`, in metres. The planner aims the
     # *frame*; the tip is this far along the tool axis, so the flange has to be
     # lifted by it for the tip to reach the requested height. Fixed mode can take

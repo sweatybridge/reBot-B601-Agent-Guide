@@ -562,8 +562,8 @@ async def drive_page(cdp, args) -> int:
                  first_expected, second_expected))
         raise SystemExit("the markers did not carry their tip heights")
 
-    # The badge must stop at the tip floor: min_z minus the worktop. On the
-    # default bench (min_z 10 cm, plane 0) that is exactly 10 cm; tip_m is only
+    # The badge must stop at the tip floor: min_z minus the worktop. The bench
+    # pins hover_m with plane 0, so the floor equals that hover; tip_m is only
     # the flange offset and does not enter.
     floor = await cdp.evaluate("""(async () => {
         const stage = document.getElementById('stage');
@@ -584,7 +584,7 @@ async def drive_page(cdp, args) -> int:
         await new Promise((resolve) => setTimeout(resolve, 40));
         const health = state.health || {};
         return {label: label,
-                expected: Math.max(0, (health.min_z ?? 0.10) - (health.plane_z ?? 0))};
+                expected: Math.max(0, (health.min_z ?? 0.04) - (health.plane_z ?? 0))};
     })()""", page)
     floor_ok = abs(centimetres(floor["label"]) / 100.0 - float(floor["expected"])) < 0.006
     print("  [%s] height badge floor is %s (min_z - plane_z)"

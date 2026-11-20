@@ -114,7 +114,7 @@
 
   // How a tap becomes a point: "fixed" projects through the rig a sweep fitted;
   // "handheld" solves the camera from the base marker in the tapped frame. Both
-  // end with the tool tip 10 cm above the tapped place. The page owns the choice
+  // end with the tool tip 4 cm above the tapped place. The page owns the choice
   // (a chip), because it applies to every tap, not to the rig card.
   let cameraMode = "handheld";
 
