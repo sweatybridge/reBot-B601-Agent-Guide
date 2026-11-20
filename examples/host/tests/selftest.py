@@ -5401,6 +5401,21 @@ def test_identify_cad_model(workdir: Path):
           "chamfer %.2f px" % (err[0] if err else -1))
     check("identify_cad: tiny masks are unmeasurable",
           identify_cad.mask_error(np.zeros((20, 20), np.uint8), mask) is None)
+
+    # Correspondence gate: a green object far from the arm is dropped, the
+    # arm's own blobs stay.
+    polluted = mask.copy()
+    polluted[20:60, 560:620] = 255                     # a 'shelf object', far away
+    hold = identify_cad.Hold(q_cmd=q, q_meas=q)
+    hold.meas_mask = polluted
+    hold.meas_edge = identify_cad.mask_edges(polluted)
+    hold.meas_dt = cv2.distanceTransform((polluted == 0).astype(np.uint8), cv2.DIST_L2, 3)
+    dropped = identify_cad.clean_measured(hold, model, identify_cad.theta0(), K, dist,
+                                          T_base_cam, sweep.kp_vector(), size, 1.0)
+    check("identify_cad: background green blob is gated out",
+          dropped == 1 and hold.meas_mask[40, 590] == 0
+          and int(hold.meas_mask.sum()) // 255 == int(mask.sum()) // 255,
+          "%d dropped, %d px kept" % (dropped, int(hold.meas_mask.sum()) // 255))
     return model
 
 
