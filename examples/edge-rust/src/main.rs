@@ -61,16 +61,21 @@ const GRIPPER_STALL_ERROR: f64 = 0.15; // rad of commanded-vs-measured gap
 const GRIPPER_STALL_VELOCITY: f64 = 0.08; // rad/s below which the jaw is "not moving"
 const GRIPPER_STALL_MIN_S: f64 = 0.10;
 const GRIPPER_STALL_MAX_S: f64 = 5.0;
-// The return ramp. The duration follows the same rule as the way out -- a
-// cosine ease (`ease_in_out`, peak = pi/2 x average) capped at a peak speed --
-// so a long way home is not rushed, and a short nudge still takes long enough
-// to have a beginning and an end.
+// The return ramp. The duration follows the same rule as the way out -- the
+// cosine-calibrated peak-speed cap (peak = pi/2 x average) -- so a long way home
+// is not rushed, and a short nudge still takes long enough to have a beginning
+// and an end. The trapezoid profile's cruise stays under that cap for any ramp
+// longer than ~0.8 s, so the formula remains a conservative floor.
 const RETURN_PEAK_SPEED: f64 = 0.35; // rad/s, base speed for the return cap
 const RETURN_MIN_S: f64 = 3.0;       // s, floor for any return ramp
 // Every exit (normal end, fault, Ctrl-C/SIGTERM) ramps home at three times the
 // base speed, so a fully open jaw closes in ~7.3 s (half-closed in ~3.7 s).
 // The arm joints use the same duration.
 const SHUTDOWN_PEAK_SPEED: f64 = 3.0 * RETURN_PEAK_SPEED;
+// Velocity ramp at each end of an internally generated leg, seconds. Mirrors
+// traj.py's RAMP_S: trapezoid velocity (short ramps, constant cruise) so slow
+// legs do not linger below the drive's stiction breakaway speed (~0.1 rad/s).
+const MOVE_RAMP_S: f64 = 0.3;
 
 // RobStride communication types (see robstride_dynamics/protocol.py).
 const COMM_OPERATION_CONTROL: u32 = 1;
@@ -1567,11 +1572,11 @@ impl<T: Transport> Arm<T> {
             BTreeSet::new()
         };
         let mut latest: Vec<Option<State>> = vec![None; self.ids.len()];
-        // Analytic derivative of the cosine ease: v = delta * (pi / 2T) * sin(pi * step / steps),
-        // zero at both ends. Feeding it to the MIT frame keeps the kd term from
-        // braking the leg itself (with v=0 the arm pulses at the tick rate).
-        let velocity_scale =
-            (std::f64::consts::PI / 2.0) / (f64::from(steps) * self.period.as_secs_f64());
+        // Trapezoid velocity profile (mirrors traj.py): short ramps into a
+        // constant-velocity cruise, so slow legs do not linger below the drive's
+        // stiction breakaway speed. The analytic derivative feeds the MIT frame's
+        // v field; with v=0 the kd term brakes the leg itself.
+        let leg_seconds = f64::from(steps) * self.period.as_secs_f64();
 
         for step in 0..=steps {
             if honor_interrupt && interrupted() {
@@ -1589,17 +1594,18 @@ impl<T: Transport> Arm<T> {
                     }
                 }
             }
-            let fraction = ease_in_out(f64::from(step) / f64::from(steps));
+            let u = f64::from(step) / f64::from(steps);
+            let fraction = ease_fraction(u, leg_seconds, MOVE_RAMP_S);
             let command: Vec<f64> = begin
                 .iter()
                 .zip(targets)
                 .map(|(from, to)| from + (to - from) * fraction)
                 .collect();
-            let phase = std::f64::consts::PI * f64::from(step) / f64::from(steps);
+            let speed = ease_velocity(u, leg_seconds, MOVE_RAMP_S);
             let velocities: Vec<f64> = begin
                 .iter()
                 .zip(targets)
-                .map(|(from, to)| (to - from) * velocity_scale * phase.sin())
+                .map(|(from, to)| (to - from) * speed)
                 .collect();
             let is_sample = sample_at.contains(&step);
             self.command(&command, None, Some(&velocities), false)?;
@@ -1697,8 +1703,36 @@ impl<T: Transport> Arm<T> {
     }
 }
 
-fn ease_in_out(t: f64) -> f64 {
-    0.5 * (1.0 - (std::f64::consts::PI * t.clamp(0.0, 1.0)).cos())
+/// Trapezoid velocity profile: fraction of travel at normalized time u, with
+/// linear velocity ramps of `ramp` seconds at each end (mirrors traj.py's
+/// ease_fraction). Legs shorter than 2*ramp degenerate to a triangle; both
+/// shapes start and end at rest.
+fn ease_fraction(u: f64, duration: f64, ramp: f64) -> f64 {
+    let r = (ramp / duration.max(1e-9)).clamp(1e-9, 0.5);
+    let vc = 1.0 / (1.0 - r);
+    let u = u.clamp(0.0, 1.0);
+    if u <= r {
+        vc * u * u / (2.0 * r)
+    } else if u >= 1.0 - r {
+        1.0 - vc * (1.0 - u) * (1.0 - u) / (2.0 * r)
+    } else {
+        vc * (u - 0.5 * r)
+    }
+}
+
+/// d(ease_fraction)/dt in 1/s; multiply by the joint travel for rad/s.
+fn ease_velocity(u: f64, duration: f64, ramp: f64) -> f64 {
+    let duration = duration.max(1e-9);
+    let r = (ramp / duration).clamp(1e-9, 0.5);
+    let vc = 1.0 / (1.0 - r);
+    let u = u.clamp(0.0, 1.0);
+    if u <= r {
+        vc * u / (r * duration)
+    } else if u >= 1.0 - r {
+        vc * (1.0 - u) / (r * duration)
+    } else {
+        vc / duration
+    }
 }
 
 fn ramp_duration_at(from: &[f64], to: &[f64], peak_speed: f64) -> f64 {
@@ -4639,10 +4673,10 @@ mod tests {
     }
 
     #[test]
-    fn move_leg_commands_the_cosine_velocity() {
+    fn move_leg_commands_the_trapezoid_velocity() {
         // The internally generated legs (align, /move, return home) carry the
-        // analytic derivative of the cosine ease: zero at both ends, peak
-        // delta * pi / (2T) at the midpoint.
+        // analytic trapezoid velocity: zero at the ends, linear ramps, then a
+        // flat cruise at delta / (T - ramp).
         let mock = MockBus::new(&[(1, 0.0), (2, 0.0)]);
         let mut arm = Arm::new(
             mock,
@@ -4654,20 +4688,69 @@ mod tests {
         );
         arm.bring_up().unwrap();
 
-        arm.move_leg(&[0.2, 0.4], 0.3, "test", false, false, false).unwrap();
+        arm.move_leg(&[0.2, 0.4], 1.0, "test", false, false, false).unwrap();
 
         let frames = arm.bus.frames.borrow();
         let joint2: Vec<&MockFrame> = frames.iter().filter(|frame| frame.device == 2).collect();
-        assert_eq!(joint2.len(), 31, "one frame per tick, steps 0..=30");
+        assert_eq!(joint2.len(), 101, "one frame per tick, steps 0..=100");
         assert!(joint2[0].velocity.abs() < 2e-3, "the leg starts at rest");
-        assert!(joint2[30].velocity.abs() < 2e-3, "the leg ends at rest");
-        let peak = 0.4 * std::f64::consts::PI / (2.0 * 0.3);
+        assert!(joint2[100].velocity.abs() < 2e-3, "the leg ends at rest");
+        let cruise = 0.4 / (1.0 - MOVE_RAMP_S);
         assert!(
-            (joint2[15].velocity - peak).abs() < 2e-3,
-            "midpoint velocity {} should be {peak}",
-            joint2[15].velocity
+            (joint2[50].velocity - cruise).abs() < 2e-3,
+            "cruise velocity {} should be {cruise}",
+            joint2[50].velocity
+        );
+        // The cruise is flat, and the ramp midpoint is half the cruise.
+        assert!((joint2[40].velocity - joint2[60].velocity).abs() < 2e-3);
+        assert!(
+            (joint2[15].velocity - 0.5 * cruise).abs() < 2e-3,
+            "ramp midpoint {} should be {}",
+            joint2[15].velocity,
+            0.5 * cruise
         );
         assert!(joint2.iter().all(|frame| frame.velocity > -2e-3));
+    }
+
+    #[test]
+    fn trapezoid_profile_is_continuous_and_consistent() {
+        for duration in [0.2_f64, 0.6, 1.0, 24.7] {
+            // Endpoints and monotonicity.
+            assert!(ease_fraction(0.0, duration, MOVE_RAMP_S).abs() < 1e-12);
+            assert!((ease_fraction(1.0, duration, MOVE_RAMP_S) - 1.0).abs() < 1e-12);
+            let mut previous = 0.0;
+            for step in 0..=1000 {
+                let u = f64::from(step) / 1000.0;
+                let value = ease_fraction(u, duration, MOVE_RAMP_S);
+                assert!(value >= previous - 1e-12, "non-monotonic at u={u}");
+                previous = value;
+            }
+            // The analytic velocity matches a finite difference of the fraction
+            // (exact within each phase; the ramp/cruise acceleration corners are
+            // discontinuous by design, so skip their neighbourhoods).
+            let r = (MOVE_RAMP_S / duration).clamp(1e-9, 0.5);
+            for step in 1..1000 {
+                let u = f64::from(step) / 1000.0;
+                if (u - r).abs() < 1e-3 || (u - (1.0 - r)).abs() < 1e-3 {
+                    continue;
+                }
+                let h = 1e-4;
+                let numeric = (ease_fraction(u + h, duration, MOVE_RAMP_S)
+                    - ease_fraction(u - h, duration, MOVE_RAMP_S))
+                    / (2.0 * h * duration);
+                let analytic = ease_velocity(u, duration, MOVE_RAMP_S);
+                assert!(
+                    (numeric - analytic).abs() < 1e-3,
+                    "duration {duration}, u {u}: numeric {numeric} vs analytic {analytic}"
+                );
+            }
+            // Cruise speed never exceeds the cosine-calibrated policy peak for
+            // legs of at least ~0.8 s (the sweep's shortest real leg is 3 s).
+            if duration >= 0.8 {
+                let cruise = ease_velocity(0.5, duration, MOVE_RAMP_S);
+                assert!(cruise <= (std::f64::consts::PI / 2.0) / duration + 1e-9);
+            }
+        }
     }
 
     #[test]

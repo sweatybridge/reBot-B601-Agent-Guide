@@ -144,10 +144,6 @@ def compensate_waypoints(waypoints, options, model, n_arm, lower, upper):
     return out
 
 
-def ease(x):
-    return 0.5 - 0.5 * math.cos(math.pi * max(0.0, min(1.0, x)))
-
-
 def rotz(deg):
     c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
@@ -381,7 +377,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         count = max(1, int(round(seconds * options.hz)))
         for index in range(1, count + 1):
             state["t"] += period
-            fraction = ease(index / count)
+            fraction = traj.ease_fraction(index / count, count / options.hz)
             target_q = base + np.array([delta.get(k, 0.0) for k in range(n_arm)]) * fraction
             append(pad_q_for_model(model, target_q, n_arm))
         if not options.quiet:
@@ -392,7 +388,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         count = max(1, int(round(seconds * options.hz)))
         for index in range(1, count + 1):
             state["t"] += period
-            fraction = ease(index / count)
+            fraction = traj.ease_fraction(index / count, count / options.hz)
             place = start + (end - start) * fraction
             rotation = blend_rotation(rotation_from, rotation_to,
                                       min(1.0, fraction / max(1e-6, blend_fraction)))
@@ -409,7 +405,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         count = max(1, int(round(seconds * options.hz)))
         for index in range(1, count + 1):
             state["t"] += period
-            angle = current + (target_angle - current) * ease(index / count)
+            angle = current + (target_angle - current) * traj.ease_fraction(index / count, count / options.hz)
             waypoints.append(traj.waypoint(
                 state["t"], waypoints[-1]["q"][:6] + [angle], waypoints[-1]["tau"]))
 
@@ -672,7 +668,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         count = max(1, int(round(seconds * options.hz)))
         for index in range(1, count + 1):
             state["t"] += period
-            angle = current + (target - current) * ease(index / count)
+            angle = current + (target - current) * traj.ease_fraction(index / count, count / options.hz)
             waypoints.append(traj.waypoint(
                 state["t"], waypoints[-1]["q"][:6] + [angle], waypoints[-1]["tau"]))
 
@@ -681,7 +677,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         count = max(1, int(round(seconds * options.hz)))
         for index in range(1, count + 1):
             state["t"] += period
-            fraction = ease(index / count)
+            fraction = traj.ease_fraction(index / count, count / options.hz)
             target_q = base + np.array([delta.get(k, 0.0) for k in range(n_arm)]) * fraction
             append(pad_q_for_model(model, target_q, n_arm), gripper)
         if not options.quiet:
@@ -693,7 +689,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         count = max(1, int(round(seconds * options.hz)))
         for index in range(1, count + 1):
             state["t"] += period
-            fraction = ease(index / count)
+            fraction = traj.ease_fraction(index / count, count / options.hz)
             place = start + (end - start) * fraction
             rotation = blend_rotation(rotation_from, rotation_to,
                                       min(1.0, fraction / max(1e-6, blend_fraction)))

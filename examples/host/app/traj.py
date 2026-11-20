@@ -31,6 +31,47 @@ LIMIT_TOL = 0.002          # rad, encoders read a few mrad past a stop at rest
 MIT_POSITION_LIMIT = 4.0 * math.pi
 MIN_HZ, MAX_HZ = 5.0, 200.0
 
+# Velocity ramp at each end of a leg, seconds. The profile is trapezoid: short
+# linear velocity ramps into a constant-velocity cruise. The cosine ease this
+# replaces has sine velocity tails that scale with leg duration -- on a 25 s leg
+# the P-only drive spent ~2.5 s at each end below its stiction breakaway speed
+# (~0.1 rad/s at kp=50) and moved in stick-slip segments. The trapezoid crosses
+# that band in ramp * v_stiction / v_cruise (~0.1 s) regardless of leg length.
+RAMP_S = 0.3
+
+
+def _ramp_ratio(duration, ramp):
+    return min(0.5, max(1e-9, float(ramp) / max(float(duration), 1e-9)))
+
+
+def ease_fraction(u, duration, ramp=RAMP_S):
+    """Fraction of a leg's travel at normalized time u, trapezoid velocity.
+
+    Legs shorter than 2*ramp degenerate to a triangle (no cruise); both shapes
+    start and end at rest. `duration` is the leg's scheduled time in seconds.
+    """
+    r = _ramp_ratio(duration, ramp)
+    vc = 1.0 / (1.0 - r)
+    u = max(0.0, min(1.0, float(u)))
+    if u <= r:
+        return vc * u * u / (2.0 * r)
+    if u >= 1.0 - r:
+        return 1.0 - vc * (1.0 - u) ** 2 / (2.0 * r)
+    return vc * (u - 0.5 * r)
+
+
+def ease_velocity(u, duration, ramp=RAMP_S):
+    """d(ease_fraction)/dt in 1/s; multiply by the joint travel for rad/s."""
+    r = _ramp_ratio(duration, ramp)
+    vc = 1.0 / (1.0 - r)
+    u = max(0.0, min(1.0, float(u)))
+    duration = max(float(duration), 1e-9)
+    if u <= r:
+        return vc * u / (r * duration)
+    if u >= 1.0 - r:
+        return vc * (1.0 - u) / (r * duration)
+    return vc / duration
+
 
 def waypoint(t, q, tau=None):
     # Six decimals is microseconds: enough for the player's scheduler, and it
@@ -49,10 +90,11 @@ def build(waypoints, control_hz, limits, steps, extra=None, hold_start=None, hol
         cleaned.append(entry)
 
     # Velocity feedforward, derived once for every producer: central difference
-    # inside the series, one-sided at the ends. For a cosine-eased leg this is
-    # the analytic derivative to O(period^2); for an IK leg it is the only honest
-    # estimate. Holds come out exactly zero. A repeated timestamp (degenerate,
-    # still schema-legal) gets zero rather than a division by zero.
+    # inside the series, one-sided at the ends. Shape-agnostic -- trapezoid legs
+    # and IK legs alike; the difference is exact to O(period^2) on the smooth
+    # parts and smears the ramp/cruise acceleration corner over at most one tick.
+    # Holds come out exactly zero. A repeated timestamp (degenerate, still
+    # schema-legal) gets zero rather than a division by zero.
     if len(cleaned) >= 2:
         for index, entry in enumerate(cleaned):
             if index == 0:
@@ -63,7 +105,7 @@ def build(waypoints, control_hz, limits, steps, extra=None, hold_start=None, hol
                 ahead, behind = cleaned[index + 1], cleaned[index - 1]
             dt = ahead["t"] - behind["t"]
             # A sample identical to either neighbour is at rest at that instant
-            # (the end of a cosine leg, every hold): the straddling difference
+            # (the end of a leg, every hold): the straddling difference
             # would otherwise smear half a tick of motion into the hold.
             q = np.asarray(entry["q"])
             at_rest = any(
@@ -133,7 +175,7 @@ def joint_move(q_from, q_to, seconds, control_hz=30.0, hold_s=0.4, limits=None, 
     time_now = 0.0
     for index in range(1, count + 1):
         time_now += period
-        fraction = 0.5 - 0.5 * math.cos(math.pi * index / count)
+        fraction = ease_fraction(index / count, count / hz)
         waypoints.append(waypoint(time_now, q_from + (q_to - q_from) * fraction))
     for _ in range(max(1, int(round(float(hold_s) * hz)))):
         time_now += period
@@ -144,8 +186,9 @@ def joint_move(q_from, q_to, seconds, control_hz=30.0, hold_s=0.4, limits=None, 
                      label or ("joint move %.2f rad over %.1f s" % (travel, seconds)))
     except ValueError as error:
         raise ValueError("%s (slow the move down: %.2f rad over %.1f s is %.2f rad per "
-                         "waypoint, the limit is %.2f)"
-                         % (error, travel, seconds, travel / max(1, count) * math.pi / 2,
+                         "waypoint at cruise, the limit is %.2f)"
+                         % (error, travel, seconds,
+                            travel / max(1.0, count - RAMP_S * hz),
                             MAX_JOINT_STEP)) from error
 
 
@@ -178,7 +221,7 @@ def joint_sequence(poses, seconds, hold_s=0.4, control_hz=30.0, limits=None, lab
         count = max(2, int(round(max(0.2, durations[index - 1]) * hz)))
         for step in range(1, count + 1):
             now += period
-            fraction = 0.5 - 0.5 * math.cos(math.pi * step / count)
+            fraction = ease_fraction(step / count, count / hz)
             waypoints.append(waypoint(now, start + (end - start) * fraction))
         for _ in range(hold):
             now += period
