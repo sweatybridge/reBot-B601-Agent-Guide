@@ -1,0 +1,264 @@
+{
+  "version": 1,
+  "cells": {
+    "r2-h2-s7": {
+      "predicted_mm": null,
+      "measured_mm": 80.09,
+      "n": 11,
+      "n_good": 1,
+      "validated_at": null
+    },
+    "r1-h2-s0": {
+      "predicted_mm": 10.54,
+      "measured_mm": 85.3,
+      "n": 9,
+      "n_good": 2,
+      "validated_at": null
+    },
+    "r2-h2-s0": {
+      "predicted_mm": null,
+      "measured_mm": 184.3,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r2-h3-s0": {
+      "predicted_mm": null,
+      "measured_mm": 59.52,
+      "n": 4,
+      "n_good": 2,
+      "validated_at": null
+    },
+    "r3-h2-s0": {
+      "predicted_mm": null,
+      "measured_mm": 62.85,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r3-h3-s7": {
+      "predicted_mm": 13.62,
+      "measured_mm": 116.22,
+      "n": 6,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r1-h2-s7": {
+      "predicted_mm": null,
+      "measured_mm": 79.91,
+      "n": 5,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r3-h2-s7": {
+      "predicted_mm": null,
+      "measured_mm": 103.12,
+      "n": 7,
+      "n_good": 3,
+      "validated_at": "2026-11-19T04:30:23Z"
+    },
+    "r3-h3-s0": {
+      "predicted_mm": null,
+      "measured_mm": 38.45,
+      "n": 5,
+      "n_good": 1,
+      "validated_at": null
+    },
+    "r1-h3-s0": {
+      "predicted_mm": null,
+      "measured_mm": 79.88,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r4-h3-s0": {
+      "predicted_mm": 7.91,
+      "measured_mm": 101.3,
+      "n": 3,
+      "n_good": 1,
+      "validated_at": null
+    },
+    "r1-h3-s7": {
+      "predicted_mm": 10.6,
+      "measured_mm": 75.43,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r1-h1-s7": {
+      "predicted_mm": 11.39,
+      "measured_mm": 74.32,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r3-h1-s6": {
+      "predicted_mm": 14.62,
+      "measured_mm": 66.43,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r3-h2-s6": {
+      "predicted_mm": 14.49,
+      "measured_mm": 60.75,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r3-h3-s6": {
+      "predicted_mm": 14.1,
+      "measured_mm": 117.95,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r4-h3-s7": {
+      "predicted_mm": 13.24,
+      "measured_mm": 201.26,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r4-h2-s7": {
+      "predicted_mm": 13.25,
+      "measured_mm": 34.59,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r2-h3-s1": {
+      "predicted_mm": 8.07,
+      "measured_mm": 132.47,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r2-h3-s2": {
+      "predicted_mm": 9.63,
+      "measured_mm": 167.63,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r2-h3-s3": {
+      "predicted_mm": 12.27,
+      "measured_mm": 102.93,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r2-h3-s4": {
+      "predicted_mm": 14.32,
+      "measured_mm": 206.19,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r2-h3-s5": {
+      "predicted_mm": 14.97,
+      "measured_mm": 229.02,
+      "n": 2,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r2-h2-s6": {
+      "predicted_mm": 14.09,
+      "measured_mm": 41.17,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r2-h3-s6": {
+      "predicted_mm": 14.04,
+      "measured_mm": 48.57,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r0-h3-s0": {
+      "predicted_mm": 10.37,
+      "measured_mm": 84.27,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r0-h3-s1": {
+      "predicted_mm": 9.96,
+      "measured_mm": 16.69,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r0-h3-s2": {
+      "predicted_mm": 10.55,
+      "measured_mm": 45.08,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r0-h3-s3": {
+      "predicted_mm": 11.75,
+      "measured_mm": 221.54,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r0-h3-s6": {
+      "predicted_mm": 12.55,
+      "measured_mm": 20.0,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r0-h3-s7": {
+      "predicted_mm": 11.48,
+      "measured_mm": 81.53,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r1-h3-s1": {
+      "predicted_mm": 9.01,
+      "measured_mm": 11.45,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r1-h3-s2": {
+      "predicted_mm": 10.03,
+      "measured_mm": 202.84,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r1-h3-s3": {
+      "predicted_mm": 11.92,
+      "measured_mm": 58.51,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r1-h3-s4": {
+      "predicted_mm": 13.5,
+      "measured_mm": 193.82,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r1-h3-s5": {
+      "predicted_mm": 13.98,
+      "measured_mm": 68.09,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    },
+    "r1-h3-s6": {
+      "predicted_mm": 13.26,
+      "measured_mm": 82.35,
+      "n": 1,
+      "n_good": 0,
+      "validated_at": null
+    }
+  }
+}
