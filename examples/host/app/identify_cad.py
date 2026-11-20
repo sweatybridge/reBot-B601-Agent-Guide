@@ -241,6 +241,9 @@ def mask_edges(mask):
 # removes background objects without constraining the climb; a frame whose
 # arm blobs all fall outside it is reported unmeasurable, not fitted.
 MEAS_GATE_PX = 80.0
+# Held-out tag-reprojection bound for a climbed rig (spec 7.3a): the climb may
+# move the rig off the tag prior by more than PnP noise, but not by centimetres.
+CLIMB_TAG_MAX_PX = 3.0
 
 
 def clean_measured(hold, model, theta, K, dist, T_prior, kp, size, scale):
@@ -588,6 +591,19 @@ class Bench:
         finally:
             eye.close()
 
+    def grab_upright(self, turn, tries=12):
+        """A still on the calibration grid, turned back. The phone renegotiates
+        its stream size now and then (a 762x1356 window was observed mid-run);
+        K belongs to the calibration grid, so wait for a frame that is on it."""
+        expected = (int(self.calibration.image_size[0]), int(self.calibration.image_size[1]))
+        for _ in range(max(1, tries)):
+            frame = self.upright(self.grab(), turn)
+            if (frame.shape[1], frame.shape[0]) == expected:
+                return frame
+            time.sleep(0.5)
+        raise IdentifyError("the stream stayed off the calibration grid %dx%d; "
+                            "cannot verify against the tag" % expected)
+
     def measure_turn(self, frame):
         """Quarter turns back to the calibration grid, decided by the base tag.
 
@@ -792,7 +808,7 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
     frame = bench.grab()
     turn, turn_err = bench.measure_turn(frame)
     print("stream turn: %d quarter turn(s), tag error %.1f px" % (turn, turn_err))
-    upright = bench.upright(frame, turn)
+    upright = bench.grab_upright(turn)
     size = (upright.shape[1], upright.shape[0])
     K, dist = bench.calibration.K, bench.calibration.dist
     T_prior = np.asarray(bench.rig.T_base_cam, float)
@@ -948,8 +964,14 @@ def _save_round_overlay(bench, model, holds, theta, K, dist, T_prior, size, turn
 
 
 def _finalise(bench, model, theta, trace, session, K, dist, T_prior, size, turn):
-    """Verify-before-hotload: the climbed rig must still reproject the tag."""
-    frame = bench.upright(bench.grab(), turn)
+    """Verify-before-hotload: the climbed rig must still reproject the tag.
+
+    The fresh tag solve must pass verify_marker (PnP quality), and the climbed
+    rig's own corner reprojection must stay within the held-out bound of spec
+    7.3a (3 px) -- the climb is allowed to move the rig off the tag prior by
+    more than the PnP noise, but not by centimetres.
+    """
+    frame = bench.grab_upright(turn)
     T_climbed = rig_from_theta(theta, T_prior)
     result = {"theta": [float(v) for v in theta], "verify_ok": False}
     try:
@@ -970,7 +992,7 @@ def _finalise(bench, model, theta, trace, session, K, dist, T_prior, size, turn)
         result.update(tag_rms_px=round(rms, 3), tag_side_px=round(side, 1),
                       tag_solve_rms_px=round(float(evidence["rms_px"]), 3),
                       tag_grazing_deg=round(float(evidence["grazing_deg"]), 1))
-        gate = (rms <= auto_calibrate.MARKER_MAX_RMS_PX
+        gate = (rms <= CLIMB_TAG_MAX_PX
                 and side >= auto_calibrate.MARKER_MIN_SIDE_PX
                 and float(evidence["grazing_deg"]) <= auto_calibrate.MARKER_MAX_GRAZING_DEG
                 and run.verdict["ok"])
@@ -997,8 +1019,8 @@ def _finalise(bench, model, theta, trace, session, K, dist, T_prior, size, turn)
     # sweep.load_sag_map / sag_correction can apply it): r = a*tau_g + b around
     # gravity_sag. Written as a candidate in the session dir, never hot-loaded.
     a = (theta[6:12] - 1.0) / bench.kp
-    q_all = np.asarray([h["q_cmd"] for r in trace["rounds"] for h in r.get("hold_q", [])]) \
-        if trace["rounds"] and trace["rounds"][0].get("hold_q") else None
+    q_list = [q for r in trace["rounds"] for q in r.get("hold_q", [])]
+    q_all = np.asarray(q_list, float) if q_list else None
     tips = np.asarray(trace["tips"], float)
     radius = np.hypot(tips[:, 0], tips[:, 1])
     envelope = {"radius_m": [float(radius.min()), float(radius.max())],
@@ -1032,7 +1054,7 @@ def dry_run(bench, model, session_dir=None):
     session = Path(session_dir) if session_dir else make_session_dir(bench.state)
     frame = bench.grab()
     turn, turn_err = bench.measure_turn(frame)
-    upright = bench.upright(frame, turn)
+    upright = bench.grab_upright(turn)
     size = (upright.shape[1], upright.shape[0])
     pose = bench.arm.pose()
     q = np.asarray(pose["q"][:6], float)
