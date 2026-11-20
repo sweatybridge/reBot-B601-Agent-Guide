@@ -284,6 +284,12 @@ def plan_targets(body):
     options.kp_spec = str(body.get("kp") or KP)
     options.calib_dir = str(CALIB_DIR)
 
+    # Every hover plan -- single tap or marker sequence -- drives the same
+    # Cartesian approach, which passes close to the reach boundary mid-leg:
+    # there the IK stalls a few mm short with the orientation already solved.
+    # The arm's repeatability is ~23 mm, so a 2 mm acceptance band rejects poses
+    # the hardware could not hold anyway. Floor the band at 10 mm for both.
+    options.ik_pos_tol = max(float(options.ik_pos_tol), 0.010)
     started = time.time()
     try:
         if gripper == "none":
@@ -292,9 +298,6 @@ def plan_targets(body):
             payload, summary = planner.plan(pose, targets[0], options)
             label = "plan"
         else:
-            # A sequence may pass close to the reach boundary between two
-            # markers; the arm's repeatability is 23 mm.
-            options.ik_pos_tol = max(float(options.ik_pos_tol), 0.010)
             payload, summary = planner.plan_sequence(pose, targets, options)
             label = "sequence"
     except planner.PlanError as error:
