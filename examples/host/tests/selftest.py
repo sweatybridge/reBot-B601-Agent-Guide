@@ -3676,6 +3676,27 @@ def test_auto_sweep(workdir: Path):
           sweep.seconds_for(legs[-2], legs[-1]) >= sweep.MIN_SECONDS,
           "%.1f s" % sweep.seconds_for(legs[-2], legs[-1]))
 
+    # The jaw has its own cap: a fixed 0.8 s open leg commanded 9.6 rad/s and
+    # the jaw lagged 42 degrees behind. gripper_seconds is the floor that fixes
+    # that, same cosine-peak inversion as the arm policy.
+    open_travel = 4.9
+    open_seconds = sweep.gripper_seconds(open_travel)
+    check("a full-open leg is slowed to the jaw cap",
+          abs((math.pi / 2.0) * open_travel / open_seconds - sweep.GRIPPER_PEAK_SPEED) < 1e-9
+          and open_seconds > 0.8,
+          "%.2f s, peak %.2f rad/s" % (open_seconds,
+                                       (math.pi / 2.0) * open_travel / open_seconds))
+    check("a small gripper nudge keeps the caller's floor",
+          max(0.8, sweep.gripper_seconds(0.1)) == 0.8
+          and sweep.gripper_seconds(0.0) == 0.0
+          and sweep.gripper_seconds(float("nan")) == 0.0)
+    wrap = (np.array([-2.72, 0, 0, 0, 0, 0]), np.array([2.77, 0, 0, 0, 0, 0]))
+    wrap_seconds = sweep.seconds_for(*wrap)
+    check("a j1 wrap leg gets the policy floor, not a 3 s whip",
+          wrap_seconds > 20.0
+          and (math.pi / 2.0) * 5.49 / wrap_seconds <= sweep.PEAK_SPEED + 1e-9,
+          "%.1f s" % wrap_seconds)
+
     # The selection is the part that replaces timing: a pose counts only if the
     # log shows a *run* of frames at it, and one frame is passing through.
     entries = [{"i": i, "t": i / 15.0, "q": list(sweep.HOME)} for i in range(40)]
