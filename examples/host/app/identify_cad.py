@@ -219,6 +219,50 @@ def mask_edges(mask):
     return (mask > 0) & (eroded == 0)
 
 
+# The colour detector sees every lime object in the scene, not just the arm
+# (a shelf, a toy). A measured blob this far from the predicted arm is not a
+# correspondence -- the same rule auto_calibrate's GREEN_NEAREST applies to
+# tip blobs. The gate is generous next to the tag prior's accuracy, so it
+# removes background objects without constraining the climb; a frame whose
+# arm blobs all fall outside it is reported unmeasurable, not fitted.
+MEAS_GATE_PX = 80.0
+
+
+def clean_measured(hold, model, theta, K, dist, T_prior, kp, size, scale):
+    """Drop measured green blobs that sit nowhere near the predicted arm.
+
+    Returns the number of blobs dropped. Uses the round's starting prediction
+    only to decide *which blobs are the arm*; the error itself is still
+    measured against the raw segmentation of those blobs.
+    """
+    if hold.meas_mask is None:
+        return 0
+    T_cam = ex.invert(rig_from_theta(theta, T_prior))
+    q_pred = held_prediction(theta, hold.q_cmd, kp)
+    pred = render_green(model, q_pred, K, dist, T_cam, size, scale)
+    dt = cv2.distanceTransform((pred == 0).astype(np.uint8), cv2.DIST_L2, 3)
+    count, labels, stats, _cent = cv2.connectedComponentsWithStats(hold.meas_mask, 8)
+    keep = np.zeros_like(hold.meas_mask)
+    dropped = 0
+    gate = MEAS_GATE_PX * scale
+    for index in range(1, count):
+        blob = labels == index
+        if int(blob.sum()) < 25:
+            continue
+        edge = blob & (cv2.erode(blob.astype(np.uint8), np.ones((3, 3), np.uint8)) == 0)
+        if not edge.any():
+            continue
+        if float(dt[edge].mean()) <= gate:
+            keep[blob] = 255
+        else:
+            dropped += 1
+    hold.meas_mask = keep
+    hold.meas_edge = mask_edges(keep)
+    hold.meas_dt = cv2.distanceTransform((keep == 0).astype(np.uint8), cv2.DIST_L2, 3)
+    hold.green_px = int(keep.sum()) // 255
+    return dropped
+
+
 def mask_error(predicted, measured):
     """(chamfer px, IoU) or None when either side is too small to measure."""
     pe, me = predicted > 0, measured > 0
@@ -666,6 +710,20 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
     K, dist = bench.calibration.K, bench.calibration.dist
     T_prior = np.asarray(bench.rig.T_base_cam, float)
     theta = theta0()
+    # Start from the telemetry sag map when one is loaded for this rig/kp/zeros
+    # (identify.fit_sag_map's schema): the climb only learns the residual the
+    # arm-independent loop has not already explained.
+    kp_key = os.environ.get("REBOT_KP", sweep.KP_DEFAULT)
+    sag_prior = sweep.load_sag_map(bench.calib_dir, bench.rig.fingerprint,
+                                   kp_key=kp_key, zeros_key=sweep.zeros_key(bench.rig.joint_zeros))
+    if sag_prior:
+        for j in range(6):
+            entry = sag_prior["per_motor"][str(j + 1)]
+            theta[6 + j] = float(np.clip(1.0 + entry["a"] * bench.kp[j], LOWER[6 + j], UPPER[6 + j]))
+            theta[12 + j] = float(np.clip(entry["b"], LOWER[12 + j], UPPER[12 + j]))
+        print("sag prior: loaded %s (%d samples)" % (sweep.sag_map_path(bench.calib_dir,
+                                                                        bench.rig.fingerprint),
+                                                     sag_prior.get("samples", 0)))
     tips = run_tips()
     trace = {
         "format": "rebot-identify-trace", "version": 1,
@@ -673,6 +731,7 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
         "session": str(session), "objective": "whole-pose CAD green-cover chamfer, px",
         "scale": scale, "kp": [float(v) for v in bench.kp],
         "rig_prior_fingerprint": bench.rig.fingerprint,
+        "sag_prior": bool(sag_prior),
         "turns": turn, "turn_error_px": round(turn_err, 2),
         "tips": [[float(v) for v in point] for point in tips],
         "rounds": [], "params": PARAM_NAMES,
@@ -697,7 +756,13 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
         for index, hold in enumerate(holds):
             hold.fit = index % 2 == 0
             hold.prepare(scale)
-        usable = [h for h in holds if h.meas_mask is not None]
+        dropped = 0
+        for hold in holds:
+            dropped += clean_measured(hold, model, theta, K, dist, T_prior, bench.kp, size, scale)
+        usable = [h for h in holds if h.meas_mask is not None and h.green_px >= 40]
+        if dropped:
+            print("  dropped %d background green blob(s) outside the %d px correspondence gate"
+                  % (dropped, int(MEAS_GATE_PX)))
         fit = [h for h in usable if h.fit]
         val = [h for h in usable if not h.fit]
         if len(fit) < 2 or len(val) < 2:
@@ -729,7 +794,7 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
         record = {
             "round": round_no, "plan_id": plan_id,
             "holds": len(usable), "fit_holds": len(fit), "val_holds": len(val),
-            "skipped": skipped,
+            "skipped": skipped, "blobs_dropped": dropped,
             "unlearned": [PARAM_NAMES[i] for i in frozen],
             "torque_span_nm": [round(float(v), 4) for v in span],
             "err_fit_before": round(err_fit_before, 4), "err_fit_after": round(err_fit_after, 4),
@@ -888,10 +953,16 @@ def dry_run(bench, model, session_dir=None):
     cv2.imwrite(str(session / "cad-preview.jpg"), overlay, [cv2.IMWRITE_JPEG_QUALITY, 92])
     green = render_green(model, q, K, dist, T_cam, size, 1.0)
     meas = auto_calibrate.green_mask(upright)
-    err = mask_error(green, meas)
+    hold = Hold(q_cmd=q, q_meas=q, frame=upright)
+    hold.meas_mask = meas
+    hold.meas_edge = mask_edges(meas)
+    hold.meas_dt = cv2.distanceTransform((meas == 0).astype(np.uint8), cv2.DIST_L2, 3)
+    dropped = clean_measured(hold, model, theta0(), K, dist, bench.rig.T_base_cam,
+                             bench.kp, size, 1.0)
+    err = mask_error(green, hold.meas_mask)
     report = {"turns": turn, "turn_error_px": round(turn_err, 2),
               "plan_id": plan["id"], "q": [float(v) for v in q],
-              "green_px_measured": int(meas.sum()) // 255,
+              "green_px_measured": hold.green_px, "blobs_dropped": dropped,
               "green_px_predicted": int(green.sum()) // 255,
               "baseline_chamfer_px": None if err is None else round(err[0], 3),
               "baseline_iou": None if err is None else round(err[1], 4),
