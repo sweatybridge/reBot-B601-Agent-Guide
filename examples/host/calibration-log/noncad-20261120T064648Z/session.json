@@ -1,0 +1,59 @@
+{
+ "session": "noncad-20261120T064648Z",
+ "sag_fit": {
+  "route": "POST /identify/sag",
+  "ok": false,
+  "holds": 261,
+  "rms_mrad": 17.859,
+  "train_rms_mrad": 18.0,
+  "reason": "hold-out 17.9 mrad exceeds SAG_VALIDATE_MAX_MRAD 15.0; map not stored (unlearned)"
+ },
+ "coverage": {
+  "route": "POST /identify/run mode=cartesian",
+  "plan_id": "20261120T064648Z-a7dd9e",
+  "ok": true,
+  "poses": 12,
+  "duration_s": 66.23,
+  "seconds_with_holds": 79.5,
+  "waypoints": 1988,
+  "telemetry": true,
+  "writes_rig": false,
+  "cells_measured": [
+   "r0-h3-s0",
+   "r0-h3-s1",
+   "r0-h3-s2",
+   "r0-h3-s3",
+   "r0-h3-s6",
+   "r0-h3-s7",
+   "r1-h3-s1",
+   "r1-h3-s2",
+   "r1-h3-s3",
+   "r1-h3-s4",
+   "r1-h3-s5",
+   "r1-h3-s6"
+  ],
+  "ik_refused_cells": 31,
+  "skipped_below_min_z": 40,
+  "accuracy_after": {
+   "measured": 37,
+   "validated": 1,
+   "cells": 160,
+   "note": "validation needs >=3 holds per cell under threshold"
+  }
+ },
+ "cross_check": {
+  "rig": "6da419706036 (climbed, hot-loaded)",
+  "tag_reprojection_px": 1.81,
+  "independent_tip_projection": "telemetry FK + climbed rig lands ON the gripper (hold-2 marked red/orange)",
+  "oracle_predicted_tip_px": [
+   822.3,
+   1006.5
+  ],
+  "oracle_detected_tip_px": [
+   933.0,
+   1021.0
+  ],
+  "finding": "oracle pixel layer mis-measures at these wrist orientations: predicted tip ~50 px off (tip-offset axis convention) and template detector locked on blank wall (score 0.87); arm-space residuals (tip_error_mm 3-9 mm, placement ~10 mm) agree with the CAD/telemetry sag results; pixel_error_mm 16-221 mm and the turns-correction verdict are perception-path artifacts, not rig error"
+ },
+ "consent": "user chose sag + cartesian coverage, keeping the climbed rig; refit not run"
+}
