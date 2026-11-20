@@ -449,7 +449,6 @@
 
     function onMotion(event) {
       if (!visible || !motionStarted || !livePose) return;
-      if (!useEkf && !baseCamera) return;
 
       const rate = event.rotationRate;
       let omega = null;
@@ -495,38 +494,12 @@
       lastMotionAt = now;
       if (!(dt > 0 && dt < 0.2)) return;
 
-      if (useEkf) {
-        if (ekf) ekf.predict(omega, accelCamera, dt);
-        return;
-      }
-
-      if (omega) {
-        const magnitude = Math.hypot(omega[0], omega[1], omega[2]);
-        if (magnitude > 1e-6) {
-          const axis = [omega[0] / magnitude, omega[1] / magnitude, omega[2] / magnitude];
-          baseCamera = matMul(baseCamera, axisAngle(axis, magnitude * dt));
-        }
-      }
-
-      if (!basePosition) return;
-      // The tag gives an absolute position every detection; between detections
-      // the accelerometer rides out translation (including lowering the phone),
-      // and the tag-derived velocity covers devices with no linear acceleration.
-      let a = [0, 0, 0];
-      if (accelCamera) {
-        a = matVec(baseCamera, accelCamera).map((value) =>
-          Math.max(-20, Math.min(20, value)));
-      }
-      basePosition = [
-        basePosition[0] + baseVelocity[0] * dt + 0.5 * a[0] * dt * dt,
-        basePosition[1] + baseVelocity[1] * dt + 0.5 * a[1] * dt * dt,
-        basePosition[2] + baseVelocity[2] * dt + 0.5 * a[2] * dt * dt,
-      ];
-      baseVelocity = [
-        Math.max(-3, Math.min(3, baseVelocity[0] + a[0] * dt)),
-        Math.max(-3, Math.min(3, baseVelocity[1] + a[1] * dt)),
-        Math.max(-3, Math.min(3, baseVelocity[2] + a[2] * dt)),
-      ];
+      // onMotion is only registered under useEkf (startMotion gates on it), so
+      // the EKF prediction is the only live path here. The former non-EKF IMU
+      // propagation below this point was dead code and has been removed; the
+      // tag-only pose tracking in applyTagPose/predictedPose is separate and
+      // still used when the EKF is off.
+      if (ekf) ekf.predict(omega, accelCamera, dt);
     }
 
     function applyTagPose(T) {
@@ -869,12 +842,25 @@
       }
     }
 
+    async function projectPointLoaded(point) {
+      // The agent's arm_to_pixel must work without the overlay toggled on:
+      // projectPoint reads the private `config`, which apply() only fills
+      // while visible. Load it on demand (no band recompute -- projection
+      // needs the rig, not a reachable band at the current height).
+      if (!config) {
+        if (!configStore) throw new Error("the reach config loader is not loaded");
+        config = await configStore.load(token);
+      }
+      return projectPoint(point);
+    }
+
     return {
       toggle: toggle,
       // The page's camera mode changed: restart detection/pose selection.
       refresh: apply,
       setPose: setPose,
       projectPoint: projectPoint,
+      projectPointLoaded: projectPointLoaded,
       setHeight: setHeight,
       get height() { return heightM; },
       get visible() { return visible; },

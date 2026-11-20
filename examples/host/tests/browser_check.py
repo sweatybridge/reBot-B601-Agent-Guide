@@ -844,6 +844,40 @@ async def drive_live(cdp, args) -> int:
         })()""", page)
         report("an unknown stream turn is undefined, never 0",
                unknown_turn == "undefined", str(unknown_turn))
+
+        # A-M9: rotateFrame turns the frame clockwise onto the calibration grid,
+        # matching mapPixel. A 3x2 frame with marked corners, turned once, must
+        # land each corner where a 90 deg CW rotation puts it.
+        rotated = await cdp.evaluate("""(() => {
+            const w = 3, h = 2;
+            const data = new Uint8ClampedArray(w * h * 4);
+            const set = (x, y, v) => { const i = (y * w + x) * 4;
+              data[i] = v; data[i + 1] = v; data[i + 2] = v; data[i + 3] = 255; };
+            set(0, 0, 10); set(2, 0, 20); set(0, 1, 30); set(2, 1, 40);
+            const r = BrowserLocate.rotateFrame(data, w, h, 1);
+            const at = (x, y) => r.data[(y * r.width + x) * 4];
+            // CW: (x,y) -> (h-1-y, x); new grid is 2 wide x 3 tall.
+            return {w: r.width, h: r.height,
+                    tl: at(0, 0), tr: at(1, 0), bl: at(0, 2), br: at(1, 2)};
+        })()""", page)
+        report("rotateFrame turns the frame clockwise onto the calibration grid",
+               bool(rotated) and rotated["w"] == 2 and rotated["h"] == 3
+               and rotated["tl"] == 30 and rotated["tr"] == 10
+               and rotated["bl"] == 40 and rotated["br"] == 20,
+               str(rotated))
+
+        # A-M10: arm_to_pixel works without the Reach overlay toggled on (it
+        # loads the rig on demand instead of reading the overlay's private cache).
+        arm_pixel = await cdp.evaluate("""(async () => {
+            try {
+              const r = await toolArmToPixel({x: 0.30, y: 0.0, z: 0.10});
+              return {ok: r.ok, u: r.u, v: r.v};
+            } catch (e) { return {error: String(e && e.message || e)}; }
+        })()""", page)
+        report("arm_to_pixel projects without the overlay toggled on",
+               bool(arm_pixel) and arm_pixel.get("ok") is True
+               and isinstance(arm_pixel.get("u"), (int, float)),
+               str(arm_pixel))
         session_id = await cdp.evaluate("CHAT.sessionId", page)
         report("the page stamps a capture-format session id",
                bool(session_id) and len(str(session_id)) == 23

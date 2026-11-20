@@ -173,9 +173,14 @@ def sequence():
 
 
 def sweep_seconds(park=None):
-    """Total motion time: out to each pose once, plus the hold at each."""
+    """Total motion time: out to each pose once, the hold at each, and back.
+
+    The board walks the arm back to park at the end of the one-pass trajectory,
+    so the return leg is part of the motion the estimate must include.
+    """
     source = HOME if park is None else park
     travel = sum(value for _, value in legs(source))
+    travel += seconds_for(np.asarray(POSES[-1], dtype=float), np.asarray(source, dtype=float))
     return travel + len(POSES) * HOLD_SECONDS
 
 

@@ -746,9 +746,19 @@ async def handle_capture(request: web.Request) -> web.Response:
         part = await reader.next()
         while part is not None:
             if part.name == "meta":
-                body = await part.read()
-                if len(body) > 65536:
-                    raise web.HTTPBadRequest(text="meta is larger than 64 KiB")
+                # Read with a running cap so an oversized part cannot buffer
+                # unbounded memory before the size check rejects it.
+                chunks = []
+                meta_size = 0
+                while True:
+                    chunk = await part.read_chunk(64 * 1024)
+                    if not chunk:
+                        break
+                    meta_size += len(chunk)
+                    if meta_size > 65536:
+                        raise web.HTTPBadRequest(text="meta is larger than 64 KiB")
+                    chunks.append(chunk)
+                body = b"".join(chunks)
                 try:
                     meta = json.loads(body.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -897,6 +907,31 @@ def effective_mode(app):
     return "fixed" if app.get("rig") is not None else "handheld"
 
 
+def check_camera_override(app, url):
+    """Refuse a camera override that points away from the configured camera's host.
+
+    The server fetches this URL itself, so with no write token an arbitrary
+    value is an SSRF vector into the LAN. A local `device:` source is allowed;
+    otherwise the override must stay on the configured camera's own host (for
+    example another path on the same MediaMTX). The configured host is itself
+    private (mediamtx), so a blanket private-IP ban would break normal use --
+    pinning to that host is the proportionate boundary.
+    """
+    configured = app.get("camera") or ""
+    if not url or url == configured or str(url).startswith("device:"):
+        return
+    target = urlparse(str(url))
+    base = urlparse(str(configured))
+    if target.scheme not in ("rtsp", "rtmps", "http", "https") or not base.hostname:
+        raise web.HTTPUnprocessableEntity(
+            text="camera override must use the configured camera's host (%s)"
+                 % (base.hostname or "none configured"))
+    if (target.hostname or "").lower() != base.hostname.lower():
+        raise web.HTTPUnprocessableEntity(
+            text="camera override may not point at %s (configured host: %s)"
+                 % (target.hostname, base.hostname))
+
+
 def locate_options(app, body):
     """The locator's options: a rig for a fixed camera, the base marker for a handheld one.
 
@@ -923,7 +958,10 @@ def locate_options(app, body):
             plane_z=plane_z,
             annotate="",
             extrinsics=None,
-            witness=app["witness"],
+            # The witness verifies a FIXED mount has not moved. A handheld
+            # camera moves by design, so applying the fixed rig's witness here
+            # would refuse every handheld tap once a rig exists.
+            witness=None,
             witness_max_px=app["witness_max_px"],
         )
     if app["rig"] is None:
@@ -1210,7 +1248,10 @@ async def handle_plan(request: web.Request) -> web.Response:
         "target": target,
         "preview": "/captures/%s/annotated.jpg" % capture_id,
         "plan": payload,
-        "execute": app["execute"],
+        # Both gates must agree, exactly as /sequence: the host's --execute AND
+        # the gateway's. Offering execute on the host flag alone advertises a
+        # move the gateway will refuse.
+        "execute": bool(app["execute"] and payload.get("execute", True)),
     })
 
 
@@ -2175,6 +2216,7 @@ async def handle_calibrate(request: web.Request) -> web.Response:
 
     calibration_path = resolve_calibration(app, body.get("calib"))
     camera_url = body.get("camera") or app["camera"]
+    check_camera_override(app, camera_url)
 
     app["calibrating"] = True
     app["progress"] = {"pose": 0, "of": len(sweep.POSES), "phase": "starting",
@@ -2503,6 +2545,7 @@ async def handle_identify_run(request: web.Request) -> web.Response:
 
     calibration_path = resolve_calibration(app, body.get("calib"))
     camera_url = body.get("camera") or app["camera"]
+    check_camera_override(app, camera_url)
     sid = request.headers.get("X-Rebot-Session", "")
     app["calibrating"] = True
     app["progress"] = {"pose": 0, "of": 0, "phase": "starting", "started": time.time()}
@@ -2888,6 +2931,7 @@ async def handle_capture_pose(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         body = {}
     camera_url = body.get("camera") or app["camera"]
+    check_camera_override(app, camera_url)
     if not camera_url:
         raise web.HTTPUnprocessableEntity(text="no camera: set REBOT_CAMERA or pass camera=")
     try:
@@ -3005,8 +3049,6 @@ def build_app(args) -> web.Application:
                                 or os.environ.get("REBOT_MARKER_AT", ""),
                                 getattr(args, "marker_size", 0.0)
                                 or float(os.environ.get("REBOT_MARKER_SIZE", "0.04")))
-    app["hover"] = (getattr(args, "hover", "")
-                    or os.environ.get("REBOT_HOVER", "1")) != "0"
     # The tool tip below the flange: fixed mode can take it from the rig, but a
     # handheld profile and the planner's fallback need a number.
     app["tip_m"] = float(getattr(args, "tip_mm", 0.0)
@@ -3263,8 +3305,7 @@ def main(argv=None):
     ip = lan_ip()
     print("capture server %s" % VERSION)
     print("  listen   : %s://%s:%d" % (scheme, args.host, args.port))
-    print("  phone    : %s://%s:%d/%s" % (scheme, ip, args.port,
-                                          "?token=" + args.token if args.token else ""))
+    print("  phone    : %s://%s:%d/" % (scheme, ip, args.port))
     print("  captures : %s" % app["captures"])
     print("  whip     : %s" % (app["whip_url"] or "disabled"))
     print("  planner  : %s%s" % (app["planner"],

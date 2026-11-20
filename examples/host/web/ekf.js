@@ -329,8 +329,8 @@
       const velocityProcess = accelNoise * step;
       const positionProcess = 0.5 * accelNoise * step * step;
       const angleProcess = gyroNoise * step;
-      const gyroBiasProcess = gyroBiasWalk * step;
-      const accelBiasProcess = accelBiasWalk * step;
+      const gyroBiasProcess = gyroBiasWalk * Math.sqrt(step);
+      const accelBiasProcess = accelBiasWalk * Math.sqrt(step);
       for (let i = 0; i < 3; i += 1) {
         Q[i][i] = positionProcess * positionProcess + 1e-12;
         Q[3 + i][3 + i] = velocityProcess * velocityProcess;

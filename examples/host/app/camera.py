@@ -18,6 +18,7 @@ second or two and can hand back a keyframe from before the arm moved.
 from __future__ import annotations
 
 import time
+import sys
 import urllib.error
 import urllib.request
 
@@ -82,8 +83,13 @@ class Stream(Source):
         self.name = str(url)
         target = int(url.split(":", 1)[1]) if self.name.startswith("device:") else self.name
         if self.name.startswith("device:"):
-            self.capture = cv2.VideoCapture(target, cv2.CAP_DSHOW) if hasattr(cv2, "CAP_DSHOW") \
-                else cv2.VideoCapture(target)
+            # DirectShow is Windows-only. The CAP_DSHOW attribute exists on
+            # Linux builds too, so an attribute check picks it there and fails
+            # to open /dev/videoN -- gate on the platform, not the attribute.
+            if sys.platform == "win32":
+                self.capture = cv2.VideoCapture(target, cv2.CAP_DSHOW)
+            else:
+                self.capture = cv2.VideoCapture(target)
         else:
             self.capture = cv2.VideoCapture(target)
         try:

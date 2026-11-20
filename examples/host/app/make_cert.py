@@ -138,6 +138,11 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     ca_cert_path, ca_key_path = out / "ca.pem", out / "ca-key.pem"
 
+    # --reuse must refuse before the CA block below creates a missing ca.pem,
+    # otherwise the guard could never fire (the block already wrote the file).
+    if args.reuse and not ca_cert_path.is_file():
+        raise SystemExit("--reuse given but %s does not exist" % ca_cert_path)
+
     if ca_cert_path.is_file() and not args.force:
         ca_key, ca_cert = load_ca(out)
         print("reusing CA  : %s" % ca_cert_path)
@@ -148,8 +153,6 @@ def main(argv=None):
         print("created CA  : %s" % ca_cert_path)
 
     ips = addresses(args.ip, os.environ.get("REBOT_HOST_IP", "").strip())
-    if args.reuse and not ca_cert_path.is_file():
-        raise SystemExit("--reuse given but %s does not exist" % ca_cert_path)
 
     leaf_key, leaf_cert = make_leaf(ca_key, ca_cert, args.host, ips, args.days)
     write_key(out / "key.pem", leaf_key)

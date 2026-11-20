@@ -1092,12 +1092,35 @@ async function toolPixelToArm(args) {
   return tipReport(config, tip.tip, height, { u: u, v: v });
 }
 
-function toolArmToPixel(args) {
+async function toolArmToPixel(args) {
   const point = [Number(args.x), Number(args.y), Number(args.z)];
   if (!point.every((value) => Number.isFinite(value))) throw new Error("x, y and z must be metres");
-  const pixel = reachOverlay.projectPoint(point);
+  // Load the rig on demand: this tool must not depend on the Reach overlay
+  // being toggled on (its private config cache is empty until then).
+  const pixel = await reachOverlay.projectPointLoaded(point);
   if (!pixel) throw new Error("that point does not project: is a fixed rig fitted?");
   return { ok: true, u: round3(pixel[0]), v: round3(pixel[1]) };
+}
+
+// An abort can leave an assistant turn's tool_calls without matching tool
+// results (the loop broke, or runTool threw mid-call). Strict OpenAI-compatible
+// servers reject the next turn over that gap. Give every unanswered call a
+// cancelled result so the history stays valid.
+function cancelUnansweredTools() {
+  const answered = new Set();
+  for (const message of CHAT.history) {
+    if (message.role === "tool") answered.add(message.tool_call_id);
+  }
+  for (const message of CHAT.history) {
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
+    for (const call of message.tool_calls) {
+      if (!answered.has(call.id)) {
+        CHAT.history.push({ role: "tool", tool_call_id: call.id,
+          content: JSON.stringify({ ok: false, error: "cancelled by user" }) });
+        answered.add(call.id);
+      }
+    }
+  }
 }
 
 async function toolAddMarker(args) {
@@ -1455,6 +1478,7 @@ async function runAgent() {
       }
     }
     if (signal.aborted) {
+      cancelUnansweredTools();
       RebotTrace.trace("abort", {});
       pushChat("meta", "stopped");
     } else {
@@ -1471,6 +1495,7 @@ async function runAgent() {
       thinkingLine = null;
     }
     if (isAbort(error)) {
+      cancelUnansweredTools();
       RebotTrace.trace("abort", {});
       pushChat("meta", "stopped");
     } else {

@@ -1417,7 +1417,11 @@ def cmd_run(args, cases):
         Path(args.json).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print("wrote " + str(args.json))
     if args.allow_flaky:
-        return 0 if unstable < total else 1
+        # Flaky means "passed on some runs". A case that failed EVERY run is a
+        # real failure, not flakiness, and must still fail the gate -- the old
+        # `unstable < total` masked it whenever any other case was stable.
+        dead = sum(1 for case in report["cases"] if case["passed"] == 0)
+        return 0 if dead == 0 else 1
     return 0 if unstable == 0 else 1
 
 

@@ -168,7 +168,7 @@
   // and, like it, it can only guess the sign, so 3 (assume the frame arrived
   // clockwise) is that guess. `-1` means "not a quarter turn at all".
   function shapeTurn(calibrationSize, frameSize) {
-    if (!calibrationSize || !frameSize) return 0;
+    if (!calibrationSize || !frameSize) return -1;
     const cw = calibrationSize[0];
     const ch = calibrationSize[1];
     const fw = frameSize[0];
