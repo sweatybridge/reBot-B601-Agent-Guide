@@ -232,6 +232,14 @@ PEAK_SPEED = 0.35        # rad/s
 MIN_SECONDS = 3.0
 MAX_SECONDS = 25.0
 
+# The jaw is not the arm: a short-travel axis with real stiction. A fixed-duration
+# gripper leg commands whatever speed its travel implies -- the sequence's full
+# open (4.9 rad in 0.8 s) asked for 9.6 rad/s and the jaw lagged 42 degrees behind
+# even with velocity feedforward. Cap its peak the same way the sweep caps the
+# arm's, with its own number: 3 rad/s is brisk but trackable at the vendor gains.
+# No MIN_SECONDS floor here -- the caller's own floor (0.8 s, grasp_s) stands.
+GRIPPER_PEAK_SPEED = 3.0   # rad/s
+
 # The board returns the arm to the pose a move started from as soon as the file
 # ends -- `shut_down` ramps to `self.start`, the pose at bring-up. So a pose only
 # exists while the file is still holding it. The camera records the whole sweep
@@ -437,3 +445,17 @@ def seconds_for(a, b, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SE
     """
     travel = float(np.max(np.abs(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))))
     return max(minimum, min(maximum, (math.pi / 2.0) * travel / float(peak_speed)))
+
+
+def gripper_seconds(travel, peak_speed=GRIPPER_PEAK_SPEED):
+    """Duration that keeps a cosine-eased gripper leg under the jaw speed cap.
+
+    A floor, never a ceiling: callers take max(their own seconds, this), so a
+    caller asking for a slower grasp still gets it. Same cosine-peak inversion
+    as `seconds_for`, without the sweep's 3 s minimum -- a 2.45 rad half-close
+    wants 1.3 s at the cap, not three.
+    """
+    travel = abs(float(travel))
+    if not math.isfinite(travel):
+        return 0.0
+    return (math.pi / 2.0) * travel / float(peak_speed)

@@ -401,8 +401,12 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         return seed
 
     def gripper_leg(target_angle, seconds):
-        count = max(1, int(round(seconds * options.hz)))
         current = waypoints[-1]["q"][6]
+        # The jaw speed cap is a floor on the duration, mandatory for every
+        # gripper leg: a fixed seconds with a big travel commands a speed the
+        # jaw cannot follow.
+        seconds = max(seconds, sweep.gripper_seconds(target_angle - current))
+        count = max(1, int(round(seconds * options.hz)))
         for index in range(1, count + 1):
             state["t"] += period
             angle = current + (target_angle - current) * ease(index / count)
@@ -663,8 +667,9 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                                    n_arm), gripper)
 
     def gripper_leg(target, seconds):
-        count = max(1, int(round(seconds * options.hz)))
         current = waypoints[-1]["q"][6]
+        seconds = max(seconds, sweep.gripper_seconds(target - current))
+        count = max(1, int(round(seconds * options.hz)))
         for index in range(1, count + 1):
             state["t"] += period
             angle = current + (target - current) * ease(index / count)
@@ -751,10 +756,16 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                     "the leg from marker %d to marker %d dips within a link radius "
                     "of the worktop; space the markers further apart or move the arm "
                     "clear" % (index - 1, index))
+            # The sweep's speed policy is the floor, exactly as on /move: a
+            # caller may ask for a slower leg, never a quicker one. Without it
+            # the wrap legs (j1's long way around the +-2.8 rad stop, ~5.5 rad)
+            # ran in approach_s and whipped the base at ~2.9 rad/s.
+            leg_seconds = max(options.approach_s,
+                              sweep.seconds_for(current_q, target[:n_arm]))
             seed = joint_leg(
                 current_q,
                 {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
-                options.approach_s, "marker %d" % index, gripper)
+                leg_seconds, "marker %d" % index, gripper)
         hold_t0 = state["t"]
         hold(0.25, gripper)
         next_gripper = MOTOR7_HALF if index % 2 == 1 else MOTOR7_OPEN
@@ -777,7 +788,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                         "link radius of the worktop; move the arm clear and retry"
                         % len(points))
     joint_leg(q_last, {index: q_home[index] - q_last[index] for index in range(n_arm)},
-              options.return_s, "return", gripper)
+              max(options.return_s, sweep.seconds_for(q_last, q_home)), "return", gripper)
 
     steps = ("%d markers: move each tip to its arm-space point; gripper open, "
              "half-close on odd, open on even; return" % len(points))
