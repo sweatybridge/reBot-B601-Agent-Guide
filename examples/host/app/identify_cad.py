@@ -6,19 +6,26 @@ The tip-only fit asks one point of the arm where it is. This module asks the
 whole arm: the CAD visual meshes (Seeed's RS URDF, `cad/visuals.json`) are
 posed by `rebot_ik.forward` at the *predicted held* joints, rendered through
 the camera rig, and compared against the arm's lime covers segmented from the
-recorded frames (`auto_calibrate.green_mask` -- the same physical parts the
-meshes `pla2_green`, `pla3_green`, `pla5_green`, `pla7_green` describe). The
-error is a symmetric contour chamfer in pixels, averaged over the holds of a
-cartesian run.
+recorded frames (`auto_calibrate.green_mask`). The cover set is the meshes
+that empirically carry the arm's lime colour on this bench (COVER_MESHES,
+selected from per-part coverage over eight diverse holds). The error is a
+ONE-WAY contour chamfer in pixels -- measured green edge to predicted cover
+surface, averaged over the holds of a cartesian run -- because the
+segmentation sees only the lit, visible fraction of the covers.
 
-What gets climbed, jointly, on that error:
+What gets climbed:
 
-* the camera rig -- a bounded SE(3) delta on the tag-fitted `T_base_cam`
-  (rotation in the camera frame, translation in the base frame);
 * the sag residual map -- per joint, `sag_j = g_j * tau_g_j(q)/kp_j + b_j`,
-  the affine correction of spec 7.3(b) around the gravity-sag model. The
-  prediction chain is `q_cmd -> q_cmd - sag(q_cmd) -> FK -> CAD -> pixels`,
-  so a wrong sag map moves the whole rendered arm, not just the tip.
+  learned from the run's OWN TELEMETRY (the held-vs-commanded joint residual
+  is directly observable; the same signal identify.fit_sag_map uses). The
+  gains enter the prediction chain `q_cmd -> q_cmd - sag(q_cmd) -> FK -> CAD
+  -> pixels`, so a wrong sag map moves the whole rendered arm.
+* the camera rig -- a bounded SE(3) delta on the tag-fitted `T_base_cam`,
+  climbed on the whole-pose projection error with the sag held at its
+  telemetry estimate. Pixel error alone cannot identify the sag gains (a
+  one-way surface objective is flat inside the covers), so the two signals
+  are combined the way the branch's architecture separates them: telemetry
+  for the joints, camera for the rig, one projection error validating both.
 
 Joint zeros are NOT climbed (spec 7.2): the tag cannot observe them and a
 constant sag bias is bounded to +-30 mrad and reported, never absorbed into a
@@ -95,11 +102,18 @@ class IdentifyError(Exception):
 LINK_FRAME = {"link1": 0, "link2": 1, "link3": 2, "link4": 3,
               "link5": 4, "link6": 5, "gripper_end": 6}
 
-# The parts the colour detector can actually see: the arm's lime covers. The
-# objective compares these meshes against the green segmentation -- the same
-# physical plastic on both sides, spread over link2, link3, link5 and the
-# gripper, so the whole pose is constrained, not one point.
-GREEN_MESHES = ("pla2_green.STL", "pla3_green.STL", "pla5_green.STL", "pla7_green.STL")
+# The parts that carry the arm's lime colour ON THIS BENCH, selected from data:
+# each of these meshes covered >= 5% of the measured green (median over eight
+# diverse holds, min >= 2%) when rendered at the measured pose. The URDF's
+# "green" files alone are not the whole story -- the link2/link3 shells and the
+# cnc3/cnc7 brackets carry green plastic/anodising here too. The objective
+# compares this set against the green segmentation, spread over link2, link3,
+# link5 and the gripper, so the whole pose is constrained, not one point.
+# Re-select with the per-part coverage diagnostic if the bench arm changes.
+COVER_MESHES = ("pla2_black.STL", "pla2_green.STL",
+                "pla3_black_without_seeed_badge.STL", "pla3_green.STL",
+                "pla3_seeed_badge_with_counters.STL", "cnc3.STL",
+                "pla5_green.STL", "pla7_green.STL", "cnc7.STL")
 
 
 def load_stl(path):
@@ -120,7 +134,8 @@ class Part:
     link: str
     frame: int | None          # None = base_link (identity)
     verts: np.ndarray          # (N, 3, 3) in the link frame
-    green: bool
+    cover: bool
+    name: str = ""
 
 
 class CadModel:
@@ -141,12 +156,12 @@ class CadModel:
                 raise IdentifyError("visual %s has a non-zero origin; the renderer "
                                     "assumes the RS visuals sit on their link frame" % name)
             self.parts.append(Part(link=link, frame=LINK_FRAME.get(link),
-                                   verts=seen[name], green=name in GREEN_MESHES))
-        self.green_parts = [p for p in self.parts if p.green]
-        if len(self.green_parts) != len(GREEN_MESHES):
-            raise IdentifyError("expected %d green cover meshes, found %d"
-                                % (len(GREEN_MESHES), len(self.green_parts)))
-        self.green_tris = sum(len(p.verts) for p in self.green_parts)
+                                   verts=seen[name], cover=name in COVER_MESHES, name=name))
+        self.cover_parts = [p for p in self.parts if p.cover]
+        if len(self.cover_parts) != len(COVER_MESHES):
+            raise IdentifyError("expected %d cover meshes, found %d"
+                                % (len(COVER_MESHES), len(self.cover_parts)))
+        self.cover_tris = sum(len(p.verts) for p in self.cover_parts)
 
     def link_frames(self, q):
         _tool, links = rebot_ik.forward(np.asarray(q, float).reshape(6), with_links=True)
@@ -206,12 +221,12 @@ def render_parts(model, parts, q, K, dist, T_cam_base, size, scale=1.0):
     return mask
 
 
-def render_green(model, q, K, dist, T_cam_base, size, scale=1.0):
-    return render_parts(model, model.green_parts, q, K, dist, T_cam_base, size, scale)
+def render_cover(model, q, K, dist, T_cam_base, size, scale=1.0):
+    return render_parts(model, model.cover_parts, q, K, dist, T_cam_base, size, scale)
 
 
 # --------------------------------------------------------------------------- #
-# The objective: symmetric contour chamfer between predicted and measured
+# The objective: one-way contour chamfer, measured green -> predicted covers
 # --------------------------------------------------------------------------- #
 
 def mask_edges(mask):
@@ -239,7 +254,7 @@ def clean_measured(hold, model, theta, K, dist, T_prior, kp, size, scale):
         return 0
     T_cam = ex.invert(rig_from_theta(theta, T_prior))
     q_pred = held_prediction(theta, hold.q_cmd, kp)
-    pred = render_green(model, q_pred, K, dist, T_cam, size, scale)
+    pred = render_cover(model, q_pred, K, dist, T_cam, size, scale)
     dt = cv2.distanceTransform((pred == 0).astype(np.uint8), cv2.DIST_L2, 3)
     count, labels, stats, _cent = cv2.connectedComponentsWithStats(hold.meas_mask, 8)
     keep = np.zeros_like(hold.meas_mask)
@@ -276,6 +291,18 @@ def mask_error(predicted, measured):
     chamfer = 0.5 * (float(dt_m[e_p].mean()) + float(dt_p[e_m].mean()))
     iou = float((pe & me).sum()) / float((pe | me).sum())
     return chamfer, iou
+
+
+def oneway_error(predicted, measured):
+    """Mean distance from the measured green edge to the predicted surface."""
+    pe, me = predicted > 0, measured > 0
+    if int(pe.sum()) < 40 or int(me.sum()) < 40:
+        return None
+    e_m = mask_edges(measured)
+    if not e_m.any():
+        return None
+    dt_p = cv2.distanceTransform((~pe).astype(np.uint8), cv2.DIST_L2, 3)
+    return float(dt_p[e_m].mean())
 
 
 # --------------------------------------------------------------------------- #
@@ -359,6 +386,16 @@ class Objective:
         self.evals = 0
 
     def per_hold(self, theta):
+        """(one-way chamfer, IoU, two-way chamfer) per hold; None if unmeasurable.
+
+        The climb error is ONE-WAY: measured green edge -> predicted cover
+        surface. The segmentation sees only the lit, visible fraction of the
+        covers, so the reverse direction (predicted -> measured) would punish
+        the prediction for surfaces the camera cannot see, and its floor is
+        segmentation noise, not geometry. Every measured green pixel must lie
+        on the predicted arm; a wrong rig or sag moves the whole surface away
+        from them, which is exactly the signal being climbed.
+        """
         T_cam = ex.invert(rig_from_theta(theta, self.T_prior))
         out = []
         for hold in self.holds:
@@ -366,19 +403,19 @@ class Objective:
                 out.append(None)
                 continue
             q_pred = held_prediction(theta, hold.q_cmd, self.kp)
-            pred = render_green(self.model, q_pred, self.K, self.dist, T_cam,
+            pred = render_cover(self.model, q_pred, self.K, self.dist, T_cam,
                                 self.size, self.scale)
             pe = pred > 0
             if int(pe.sum()) < 40 or not hold.meas_edge.any():
                 out.append(None)
                 continue
-            e_p = mask_edges(pred)
             dt_p = cv2.distanceTransform((~pe).astype(np.uint8), cv2.DIST_L2, 3)
-            chamfer = 0.5 * (float(hold.meas_dt[e_p].mean())
-                             + float(dt_p[hold.meas_edge].mean()))
+            oneway = float(dt_p[hold.meas_edge].mean())
+            e_p = mask_edges(pred)
+            twoway = 0.5 * (oneway + float(hold.meas_dt[e_p].mean()))
             iou = float((pe & (hold.meas_mask > 0)).sum()) / float(
                 (pe | (hold.meas_mask > 0)).sum())
-            out.append((chamfer, iou))
+            out.append((oneway, iou, twoway))
         return out
 
     def error(self, theta):
@@ -405,6 +442,36 @@ def identifiability(holds, kp):
     return span, sorted(set(frozen))
 
 
+def telemetry_sag_gains(holds, kp):
+    """Per-joint sag gains from the run's own telemetry: held = cmd - g*tau_g/kp.
+
+    The joint residual is directly observable (edge pose vs commanded waypoint),
+    so the gains do not need the camera -- the same signal identify.fit_sag_map
+    learns from, computed here per run. A joint whose modelled sag is under
+    5 mrad in every hold cannot teach its gain: it stays at 1, unlearned.
+    Returns (gains, per-joint sample counts, residual rms in mrad).
+    """
+    kp = np.asarray(kp, float)
+    gains = np.ones(6)
+    counts = np.zeros(6, int)
+    residuals = [[] for _ in range(6)]
+    for j in range(6):
+        samples = []
+        for h in holds:
+            model_sag = rebot_ik.gravity_torques(h.q_cmd)[j] / kp[j]
+            if abs(model_sag) < 0.005:
+                continue
+            measured = float(h.q_cmd[j] - h.q_meas[j])
+            samples.append(measured / model_sag)
+            residuals[j].append(measured - model_sag)
+        counts[j] = len(samples)
+        if len(samples) >= 3:
+            gains[j] = float(np.clip(np.median(samples), LOWER[6 + j], UPPER[6 + j]))
+    rms = [float(np.sqrt(np.mean(np.square(r)))) * 1000.0 if r else None
+           for r in residuals]
+    return gains, counts, rms
+
+
 @dataclass
 class Change:
     n: int
@@ -417,17 +484,22 @@ class Change:
     round: int = 0
 
 
-def hillclimb(objective, theta, frozen=(), max_evals=1500, min_gain=1e-3, round_no=0):
+def hillclimb(objective, theta, frozen=(), max_evals=1500, min_gain=0.03, round_no=0,
+              val_objective=None, val_tolerance=0.01):
     """Coordinate pattern search; every accepted step is traced.
 
     Monotone by construction: a candidate is accepted only when the fit error
-    drops by more than `min_gain`. Steps halve on refusal and the search stops
-    when every free step is under its floor -- the plateau, not a budget.
+    drops by more than `min_gain` (above the rasterisation noise floor). With a
+    `val_objective`, the held-out corpus must also not degrade by more than
+    `val_tolerance` -- a step that only flatters the fit holds is refused on
+    the spot, not rolled back after the fact. Steps halve on refusal and the
+    search stops when every free step is under its floor.
     """
     theta = np.array(theta, float)
     steps = STEP0.copy()
     changes = []
     err = objective.error(theta)
+    val_err = val_objective.error(theta) if val_objective is not None else None
     evals0 = objective.evals
     while objective.evals - evals0 < max_evals:
         accepted = 0
@@ -441,15 +513,24 @@ def hillclimb(objective, theta, frozen=(), max_evals=1500, min_gain=1e-3, round_
                 if candidate[index] == theta[index]:
                     continue
                 trial = objective.error(candidate)
-                if trial < err - min_gain:
-                    changes.append(Change(
-                        n=len(changes) + 1, param=PARAM_NAMES[index],
-                        value_before=float(theta[index]), value_after=float(candidate[index]),
-                        err_before=float(err), err_after=float(trial),
-                        gain_px=float(err - trial), round=round_no))
-                    theta, err = candidate, trial
-                    accepted += 1
-                    break
+                if trial >= err - min_gain:
+                    continue
+                if val_objective is not None:
+                    trial_val = val_objective.error(candidate)
+                    if trial_val > val_err + val_tolerance:
+                        continue
+                else:
+                    trial_val = None
+                changes.append(Change(
+                    n=len(changes) + 1, param=PARAM_NAMES[index],
+                    value_before=float(theta[index]), value_after=float(candidate[index]),
+                    err_before=float(err), err_after=float(trial),
+                    gain_px=float(err - trial), round=round_no))
+                theta, err = candidate, trial
+                if trial_val is not None:
+                    val_err = trial_val
+                accepted += 1
+                break
             else:
                 steps[index] *= 0.5
         if accepted == 0:
@@ -642,11 +723,17 @@ def extract_holds(segments, log_path, trajectory, turn, bench, workdir,
             capture.release()
 
     holds = []
+    expected = (int(bench.calibration.image_size[0]), int(bench.calibration.image_size[1]))
     for item in pending:
         if "frame" not in item:
             skipped.append("no recorded frame for the stop at t=%.1f" % item["t"])
             continue
         frame = bench.upright(item["frame"], turn)
+        if (frame.shape[1], frame.shape[0]) != expected:
+            skipped.append("stop at t=%.1f: frame %dx%d is not the calibration grid %dx%d "
+                           "(the stream changed shape)" % (item["t"], frame.shape[1],
+                                                           frame.shape[0], *expected))
+            continue
         hold = Hold(q_cmd=item["q_cmd"], q_meas=item["q_meas"], frame=frame)
         mask = auto_calibrate.green_mask(frame)
         hold.green_px = int(mask.sum()) // 255
@@ -728,7 +815,7 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
     trace = {
         "format": "rebot-identify-trace", "version": 1,
         "started": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "session": str(session), "objective": "whole-pose CAD green-cover chamfer, px",
+        "session": str(session), "objective": "whole-pose CAD cover one-way chamfer, px",
         "scale": scale, "kp": [float(v) for v in bench.kp],
         "rig_prior_fingerprint": bench.rig.fingerprint,
         "sag_prior": bool(sag_prior),
@@ -769,9 +856,18 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
             raise IdentifyError("round %d: fit/holdout split too small (%d/%d)"
                                 % (round_no, len(fit), len(val)))
         span, frozen = identifiability(usable, bench.kp)
-        print("  %d holds (%d fit / %d holdout), unlearned sag joints: %s"
-              % (len(usable), len(fit), len(val),
-                 ", ".join("j%d" % (i - 5) for i in frozen if i < 12) or "none"))
+        # Sag comes from the run's telemetry (directly observable joint
+        # residual); the projection climb then moves only the rig. Constant
+        # biases stay at the telemetry prior: they are indistinguishable from
+        # joint-zero drift in camera data, and zeros are never climbed (7.2).
+        gains, counts, sag_rms = telemetry_sag_gains(usable, bench.kp)
+        theta[6:12] = gains
+        frozen = sorted(set(range(6, 18)))
+        unlearned = ["j%d" % (j + 1) for j in range(6)
+                     if counts[j] < 3 or span[j] < MIN_TORQUE_SPAN_NM]
+        print("  %d holds (%d fit / %d holdout); telemetry sag gains %s (samples %s)"
+              % (len(usable), len(fit), len(val), np.round(gains, 3), counts))
+        print("  unlearned sag joints: %s" % (", ".join(unlearned) or "none"))
 
         obj_fit = Objective(model, fit, K, dist, T_prior, bench.kp, size, scale)
         obj_val = Objective(model, val, K, dist, T_prior, bench.kp, size, scale)
@@ -781,7 +877,8 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
         err_all_before = obj_all.error(theta)
         theta_start = theta.copy()
         theta, err_fit_after, changes = hillclimb(
-            obj_fit, theta, frozen=frozen, max_evals=max_evals, round_no=round_no)
+            obj_fit, theta, frozen=frozen, max_evals=max_evals, round_no=round_no,
+            val_objective=obj_val)
         err_val_after = obj_val.error(theta)
         err_all_after = obj_all.error(theta)
         # The holdout is the overfit guard: a round that only flatters its fit
@@ -795,7 +892,10 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
             "round": round_no, "plan_id": plan_id,
             "holds": len(usable), "fit_holds": len(fit), "val_holds": len(val),
             "skipped": skipped, "blobs_dropped": dropped,
-            "unlearned": [PARAM_NAMES[i] for i in frozen],
+            "unlearned": unlearned,
+            "sag_gains": [float(v) for v in gains],
+            "sag_samples": [int(v) for v in counts],
+            "sag_rms_mrad": [None if v is None else round(v, 2) for v in sag_rms],
             "torque_span_nm": [round(float(v), 4) for v in span],
             "err_fit_before": round(err_fit_before, 4), "err_fit_after": round(err_fit_after, 4),
             "err_val_before": round(err_val_before, 4), "err_val_after": round(err_val_after, 4),
@@ -804,6 +904,8 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
             "changes": [vars(c) for c in changes],
             "theta_after": [float(v) for v in theta],
             "hold_q": [[float(v) for v in h.q_cmd] for h in usable],
+            "per_hold_px": [None if v is None else round(v[0], 3)
+                            for v in obj_all.per_hold(theta)],
             "seconds": round(time.time() - started, 1),
         }
         trace["rounds"].append(record)
@@ -835,7 +937,7 @@ def _save_round_overlay(bench, model, holds, theta, K, dist, T_prior, size, turn
         return
     T_cam = ex.invert(rig_from_theta(theta, T_prior))
     q_pred = held_prediction(theta, hold.q_cmd, bench.kp)
-    pred = render_green(model, q_pred, K, dist, T_cam, size, 1.0)
+    pred = render_cover(model, q_pred, K, dist, T_cam, size, 1.0)
     overlay = hold.frame.copy()
     contours, _ = cv2.findContours(pred, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2)
@@ -951,7 +1053,7 @@ def dry_run(bench, model, session_dir=None):
     contours, _ = cv2.findContours(full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2)
     cv2.imwrite(str(session / "cad-preview.jpg"), overlay, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    green = render_green(model, q, K, dist, T_cam, size, 1.0)
+    green = render_cover(model, q, K, dist, T_cam, size, 1.0)
     meas = auto_calibrate.green_mask(upright)
     hold = Hold(q_cmd=q, q_meas=q, frame=upright)
     hold.meas_mask = meas
@@ -959,18 +1061,19 @@ def dry_run(bench, model, session_dir=None):
     hold.meas_dt = cv2.distanceTransform((meas == 0).astype(np.uint8), cv2.DIST_L2, 3)
     dropped = clean_measured(hold, model, theta0(), K, dist, bench.rig.T_base_cam,
                              bench.kp, size, 1.0)
-    err = mask_error(green, hold.meas_mask)
+    err = oneway_error(green, hold.meas_mask)
+    iou = mask_error(green, hold.meas_mask)
     report = {"turns": turn, "turn_error_px": round(turn_err, 2),
               "plan_id": plan["id"], "q": [float(v) for v in q],
               "green_px_measured": hold.green_px, "blobs_dropped": dropped,
               "green_px_predicted": int(green.sum()) // 255,
-              "baseline_chamfer_px": None if err is None else round(err[0], 3),
-              "baseline_iou": None if err is None else round(err[1], 4),
+              "baseline_chamfer_px": None if err is None else round(err, 3),
+              "baseline_iou": None if iou is None else round(iou[1], 4),
               "preview": str(session / "cad-preview.jpg")}
     (session / "dry-run.json").write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
     print("baseline whole-pose error at the current pose: %s"
           % ("n/a (arm not visible enough)" if err is None
-             else "%.3f px chamfer, IoU %.3f" % err))
+             else "%.3f px one-way chamfer, IoU %.3f" % (err, iou[1])))
     print("preview: %s" % report["preview"])
     return report
 
@@ -1092,8 +1195,8 @@ def main(argv=None):
         return 0
 
     model = CadModel()
-    print("CAD: %d visual parts, %d green-cover triangles"
-          % (len(model.parts), model.green_tris))
+    print("CAD: %d visual parts, %d cover triangles"
+          % (len(model.parts), model.cover_tris))
     bench = Bench()
     if args.dry_run or not args.confirm:
         dry_run(bench, model, session_dir=args.session)
