@@ -426,14 +426,47 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
     if options.hover:
         # One leg out, a hold, and the way back. The tap meant "this place": the
         # arm visits it and stops, with no descend, grip or lift.
+        #
+        # Endpoint-first, exactly like a one-marker sequence: solve the hover
+        # pose once, then interpolate joint space. The incremental Cartesian
+        # approach this used to run slipped IK branches near the orientation
+        # blend's end and stalled a few mm short mid-leg -- a 10 mm+ residual the
+        # acceptance band then refused as "out of reach". Holding the start
+        # orientation also forced a marginal wrist; point the tool down and yaw
+        # toward the target instead, the free-yaw envelope the reach overlay
+        # draws. A straight Cartesian line can leave the reachable annulus; the
+        # capsule check still guards the worktop.
         hover_point = flange_point
-        seed = cartesian(p0, hover_point, R0, R_work, options.approach_s, 0.4, seed, "hover")
+        hover_axis = "z-" if options.tool_axis == "current" else options.tool_axis
+        hover_yaw = (math.degrees(math.atan2(float(point[1]), float(point[0])))
+                     if options.tool_axis == "current" else options.yaw)
+        R_hover = work_orientation(R0, hover_axis, hover_yaw)
+        report_axis, report_yaw = hover_axis, hover_yaw
+        start_seed = seed.copy()
+        try:
+            target_q = ik_to(hover_point, R_hover, seed, "hover")
+        except PlanError:
+            target_q = ik_to(hover_point, R_hover, start_seed, "hover")
+        current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+        if not sweep.path_safe(current_q, target_q[:n_arm]):
+            raise PlanError("the leg to the tap dips within a link radius of the "
+                            "worktop; tap a point further out or move the arm clear")
+        seed = joint_leg(current_q,
+                         {j: target_q[j] - current_q[j] for j in range(n_arm)},
+                         sweep.seconds_for(current_q, target_q[:n_arm]), "hover")
         hold_start = state["t"]
         hold(options.hold_s)
         hold_end = state["t"]
         if not options.no_return:
-            cartesian(hover_point, p0, R_work, R0, options.return_s, 0.4, seed, "return")
+            q_last = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+            if not sweep.path_safe(q_last, start_seed[:n_arm]):
+                raise PlanError("the return to the start pose dips within a link "
+                                "radius of the worktop; move the arm clear and retry")
+            joint_leg(q_last,
+                      {j: start_seed[j] - q_last[j] for j in range(n_arm)},
+                      sweep.seconds_for(q_last, start_seed[:n_arm]), "return")
     else:
+        report_axis, report_yaw = options.tool_axis, options.yaw
         seed = cartesian(p0, pre, R0, R_work, options.approach_s, 0.4, seed, "approach")
         seed = cartesian(pre, point, R_work, R_work, options.descend_s, 1.0, seed, "descend")
         gripper_leg(options.grasp_q, options.grasp_s)
@@ -496,8 +529,8 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         steps,
         extra={
             "capture": provenance,
-            "tool_axis": options.tool_axis,
-            "yaw_deg": options.yaw,
+            "tool_axis": report_axis,
+            "yaw_deg": report_yaw,
             "dynamics": {
                 "source": "reBotArm_control_py.compute_generalized_gravity (Pinocchio RNEA)",
                 "tau": "gravity torque of the planned pose, per waypoint",
@@ -518,8 +551,8 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         "tip_m": tip_offset_m if options.hover else None,
         "tap_height_m": target.get("tap_height_m"),
         "point_frame": target.get("point_frame"),
-        "tool_axis": options.tool_axis,
-        "yaw_deg": options.yaw,
+        "tool_axis": report_axis,
+        "yaw_deg": report_yaw,
         "waypoints": stats["waypoints"],
         "duration_s": stats["duration_s"],
         "worst_ik_m": worst["residual"],
