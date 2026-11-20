@@ -1,12 +1,15 @@
+import sys
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+from draw import font_path
 root = Path("manuals/assets")
 cards = [(f"{l}-{i:02d}", root / f"layout-{l.lower()}-mess-{i:02d}.png") for l in "ABC" for i in range(1,6)]
 tw, th = 420, 280
 W, H = 5*tw, 3*th
 sheet = Image.new("RGB", (W, H), (247,243,234))
 d = ImageDraw.Draw(sheet)
-font = ImageFont.truetype(r"C:\Windows\Fonts\consolab.ttf", 14)
+font = ImageFont.truetype(font_path("mono", "b"), 14)
 for idx, (label, path) in enumerate(cards):
     im = Image.open(path).convert("RGB").resize((tw, th), Image.LANCZOS)
     x, y = (idx % 5)*tw, (idx//5)*th

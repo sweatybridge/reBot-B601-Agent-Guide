@@ -8,7 +8,9 @@ All public coordinates are in "logical" pixels (the 1x canvas).
 from __future__ import annotations
 
 import math
+import os
 import random
+import sys
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -46,7 +48,16 @@ ACCENTS = {
     "c": {"main": "#3F4C8A", "light": "#DDE0EF", "mid": "#8B95C4", "deep": "#272F5C"},
 }
 
-FONT_DIR = r"C:\Windows\Fonts"
+def _default_font_dir():
+    if sys.platform == "win32":
+        return r"C:\Windows\Fonts"
+    if sys.platform == "darwin":
+        return "/System/Library/Fonts/Supplemental"
+    return "/usr/share/fonts/truetype"
+
+
+# Override with REBOT_FONT_DIR to regenerate on another machine / OS.
+FONT_DIR = os.environ.get("REBOT_FONT_DIR") or _default_font_dir()
 FONT_FILES = {
     ("body", "r"): "segoeui.ttf",
     ("body", "sb"): "seguisb.ttf",
@@ -58,6 +69,41 @@ FONT_FILES = {
     ("mono", "b"): "consolab.ttf",
     ("serif", "r"): "georgia.ttf",
 }
+
+# Cross-platform substitutes when the primary fonts are not present.
+_FALLBACK_FONTS = {
+    ("body", "r"): ("DejaVuSans.ttf", "LiberationSans-Regular.ttf", "segoeui.ttf", "arial.ttf"),
+    ("body", "l"): ("DejaVuSans.ttf", "LiberationSans-Regular.ttf", "segoeui.ttf", "arial.ttf"),
+    ("body", "sb"): ("DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "segoeuib.ttf", "arialbd.ttf"),
+    ("body", "b"): ("DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "segoeuib.ttf", "arialbd.ttf"),
+    ("head", "r"): ("DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "bahnschrift.ttf", "arialbd.ttf"),
+    ("head", "b"): ("DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "bahnschrift.ttf", "arialbd.ttf"),
+    ("mono", "r"): ("DejaVuSansMono.ttf", "LiberationMono-Regular.ttf", "consola.ttf", "cour.ttf"),
+    ("mono", "b"): ("DejaVuSansMono-Bold.ttf", "LiberationMono-Bold.ttf", "consolab.ttf", "courbd.ttf"),
+    ("serif", "r"): ("DejaVuSerif.ttf", "LiberationSerif-Regular.ttf", "georgia.ttf", "times.ttf"),
+}
+_FALLBACK_DIRS = (
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/liberation",
+    "/usr/share/fonts",
+    "/System/Library/Fonts",
+    "/System/Library/Fonts/Supplemental",
+    r"C:\Windows\Fonts",
+)
+
+
+def font_path(family="body", weight="r"):
+    """Resolve a font file: FONT_DIR first, then cross-platform fallbacks."""
+    name = FONT_FILES.get((family, weight), FONT_FILES[("body", "r")])
+    path = os.path.join(FONT_DIR, name)
+    if os.path.isfile(path):
+        return path
+    for fb in _FALLBACK_FONTS.get((family, weight), _FALLBACK_FONTS[("body", "r")]):
+        for d in (FONT_DIR,) + _FALLBACK_DIRS:
+            cand = os.path.join(d, fb)
+            if os.path.isfile(cand):
+                return cand
+    return path
 
 
 def hx(value: str) -> tuple[int, int, int]:
@@ -144,9 +190,8 @@ class Canvas:
     def font(self, size, family="body", weight="r"):
         key = (family, weight, size)
         if key not in self._fonts:
-            path = FONT_FILES.get((family, weight), FONT_FILES[("body", "r")])
             self._fonts[key] = ImageFont.truetype(
-                f"{FONT_DIR}\\{path}", max(1, round(size * self.k)))
+                font_path(family, weight), max(1, round(size * self.k)))
         return self._fonts[key]
 
     def text(self, x, y, s, size=18, color=INK, family="body", weight="r",

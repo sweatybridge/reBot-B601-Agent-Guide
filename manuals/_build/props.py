@@ -9,6 +9,21 @@ from draw import CABINET, LINE, STEEL, STEEL_DARK, SURFACE, WOOD, WOOD_DARK, WOO
 from scene3d import Scene
 
 
+def _rot_box(s: Scene, x, y, dx, dy, u0, v0, z0, u1, v1, z1, color, outline=None):
+    """Axis-aligned box in local (u, v) coords, rotated by (dx, dy) about (x, y)."""
+    def P(u, v, z):
+        return (x + u * dx - v * dy, y + u * dy + v * dx, z)
+    quads = (
+        [P(u0, v0, z1), P(u1, v0, z1), P(u1, v1, z1), P(u0, v1, z1)],
+        [P(u0, v0, z0), P(u1, v0, z0), P(u1, v0, z1), P(u0, v0, z1)],
+        [P(u0, v1, z0), P(u0, v1, z1), P(u1, v1, z1), P(u1, v1, z0)],
+        [P(u0, v0, z0), P(u0, v0, z1), P(u0, v1, z1), P(u0, v1, z0)],
+        [P(u1, v0, z0), P(u1, v1, z0), P(u1, v1, z1), P(u1, v0, z1)],
+    )
+    for q in quads:
+        s.face(q, color, outline)
+
+
 # --------------------------------------------------------------------------- #
 # Counter context
 # --------------------------------------------------------------------------- #
@@ -130,10 +145,10 @@ def sieve(s: Scene, cx, cy, r=0.065, color="#C9CFCC"):
 
 def peeler(s: Scene, x, y, angle=0.0):
     dx, dy = math.cos(angle), math.sin(angle)
-    s.box(x - 0.05, y - 0.012, 0.006, x + 0.06, y + 0.012, 0.020, "#3D6B58",
-          outline="#274839")
-    s.box(x + 0.06, y - 0.015, 0.010, x + 0.10, y + 0.015, 0.014, "#B9C2C0",
-          outline="#8E9997")
+    _rot_box(s, x, y, dx, dy, -0.05, -0.012, 0.006, 0.06, 0.012, 0.020, "#3D6B58",
+             outline="#274839")
+    _rot_box(s, x, y, dx, dy, 0.06, -0.015, 0.010, 0.10, 0.015, 0.014, "#B9C2C0",
+             outline="#8E9997")
 
 
 def honey_jar_tipped(s: Scene, x, y, length=0.14, r=0.036):
@@ -238,17 +253,17 @@ def eggshell(s: Scene, cx, cy, z=0.0, scale=1.0, color="#F2EBDD"):
 
 def knife(s: Scene, x, y, angle=0.0, length=0.20, blade=0.14):
     dx, dy = math.cos(angle), math.sin(angle)
-    s.box(x - 0.008, y - 0.012, 0.004, x + blade, y + 0.012, 0.008, "#C3CBC9",
-          outline="#8E9997")
-    s.box(x + blade, y - 0.010, 0.006, x + length, y + 0.010, 0.018, "#3A3028",
-          outline="#241D18")
+    _rot_box(s, x, y, dx, dy, -0.008, -0.012, 0.004, blade, 0.012, 0.008, "#C3CBC9",
+             outline="#8E9997")
+    _rot_box(s, x, y, dx, dy, blade, -0.010, 0.006, length, 0.010, 0.018, "#3A3028",
+             outline="#241D18")
 
 
 def onion(s: Scene, cx, cy, r=0.048):
     s.sphere(cx, cy, r * 0.8, r, "#B98A4E")
 
 
-def compost_chute(s: Scene, cx, cy, r=0.060):
+def compost_chute(s: Scene, cx, cy, r=0.055):
     s.cylinder(cx, cy, r + 0.012, 0.0, 0.012, "#B9C2C1", top="#D4DBD9")
     s.cylinder(cx, cy, r, 0.003, 0.013, "#3C4645", top="#2A3332")
 

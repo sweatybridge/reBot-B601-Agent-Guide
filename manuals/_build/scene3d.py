@@ -102,7 +102,7 @@ class Scene:
     def plane(self, pts, color, outline=None, double=True):
         self.face(pts, color, outline, double=double)
 
-    def prism(self, cx, cy, r, z0, z1, color, n=28, outline=None, top=None, bottom=True):
+    def prism(self, cx, cy, r, z0, z1, color, n=28, outline=None, top=None):
         pts = [(cx + r * math.cos(2 * math.pi * i / n),
                 cy + r * math.sin(2 * math.pi * i / n)) for i in range(n)]
         for i in range(n):
@@ -110,8 +110,6 @@ class Scene:
             self.face([(a[0], a[1], z0), (b[0], b[1], z0),
                        (b[0], b[1], z1), (a[0], a[1], z1)], color, outline)
         self.face([(p[0], p[1], z1) for p in pts], top or shade(color, 0.10), outline)
-        if bottom:
-            pass
 
     def cylinder(self, cx, cy, r, z0, z1, color, top=None, inner=None, n=48):
         """Cylinder as flat-tone side quads + caps (no per-face lighting stripes)."""

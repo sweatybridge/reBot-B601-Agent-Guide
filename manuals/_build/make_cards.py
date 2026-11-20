@@ -109,7 +109,7 @@ def overlay_a03(c, cam):
               rgba("#E8A21C", 0.55, SURFACE_HI), z=0.001)
     draw_blob(c, cam, blob_pts(0.365, 0.278, 0.028, 0.018, seed=42, n=12, rough=0.3),
               rgba("#F2B93C", 0.85, SURFACE_HI), z=0.0012)
-    label_wall(c, cam, (0.255, 0.215, 0.04), (80, 610), "SHELL 6–14 mm  ·  3-POINT GRASP")
+    label_wall(c, cam, (0.255, 0.215, 0.04), (80, 610), "SHELL 5–15 mm  ·  3-POINT GRASP")
     label_wall(c, cam, (0.365, 0.278, 0.0), (770, 672), "YOLK FILM  ·  WET WIPE AFTER PICK")
 
 
@@ -158,7 +158,7 @@ def overlay_a04(c, cam):
 # --------------------------------------------------------------------------- #
 def build_a05(s, cam):
     P.counter(s)
-    P.arm_from(s, (-0.60, -0.16, 0.44), (0.305, 0.394, 0.175), elbow=(0.02, 0.10, 0.32))
+    P.arm_from(s, (0.95, -0.16, 0.44), (0.305, 0.394, 0.175), elbow=(0.62, 0.10, 0.32))
     P.jaws(s, 0.305, 0.394, 0.165, 0.132)
     # squeegee blade held against the tile
     s.box(0.265, 0.398, 0.105, 0.345, 0.407, 0.132, "#9AA5A3", outline="#6F7A78")
@@ -229,7 +229,7 @@ SCENES = [
     ("B-03", "Onion skins & peels", "CORNER PREP  ·  SOLID CLUTTER", "b",
      ["GRASP"], B.build_b03, B.overlay_b03,
      ["Parallel jaw + vacuum", "Largest first, 20 picks"],
-     ["Drop into chute Ø120", "Vacuum the fragments"],
+     ["Drop into chute Ø110", "Vacuum the fragments"],
      ["Do not handle the knife", "Wet peels adhere — lift slow"], B.cam_b(eye=(0.42, -0.48, 0.48))),
     ("B-04", "Raw egg spill", "SINK DECK  ·  BIOHAZARD", "b",
      ["BIOHAZARD"], B.build_b04, B.overlay_b04,

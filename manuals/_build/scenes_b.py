@@ -115,7 +115,7 @@ def build_b03(s, cam):
     P.board(s, 0.12, 0.07, 0.28, 0.19)
     P.onion(s, 0.185, 0.175, r=0.050)
     P.knife(s, 0.25, 0.13, angle=0.15, length=0.19)
-    P.compost_chute(s, 0.60, 0.28, r=0.060)
+    P.compost_chute(s, 0.60, 0.28, r=0.055)
     P.arm_from(s, (-0.55, -0.10, 0.50), (0.26, 0.205, 0.12), elbow=(0.02, 0.03, 0.32))
     P.jaws(s, 0.26, 0.205, 0.11, 0.055)
 
@@ -133,7 +133,7 @@ def overlay_b03(c, cam):
     label_wall(c, cam, (0.26, 0.205, 0.05), (74, 606),
                "PEEL 10–40 mm  ·  GRASP + DROP", size=14)
     label_wall(c, cam, (0.60, 0.28, 0.02), (770, 668),
-               "COMPOST CHUTE Ø120  ·  NO KNIFE", size=14)
+               "COMPOST CHUTE Ø110  ·  NO KNIFE", size=14)
 
 
 # --------------------------------------------------------------------------- #

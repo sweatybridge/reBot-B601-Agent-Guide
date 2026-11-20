@@ -1,9 +1,12 @@
 """Can the B601-RS work *under* an upper cabinet?
 
 Samples joint space for poses that put the tool on the worktop below a
-350 mm-deep cabinet whose underside is 450 mm above the worktop. Rejects poses
-where any link capsule intersects the cabinet AABB. Pure stdlib, same chain as
-`workspace_probe.py`.
+350 mm-deep cabinet whose underside is 450 mm above the worktop. The base sits
+on the counter at y=base_y, in front of the cabinet; the arm folds forward
+under the cabinet. Rejects poses where any link capsule intersects the cabinet
+AABB. Reports how far behind the cabinet front edge the tool reaches, the
+highest link point of that pose, and its clearance below the underside. Pure
+stdlib, same chain as `workspace_probe.py`.
 """
 
 import math
@@ -48,7 +51,8 @@ def segment_box_clear(p, q, box, radius, samples=24):
 
 
 def probe(cabinet_depth=0.35, cabinet_bottom=0.45, base_y=0.55, samples=300_000):
-    # cabinet against the wall (y=0), 600 mm wide, base on the counter at y=base_y
+    # cabinet against the wall (y=0), 600 mm wide; the base sits on the counter
+    # at y=base_y, in front of the cabinet edge, and folds forward under it
     box = (-0.30, 0.0, cabinet_bottom, 0.30, cabinet_depth, 2.25)
     radii = [0.055, 0.055, 0.050, 0.045, 0.035, 0.030, 0.020]
     random.seed(5)
@@ -57,6 +61,8 @@ def probe(cabinet_depth=0.35, cabinet_bottom=0.45, base_y=0.55, samples=300_000)
     for _ in range(samples):
         q = [random.uniform(lo, hi) for _n, _x, _r, _a, lo, hi in CHAIN]
         pts, tool, zaxis = joint_points(q)
+        pts = [(x, y + base_y, z) for x, y, z in pts]
+        tool = (tool[0], tool[1] + base_y, tool[2])
         # tool on the worktop, pointing down, under the cabinet
         if not (0.005 < tool[2] < 0.060):
             continue
@@ -73,17 +79,20 @@ def probe(cabinet_depth=0.35, cabinet_bottom=0.45, base_y=0.55, samples=300_000)
                 break
         if not ok:
             continue
-        depth = tool[1]
+        depth = cabinet_depth - tool[1]
         if best is None or depth > best[1]:
-            best = (q, depth, tool)
+            best = (q, depth, tool, max(p[2] for p in pts))
     return hits, best
 
 
 if __name__ == "__main__":
-    for depth in (0.20, 0.25, 0.30, 0.35):
+    for cab_depth in (0.20, 0.25, 0.30, 0.35):
         for bottom in (0.40, 0.45, 0.50):
-            hits, best = probe(cabinet_depth=depth, cabinet_bottom=bottom, samples=200_000)
+            hits, best = probe(cabinet_depth=cab_depth, cabinet_bottom=bottom, samples=200_000)
             if best:
-                print(f"depth={depth:.2f} bottom={bottom:.2f}: tool under cabinet at y={best[1]:.3f} m; candidates={hits}")
+                _q, depth, tool, maxz = best
+                print(f"depth={cab_depth:.2f} bottom={bottom:.2f}: tool {depth*1000:.0f} mm behind edge "
+                      f"(y={tool[1]:.3f} m); highest link {maxz*1000:.0f} mm; "
+                      f"clearance {(bottom - maxz)*1000:.0f} mm; candidates={hits}")
             else:
-                print(f"depth={depth:.2f} bottom={bottom:.2f}: NO collision-free pose; candidates={hits}")
+                print(f"depth={cab_depth:.2f} bottom={bottom:.2f}: NO collision-free pose; candidates={hits}")

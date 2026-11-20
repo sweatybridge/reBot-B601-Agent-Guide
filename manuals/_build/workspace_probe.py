@@ -89,12 +89,12 @@ def main():
         pz = t[2][3] + 0.080 * zz
         if -0.005 <= pz <= 0.060:
             best.append((math.hypot(px, py), pz, px, py, q))
-    best.sort(key=lambda r: r[0], reverse=True)
+    best.sort(key=lambda r: r[0])
     print(f"samples={samples} down_poses={n_down} counter_poses={len(best)}")
     if best:
-        print("max radius at counter:", round(best[0][0] * 1000, 1), "mm at z", round(best[0][1] * 1000, 1))
-        for pct in (50, 90, 99):
-            idx = int(len(best) * pct / 100) - 1
+        print("max radius at counter:", round(best[-1][0] * 1000, 1), "mm at z", round(best[-1][1] * 1000, 1))
+        for pct in (10, 50, 90, 99):
+            idx = max(0, int(len(best) * pct / 100) - 1)
             print(f"p{pct} radius:", round(best[idx][0] * 1000, 1), "mm")
         # radius by approach direction octant
         octants = {}
