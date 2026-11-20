@@ -30,6 +30,13 @@ DICTIONARY = cv2.aruco.DICT_4X4_50
 MARKER_ID = 0
 SIZE_M = 0.04                 # the standard tag: 4 cm across the black square
 QUIET_M = 0.01                # white margin the detector needs around it
+# A planar tag has two mirror poses that reproject the corners almost identically
+# when it is small and nearly face-on; the RMS gap can be a fraction of a pixel.
+# Sub-pixel corner noise is ~0.3-0.5 px, so two front-facing branches whose RMS
+# differs by less than this are statistically tied -- pixel error cannot pick the
+# real one. camera_solve breaks such a tie with the physical prior (the camera is
+# above the base plane) instead of leaving it to min-RMS.
+BRANCH_RMS_TOL_PX = 0.5
 
 # The standard placement, from the RS URDF's base_link.STL: a 140 x 200 x 10 mm
 # foot plate under a round column of radius ~47.5 mm that rises to z = 75 mm, with
@@ -83,6 +90,33 @@ def object_points(size_m=SIZE_M):
                      [half, half, 0.0],
                      [half, -half, 0.0],
                      [-half, -half, 0.0]], dtype=float)
+
+
+def _pose_evidence(points, corners, rvec, tvec, K, dist, marker_id):
+    """`T_cam_marker` plus the reprojection evidence for one PnP pose."""
+    rotation, _jacobian = cv2.Rodrigues(rvec)
+    tvec = np.asarray(tvec, dtype=float).reshape(3)
+    projected, _jacobian = cv2.projectPoints(points, rvec, tvec, K, dist)
+    errors = np.linalg.norm(projected.reshape(-1, 2) - corners, axis=1)
+    rms_px = float(np.sqrt(np.mean(errors ** 2)))
+    sides = [float(np.linalg.norm(corners[(index + 1) % 4] - corners[index]))
+             for index in range(4)]
+    side_px = float(np.mean(sides))
+    area_px = float(abs(cv2.contourArea(corners.astype(np.float32))))
+    view = -tvec / max(1e-12, float(np.linalg.norm(tvec)))
+    grazing_deg = float(np.degrees(np.arccos(np.clip(
+        abs(float(rotation[:, 2] @ view)), 0.0, 1.0))))
+    matrix = np.eye(4)
+    matrix[:3, :3] = rotation
+    matrix[:3, 3] = tvec
+    return {
+        "T_cam_marker": matrix,
+        "rms_px": rms_px,
+        "side_px": side_px,
+        "area_px": area_px,
+        "grazing_deg": grazing_deg,
+        "id": None if marker_id is None else int(marker_id),
+    }
 
 
 def solve(image, K, dist, size_m=SIZE_M, marker_id=MARKER_ID):
@@ -156,28 +190,7 @@ def solve(image, K, dist, size_m=SIZE_M, marker_id=MARKER_ID):
         if rms2 <= best["rms_px"] * 1.05 and float(rotation2[:, 2] @ (-tvec2)) > 0.0:
             rvec, tvec, rotation = rvec2, tvec2, rotation2
 
-    projected, _jacobian = cv2.projectPoints(points, rvec, tvec, K, dist)
-    errors = np.linalg.norm(projected.reshape(-1, 2) - corners, axis=1)
-    rms_px = float(np.sqrt(np.mean(errors ** 2)))
-    sides = [float(np.linalg.norm(corners[(index + 1) % 4] - corners[index]))
-             for index in range(4)]
-    side_px = float(np.mean(sides))
-    area_px = float(abs(cv2.contourArea(corners.astype(np.float32))))
-    view = -tvec / max(1e-12, float(np.linalg.norm(tvec)))
-    grazing_deg = float(np.degrees(np.arccos(np.clip(
-        abs(float(rotation[:, 2] @ view)), 0.0, 1.0))))
-
-    matrix = np.eye(4)
-    matrix[:3, :3] = rotation
-    matrix[:3, 3] = tvec
-    return {
-        "T_cam_marker": matrix,
-        "rms_px": rms_px,
-        "side_px": side_px,
-        "area_px": area_px,
-        "grazing_deg": grazing_deg,
-        "id": None if marker_id is None else int(marker_id),
-    }
+    return _pose_evidence(points, corners, rvec, tvec, K, dist, marker_id)
 
 
 def pose(image, K, dist, size_m=SIZE_M, marker_id=MARKER_ID):
@@ -214,12 +227,68 @@ def base_from_marker(at, yaw=0.0, mode="flat"):
     return matrix
 
 
+def _above_plane_branch(image, K, dist, from_marker, evidence, size_m, marker_id):
+    """The real mirror branch when min-RMS picked the one below the base plane.
+
+    A square tag's two PnP poses reproject the corners almost identically at a
+    near-frontal view, so the lowest-RMS front-facing candidate can be the mirror
+    twin that puts the camera under the table. No real mount does. When the chosen
+    solve is below the base plane, look at the other IPPE_SQUARE branch: if it
+    also sees the printed face, reprojects within corner noise of the chosen one,
+    and sits above the base plane, it is the real pose. Returns `(T_base_cam,
+    evidence)` for it, or None when no such branch exists (the caller's gate then
+    refuses the underground solve as before).
+    """
+    K = np.asarray(K, dtype=float).reshape(3, 3)
+    dist = np.asarray(dist, dtype=float).reshape(-1)
+    corners = detect(image, marker_id=marker_id)
+    points = object_points(size_m)
+    try:
+        count, rvecs, tvecs, _errs = cv2.solvePnPGeneric(
+            points, corners, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+    except cv2.error:
+        return None
+    best = None
+    for index in range(count):
+        rotation, _jacobian = cv2.Rodrigues(rvecs[index])
+        tvec = np.asarray(tvecs[index], dtype=float).reshape(3)
+        if float(rotation[:, 2] @ (-tvec)) <= 0.0:      # must see the printed face
+            continue
+        candidate = _pose_evidence(points, corners, rvecs[index], tvecs[index],
+                                   K, dist, marker_id)
+        if candidate["rms_px"] > evidence["rms_px"] + BRANCH_RMS_TOL_PX:
+            continue
+        matrix = from_marker @ np.linalg.inv(candidate["T_cam_marker"])
+        if matrix[2, 3] <= 0.0:                          # the physical prior
+            continue
+        # Polish the rescued branch the same way solve() polishes its pick.
+        try:
+            rvec2, tvec2 = cv2.solvePnPRefineLM(
+                points, corners.reshape(-1, 1, 2), K, dist,
+                rvecs[index].copy(), tvecs[index].copy())
+            polished = _pose_evidence(points, corners, rvec2, tvec2, K, dist, marker_id)
+            polished_matrix = from_marker @ np.linalg.inv(polished["T_cam_marker"])
+            if polished_matrix[2, 3] > 0.0:
+                candidate, matrix = polished, polished_matrix
+        except cv2.error:
+            pass
+        if best is None or candidate["rms_px"] < best[1]["rms_px"]:
+            best = (matrix, candidate)
+    return best
+
+
 def camera_solve(image, K, dist, at, yaw=0.0, size_m=SIZE_M, marker_id=MARKER_ID,
                  mode="flat"):
     """`T_base_cam` from one photograph, and the PnP evidence for it."""
     from_marker = base_from_marker(at, yaw, mode=mode)
     evidence = solve(image, K, dist, size_m=size_m, marker_id=marker_id)
-    return from_marker @ np.linalg.inv(evidence["T_cam_marker"]), evidence
+    matrix = from_marker @ np.linalg.inv(evidence["T_cam_marker"])
+    if matrix[2, 3] < 0.0:
+        rescued = _above_plane_branch(image, K, dist, from_marker, evidence,
+                                      size_m, marker_id)
+        if rescued is not None:
+            matrix, evidence = rescued
+    return matrix, evidence
 
 
 def camera_pose(image, K, dist, at, yaw=0.0, size_m=SIZE_M, marker_id=MARKER_ID,

@@ -1143,11 +1143,14 @@ def verify_marker(evidence, camera_at=None):
     small to localise, or one seen edge-on is refused rather than written.
 
     `camera_at` is the solved camera centre in the base frame, and it carries the
-    one check that actually separates the planar PnP's two mirror branches. Both
-    reproject the tag's corners identically, so no pixel-space gate can tell them
-    apart -- but the wrong branch puts the camera below the base plane, which no
-    real mount does. Callers that only have the evidence dict still get every
-    other gate; they just cannot be told the branch is wrong.
+    check that separates the planar PnP's two mirror branches. Both reproject the
+    tag's corners identically, so no pixel-space gate can tell them apart -- but
+    the wrong branch puts the camera below the base plane, which no real mount
+    does. `base_marker.camera_solve` already prefers the above-plane branch when
+    the two are tied within corner noise; this gate is the backstop for the cases
+    it cannot rescue (both branches underground, or the gap too wide to trust).
+    Callers that only have the evidence dict still get every other gate; they
+    just cannot be told the branch is wrong.
     """
     rms = float(evidence.get("rms_px", float("inf")))
     side = float(evidence.get("side_px", 0.0))
