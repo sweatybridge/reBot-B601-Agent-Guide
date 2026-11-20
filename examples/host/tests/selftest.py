@@ -327,9 +327,9 @@ def test_schema():
     hold_count = int(round(0.4 * 30))
     check("a joint move holds at zero velocity",
           all(v == 0.0 for point in move_wps[-hold_count:] for v in point["v"]))
-    # Cosine ease peak speed: travel * pi / (2T); travel 0.4 rad over 1 s.
-    expect_peak = 0.4 * math.pi / 2.0
-    check("a joint move's peak v matches the cosine ease",
+    # Trapezoid cruise speed: travel / (T - ramp); travel 0.4 rad over 1 s.
+    expect_peak = 0.4 / (1.0 - traj.RAMP_S)
+    check("a joint move's peak v matches the trapezoid cruise",
           abs(move_stats["peak_v"] - expect_peak) < 0.02 * expect_peak,
           "%.4f vs %.4f rad/s" % (move_stats["peak_v"], expect_peak))
     check("a joint move starts near rest",
@@ -356,6 +356,27 @@ def test_schema():
             lambda p: p["waypoints"][1]["v"].__setitem__(0, float("nan")))
     rejects("rejects a v above the step gate",
             lambda p: p["waypoints"][1]["v"].__setitem__(0, 100.0))
+
+    # The shared leg profile: trapezoid velocity, continuous fraction, analytic
+    # velocity consistent with the fraction, triangle fallback for short legs.
+    for duration in (0.2, 0.6, 1.0, 24.7):
+        fr = [traj.ease_fraction(i / 200.0, duration) for i in range(201)]
+        check("the profile runs 0..1 monotonically (T=%.1f)" % duration,
+              abs(fr[0]) < 1e-12 and abs(fr[-1] - 1.0) < 1e-12
+              and all(b >= a - 1e-12 for a, b in zip(fr, fr[1:])))
+        r = min(0.5, traj.RAMP_S / duration)
+        err = max(abs((traj.ease_fraction((i + 1) / 200.0, duration)
+                       - traj.ease_fraction((i - 1) / 200.0, duration)) * 100.0 / duration
+                      - traj.ease_velocity(i / 200.0, duration))
+                  for i in range(1, 200)
+                  if abs(i / 200.0 - r) > 0.01 and abs(i / 200.0 - (1.0 - r)) > 0.01)
+        check("the profile velocity is the fraction's derivative (T=%.1f)" % duration,
+              err < 1e-3, "worst %.2e" % err)
+    check("a long leg cruises at travel/(T-ramp)",
+          abs(traj.ease_velocity(0.5, 10.0) - 1.0 / (10.0 - traj.RAMP_S)) < 1e-12)
+    check("a short leg degenerates to a triangle, still at rest at the ends",
+          traj.ease_velocity(0.0, 0.2) == 0.0 and traj.ease_velocity(1.0, 0.2) == 0.0
+          and abs(traj.ease_velocity(0.5, 0.2) - 2.0 / 0.2) < 1e-9)
     rejects("rejects a joint outside its limit",
             lambda p: p["waypoints"][0]["q"].__setitem__(1, 2.9))
     rejects("rejects a 0.5 rad jump",
@@ -1864,7 +1885,9 @@ async def test_oracle_server(workdir: Path, geometry):
     plan_id = capture_server.new_capture_id()
     limits = [[float(lo), float(hi)] for lo, hi in rebot_ik.LIMITS] + [[-0.1, 5.0]]
     poses = [np.append(sweep.POSES[3], 0.0), np.append(sweep.POSES[4], 0.0)]
-    trajectory = traj.joint_sequence([np.zeros(7)] + poses, [0.5, 0.5],
+    # 1.5 s legs: the poses are ~3.9 rad apart, and the trapezoid profile's
+    # triangle peak (2*travel/T) on a 0.5 s leg would trip the 0.5 rad step gate.
+    trajectory = traj.joint_sequence([np.zeros(7)] + poses, [1.5, 1.5],
                                      hold_s=1.0, limits=limits)
     out_dir = captures.parent / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3667,7 +3690,7 @@ def test_auto_sweep(workdir: Path):
 
     # The whole sweep, the return to park included, follows one speed policy.
     legs = sweep.sequence()
-    peaks = [(math.pi / 2.0) * float(np.max(np.abs(b - a))) / sweep.seconds_for(a, b)
+    peaks = [float(np.max(np.abs(b - a))) / (sweep.seconds_for(a, b) - traj.RAMP_S)
              for a, b in zip(legs, legs[1:]) if float(np.max(np.abs(b - a))) > 0.0]
     check("no leg, the return included, outruns the speed cap",
           max(peaks) <= sweep.PEAK_SPEED + 1e-9,
@@ -4454,7 +4477,7 @@ def test_identify_gate(workdir: Path):
     chain = [np.zeros(6)] + [entry["q"] for entry in chosen]
     check("the coverage chain is path-safe from the current pose",
           all(sweep.path_safe(a, b) for a, b in zip(chain, chain[1:])))
-    peaks = [(math.pi / 2.0) * float(np.max(np.abs(b - a))) / sweep.seconds_for(a, b)
+    peaks = [float(np.max(np.abs(b - a))) / (sweep.seconds_for(a, b) - traj.RAMP_S)
              for a, b in zip(chain, chain[1:])]
     check("coverage legs stay under the speed cap", max(peaks) <= sweep.PEAK_SPEED + 1e-9,
           "worst %.3f rad/s" % max(peaks))
