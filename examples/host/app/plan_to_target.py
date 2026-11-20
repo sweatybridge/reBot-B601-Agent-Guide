@@ -731,12 +731,11 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             raise PlanError(
                 "the leg to marker %d dips within a link radius of the worktop; "
                 "space the markers further apart or move the arm clear" % index)
-        # The sweep's speed policy is the floor, exactly as on /move: a
-        # caller may ask for a slower leg, never a quicker one. Without it
-        # the wrap legs (j1's long way around the +-2.8 rad stop, ~5.5 rad)
-        # ran in approach_s and whipped the base at ~2.9 rad/s.
-        leg_seconds = max(options.approach_s,
-                          sweep.seconds_for(current_q, target[:n_arm]))
+        # Policy-paced, exactly as on /move: the speed policy (peak cap plus a
+        # cruise floor above stiction breakaway) sets the leg time. approach_s
+        # belongs to the single-tap Cartesian approach; as a floor here it
+        # stretched short legs into a sub-breakaway crawl.
+        leg_seconds = sweep.seconds_for(current_q, target[:n_arm])
         seed = joint_leg(
             current_q,
             {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
@@ -761,7 +760,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                         "link radius of the worktop; move the arm clear and retry"
                         % len(points))
     joint_leg(q_last, {index: q_home[index] - q_last[index] for index in range(n_arm)},
-              max(options.return_s, sweep.seconds_for(q_last, q_home)), "return", gripper)
+              sweep.seconds_for(q_last, q_home), "return", gripper)
 
     steps = ("%d markers: move each tip to its arm-space point; gripper open, "
              "half-close on odd, open on even; return" % len(points))

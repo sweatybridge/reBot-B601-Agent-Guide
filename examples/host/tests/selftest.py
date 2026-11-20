@@ -3720,10 +3720,10 @@ def test_auto_sweep(workdir: Path):
           and sweep.gripper_seconds(float("nan")) == 0.0)
     wrap = (np.array([-2.72, 0, 0, 0, 0, 0]), np.array([2.77, 0, 0, 0, 0, 0]))
     wrap_seconds = sweep.seconds_for(*wrap)
-    check("a j1 wrap leg gets the policy floor, not a 3 s whip",
-          wrap_seconds > 20.0
-          and (math.pi / 2.0) * 5.49 / wrap_seconds <= sweep.PEAK_SPEED + 1e-9,
-          "%.1f s" % wrap_seconds)
+    check("a j1 wrap leg is policy-paced, not a 3 s whip",
+          wrap_seconds > 5.0
+          and 5.49 / (wrap_seconds - traj.RAMP_S) <= sweep.PEAK_SPEED + 1e-9,
+          "%.1f s, cruise %.3f rad/s" % (wrap_seconds, 5.49 / (wrap_seconds - traj.RAMP_S)))
 
     # The selection is the part that replaces timing: a pose counts only if the
     # log shows a *run* of frames at it, and one frame is passing through.
@@ -3965,8 +3965,10 @@ def test_calibrate_api(workdir: Path):
                       (status.get("sweep") or {}).get("poses") == len(sweep.POSES)
                       and status.get("progress") is None)
                 check("GET /calibrate estimates the sweep's motion time",
-                      (status.get("sweep") or {}).get("seconds", 0) > 60,
-                      "%s s" % (status.get("sweep") or {}).get("seconds"))
+                      abs((status.get("sweep") or {}).get("seconds", 0)
+                          - round(sweep.sweep_seconds())) <= 1,
+                      "%s s vs policy %s s" % ((status.get("sweep") or {}).get("seconds"),
+                                               round(sweep.sweep_seconds())))
 
                 # Now with a correspondence a real gripper edge would give.
                 auto_calibrate.detect_all = exact_detect
