@@ -133,8 +133,9 @@ the wrist.
 These apply in every layout:
 
 1. **Heat lockout.** No entry into a hob zone until the surface is below 40 °C,
-   the gas is off, and the burner is locked out. A 300 mm exclusion ring is drawn
-   around every hob.
+   the gas is off, and the burner is locked out. A 300 mm exclusion ring applies
+   around every hob; it is marked on the Layout B sheet, the only layout whose
+   disc overlaps a hob.
 2. **Water and power.** GFCI on the 48 V supply, drip loops, no spray, no tool
    saturated enough to drip. The arm wipes; it does not rinse.
 3. **Presence.** A 300 mm keep-clear around the base and a supervised mode. Stop
@@ -150,8 +151,9 @@ These apply in every layout:
 
 Each layout sheet has a **plan** at a stated scale with a 1 m scale bar, a
 **schematic section**, and deployment notes. The plan shows the base, the 600 mm
-working radius, the 755 mm maximum, the 40° dead wedge, the tool dock, and the
-heat keep-out. It also shows the optional cameras: a teal module at the hood edge
+working radius, the 755 mm maximum, the 40° dead wedge, and the tool dock; Layout
+B also marks the heat keep-out (its hob is inside the disc — A and C keep the hob
+outside the envelope, so their sheets draw no keep-out). It also shows the optional cameras: a teal module at the hood edge
 and a purple module at the bottom edge of the upper cabinets (or the island soffit
 in C), each with a dashed view rectangle. The mess cards are close-ups: the arm
 enters from the side that matches the layout, the tool is the one named in the

@@ -259,13 +259,6 @@ class Plan:
         ring(r_work, self.acc["main"], 1.6, False)
         ring(r_max, self.acc["mid"], 1.1, True)
 
-    def keepout(self, x0, y0, w, d, margin=400):
-        # rounded dashed rectangle around the hob
-        x, y = x0 - margin, y0 - margin
-        ww, dd = w + margin * 2, d + margin * 2
-        pts = [(x, y), (x + ww, y), (x + ww, y + dd), (x, y + dd), (x, y)]
-        self.line(pts, fill=KEEPOUT, width=1.2, dash=True)
-
     def dock(self, x0, y0, w, d):
         self.rect(x0, y0, w, d, fill="#EFE8DA", outline=self.acc["mid"], width=1, dash=True)
         p = self.p(x0 + w / 2, y0 + d / 2)
@@ -509,19 +502,20 @@ def panel(c, box, title=None, accent="a"):
                weight="b", tracking=1.4)
 
 
-def legend(c, x, y, accent):
+def legend(c, x, y, accent, heat=False):
     acc = ACCENTS[accent]
     items = [
         ("base", "arm base Ø180"),
         ("work", "600 working radius"),
         ("max", "755 max reach"),
         ("dead", "40° dead wedge"),
-        ("keep", "heat keep-out"),
         ("dock", "tool dock"),
         ("cam", "hood camera"),
         ("ccam", "cabinet cam"),
         ("hood", "hood outline"),
     ]
+    if heat:
+        items.insert(4, ("keep", "heat keep-out"))
     for i, (kind, label) in enumerate(items):
         xx = x + (i % 3) * 200
         yy = y + (i // 3) * 34
@@ -550,7 +544,7 @@ def legend(c, x, y, accent):
         c.text(xx + 24, yy + 5, label, size=10, color=INK_SOFT, family="mono")
 
 
-def notes_panel(c, box, title, items, accent, key=True):
+def notes_panel(c, box, title, items, accent, key=True, heat=False):
     x0, y0, x1, y1 = box
     acc = ACCENTS[accent]
     panel(c, box, title, accent)
@@ -562,7 +556,7 @@ def notes_panel(c, box, title, items, accent, key=True):
         y += 52
     if key:
         c.text(x0 + 18, y + 4, "KEY", 10, acc["main"], family="mono", weight="b", tracking=1.2)
-        legend(c, x0 + 18, y + 22, accent)
+        legend(c, x0 + 18, y + 22, accent, heat=heat)
 
 
 def footer(c, text, accent):

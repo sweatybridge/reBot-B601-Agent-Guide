@@ -90,11 +90,11 @@ does not have:
 | Rear/corner clearance | 100 mm service | 150 mm in the void |
 | Front clearance | 300 mm keep-clear | 1100 mm to the aisle |
 | Hob exclusion | 300 mm while hot | 300 mm marked; interlocked |
-| Tool dock | within 450 mm | 401 mm |
+| Tool dock | within 450 mm | 421 mm |
 | Compost chute | within 300 mm | 214 mm |
 | Spice station | within 400 mm | 336 mm |
 
-The tool dock at 401 mm is inside the 450 mm dock rule: it is
+The tool dock at 421 mm (centre distance) is inside the 450 mm dock rule: it is
 still inside the working disc, but the arm has to turn to reach it. Keep the dock
 clear of the sink splash zone; a wet dock is a slipping tool.
 
@@ -351,7 +351,7 @@ surface that will be wiped afterwards.
 1. Reinforce the corner: 6 mm steel plate under the counter, four M6 through-bolts.
 2. Bolt the base at (430, 430); torque to 8 Nm; check the corner for rocking.
 3. Fit the compost chute at (600, 560) with a 110 mm opening and a gasketed lid.
-4. Fit the tool dock at (820, 525), 401 mm from the base; keep it dry.
+4. Fit the tool dock at (750, 525), 421 mm from the base (centre distance); keep it dry.
 5. Fit the PSU above the cabinet floor; GFCI; drip loop; sealed cable entry.
 6. Install the hob interlock: current sensor + IR/thermocouple; test the refusal.
 7. Mark the 300 mm exclusion zone around the hob with removable tape.
@@ -369,7 +369,7 @@ surface that will be wiped afterwards.
 | Base plate, 200 × 200 × 6 steel | 1 | Corner reinforcement |
 | M6 × 60 stainless bolts | 4 | 8 Nm |
 | Compost chute kit, 110 mm | 1 | Gasketed lid, 6 L bin |
-| Tool dock, 8 slots | 1 | 401 mm from base |
+| Tool dock, 8 slots | 1 | 421 mm from base |
 | Tools T1–T8 | 1 set | <300 g each |
 | Hob interlock: current sensor + IR/thermocouple | 1 | Refuses start when hot |
 | Gas isolation / smart valve | 1 | Cold-clean mode |

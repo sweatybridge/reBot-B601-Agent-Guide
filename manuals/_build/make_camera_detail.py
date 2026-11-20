@@ -48,15 +48,16 @@ def main():
     c.rect([wall_x, counter_y, 880, floor_y], fill="#F2EBDD", outline="#C9BEA9", width=1)
     for x in (260, 420, 580, 740):
         c.line([(x, counter_y + 10), (x, floor_y)], fill="#DDD3C1", width=0.8)
-    c.rect([wall_x, counter_y - 12, 760, counter_y + 2], fill=COUNTER_FILL, outline=COUNTER_LINE, width=1)
-    c.line([(wall_x, counter_y - 12), (760, counter_y - 12)], fill="#FBF6EC", width=2)
+    # worktop slab: top surface exactly at counter_y (900 AFF), thickness below
+    c.rect([wall_x, counter_y, 760, counter_y + 14], fill=COUNTER_FILL, outline=COUNTER_LINE, width=1)
+    c.line([(wall_x, counter_y), (760, counter_y)], fill="#FBF6EC", width=2)
 
     # hob
-    c.rect([back_x, counter_y - 14, front_x, counter_y - 6], fill="#2B3231", outline="#171D1C", width=1)
+    c.rect([back_x, counter_y - 8, front_x, counter_y], fill="#2B3231", outline="#171D1C", width=1)
     for x in (240, 390):
-        c.ellipse([x - 30, counter_y - 40, x + 30, counter_y - 12], outline="#6C7774", width=1)
-        c.line([(x - 30, counter_y - 26), (x + 30, counter_y - 26)], fill="#6C7774", width=0.8)
-        c.line([(x, counter_y - 40), (x, counter_y - 12)], fill="#6C7774", width=0.8)
+        c.ellipse([x - 30, counter_y - 28, x + 30, counter_y], outline="#6C7774", width=1)
+        c.line([(x - 30, counter_y - 14), (x + 30, counter_y - 14)], fill="#6C7774", width=0.8)
+        c.line([(x, counter_y - 28), (x, counter_y)], fill="#6C7774", width=0.8)
 
     # hood
     c.rect([back_x, hood_top, front_x, hood_bottom], fill="#E6DDCC", outline="#8E8576", width=1)
@@ -76,9 +77,9 @@ def main():
     c.line([(front_x - 8, hood_bottom), (front_x + 8, hood_bottom)], fill=ACC["main"], width=2)
 
     # FOV cone
-    c.dashed([(front_x, hood_bottom), (back_x, counter_y - 12)], dash=8, gap=6,
+    c.dashed([(front_x, hood_bottom), (back_x, counter_y)], dash=8, gap=6,
              fill=ACC["main"], width=1.1)
-    c.dashed([(front_x, hood_bottom), (760, counter_y - 12)], dash=8, gap=6,
+    c.dashed([(front_x, hood_bottom), (760, counter_y)], dash=8, gap=6,
              fill=ACC["main"], width=1.1)
     c.arc([front_x - 190, counter_y - 36, front_x + 190, counter_y + 36], 180, 360,
           fill=ACC["main"], width=1.0)
@@ -91,13 +92,14 @@ def main():
     c.text(back_x + 12, 262, "USB-C / 5 V 2 A", size=8, color=MUTED, family="mono")
 
     # dimensions
-    c.line([(790, hood_bottom), (790, counter_y - 12)], fill=MUTED, width=0.8)
-    for y in (hood_bottom, counter_y - 12):
+    # dimensions: lens 1500 AFF, worktop 900 AFF -> 600 gap; floor -> worktop 900
+    c.line([(790, hood_bottom), (790, counter_y)], fill=MUTED, width=0.8)
+    for y in (hood_bottom, counter_y):
         c.line([(784, y), (796, y)], fill=MUTED, width=0.8)
     c.text(798, (hood_bottom + counter_y) / 2, "600", size=10, color=MUTED, family="mono")
 
-    c.line([(820, counter_y - 12), (820, floor_y)], fill=MUTED, width=0.8)
-    for y in (counter_y - 12, floor_y):
+    c.line([(820, counter_y), (820, floor_y)], fill=MUTED, width=0.8)
+    for y in (counter_y, floor_y):
         c.line([(814, y), (826, y)], fill=MUTED, width=0.8)
     c.text(828, (counter_y + floor_y) / 2, "900", size=10, color=MUTED, family="mono")
 

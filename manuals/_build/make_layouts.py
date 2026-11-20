@@ -206,7 +206,7 @@ def layout_b():
     p.circle(600, 560, 40, fill="#2A3332", outline=None)
     c.text(p.p(600, 560)[0], p.p(600, 560)[1] + 3, "BIN", size=8, color="#D4DBD9",
            family="mono", anchor="mm")
-    p.dock(820, 525, 160, 75)
+    p.dock(750, 525, 160, 75)
 
     p.cabinet(1300, 0, 1100, 350)
     p.cabinet(280, 0, 300, 350)
@@ -220,7 +220,9 @@ def layout_b():
 
     p.arm(430, 430, dead_center=-135)
     p.line([(430, 430), (20, 20)], fill="#8C8A80", width=1.1, dash=True)
-    p.line([(0, 650), (600, 650), (600, 1350), (0, 1350)], fill=KEEPOUT, width=1.2, dash=True)
+    # 300 mm heat exclusion around the hob (100, 750, 400, 500); the wall side
+    # is clipped at x = 0 because the hob sits 100 mm from the left wall
+    p.line([(0, 450), (800, 450), (800, 1550), (0, 1550)], fill=KEEPOUT, width=1.2, dash=True)
 
     p.dim_v(0, 600, 2550, "600")
     p.dim_h(0, 600, 2500, "600")
@@ -230,7 +232,7 @@ def layout_b():
     p.label((300, 1000), (600, 1400), "HOB  ·  NEAR BURNERS 462–509 mm", size=11)
     p.label((560, 120), (430, 240), "SPICE RACK", size=10)
     p.label((600, 560), (720, 600), "BIN Ø110", size=10)
-    p.label((900, 560), (1000, 680), "TOOL DOCK", size=10)
+    p.label((830, 560), (1000, 680), "TOOL DOCK", size=10)
     p.label((1850, 175), (1500, 820), "UPPER RUN STARTS 870 mm FROM BASE", size=10)
 
     p.section_mark(430, 650, 430, 1350, "B")
@@ -263,9 +265,9 @@ def layout_b():
     s.reach(430, 900, 600, 755)
     s.arm([(430, 900), (430, 990), (620, 1230), (900, 1140), (820, 950)],
           base_x=430, base_z=900)
-    # heat exclusion line
-    s.line([(750, 0), (750, 2400)], fill=KEEPOUT, width=1.2, dash=True)
-    c.text(s.p(750, 2320)[0] + 6, s.p(750, 2320)[1], "COLD CLEAN ONLY", size=9,
+    # heat exclusion line, 300 mm before the hob edge (750 - 300)
+    s.line([(450, 0), (450, 2400)], fill=KEEPOUT, width=1.2, dash=True)
+    c.text(s.p(450, 2320)[0] + 6, s.p(450, 2320)[1], "COLD CLEAN ONLY", size=9,
            color=KEEPOUT, family="mono")
 
     s.dim_v(1320, 900, 1350, "450", side="right")
@@ -282,9 +284,9 @@ def layout_b():
         ("Dual coverage", "Sink centre 536 mm; near burners 462–509 mm."),
         ("Cabinet line", "Main runs start 870 mm; a 300 × 350 camera cabinet sits over the base at 450 mm."),
         ("Heat interlock", "Hob surface < 40 °C, gas off, burner lockout before entry."),
-        ("Waste + tools", "Compost chute 214 mm; tool dock 401 mm (inside the 450 mm rule)."),
+        ("Waste + tools", "Compost chute 214 mm; tool dock 421 mm (inside the 450 mm rule)."),
         ("Human only", "Far burners and the upper cabinets stay outside the envelope."),
-    ], acc)
+    ], acc, heat=True)
 
     footer(c, "Layout B  ·  plan to scale, section schematic  ·  all dimensions in mm", acc)
     c.save(str(OUT / "layout-b-plan.png"))
