@@ -223,15 +223,14 @@ def check(start=None, verbose=False):
 # Motion policy for every leg of the sweep, the return to park included.
 #
 # Legs use the trapezoid profile (traj.ease_fraction): short velocity ramps into
-# a constant cruise. The duration is the slower of two demands -- the peak cap
-# (cosine-calibrated: pi/2 x travel / peak, which the trapezoid cruise stays
-# under) and a cruise floor above the drive's stiction breakaway (~0.2 rad/s at
-# kp=50): a leg that crawls below breakaway sticks and slips instead of moving.
-# 0.35 rad/s is about 20 deg/s -- slow enough to watch, and it costs a couple of
-# minutes once, on a commissioning pass that should not be hurried. The old 3 s
-# minimum is gone: it made short legs cruise far below breakaway. The ramps now
-# provide the gentle start, so MIN_SECONDS is just the triangle floor (2 x ramp).
-PEAK_SPEED = 0.35        # rad/s
+# a constant cruise, so the cap is calibrated to the profile actually used --
+# cruise = travel / (T - ramp), and PEAK_SPEED means what it says. 0.5 rad/s is
+# about 29 deg/s. A cruise floor (MIN_CRUISE_SPEED) keeps legs above the drive's
+# stiction breakaway (~0.2 rad/s at kp=50) if the maximum clamp would otherwise
+# make a huge leg crawl. The old 3 s minimum is gone: it made short legs cruise
+# far below breakaway. The ramps provide the gentle start, so MIN_SECONDS is
+# just the triangle floor (2 x ramp).
+PEAK_SPEED = 0.5         # rad/s
 MIN_CRUISE_SPEED = 0.25  # rad/s, above the ~0.2 rad/s stiction breakaway
 MIN_SECONDS = 0.3
 MAX_SECONDS = 25.0
@@ -442,15 +441,16 @@ def sag_compensator(kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
 def seconds_for(a, b, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SECONDS):
     """How long a leg should take, from the furthest-travelling joint.
 
-    Two demands, whichever is slower: the cosine-calibrated peak cap (the
-    trapezoid cruise stays under it for any leg longer than ~0.4 s), and a
-    cruise floor above the drive's stiction breakaway so short legs move
-    instead of stick-slipping. The caller's minimum/maximum clamp the result.
+    Trapezoid-native: cruise = travel / (T - ramp), so the peak cap is
+    travel / peak + ramp. The cruise floor is an upper bound on T -- if the
+    maximum clamp would make a huge leg crawl below stiction breakaway, the
+    leg is shortened to keep cruise >= MIN_CRUISE_SPEED. The caller's minimum
+    is the triangle floor for tiny nudges.
     """
     travel = float(np.max(np.abs(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))))
-    peak_time = (math.pi / 2.0) * travel / float(peak_speed)
-    cruise_time = travel / MIN_CRUISE_SPEED + traj.RAMP_S
-    return max(minimum, min(maximum, max(peak_time, cruise_time)))
+    peak_time = travel / float(peak_speed) + traj.RAMP_S
+    cruise_cap = travel / MIN_CRUISE_SPEED + traj.RAMP_S
+    return max(minimum, min(maximum, peak_time, cruise_cap))
 
 
 def gripper_seconds(travel, peak_speed=GRIPPER_PEAK_SPEED):
