@@ -553,7 +553,12 @@ fn parse_model_spec(spec: &str, default: &str, ids: &[u8]) -> Result<Vec<Model>>
 }
 
 fn clamp_u16(value: f64) -> u16 {
-    if !value.is_finite() || value <= 0.0 {
+    if !value.is_finite() {
+        // NaN must not decode to the extreme: u16 0 is -max (−4π position,
+        // −Tmax torque). Mid-scale is the neutral zero for the symmetric
+        // fields, the safest direction for a defensive clamp to fail in.
+        0x7FFF
+    } else if value <= 0.0 {
         0
     } else if value >= 65535.0 {
         0xFFFF
@@ -823,6 +828,12 @@ impl CanBus {
             }
             if ready == 0 {
                 return Ok(None);
+            }
+            // POLLERR/POLLHUP/POLLNVAL make poll return immediately with no
+            // POLLIN; continuing would busy-spin to the deadline. The bus is
+            // gone (interface down / fd invalid) -- report it, do not spin.
+            if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                bail!("{}: poll error (revents {:#x})", self.channel, pollfd.revents);
             }
             if pollfd.revents & libc::POLLIN == 0 {
                 continue;
@@ -2549,6 +2560,20 @@ fn read_drift<T: Transport>(arm: &mut Arm<T>, trajectory: &Trajectory) -> Result
     Ok(worst)
 }
 
+/// The waypoint indices `--track` reports at 25/50/75/100% of the trajectory.
+/// The play loop indexes `0..len-1`, so 100% must be `len-1`: using `len`
+/// (the old computation) never matches and silently drops the final sample.
+fn track_samples(len: usize) -> BTreeSet<usize> {
+    if len == 0 {
+        return BTreeSet::new();
+    }
+    let last = (len - 1) as f64;
+    [0.25_f64, 0.5, 0.75, 1.0]
+        .iter()
+        .map(|fraction| (last * fraction).round() as usize)
+        .collect()
+}
+
 fn play<T: Transport>(
     arm: &mut Arm<T>,
     trajectory: &Trajectory,
@@ -2558,10 +2583,7 @@ fn play<T: Transport>(
 ) -> Result<i32> {
     let speed = args.speed.clamp(0.1, 5.0);
     let sample_at: BTreeSet<usize> = if args.track {
-        [0.25_f64, 0.5, 0.75, 1.0]
-            .iter()
-            .map(|fraction| (trajectory.raw.waypoints.len() as f64 * fraction).round() as usize)
-            .collect()
+        track_samples(trajectory.raw.waypoints.len())
     } else {
         BTreeSet::new()
     };
@@ -2949,6 +2971,12 @@ struct ServerState {
     playing: AtomicBool,
     stopping: AtomicBool,
     child: AtomicI32,
+    // A pidfd pins the child's identity, so /stop can signal it without the
+    // PID-reuse race a bare kill(pid) has between exit and store(0). -1 when
+    // unavailable (non-Linux or old kernel); stop() then falls back to kill.
+    // pidfd_lock serializes using the fd against closing it after the wait.
+    child_pidfd: AtomicI32,
+    pidfd_lock: Mutex<()>,
 }
 
 fn is_loopback(listen: &str) -> bool {
@@ -3007,6 +3035,8 @@ fn serve(mut args: ServeArgs) -> Result<i32> {
         playing: AtomicBool::new(false),
         stopping: AtomicBool::new(false),
         child: AtomicI32::new(0),
+        child_pidfd: AtomicI32::new(-1),
+        pidfd_lock: Mutex::new(()),
     });
 
     for connection in listener.incoming() {
@@ -3229,7 +3259,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 fn route(state: &ServerState, request: &Request) -> (u16, serde_json::Value) {
     if request.path == "/health" {
-        return (200, health(state));
+        // Health is open (no token), but only on GET: POST /health is a wrong
+        // method, not a free 200. Dispatch the method here so the 405 arm below
+        // is not dead code.
+        if request.method == "GET" {
+            return (200, health(state));
+        }
+        return (405, serde_json::json!({ "ok": false, "error": "wrong method for this path" }));
     }
     if !authorised(state, request) {
         return (401, serde_json::json!({
@@ -3252,7 +3288,7 @@ fn route(state: &ServerState, request: &Request) -> (u16, serde_json::Value) {
         }
         ("POST", "/play") => handle_play(state, request),
         ("POST", "/stop") => stop(state),
-        ("GET", "/play") | ("POST", "/pose") | ("POST", "/health") | ("GET", "/stop") => {
+        ("GET", "/play") | ("POST", "/pose") | ("GET", "/stop") => {
             (405, serde_json::json!({ "ok": false, "error": "wrong method for this path" }))
         }
         _ => (404, serde_json::json!({ "ok": false, "error": "no such path" })),
@@ -3394,10 +3430,33 @@ fn run_child(
             return (500, serde_json::json!({ "ok": false, "error": format!("cannot start the player: {error}") }));
         }
     };
-    state.child.store(child.id() as i32, Ordering::SeqCst);
+    // Open the pidfd before publishing the pid, under the same lock stop()
+    // takes, so a published child always has its pidfd set (or -1 if the
+    // kernel lacks pidfd). pidfd_send_signal then cannot hit a reused PID.
+    #[cfg(target_os = "linux")]
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as i32, 0u32) } as i32;
+    {
+        let _guard = state.pidfd_lock.lock().unwrap();
+        #[cfg(target_os = "linux")]
+        state.child_pidfd.store(pidfd, Ordering::SeqCst);
+        state.child.store(child.id() as i32, Ordering::SeqCst);
+    }
 
     let output = child.wait_with_output();
-    state.child.store(0, Ordering::SeqCst);
+    {
+        // Close the pidfd and clear the pid atomically wrt stop(): under this
+        // lock, pidfd == -1 implies child == 0, so stop() never falls back to
+        // kill() on a stale pid once the child has been reaped.
+        let _guard = state.pidfd_lock.lock().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let fd = state.child_pidfd.swap(-1, Ordering::SeqCst);
+            if fd >= 0 {
+                unsafe { libc::close(fd); }
+            }
+        }
+        state.child.store(0, Ordering::SeqCst);
+    }
     let _ = fs::remove_file(&path);
     // Read the log even when the player aborted: the abort/stall fields are
     // exactly what the caller needs then. A missing or torn log costs the
@@ -3530,6 +3589,9 @@ fn stop(state: &ServerState) -> (u16, serde_json::Value) {
             "error": "execution is disabled: start the server with --allow-execute",
         }));
     }
+    // Hold the pidfd lock across the whole decision so the child cannot be
+    // reaped (pidfd closed, pid cleared) between reading the pid and signaling.
+    let _guard = state.pidfd_lock.lock().unwrap();
     let pid = state.child.load(Ordering::SeqCst);
     if pid <= 0 {
         return (200, serde_json::json!({
@@ -3539,6 +3601,31 @@ fn stop(state: &ServerState) -> (u16, serde_json::Value) {
         }));
     }
     state.stopping.store(true, Ordering::SeqCst);
+    #[cfg(target_os = "linux")]
+    {
+        let fd = state.child_pidfd.load(Ordering::SeqCst);
+        if fd >= 0 {
+            let rc = unsafe {
+                libc::syscall(libc::SYS_pidfd_send_signal, fd, libc::SIGTERM,
+                              std::ptr::null_mut::<libc::siginfo_t>(), 0u32)
+            };
+            if rc == 0 {
+                return (200, serde_json::json!({ "ok": true, "stopping": true, "pid": pid }));
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                // The pidfd pins identity: ESRCH means OUR child already exited,
+                // not that the pid was reused. There is nothing to signal.
+                state.stopping.store(false, Ordering::SeqCst);
+                return (200, serde_json::json!({
+                    "ok": true, "stopping": false, "note": "the player already exited",
+                }));
+            }
+            // Any other error falls through to the pid fallback below.
+        }
+    }
+    // Fallback (non-Linux, or a kernel without pidfd): kill(pid) carries the
+    // legacy PID-reuse window; the pidfd path above is the race-free one.
     let signal = unsafe { libc::kill(pid, libc::SIGTERM) };
     if signal != 0 {
         let error = io::Error::last_os_error();
@@ -3842,7 +3929,7 @@ mod tests {
         let text = include_str!("../testdata/mini_trajectory.json");
         let trajectory = parse_trajectory(Path::new("mini_trajectory.json"), text).unwrap();
         assert_eq!(trajectory.ids, vec![1, 2]);
-        assert_eq!(trajectory.hz, 30);
+        assert_eq!(trajectory.hz, 10);
         assert!(trajectory.has_tau);
         assert!((trajectory.peak_tau - 0.5).abs() < 1e-12);
         assert!(trajectory.has_v);
@@ -4574,6 +4661,8 @@ mod tests {
         let code = play(&mut arm, &trajectory, &args, &mut logged, &mut notes).unwrap();
 
         assert_eq!(code, 0);
+        assert_eq!(trajectory.hz, 10,
+                   "fixture control_hz matches its 0.1 s waypoint spacing");
         assert_eq!(logged.len(), 4);
         assert!(notes.abort.is_none());
         assert!(notes.tick.is_some(), "tick spacing is recorded for the log");
@@ -4989,6 +5078,8 @@ mod tests {
             playing: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             child: AtomicI32::new(0),
+            child_pidfd: AtomicI32::new(-1),
+            pidfd_lock: Mutex::new(()),
         }
     }
 
@@ -5083,6 +5174,66 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn track_samples_fire_on_the_last_waypoint() {
+        let small = track_samples(4);
+        assert!(small.contains(&3), "100% must land on the last index: {small:?}");
+        assert!(small.iter().all(|&index| index < 4));
+        let big = track_samples(600);
+        assert!(big.contains(&599), "100% of 600 waypoints is index 599: {big:?}");
+        assert!(big.iter().all(|&index| index < 600));
+        assert_eq!(track_samples(1), BTreeSet::from([0]));
+        assert!(track_samples(0).is_empty());
+    }
+
+    #[test]
+    fn clamp_u16_nan_is_neutral_not_the_extreme() {
+        // u16 0 decodes to -max (-4pi / -Tmax): NaN must fail toward neutral.
+        assert_eq!(clamp_u16(f64::NAN), 0x7FFF);
+        assert_eq!(clamp_u16(f64::INFINITY), 0x7FFF);
+        assert_eq!(clamp_u16(f64::NEG_INFINITY), 0x7FFF);
+        assert_eq!(clamp_u16(-1.0), 0);
+        assert_eq!(clamp_u16(70000.0), 0xFFFF);
+        assert_eq!(clamp_u16(123.4), 123);
+    }
+
+    #[test]
+    fn post_health_is_405_get_health_is_open() {
+        let state = serve_state(false, "secret");
+        let (status, _) = route(&state, &http_request("POST", "/health", Some("secret"), ""));
+        assert_eq!(status, 405, "POST /health is a wrong method, not a free 200");
+        let (status, _) = route(&state, &http_request("GET", "/health", None, ""));
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn stop_on_an_idle_server_reports_nothing_playing() {
+        let state = serve_state(true, "secret");
+        let (status, body) = route(&state, &http_request("POST", "/stop", Some("secret"), ""));
+        assert_eq!(status, 200);
+        assert_eq!(body["stopping"], false);
+    }
+
+    #[test]
+    fn recv_bails_on_a_hung_up_socket_instead_of_spinning() {
+        let mut fds = [0i32; 2];
+        let rc = unsafe {
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
+        };
+        assert_eq!(rc, 0);
+        unsafe { libc::close(fds[1]); } // peer gone: POLLHUP on fds[0]
+        let bus = CanBus {
+            fd: fds[0],
+            channel: "test".to_string(),
+            reader: None,
+            active_reports: Vec::new(),
+        };
+        let result = bus.recv(Duration::from_millis(200));
+        // bus drops here, closing fds[0]; a hung-up bus must error immediately,
+        // not busy-spin to the deadline and return Ok(None).
+        assert!(result.is_err(), "a hung-up bus must error, not spin");
     }
 
     #[test]

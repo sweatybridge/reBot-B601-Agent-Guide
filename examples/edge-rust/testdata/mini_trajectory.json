@@ -2,7 +2,7 @@
   "format": "rebot-joint-trajectory",
   "version": 1,
   "created": "2026-01-01T00:00:00",
-  "control_hz": 30,
+  "control_hz": 10,
   "ids": [1, 2],
   "limits": [[-2.8, 2.8], [-2.8, 2.8]],
   "steps": "fixture: two joints, four waypoints",
