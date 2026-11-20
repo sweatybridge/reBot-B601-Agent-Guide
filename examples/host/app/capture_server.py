@@ -1831,11 +1831,22 @@ async def _oracle_hold_grabs(app, prep):
         logging.warning("oracle hold grabs for %s failed: %s", prep["plan_id"], exc)
 
 
-def _oracle_detect(frame, q6, K, dist, T_base_cam, t_tip, pre_image, predicted):
-    """The tip pixel: green first, then the pre-frame's template. None, never a guess.
+def _oracle_detect(frame, q6, K, dist, T_base_cam, t_tip):
+    """The tip pixel: green, with a fragment-cleaned retry. None, never a guess.
 
     A failed detection is `detected: null` (§5.3): the oracle reports what it
     saw, and a missing measurement is not a zero error.
+
+    There is no template fallback. Its template came from the PRE-execution
+    still, where the arm is parked: at a hold pose that patch is background,
+    and on the 20261120T064648Z coverage run it "matched" blank wall at 0.87
+    and produced 16-221 mm pixel errors. A guess from background is worse than
+    no measurement.
+
+    Green itself can fail on a fragmented cover: the nearest component is a
+    sliver below GREEN_MIN_BLOB_PX while the substantial cover sits a little
+    farther out. The retry keeps only sizeable blobs -- still colour evidence
+    from this frame, never background, never another frame.
     """
     import cv2
 
@@ -1847,18 +1858,20 @@ def _oracle_detect(frame, q6, K, dist, T_base_cam, t_tip, pre_image, predicted):
         return {"detector": "green", "uv": [found.u, found.v], "score": found.score}
     except auto_calibrate.AutoError:
         pass
-    if pre_image is None or predicted is None:
+    mask = auto_calibrate.green_mask(frame)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    clean = np.zeros_like(mask)
+    for index in range(1, count):
+        if stats[index, cv2.CC_STAT_AREA] >= auto_calibrate.GREEN_MIN_BLOB_PX:
+            clean[labels == index] = 255
+    if int(clean.sum()) // 255 < auto_calibrate.MIN_GREEN_PX:
         return None
     try:
-        templates, centre = auto_calibrate.tip_templates(pre_image, predicted, options)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        found = auto_calibrate.match_tip(gray, templates, centre, predicted, options, size)
-    except (auto_calibrate.AutoError, cv2.error):
+        found = auto_calibrate.detect_tip_green(frame, q6, K, dist, T_base_cam, t_tip,
+                                                options, size, mask=clean)
+    except auto_calibrate.AutoError:
         return None
-    if found is None:
-        return None
-    u, v, score = found
-    return {"detector": "template", "uv": [u, v], "score": score}
+    return {"detector": "green", "uv": [found.u, found.v], "score": found.score}
 
 
 def _oracle_tool_tip(app, rig):
@@ -2000,8 +2013,7 @@ async def oracle_finish(app, prep, sid):
                     hold["predicted_tip_px"] = (list(predicted) if predicted else None)
                     found = await asyncio.to_thread(
                         _oracle_detect, frame, np.asarray(hold["q_meas"][:6]),
-                        K, dist, np.asarray(rig.T_base_cam, dtype=float), t_tip,
-                        pre_image, predicted)
+                        K, dist, np.asarray(rig.T_base_cam, dtype=float), t_tip)
                     hold["detected_tip_px"] = found["uv"] if found else None
                     hold["detector"] = found["detector"] if found else None
                     hold["detector_score"] = found["score"] if found else None

@@ -1,0 +1,100 @@
+{
+ "plan_id": "20261120T064648Z-a7dd9e",
+ "old_verdict": {
+  "layer": "perception",
+  "problems": [
+   "tip-detector",
+   "sag",
+   "tip-error"
+  ]
+ },
+ "new_verdict": {
+  "layer": "perception",
+  "problems": [
+   "tip-detector",
+   "sag",
+   "tip-error"
+  ]
+ },
+ "holds": [
+  {
+   "index": 1,
+   "detector": "green",
+   "pixel_error_mm": 76.38,
+   "tip_error_mm": 13.902
+  },
+  {
+   "index": 2,
+   "detector": "green",
+   "pixel_error_mm": 49.45,
+   "tip_error_mm": 3.257
+  },
+  {
+   "index": 3,
+   "detector": "green",
+   "pixel_error_mm": 16.69,
+   "tip_error_mm": 4.082
+  },
+  {
+   "index": 4,
+   "detector": "green",
+   "pixel_error_mm": 45.08,
+   "tip_error_mm": 4.104
+  },
+  {
+   "index": 5,
+   "detector": null,
+   "pixel_error_mm": null,
+   "tip_error_mm": 28.953
+  },
+  {
+   "index": 6,
+   "detector": "green",
+   "pixel_error_mm": 20.0,
+   "tip_error_mm": 3.415
+  },
+  {
+   "index": 7,
+   "detector": "green",
+   "pixel_error_mm": 81.53,
+   "tip_error_mm": 4.153
+  },
+  {
+   "index": 8,
+   "detector": "green",
+   "pixel_error_mm": 11.45,
+   "tip_error_mm": 9.554
+  },
+  {
+   "index": 9,
+   "detector": null,
+   "pixel_error_mm": null,
+   "tip_error_mm": 8.733
+  },
+  {
+   "index": 10,
+   "detector": "green",
+   "pixel_error_mm": 58.51,
+   "tip_error_mm": 8.548
+  },
+  {
+   "index": 11,
+   "detector": "green",
+   "pixel_error_mm": 75.42,
+   "tip_error_mm": 44.357
+  },
+  {
+   "index": 12,
+   "detector": "green",
+   "pixel_error_mm": 68.09,
+   "tip_error_mm": 8.545
+  },
+  {
+   "index": 13,
+   "detector": "green",
+   "pixel_error_mm": 82.35,
+   "tip_error_mm": 8.949
+  }
+ ],
+ "note": "re-measured offline with the fixed oracle detector (green or null, fragment-cleaned retry) and attribution (coherence gate, measured-turn exemption); no arm motion, no live state changed"
+}
