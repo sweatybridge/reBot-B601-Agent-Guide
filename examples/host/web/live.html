@@ -422,14 +422,17 @@ function streamTurn() {
   const config = window.RebotConfig ? window.RebotConfig.get() : null;
   const width = Number(video.videoWidth) || 0;
   const height = Number(video.videoHeight) || 0;
-  if (!config || !width || !height) return 0;
+  // Unknown is undefined, never 0: asserting "no turn" while the config has
+  // not loaded sends the host a wrong correction it will trust (phone.html's
+  // contract). Callers fall back to the frame shape, or refuse.
+  if (!config || !width || !height) return undefined;
   const known = config.stream_turn;
   if (known && Number.isFinite(Number(known.turns))) {
     return (((Math.round(Number(known.turns)) % 4) + 4) % 4);
   }
   const shape = window.ReachGeometry.shapeTurn(config.calibration.image_size,
     [width, height]);
-  return shape > 0 ? shape : 0;
+  return shape >= 0 ? shape : undefined;
 }
 
 async function locateHere(tap, height) {

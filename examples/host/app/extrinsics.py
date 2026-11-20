@@ -489,14 +489,22 @@ def _dlt_pose(world, normalized):
         raise ExtrinsicsError("the DLT found a singular projection; check the clicked points")
     P = P / scale
 
-    Q, Rq = np.linalg.qr(P[:, :3].T)          # P^T = Q Rq  ->  P = Rq^T Q^T
-    rotation = Rq.T
-    upper = Q.T
+    # RQ decomposition: P[:3,:3] = K R with K upper triangular (the intrinsics
+    # factor) and R a rotation. QR of the row-reversed transpose gives it:
+    # (J M)^T = Q1 R1  =>  M = (J R1^T J)(J Q1^T), and J R1^T J is upper
+    # triangular. A plain QR of the transpose yields a LOWER triangular factor
+    # (LQ, not RQ): calling it a rotation left the bootstrap ~35 deg / 0.17 m
+    # off on synthetic truth, which the LM fit then masked in benign scenes.
+    J = np.fliplr(np.eye(3))
+    Q1, R1 = np.linalg.qr((J @ P[:, :3]).T)
+    upper = J @ R1.T @ J
+    rotation = J @ Q1.T
     signs = np.sign(np.diag(upper))
     signs[signs == 0.0] = 1.0
-    rotation = rotation @ np.diag(signs)
-    upper = np.diag(signs) @ upper
-    translation = P[:, 3] / float(np.mean(np.diag(upper)))
+    upper = upper @ np.diag(signs)
+    rotation = np.diag(signs) @ rotation
+    # P[:,3] = K t exactly; the old mean-of-diagonal division mis-scaled t.
+    translation = np.linalg.solve(upper, P[:, 3])
 
     # Project the 3x3 block onto SO(3): the DLT's block is only nearly so.
     U_, _, V_ = np.linalg.svd(rotation)

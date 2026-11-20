@@ -269,6 +269,34 @@ def test_tag_geometry(workdir: Path):
     check("point reprojects to the tap",
           abs(back[0] - pixel[0]) < 1.0 and abs(back[1] - pixel[1]) < 1.0)
 
+    # A nearly frontal tag is where IPPE_SQUARE can pick the mirror twin. The
+    # pose must still see the printed face AND reproject the corners: flipping
+    # one solution's normal with Rx(pi) breaks the correspondence (~80 px)
+    # while looking like a fix. Three solvers, best front-facing one wins.
+    T_front = look_at((-0.24, -0.08, 0.14), (tag_x, tag_y, tag_z))
+    R_front = T_front[:3, :3].T @ T_base_tag[:3, :3]
+    t_front = T_front[:3, :3].T @ (T_base_tag[:3, 3] - T_front[:3, 3])
+    corners_f, _ = cv2.projectPoints(obj, cv2.Rodrigues(R_front)[0], t_front, K, dist)
+    corners_f = corners_f.reshape(-1, 2)
+    image_f = render_tag(dictionary, tag_id, tag_size, corners_f, size)
+    _id_f, found_f = locate.detect_tag(cv2.cvtColor(image_f, cv2.COLOR_BGR2GRAY),
+                                       dictionary, tag_id)
+    R_f, t_f, reproj_f = locate.tag_pose(found_f, tag_size, K, dist)
+    check("a nearly frontal tag keeps its corner correspondence", reproj_f < 1.0,
+          "%.3f px" % reproj_f)
+    check("the frontal solve sees the printed face", float(R_f[:, 2] @ (-t_f)) > 0.0)
+    # Position recovery is asserted on the EXACT projected corners: the
+    # rendered-then-detected corners carry a sub-pixel bias that, at this
+    # near-frontal pose, reads as ~1.8 deg of tilt -- 19 mm at the 0.6 m
+    # lever arm. That is the detector's quantization, not the solver's.
+    R_x, t_x, reproj_x = locate.tag_pose(corners_f, tag_size, K, dist)
+    recovered_x = locate.base_from_camera(R_x, t_x, T_base_tag)
+    check("the frontal solve recovers the camera",
+          float(np.linalg.norm(recovered_x[:3, 3] - T_front[:3, 3])) < 0.001
+          and reproj_x < 0.01,
+          "%.3f mm, %.4f px" % (1000 * float(np.linalg.norm(
+              recovered_x[:3, 3] - T_front[:3, 3])), reproj_x))
+
     # A tag that is not in the frame must be a clear error, not a stale pose.
     empty = np.full((size[1], size[0]), 255, np.uint8)
     try:
@@ -2989,6 +3017,56 @@ def test_fixed_rig(workdir: Path):
     check("the fixed path lands within 3 mm", error < 0.003, "%.2f mm" % (error * 1000))
     check("the payload carries the rig provenance",
           payload["rig"].get("fingerprint") and payload["rig"].get("predicted_mm") is not None)
+
+    # The grazing gate refuses glancing rays, not steep ones: a straight-down
+    # tap is the best-conditioned one, and the old inverted comparison rejected
+    # it while accepting rays within a few degrees of the plane.
+    down = extrinsics.Rig(T_base_cam=look_at((0.30, 0.0501, 0.80), (0.30, 0.05, 0.0)))
+    tap_down = extrinsics.pixel(truth, K, dist, extrinsics.invert(down.T_base_cam))
+    steep = locate.locate(image, {"tap": {"u": tap_down[0], "v": tap_down[1]}},
+                          calibration, locate.Options(extrinsics=down, plane_z=0.0))
+    check("a straight-down tap passes the grazing gate",
+          float(np.linalg.norm(np.array(steep["point"]) - truth)) < 0.003,
+          "%.2f mm" % (1000 * float(np.linalg.norm(np.array(steep["point"]) - truth))))
+    shallow = extrinsics.Rig(T_base_cam=look_at((1.60, 0.05, 0.10), (0.30, 0.05, 0.0)))
+    tap_shallow = extrinsics.pixel(truth, K, dist, extrinsics.invert(shallow.T_base_cam))
+    try:
+        locate.locate(image, {"tap": {"u": tap_shallow[0], "v": tap_shallow[1]}},
+                      calibration, locate.Options(extrinsics=shallow, plane_z=0.0))
+        check("a glancing tap is refused", False, "no error raised")
+    except locate.LocateError as error:
+        check("a glancing tap is refused", "aim further down" in str(error), str(error)[:60])
+
+    # turn_back: a declared 0 contradicted by a swapped shape is the page
+    # asserting "no turn" while it does not know -- fall through, don't trust.
+    portrait = calib_mod.Calib(path=workdir / "turn.json", K=K, dist=dist,
+                               image_size=(1080, 1920), device="synthetic")
+    check("a declared 0 on a swapped shape is not trusted",
+          locate.turn_back({"turns": 0}, (1920, 1080), portrait) == 3)
+    check("a nonzero declared turn stands",
+          locate.turn_back({"turns": 1}, (1920, 1080), portrait) == 1)
+    check("a declared 0 on the same shape stands",
+          locate.turn_back({"turns": 0}, (1080, 1920), portrait) == 0)
+    check("no declaration falls back to the shape guess",
+          locate.turn_back({}, (1920, 1080), portrait) == 3)
+
+    # The DLT bootstrap is an RQ decomposition: it must recover a known camera
+    # exactly, not merely close enough for LM to mask. The old QR-of-transpose
+    # (an LQ factor) was ~35 deg / 0.17 m off on this very construction.
+    rng = np.random.default_rng(3)
+    angle = math.radians(25.0)
+    R_known = (np.array([[math.cos(angle), -math.sin(angle), 0.0],
+                         [math.sin(angle), math.cos(angle), 0.0], [0.0, 0.0, 1.0]])
+               @ np.array([[1.0, 0.0, 0.0], [0.0, 0.8, -0.6], [0.0, 0.6, 0.8]]))
+    t_known = np.array([0.15, -0.25, 1.10])
+    world = rng.uniform(-0.3, 0.3, (12, 3)) + np.array([0.3, 0.0, 0.2])
+    cam = (R_known @ world.T).T + t_known
+    R_boot, t_boot = extrinsics._dlt_pose(world, cam[:, :2] / cam[:, 2:3])
+    check("the DLT bootstrap recovers a known camera (RQ, not LQ)",
+          extrinsics.rotation_deg(R_boot.T @ R_known) < 0.01
+          and float(np.linalg.norm(t_boot - t_known)) < 1e-4,
+          "%.4f deg, %.4f mm" % (extrinsics.rotation_deg(R_boot.T @ R_known),
+                                 1000 * float(np.linalg.norm(t_boot - t_known))))
 
     try:
         locate.locate(image, {}, calibration, locate.Options(extrinsics=rig))

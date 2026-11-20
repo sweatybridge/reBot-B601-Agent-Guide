@@ -121,29 +121,65 @@ def detect_tag(gray, dictionary, tag_id=None):
 
 
 def tag_pose(corners, tag_size, K, dist):
-    """Pose of the tag in the camera frame, plus its reprojection error in px."""
+    """Pose of the tag in the camera frame, plus its reprojection error in px.
+
+    A planar solve has a mirror twin; the real one sees the printed face (the
+    tag's +z points back at the camera). Take the best front-facing candidate
+    from three independent solvers, exactly as `base_marker.solve` does.
+    Rotating one solution by Rx(pi) to flip its normal is NOT the mirror twin:
+    it breaks the corner correspondence (~80 px reprojection on an exact
+    solution) while looking like a fix.
+    """
     obj = tag_object_points(tag_size)
     img = np.asarray(corners, dtype=np.float64).reshape(-1, 1, 2)
 
-    ok, rvec, tvec = cv2.solvePnP(obj, img, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
-    if not ok:
-        raise LocateError("solvePnP failed on the tag")
-    try:
-        rvec, tvec = cv2.solvePnPRefineLM(obj, img, K, dist, rvec, tvec)
-    except cv2.error:
-        pass  # IPPE's answer is already usable; refinement is a bonus
+    def rms_of(rvec, tvec):
+        projected, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
+        errors = np.linalg.norm(projected.reshape(-1, 2) - corners, axis=1)
+        return float(np.sqrt(np.mean(errors ** 2)))
 
-    R = cv2.Rodrigues(rvec)[0]
-    # A planar solve has a mirror twin. The real one has +z of the tag pointing
-    # back at the camera, i.e. opposite to t.
-    if float(R[:, 2] @ (-tvec.reshape(3))) < 0.0:
-        half_turn = cv2.Rodrigues(np.array([math.pi, 0.0, 0.0]))[0]
-        R = R @ half_turn
-        rvec = cv2.Rodrigues(R)[0]
+    candidates = []
+    solvers = [cv2.SOLVEPNP_IPPE_SQUARE,
+               getattr(cv2, "SOLVEPNP_SQPNP", None),
+               cv2.SOLVEPNP_ITERATIVE]
+    for flags in [solver for solver in solvers if solver is not None]:
+        try:
+            ok, rvec, tvec = cv2.solvePnP(obj, img, K, dist, flags=flags)
+        except cv2.error:
+            continue
+        if not ok:
+            continue
+        rotation = cv2.Rodrigues(rvec)[0]
+        translation = np.asarray(tvec, dtype=float).reshape(3)
+        candidates.append({
+            "rvec": rvec, "tvec": translation, "rotation": rotation,
+            "rms": rms_of(rvec, tvec),
+            "front": float(rotation[:, 2] @ (-translation)) > 0.0,
+        })
+    if not candidates:
+        raise LocateError("solvePnP failed on the tag")
+    front = [candidate for candidate in candidates if candidate["front"]]
+    if not front:
+        raise LocateError("the tag solved only from behind: is the printed face toward "
+                          "the camera?")
+    best = min(front, key=lambda candidate: candidate["rms"])
+    rvec, tvec, rotation = best["rvec"], best["tvec"], best["rotation"]
+    try:
+        # LM writes through its inputs; copies keep the candidate intact if the
+        # refinement turns out worse than what the solver already had.
+        rvec2, tvec2 = cv2.solvePnPRefineLM(obj, img, K, dist,
+                                            rvec.copy(), tvec.reshape(3, 1).copy())
+        rotation2 = cv2.Rodrigues(rvec2)[0]
+        tvec2 = np.asarray(tvec2, dtype=float).reshape(3)
+        if (rms_of(rvec2, tvec2) <= best["rms"] * 1.05
+                and float(rotation2[:, 2] @ (-tvec2)) > 0.0):
+            rvec, tvec, rotation = rvec2, tvec2, rotation2
+    except cv2.error:
+        pass  # the solver's answer is already usable; refinement is a bonus
 
     projected, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
     reproj = float(np.mean(np.linalg.norm(projected.reshape(-1, 2) - corners, axis=1)))
-    return R, tvec.reshape(3).astype(float), reproj
+    return rotation, np.asarray(tvec, dtype=float).reshape(3), reproj
 
 
 def rotz(deg):
@@ -309,11 +345,17 @@ def locate(image, meta, calibration, options: Options):
     point, _distance, grazing = ray_plane(calibration.K, T_base_cam, tap[0], tap[1],
                                           options.plane_z, calibration.dist)
     source = "tap+fixed" if options.extrinsics is not None else "tap+marker"
-    if grazing > options.max_grazing:
+    # ray_plane's grazing is the ray's elevation ABOVE the plane (90 = straight
+    # down, the best-conditioned tap). The gate is base_marker.solve's
+    # convention: refuse the view that deviates too far from the ideal, i.e.
+    # elevation below 90 - max_grazing. Comparing elevation > max_grazing
+    # inverted it -- rejecting straight-down taps and accepting glancing ones.
+    if (90.0 - grazing) > options.max_grazing:
         raise LocateError(
-            "the tap ray meets the table at %.0f deg (limit %.0f): a grazing view turns "
-            "every pixel of the tap into centimetres -- aim further down"
-            % (grazing, options.max_grazing))
+            "the tap ray meets the table at %.0f deg above the plane (%.0f deg from "
+            "straight down, limit %.0f): a grazing view turns every pixel of the tap "
+            "into centimetres -- aim further down"
+            % (grazing, 90.0 - grazing, options.max_grazing))
 
     radius = float(np.linalg.norm(point))
     projected = project(calibration.K, T_base_cam, point, calibration.dist)
@@ -425,7 +467,13 @@ def turn_back(meta, frame_size, calibration, explicit=None):
         return int(explicit) % 4
     declared = meta.get("turns")
     if declared is not None:
-        return int(declared) % 4
+        declared = int(declared) % 4
+        # A declared 0 cannot be right when the shape says a quarter turn is
+        # needed: that is a page asserting "no turn" while it does not know
+        # (the undefined-as-0 bug). Fall through to the orientation/shape
+        # sources instead of trusting it; any other declaration stands.
+        if declared != 0 or not calib_mod.swapped_shape(calibration.image_size, frame_size):
+            return declared
     frame_deg = meta.get("orientation_deg")
     calib_deg = (calibration.raw or {}).get("orientation_deg")
     if frame_deg is not None and calib_deg is not None:
@@ -482,7 +530,8 @@ def main(argv=None):
     parser.add_argument("--max-reproj", type=float, default=1.5,
                         help="reject a tag pose above this reprojection error, px")
     parser.add_argument("--max-grazing", type=float, default=80.0,
-                        help="reject taps whose ray is flatter than this, deg from the plane")
+                        help="reject taps whose ray is more than this many degrees from "
+                             "straight down (default 80: refuse rays within 10 deg of the plane)")
     parser.add_argument("--max-reach", type=float, default=0.75, help="warn above this radius, m")
     parser.add_argument("--annotate", default="", help="write an annotated JPEG here")
     parser.add_argument("--quiet", action="store_true")

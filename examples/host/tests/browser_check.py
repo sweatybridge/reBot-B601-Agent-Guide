@@ -811,6 +811,39 @@ async def drive_live(cdp, args) -> int:
         })()""", page)
         if not report("the host offers the agent and a fixed rig", bool(agent_ready)):
             return 1
+
+        # A turned AND resized stream: the tap must be rotated onto the upright
+        # video grid and then scaled onto the calibration grid. Rotating alone
+        # leaves video pixels against a native-K camera -- a silent wrong tip.
+        turned = await cdp.evaluate("""(() => {
+            const calib = {image_size: [1080, 1920],
+                           K: [[900, 0, 540], [0, 900, 960], [0, 0, 1]],
+                           dist: [0, 0, 0, 0, 0]};
+            const c = Math.cos(0.1), s = Math.sin(0.1);
+            // camera at z=0.80 looking DOWN (optical axis = third column)
+            const T = [[1, 0, 0, 0.30], [0, -c, s, 0.05], [0, -s, -c, 0.80]];
+            const turn = 3;                       // landscape video, portrait calib
+            const uL = 900, vL = 400;             // a tap in the 1280x720 video
+            const upright = ReachGeometry.mapPixel(uL, vL, [1280, 720], turn);
+            const a = BrowserLocate.tipTarget(calib, T, uL, vL, 0, 0.05, 1280, 720, turn);
+            const b = BrowserLocate.tipTarget(calib, T, upright[0], upright[1], 0, 0.05,
+                                              720, 1280, 0);
+            const d = Math.hypot(a.tip[0] - b.tip[0], a.tip[1] - b.tip[1],
+                                 a.tip[2] - b.tip[2]);
+            return {delta_m: d, a: a.tip, b: b.tip};
+        })()""", page)
+        report("a turned+resized tap lands where the upright tap does",
+               bool(turned) and turned["delta_m"] < 1e-6,
+               "delta %.3g m" % (turned or {}).get("delta_m", -1))
+        unknown_turn = await cdp.evaluate("""(() => {
+            const saved = window.RebotConfig;
+            window.RebotConfig = null;
+            const value = streamTurn();
+            window.RebotConfig = saved;
+            return value === undefined ? 'undefined' : String(value);
+        })()""", page)
+        report("an unknown stream turn is undefined, never 0",
+               unknown_turn == "undefined", str(unknown_turn))
         session_id = await cdp.evaluate("CHAT.sessionId", page)
         report("the page stamps a capture-format session id",
                bool(session_id) and len(str(session_id)) == 23

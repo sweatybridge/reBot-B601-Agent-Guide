@@ -14,7 +14,7 @@
 Description=B601 edge player over HTTP
 Documentation=https://github.com/sweatybridge/reBot-B601-Agent-Guide
 After=network-online.target can0-setup.service
-Wants=network-online.target
+Wants=network-online.target can0-setup.service
 
 [Service]
 Type=simple
