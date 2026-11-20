@@ -5345,6 +5345,222 @@ def test_accuracy_map(workdir: Path):
 
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# identify_cad: whole-pose CAD hillclimb (offline, synthetic corpus)
+# --------------------------------------------------------------------------- #
+
+def test_identify_cad_model(workdir: Path):
+    import identify_cad
+
+    print("\nidentify_cad: CAD model and renderer")
+    model = identify_cad.CadModel()
+    check("identify_cad: four green cover parts", len(model.green_parts) == 4,
+          "%d parts, %d green triangles" % (len(model.parts), model.green_tris))
+    check("identify_cad: green parts span the arm",
+          sorted(p.link for p in model.green_parts) == ["gripper_end", "link2", "link3", "link5"])
+
+    size = (640, 480)
+    K, dist = synthetic_camera(*size, f=600.0)
+    T_base_cam = look_at((0.5, 0.95, 0.45), (0.3, 0.0, 0.25))
+    T_cam_base = np.linalg.inv(T_base_cam)
+    q = np.asarray(sweep.POSES[0], float)
+    mask = identify_cad.render_green(model, q, K, dist, T_cam_base, size, 1.0)
+    check("identify_cad: green render is non-empty", int(mask.sum()) // 255 > 500,
+          "%d px" % (int(mask.sum()) // 255))
+
+    # Independent check: every projected green vertex must sit inside (or on)
+    # the rendered silhouette's bounding box, and the mask centroid must agree
+    # with the projected vertex cloud.
+    verts = []
+    links = model.link_frames(q)
+    for part in model.green_parts:
+        frame = links[part.frame]
+        world = part.verts.reshape(-1, 3) @ frame[:3, :3].T + frame[:3, 3]
+        verts.append(world)
+    uv, valid = identify_cad.project_points(np.vstack(verts), K, dist, T_cam_base)
+    uv = uv[valid]
+    ys, xs = np.nonzero(mask)
+    check("identify_cad: render bounds contain the projected vertices",
+          xs.min() <= uv[:, 0].min() + 1 and xs.max() >= uv[:, 0].max() - 1
+          and ys.min() <= uv[:, 1].min() + 1 and ys.max() >= uv[:, 1].max() - 1)
+    centroid_mask = np.array([xs.mean(), ys.mean()])
+    centroid_pts = uv.mean(axis=0)
+    check("identify_cad: mask centroid near vertex centroid",
+          np.linalg.norm(centroid_mask - centroid_pts) < 25.0,
+          "%.1f px apart" % np.linalg.norm(centroid_mask - centroid_pts))
+
+    # The objective must see a whole-pose change, not just the tip: a sag gain
+    # on j3 swings the entire rendered arm.
+    theta_b = identify_cad.theta0()
+    theta_b[8] = 1.6                                   # g3
+    mask_b = identify_cad.render_green(
+        model, identify_cad.held_prediction(theta_b, q, sweep.kp_vector()),
+        K, dist, T_cam_base, size, 1.0)
+    err = identify_cad.mask_error(mask, mask_b)
+    check("identify_cad: whole pose is sensitive to j3 sag", err is not None and err[0] > 2.0,
+          "chamfer %.2f px" % (err[0] if err else -1))
+    check("identify_cad: tiny masks are unmeasurable",
+          identify_cad.mask_error(np.zeros((20, 20), np.uint8), mask) is None)
+    return model
+
+
+def _cad_synthetic_hold(identify_cad, model, q_cmd, theta_true, K, dist, T_prior, size, scale):
+    """A hold whose 'measurement' is the CAD render at the injected truth."""
+    T_true = np.linalg.inv(identify_cad.rig_from_theta(theta_true, T_prior))
+    q_held = identify_cad.held_prediction(theta_true, q_cmd, sweep.kp_vector())
+    mask = identify_cad.render_green(model, q_held, K, dist, T_true, size, scale)
+    hold = identify_cad.Hold(q_cmd=np.asarray(q_cmd, float), q_meas=q_held)
+    hold.meas_mask = mask
+    hold.meas_edge = identify_cad.mask_edges(mask)
+    hold.meas_dt = cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 3)
+    hold.green_px = int(mask.sum()) // 255
+    return hold
+
+
+def test_identify_cad_climb(workdir: Path, model):
+    import identify_cad
+
+    print("\nidentify_cad: hillclimb recovers injected rig + sag")
+    size = (640, 480)
+    scale = 0.5
+    K, dist = synthetic_camera(*size, f=600.0)
+    T_prior = look_at((0.5, 0.95, 0.45), (0.3, 0.0, 0.25))
+    kp = sweep.kp_vector()
+    theta_true = identify_cad.theta0()
+    theta_true[:3] = (0.008, -0.006, 0.010)            # rig rotation, rad
+    theta_true[3:6] = (0.006, -0.004, 0.005)           # rig translation, m
+    theta_true[6:12] = (1.0, 1.4, 0.7, 1.0, 1.0, 1.0)  # sag gains
+    theta_true[12:18] = (0.0, 0.005, -0.005, 0.0, 0.0, 0.0)
+    poses = [np.asarray(sweep.POSES[i], float) for i in (0, 2, 4, 6)]
+    holds = [_cad_synthetic_hold(identify_cad, model, q, theta_true, K, dist, T_prior, size, scale)
+             for q in poses]
+    span, frozen = identify_cad.identifiability(holds, kp)
+    objective = identify_cad.Objective(model, holds, K, dist, T_prior, kp, size, scale)
+    err0 = objective.error(identify_cad.theta0())
+    check("identify_cad: injected error is visible", err0 > 0.3, "%.3f px at the prior" % err0)
+    theta, err, changes = identify_cad.hillclimb(objective, identify_cad.theta0(),
+                                                 frozen=frozen, max_evals=900)
+    check("identify_cad: climb reduces the error", err < min(0.2, err0 / 3.0),
+          "%.3f -> %.3f px, %d changes, %d evals" % (err0, err, len(changes), objective.evals))
+    check("identify_cad: every accepted change is monotone",
+          all(c.err_after < c.err_before for c in changes))
+    free = [i for i in range(identify_cad.N_PARAMS) if i not in frozen]
+    gain_err = max(abs(theta[i] - theta_true[i]) for i in free if 6 <= i < 12)
+    rig_err = max(np.max(np.abs(theta[:3] - theta_true[:3])),
+                  np.max(np.abs(theta[3:6] - theta_true[3:6])))
+    check("identify_cad: sag gains recovered (identifiable joints)", gain_err < 0.25,
+          "worst gain error %.3f, frozen: %s"
+          % (gain_err, [identify_cad.PARAM_NAMES[i] for i in frozen]))
+    check("identify_cad: rig delta recovered", rig_err < 0.015,
+          "worst rig error %.4f (rad or m)" % rig_err)
+
+    # A corpus with no excitation freezes every sag direction: unlearned, not
+    # extrapolated (spec 7.2).
+    same = [_cad_synthetic_hold(identify_cad, model, poses[0], theta_true,
+                                K, dist, T_prior, size, scale)]
+    _span, frozen_all = identify_cad.identifiability(same, kp)
+    check("identify_cad: no excitation -> all sag params unlearned", len(frozen_all) == 12)
+
+
+def test_identify_cad_gates(workdir: Path, model):
+    import identify_cad
+
+    print("\nidentify_cad: gates and chart")
+    try:
+        identify_cad.run_session(None, model, confirm=False)
+        check("identify_cad: motion without --confirm is refused", False)
+    except identify_cad.IdentifyError as error:
+        check("identify_cad: motion without --confirm is refused", "--confirm" in str(error))
+
+    trace = {
+        "format": "rebot-identify-trace", "version": 1,
+        "rounds": [
+            {"round": 1, "holds": 8, "accepted": True,
+             "err_fit_before": 6.0, "err_fit_after": 3.0,
+             "err_val_before": 6.2, "err_val_after": 3.1,
+             "err_all_before": 6.1, "err_all_after": 3.05,
+             "changes": [
+                 {"n": 1, "param": "tz", "value_before": 0.0, "value_after": 0.004,
+                  "err_before": 6.0, "err_after": 4.2, "gain_px": 1.8, "round": 1},
+                 {"n": 2, "param": "g2", "value_before": 1.0, "value_after": 1.3,
+                  "err_before": 4.2, "err_after": 3.0, "gain_px": 1.2, "round": 1}]},
+            {"round": 2, "holds": 8, "accepted": False,
+             "err_fit_before": 3.0, "err_fit_after": 3.0,
+             "err_val_before": 3.1, "err_val_after": 3.1,
+             "err_all_before": 3.05, "err_all_after": 3.05,
+             "changes": [{"n": 1, "param": "rot_x", "value_before": 0.0, "value_after": 0.008,
+                          "err_before": 3.0, "err_after": 2.9, "gain_px": 0.1, "round": 2}]},
+        ],
+    }
+    trace_path = workdir / "cad-trace.json"
+    trace_path.write_text(json.dumps(trace), encoding="utf-8")
+    out = workdir / "cad-chart.png"
+    try:
+        import matplotlib  # noqa: F401
+    except ModuleNotFoundError:
+        print("  skip  chart render (matplotlib is host-side; verified on the host)")
+        return
+    identify_cad.render_chart(trace_path, out)
+    check("identify_cad: chart renders from the trace", out.is_file() and out.stat().st_size > 10000,
+          "%d bytes" % out.stat().st_size if out.exists() else "missing")
+
+
+def test_identify_cad_plan_execute(workdir: Path):
+    """The generated runs must go through /plan -> /execute, in that order."""
+    import identify_cad
+
+    print("\nidentify_cad: runs use the plan -> execute path")
+    bench = identify_cad.Bench()
+
+    class FakeArm:
+        def __init__(self):
+            self.calls = []
+
+        def _call(self, method, path, body=None, timeout=None):
+            self.calls.append((method, path, body))
+            if path == "/plan":
+                traj = workdir / "fake-cad-trajectory.json"
+                traj.write_text(json.dumps({"waypoints": [{"q": [0.0] * 7}]}), encoding="utf-8")
+                return 200, {"id": "fake-plan-1", "path": str(traj),
+                             "summary": {"markers": 8, "duration_s": 60.0}, "execute": True}
+            if path == "/execute":
+                return 200, {"ok": True, "executed": True}
+            return 200, {}
+
+        def pose(self):
+            return {"q": [0.0] * 7}
+
+    class FakeRecorder:
+        def __init__(self):
+            self.enabled = []
+
+        def enable(self):
+            self.enabled.append(True)
+
+        def disable(self):
+            self.enabled.append(False)
+
+        def segments(self, since=None):
+            return [mediamtx.Segment(path=workdir / "seg.mp4", start=time.time())]
+
+    bench.arm = FakeArm()
+    bench.recorder = FakeRecorder()
+    plan = bench.plan_run(identify_cad.run_tips())
+    check("identify_cad: run is planned as cartesian tip targets",
+          bench.arm.calls[-1][0] == "POST" and bench.arm.calls[-1][1] == "/plan"
+          and all("tip" in t for t in bench.arm.calls[-1][2]["targets"])
+          and bench.arm.calls[-1][2]["tip_offset_m"] > 0)
+    segments, log_path, _payload = bench.execute_run(plan["id"], workdir / "cad-run")
+    executes = [call for call in bench.arm.calls if call[1] == "/execute"]
+    check("identify_cad: execution is /execute with the plan id",
+          len(executes) == 1 and executes[0][2] == {"id": "fake-plan-1"})
+    order = [path for _m, path, _b in bench.arm.calls if path in ("/plan", "/execute")]
+    check("identify_cad: plan precedes execute", order == ["/plan", "/execute"])
+    check("identify_cad: recording brackets the execution",
+          bench.recorder.enabled == [True, False] and len(segments) == 1
+          and Path(log_path).is_file())
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Offline selftest for the capture pipeline.")
     parser.add_argument("--keep", action="store_true", help="keep the work directory")
@@ -5393,6 +5609,10 @@ def main(argv=None):
     test_identify_api(workdir)
     test_cartesian_targets(workdir)
     test_accuracy_map(workdir)
+    cad_model = test_identify_cad_model(workdir)
+    test_identify_cad_climb(workdir, cad_model)
+    test_identify_cad_gates(workdir, cad_model)
+    test_identify_cad_plan_execute(workdir)
 
     failures = [name for name, ok, _ in RESULTS if not ok]
     print("\n%d checks, %d failed" % (len(RESULTS), len(failures)))
