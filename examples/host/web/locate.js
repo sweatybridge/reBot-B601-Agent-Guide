@@ -61,13 +61,48 @@
     return { tip: tip, pixel: [u, v], tap: { u: u, v: v }, turn: applied };
   }
 
-  function solveTag(pixels, width, height, calibration, marker, planeZ) {
+  function rotateFrame(pixels, width, height, turns) {
+    // Rotate the frame onto the calibration grid, clockwise, matching
+    // mapPixel and the host's upright_frame (turn 1 = 90 deg CW). A handheld
+    // phone delivers a quarter-turned frame; detecting on it against an
+    // upright K is what made the handheld tag solve refuse turned streams.
+    const steps = ((Math.round(turns) % 4) + 4) % 4;
+    if (!steps) return { data: pixels, width: width, height: height };
+    let src = document.createElement("canvas");
+    src.width = width;
+    src.height = height;
+    src.getContext("2d").putImageData(new ImageData(pixels, width, height), 0, 0);
+    let w = width;
+    let h = height;
+    for (let i = 0; i < steps; i += 1) {
+      const dst = document.createElement("canvas");
+      dst.width = h;
+      dst.height = w;
+      const ctx = dst.getContext("2d");
+      ctx.translate(h, 0);
+      ctx.rotate(Math.PI / 2);
+      ctx.drawImage(src, 0, 0);
+      src = dst;
+      const swap = w;
+      w = h;
+      h = swap;
+    }
+    return { data: src.getContext("2d").getImageData(0, 0, w, h).data, width: w, height: h };
+  }
+
+  function solveTag(pixels, width, height, calibration, marker, planeZ, turn) {
     if (!window.ArucoPose) throw new Error("the browser ArUco detector is not loaded");
-    const found = window.ArucoPose.detectFrame(pixels, width, height);
+    let applied = Number.isFinite(Number(turn))
+      ? ((Math.round(Number(turn)) % 4) + 4) % 4
+      : G.shapeTurn(calibration.image_size, [width, height]);
+    if (!(applied >= 0)) applied = 0;
+    const frame = applied ? rotateFrame(pixels, width, height, applied)
+      : { data: pixels, width: width, height: height };
+    const found = window.ArucoPose.detectFrame(frame.data, frame.width, frame.height);
     if (!found || !found.corners) {
       throw new Error("the base tag is not in the tapped frame");
     }
-    const scaled = scaleCalibration(calibration, width, height);
+    const scaled = scaleCalibration(calibration, frame.width, frame.height);
     const pose = window.ArucoPose.poseFromCorners(found.corners, scaled, marker, planeZ);
     if (!pose || !pose.T_base_cam) {
       throw new Error("the base tag pose could not be solved");
@@ -98,8 +133,13 @@
         status("locating the base tag in this frame", "");
         if (!videoTools) throw new Error("the video helpers are not loaded");
         const frame = videoTools.grabImageData(video);
+        // Prefer the host-measured turn (its sign is resolved from the tag);
+        // fall back to the page's turn() and then the frame shape.
+        const measured = data.stream_turn && Number.isFinite(Number(data.stream_turn.turns))
+          ? ((Math.round(Number(data.stream_turn.turns)) % 4) + 4) % 4
+          : turn();
         T = solveTag(frame.data, frame.width, frame.height,
-          data.calibration, data.marker, data.plane_z);
+          data.calibration, data.marker, data.plane_z, measured);
       }
       return tipTarget(data.calibration, T, tap.u, tap.v, data.plane_z, tapHeight,
         video.videoWidth, video.videoHeight, turn());
@@ -114,6 +154,8 @@
       makeCamera: makeCamera,
       rayPlane: rayPlane,
       tipTarget: tipTarget,
+      solveTag: solveTag,
+      rotateFrame: rotateFrame,
       scaleCalibration: scaleCalibration,
     };
   }

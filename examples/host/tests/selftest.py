@@ -618,6 +618,12 @@ async def test_server(workdir: Path, geometry):
         check("refuses a client-set id", forged.status == 400)
         check("cleans up after a refused capture", len(list(captures.iterdir())) == 1)
 
+        form = FormData()
+        form.add_field("meta", json.dumps({"purpose": "plan", "pad": "x" * 70000}))
+        form.add_field("frame", jpeg, filename="frame.jpg", content_type="image/jpeg")
+        big = await client.post("/capture", data=form, headers={"X-Rebot-Token": "selftest-token"})
+        check("refuses an oversized meta with a running cap", big.status == 400)
+
         # A tap becomes a plan: locate runs for real (the rendered tag is in the
         # frame), then the arm gateway is unreachable, which must read as a
         # planner problem -- 502 -- not a locate problem -- 422.
@@ -1643,6 +1649,9 @@ def _import_planner():
             tip_m = 0.0
             quiet = True
             ik_pos_tol = 0.001
+            hz = 30.0
+            yaw = 0.0
+            tool_axis = "current"
 
         def _offline(*_args, **_kwargs):
             raise RuntimeError("planning needs Pinocchio; not under test here")
@@ -1705,6 +1714,18 @@ def test_planner_offline(workdir: Path):
                 check("fk refuses a bad pose", False)
             except planner.GatewayError:
                 check("fk refuses a bad pose", True)
+
+        # Options are type-validated at the boundary: a wrong JSON type is a
+        # 4xx here, not a TypeError deep in planning that surfaces as a 500.
+        opts = planner.request_options({"options": {"yaw": 12.5, "quiet": True}})
+        check("request_options accepts well-typed values",
+              opts.yaw == 12.5 and opts.quiet is True)
+        for bad in ({"yaw": "abc"}, {"quiet": 1}, {"hz": "30"}, {"tool_axis": 5}):
+            try:
+                planner.request_options({"options": bad})
+                check("request_options rejects a mistyped option", False, str(bad))
+            except planner.GatewayError:
+                check("request_options rejects a mistyped option", True, str(bad))
 
         # execute_one persists the edge's log and relays the same block.
         plan_id = planner.new_id()
@@ -2843,7 +2864,6 @@ def test_base_marker():
                        [0, bitmap.shape[0] - 1]], dtype=np.float32)
     warped = cv2.warpPerspective(bitmap, cv2.getPerspectiveTransform(source, quad),
                                  (1080, 1920), dst=image, borderValue=210)
-    cv2.imwrite(str(Path(".") / "marker-render.png"), warped)
 
     solved = base_marker.pose(warped, K, dist, size_m=size_m)
     evidence = base_marker.solve(warped, K, dist, size_m=size_m)
@@ -3922,6 +3942,7 @@ def test_calibrate_api(workdir: Path):
     original_gateway = auto_calibrate.ArmGateway
     original_source = camera_mod.open_source
     original_detect = auto_calibrate.detect_all
+    original_detect_green = auto_calibrate.detect_all_green
     original_recorder = mediamtx.Recorder
     auto_calibrate.ArmGateway = lambda *a, **k: arm
     camera_mod.open_source = lambda *a, **k: eye
@@ -4078,6 +4099,7 @@ def test_calibrate_api(workdir: Path):
         auto_calibrate.ArmGateway = original_gateway
         camera_mod.open_source = original_source
         auto_calibrate.detect_all = original_detect
+        auto_calibrate.detect_all_green = original_detect_green
         mediamtx.Recorder = original_recorder
 
 
@@ -4257,6 +4279,26 @@ def test_marker_rig(workdir: Path):
         check("a request can choose fixed",
               capture_server.locate_options(restarted, {"mode": "fixed"}).extrinsics
               is not None)
+        # The fixed mount witness must not apply to a handheld camera (A-M2):
+        # handheld moves by design, so the witness would refuse every tap.
+        restarted["witness"] = {"sentinel": True}
+        check("handheld ignores the fixed mount witness",
+              capture_server.locate_options(restarted, {"mode": "handheld"}).witness is None
+              and capture_server.locate_options(restarted, {"mode": "fixed"}).witness
+              == {"sentinel": True})
+        # SSRF (A-M11): a camera override stays on the configured camera's host.
+        srf = capture_server.build_app(args_for(True))
+        srf["camera"] = "rtsp://mediamtx:8554/phone"
+        capture_server.check_camera_override(srf, "rtsp://mediamtx:8554/other")
+        capture_server.check_camera_override(srf, "device:0")
+        check("a same-host camera override is allowed", True)
+        for bad in ("http://evil.example/x", "http://169.254.169.254/latest",
+                    "file:///etc/passwd", "rtsp://other-host:8554/phone"):
+            try:
+                capture_server.check_camera_override(srf, bad)
+                check("camera override refuses an off-host URL", False, bad)
+            except Exception:
+                check("camera override refuses an off-host URL", True, bad)
         empty_args = args_for(True)
         empty_args.calib_dir = str(workdir / "marker-empty-calib")
         empty = capture_server.build_app(empty_args)

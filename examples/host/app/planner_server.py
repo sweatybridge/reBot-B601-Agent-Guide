@@ -41,6 +41,7 @@ frame is sent -- this service adds convenience, not a new way to bypass the gate
 from __future__ import annotations
 
 import json
+import hmac
 import logging
 import math
 import os
@@ -211,6 +212,22 @@ def request_options(body):
     for name, value in raw.items():
         if not hasattr(options, name):
             raise GatewayError("unknown option %r" % name)
+        # Validate against the field's own type so a wrong JSON type is a 4xx
+        # here, not a TypeError deep in planning that surfaces as a 500.
+        default = getattr(options, name)
+        if isinstance(default, bool):
+            if not isinstance(value, bool):
+                raise GatewayError("option %r must be a boolean" % name)
+        elif isinstance(default, float):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise GatewayError("option %r must be a number" % name)
+            value = float(value)
+        elif isinstance(default, str):
+            if not isinstance(value, str):
+                raise GatewayError("option %r must be a string" % name)
+        elif isinstance(default, dict):
+            if not isinstance(value, dict):
+                raise GatewayError("option %r must be an object" % name)
         setattr(options, name, value)
     options.hover = True
     options.hover_m = 0.0
@@ -560,7 +577,9 @@ class Handler(BaseHTTPRequestHandler):
     def _authorised(self):
         if not TOKEN:
             return True
-        return self.headers.get("X-Rebot-Token", "") == TOKEN
+        # Constant-time compare: a timing side channel on the token is a real
+        # risk for a server that can move the arm.
+        return hmac.compare_digest(self.headers.get("X-Rebot-Token", ""), TOKEN)
 
     def _body(self):
         length = int(self.headers.get("Content-Length") or 0)

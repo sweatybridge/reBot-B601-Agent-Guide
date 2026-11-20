@@ -1361,6 +1361,12 @@ def commit(result: "RunResult", calibration, options: Options, rig_path,
 
     rig_path = Path(rig_path)
     rig_path.parent.mkdir(parents=True, exist_ok=True)
-    attach_witness(rig, result, calibration, rig_path)
+    # The witness is a bonus, not a gate: a WitnessError here must not escape
+    # after a successful sweep and lose the rig (commit_marker handles it the
+    # same way). Record it as a warning and write the rig regardless.
+    try:
+        attach_witness(rig, result, calibration, rig_path)
+    except witness.WitnessError as error:
+        result.warnings.append("the rig has no mount witness (%s)" % error)
     ex.save_rig(rig, rig_path)
     return rig, verdict, rig_path
