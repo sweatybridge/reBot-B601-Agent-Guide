@@ -35,9 +35,10 @@ MIN_HZ, MAX_HZ = 5.0, 200.0
 # linear velocity ramps into a constant-velocity cruise. The cosine ease this
 # replaces has sine velocity tails that scale with leg duration -- on a 25 s leg
 # the P-only drive spent ~2.5 s at each end below its stiction breakaway speed
-# (~0.1 rad/s at kp=50) and moved in stick-slip segments. The trapezoid crosses
-# that band in ramp * v_stiction / v_cruise (~0.1 s) regardless of leg length.
-RAMP_S = 0.3
+# (~0.2 rad/s at kp=50) and moved in stick-slip segments. The trapezoid crosses
+# that band in ramp * v_breakaway / v_cruise regardless of leg length; 0.15 s
+# keeps the ramp-end stall under ~0.2 s while ramp acceleration stays modest.
+RAMP_S = 0.15
 
 
 def _ramp_ratio(duration, ramp):

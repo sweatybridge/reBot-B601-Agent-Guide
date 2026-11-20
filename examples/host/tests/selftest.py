@@ -333,7 +333,7 @@ def test_schema():
           abs(move_stats["peak_v"] - expect_peak) < 0.02 * expect_peak,
           "%.4f vs %.4f rad/s" % (move_stats["peak_v"], expect_peak))
     check("a joint move starts near rest",
-          abs(move_wps[0]["v"][2]) < 0.1 * move_stats["peak_v"])
+          abs(move_wps[0]["v"][2]) < 0.15 * move_stats["peak_v"])
     seq_holds = [point for point in sweep_motion["waypoints"]
                  if all(q == 0.2 for q in point["q"][:6])]
     check("a sequence holds at zero velocity",
@@ -3698,6 +3698,11 @@ def test_auto_sweep(workdir: Path):
     check("the return to park takes at least the minimum time",
           sweep.seconds_for(legs[-2], legs[-1]) >= sweep.MIN_SECONDS,
           "%.1f s" % sweep.seconds_for(legs[-2], legs[-1]))
+    short = sweep.seconds_for(np.zeros(6), np.array([0.2, 0, 0, 0, 0, 0]))
+    short_cruise = 0.2 / (short - traj.RAMP_S)
+    check("a short nudge cruises above stiction breakaway, not 3 s of crawl",
+          short_cruise >= sweep.MIN_CRUISE_SPEED - 1e-9 and short < 3.0,
+          "%.2f s, cruise %.3f rad/s" % (short, short_cruise))
 
     # The jaw has its own cap: a fixed 0.8 s open leg commanded 9.6 rad/s and
     # the jaw lagged 42 degrees behind. gripper_seconds is the floor that fixes

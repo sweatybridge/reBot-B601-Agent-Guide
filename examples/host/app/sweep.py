@@ -34,6 +34,7 @@ from pathlib import Path
 import numpy as np
 
 import rebot_ik
+import traj
 
 # Parked pose: on the j2/j3 stops, the transit point before and after the
 # sweep. Not an observation -- the camera usually cannot see the tool there.
@@ -221,15 +222,18 @@ def check(start=None, verbose=False):
 
 # Motion policy for every leg of the sweep, the return to park included.
 #
-# `traj.joint_move` interpolates with a cosine ease, so a leg starts and stops at
-# zero velocity and its peak is pi/2 times its average. That makes the peak the
-# only number worth setting: from it, and the joint that travels furthest, comes
-# the duration. 0.35 rad/s is about 20 deg/s -- slow enough to watch, and it
-# costs a couple of minutes once, on a commissioning pass that should not be
-# hurried. The floor matters for short legs: a 0.2 rad nudge still gets three
-# seconds, so it accelerates and decelerates instead of starting with a jerk.
+# Legs use the trapezoid profile (traj.ease_fraction): short velocity ramps into
+# a constant cruise. The duration is the slower of two demands -- the peak cap
+# (cosine-calibrated: pi/2 x travel / peak, which the trapezoid cruise stays
+# under) and a cruise floor above the drive's stiction breakaway (~0.2 rad/s at
+# kp=50): a leg that crawls below breakaway sticks and slips instead of moving.
+# 0.35 rad/s is about 20 deg/s -- slow enough to watch, and it costs a couple of
+# minutes once, on a commissioning pass that should not be hurried. The old 3 s
+# minimum is gone: it made short legs cruise far below breakaway. The ramps now
+# provide the gentle start, so MIN_SECONDS is just the triangle floor (2 x ramp).
 PEAK_SPEED = 0.35        # rad/s
-MIN_SECONDS = 3.0
+MIN_CRUISE_SPEED = 0.25  # rad/s, above the ~0.2 rad/s stiction breakaway
+MIN_SECONDS = 0.3
 MAX_SECONDS = 25.0
 
 # The jaw is not the arm: a short-travel axis with real stiction. A fixed-duration
@@ -438,13 +442,15 @@ def sag_compensator(kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
 def seconds_for(a, b, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SECONDS):
     """How long a leg should take, from the furthest-travelling joint.
 
-    A cosine ease has peak speed `pi/2 * travel / seconds`, so inverting that
-    for the cap is the whole policy. It is used for every leg -- out to a pose,
-    between poses, and back to the parked pose -- so the return is never the
-    quickest part of the sweep.
+    Two demands, whichever is slower: the cosine-calibrated peak cap (the
+    trapezoid cruise stays under it for any leg longer than ~0.4 s), and a
+    cruise floor above the drive's stiction breakaway so short legs move
+    instead of stick-slipping. The caller's minimum/maximum clamp the result.
     """
     travel = float(np.max(np.abs(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))))
-    return max(minimum, min(maximum, (math.pi / 2.0) * travel / float(peak_speed)))
+    peak_time = (math.pi / 2.0) * travel / float(peak_speed)
+    cruise_time = travel / MIN_CRUISE_SPEED + traj.RAMP_S
+    return max(minimum, min(maximum, max(peak_time, cruise_time)))
 
 
 def gripper_seconds(travel, peak_speed=GRIPPER_PEAK_SPEED):
