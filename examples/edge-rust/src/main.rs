@@ -65,7 +65,7 @@ const GRIPPER_STALL_MAX_S: f64 = 5.0;
 // cosine-calibrated peak-speed cap (peak = pi/2 x average) -- so a long way home
 // is not rushed, and a short nudge still takes long enough to have a beginning
 // and an end. The trapezoid profile's cruise stays under that cap for any ramp
-// longer than ~0.8 s, so the formula remains a conservative floor.
+// longer than ~0.4 s, so the formula remains a conservative floor.
 const RETURN_PEAK_SPEED: f64 = 0.35; // rad/s, base speed for the return cap
 const RETURN_MIN_S: f64 = 3.0;       // s, floor for any return ramp
 // Every exit (normal end, fault, Ctrl-C/SIGTERM) ramps home at three times the
@@ -74,8 +74,8 @@ const RETURN_MIN_S: f64 = 3.0;       // s, floor for any return ramp
 const SHUTDOWN_PEAK_SPEED: f64 = 3.0 * RETURN_PEAK_SPEED;
 // Velocity ramp at each end of an internally generated leg, seconds. Mirrors
 // traj.py's RAMP_S: trapezoid velocity (short ramps, constant cruise) so slow
-// legs do not linger below the drive's stiction breakaway speed (~0.1 rad/s).
-const MOVE_RAMP_S: f64 = 0.3;
+// legs do not linger below the drive's stiction breakaway speed (~0.2 rad/s).
+const MOVE_RAMP_S: f64 = 0.15;
 
 // RobStride communication types (see robstride_dynamics/protocol.py).
 const COMM_OPERATION_CONTROL: u32 = 1;
@@ -4701,13 +4701,14 @@ mod tests {
             "cruise velocity {} should be {cruise}",
             joint2[50].velocity
         );
-        // The cruise is flat, and the ramp midpoint is half the cruise.
+        // The cruise is flat, and the ramp at u=0.05 is a third of the cruise
+        // (ramp ratio 0.15).
         assert!((joint2[40].velocity - joint2[60].velocity).abs() < 2e-3);
         assert!(
-            (joint2[15].velocity - 0.5 * cruise).abs() < 2e-3,
-            "ramp midpoint {} should be {}",
-            joint2[15].velocity,
-            0.5 * cruise
+            (joint2[5].velocity - cruise / 3.0).abs() < 2e-3,
+            "ramp sample {} should be {}",
+            joint2[5].velocity,
+            cruise / 3.0
         );
         assert!(joint2.iter().all(|frame| frame.velocity > -2e-3));
     }
