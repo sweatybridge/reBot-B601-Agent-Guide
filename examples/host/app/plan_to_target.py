@@ -684,19 +684,6 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             log("  %-11s: %d waypoints" % (label, count))
         return pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float), n_arm)
 
-    def cartesian(start, end, rotation_from, rotation_to, seconds, blend_fraction, seed,
-                  label, gripper):
-        count = max(1, int(round(seconds * options.hz)))
-        for index in range(1, count + 1):
-            state["t"] += period
-            fraction = traj.ease_fraction(index / count, count / options.hz)
-            place = start + (end - start) * fraction
-            rotation = blend_rotation(rotation_from, rotation_to,
-                                      min(1.0, fraction / max(1e-6, blend_fraction)))
-            seed = ik_to(place, rotation, seed, "%s %d/%d" % (label, index, count))
-            append(seed, gripper)
-        return seed
-
     # The edge starts from the arm's current gripper angle, so a closed gripper
     # would jump open on the first waypoint. Hold still and ramp it open first.
     gripper_start = float(gripper_start)
@@ -711,12 +698,9 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     unparked = any(abs(value) > 1e-9 for value in unpark.values())
     if unparked:
         seed = joint_leg(q.copy(), unpark, options.unpark_s, "unpark", gripper)
-        _, R0, T_unparked = compute_fk(model, seed)
-        p0 = T_unparked[:3, 3].copy()
+        _, R0, _ = compute_fk(model, seed)
     start_seed = seed.copy()
 
-    current_place = p0.copy()
-    current_rotation = R0.copy()
     yaw_degrees = []
     # Each marker's RAW IK solution, before the emission pass compensates sag.
     # The oracle compares FK(q_ik) against the requested flange point to measure
@@ -731,37 +715,32 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         yaw_deg = math.degrees(math.atan2(float(point[1]), float(point[0])))
         yaw_degrees.append(round(yaw_deg, 3))
         R_marker = work_orientation(R0, sequence_axis, yaw_deg)
-        if index == 1:
-            # The first approach is the one the single-tap plan is known to
-            # handle: from the arm's pose to the first marker.
-            seed = cartesian(current_place, place, current_rotation, R_marker,
-                             options.approach_s, 0.4, seed, "marker 1", gripper)
-            marker_q_ik.append([float(v) for v in seed[:n_arm]])
-        else:
-            # Between markers, a straight Cartesian line can leave the annulus
-            # the arm can reach with the tool down. Solve the marker pose, then
-            # interpolate joint space; the capsule check still guards the table.
-            try:
-                target = ik_to(place, R_marker, seed, "marker %d" % index)
-            except PlanError:
-                target = ik_to(place, R_marker, start_seed, "marker %d" % index)
-            marker_q_ik.append([float(v) for v in target[:n_arm]])
-            current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
-            if not sweep.path_safe(current_q, target[:n_arm]):
-                raise PlanError(
-                    "the leg from marker %d to marker %d dips within a link radius "
-                    "of the worktop; space the markers further apart or move the arm "
-                    "clear" % (index - 1, index))
-            # The sweep's speed policy is the floor, exactly as on /move: a
-            # caller may ask for a slower leg, never a quicker one. Without it
-            # the wrap legs (j1's long way around the +-2.8 rad stop, ~5.5 rad)
-            # ran in approach_s and whipped the base at ~2.9 rad/s.
-            leg_seconds = max(options.approach_s,
-                              sweep.seconds_for(current_q, target[:n_arm]))
-            seed = joint_leg(
-                current_q,
-                {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
-                leg_seconds, "marker %d" % index, gripper)
+        # Every marker, the first included, is approached endpoint-first: solve
+        # the marker pose, then interpolate joint space. The incremental
+        # Cartesian IK the first approach used bulged j1 forward-then-back and
+        # slipped IK branches near the orientation blend's end -- the jolt after
+        # the peel. A straight Cartesian line can also leave the annulus the arm
+        # can reach with the tool down; the capsule check still guards the table.
+        try:
+            target = ik_to(place, R_marker, seed, "marker %d" % index)
+        except PlanError:
+            target = ik_to(place, R_marker, start_seed, "marker %d" % index)
+        marker_q_ik.append([float(v) for v in target[:n_arm]])
+        current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+        if not sweep.path_safe(current_q, target[:n_arm]):
+            raise PlanError(
+                "the leg to marker %d dips within a link radius of the worktop; "
+                "space the markers further apart or move the arm clear" % index)
+        # The sweep's speed policy is the floor, exactly as on /move: a
+        # caller may ask for a slower leg, never a quicker one. Without it
+        # the wrap legs (j1's long way around the +-2.8 rad stop, ~5.5 rad)
+        # ran in approach_s and whipped the base at ~2.9 rad/s.
+        leg_seconds = max(options.approach_s,
+                          sweep.seconds_for(current_q, target[:n_arm]))
+        seed = joint_leg(
+            current_q,
+            {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
+            leg_seconds, "marker %d" % index, gripper)
         hold_t0 = state["t"]
         hold(0.25, gripper)
         next_gripper = MOTOR7_HALF if index % 2 == 1 else MOTOR7_OPEN
@@ -770,8 +749,6 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         gripper = next_gripper
         hold(0.25, gripper)
         marker_holds.append((hold_t0, state["t"]))
-        current_place = place
-        current_rotation = R_marker
 
     # Return in joint space. A Cartesian return to the parked pose is the one
     # leg where IK can fail on the last millimetres (the parked pose sits on
