@@ -30,10 +30,29 @@
 
     const applied = Number.isFinite(Number(turn))
       ? ((Math.round(Number(turn)) % 4) + 4) % 4
-      : Math.max(0, G.shapeTurn(calibration.image_size, [width, heightPx]));
-    const source = applied ? calibration.image_size : [width, heightPx];
-    const at = applied ? G.mapPixel(u, v, [width, heightPx], applied) : [u, v];
-    const camera = makeCamera(calibration, source[0], source[1]);
+      : G.shapeTurn(calibration.image_size, [width, heightPx]);
+    if (!(applied >= 0)) {
+      // Neither the host nor the frame shape knows the turn: assuming 0 here
+      // is a silent wrong target on a turned stream.
+      throw new Error("the stream turn is unknown and the frame shape does not determine it");
+    }
+    let at;
+    let camera;
+    if (applied) {
+      // Rotate the tap onto the upright video grid, then scale that grid onto
+      // the calibration grid: a turned stream can also be resized, and K stays
+      // on the grid it was fitted for. Rotating alone leaves the tap in video
+      // pixels while K expects calibration pixels.
+      const rotated = G.mapPixel(u, v, [width, heightPx], applied);
+      const uprightW = applied % 2 ? heightPx : width;
+      const uprightH = applied % 2 ? width : heightPx;
+      at = [rotated[0] * calibration.image_size[0] / uprightW,
+            rotated[1] * calibration.image_size[1] / uprightH];
+      camera = makeCamera(calibration, calibration.image_size[0], calibration.image_size[1]);
+    } else {
+      at = [u, v];
+      camera = makeCamera(calibration, width, heightPx);
+    }
 
     // Direct intersection with the raised plane: the tip is the point under the
     // tapped pixel at that height, so its x/y move along the ray as the height

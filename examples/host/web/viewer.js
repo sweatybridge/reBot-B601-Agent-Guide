@@ -687,8 +687,9 @@
           tap: tapped,
           source: options.source || "tap",
           // The correction the frame needs to reach the calibration grid, so the
-          // host does not have to guess the sign from the frame size.
-          turns: Number.isFinite(turn) ? (((Math.round(turn) % 4) + 4) % 4) : 0,
+          // host does not have to guess the sign from the frame size. Unknown is
+          // omitted, never 0: a declared 0 is a claim the host trusts.
+          turns: Number.isFinite(turn) ? (((Math.round(turn) % 4) + 4) % 4) : undefined,
           settings: video.videoWidth ? {
             width: video.videoWidth, height: video.videoHeight,
           } : {},
