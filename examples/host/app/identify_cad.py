@@ -838,7 +838,10 @@ RUN_TIPS = (
     (0.42, -0.20, 0.24),
     (0.44, +0.22, 0.32),
     (0.30, +0.05, 0.20),
-    (0.32, -0.10, 0.18),
+    # Moved out from (0.32, -0.10): the slide-in staging point 60 mm base-side
+    # of the old tip sat at r=0.275 m, inside the tool-down annulus (stage 5 IK
+    # refused, 26 mm off). The tip itself was reachable; only the staging was not.
+    (0.36, -0.11, 0.18),
     (0.28, -0.30, 0.22),
     (0.46, +0.28, 0.34),
     (0.38, -0.32, 0.28),
