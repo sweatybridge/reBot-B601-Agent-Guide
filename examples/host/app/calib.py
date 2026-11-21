@@ -124,6 +124,10 @@ class Calib:
     rms: float = 0.0
     device: str = ""
     raw: dict = field(default_factory=dict)
+    # Linear ratio of this grid to the on-disk fit. 1.0 is the native grid; a
+    # WebRTC bandwidth drop delivers the same sensor crop at another size, and
+    # `rescaled` tracks the ratio so pixel-denominated gates can follow it.
+    scale: float = 1.0
 
     @property
     def fingerprint(self) -> str:
@@ -137,6 +141,41 @@ class Calib:
             sort_keys=True,
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+    @property
+    def source_fingerprint(self) -> str:
+        """The on-disk fit's id, invariant under `rescaled` / `load(image_size=...)`.
+
+        Provenance (rigs, targets, sag-map keys) names the fit, not the grid a
+        particular frame happened to arrive on: a bandwidth drop must not
+        re-key the rig under every learned map that references it.
+        """
+        if not self.raw.get("K") or not self.raw.get("image_size"):
+            return self.fingerprint
+        blob = json.dumps(
+            {
+                "K": np.round(np.array(self.raw["K"], dtype=float).reshape(3, 3), 3).tolist(),
+                "dist": np.round(np.array(self.raw.get("dist", [0.0] * 5), dtype=float)
+                                 .reshape(-1), 6).tolist(),
+                "size": [int(v) for v in self.raw["image_size"]],
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+    def rescaled(self, image_size) -> "Calib":
+        """The same fit on another grid of the same sensor crop.
+
+        A no-op at the current size. `scale_K` refuses an aspect change: a
+        cropped or zoomed stream is a different camera, not a rescale.
+        """
+        size = (int(image_size[0]), int(image_size[1]))
+        if size == (int(self.image_size[0]), int(self.image_size[1])):
+            return self
+        K = scale_K(self.K, self.image_size, size)
+        return Calib(path=self.path, K=K, dist=self.dist, image_size=size,
+                     rms=self.rms, device=self.device, raw=self.raw,
+                     scale=self.scale * size[0] / float(self.image_size[0]))
 
     def describe(self) -> str:
         w, h = self.image_size
@@ -170,16 +209,7 @@ def load(path, image_size=None) -> Calib:
     except (KeyError, TypeError, ValueError) as exc:
         raise CalibError("%s: expected K, dist and image_size, got %s" % (path, exc)) from exc
 
-    if image_size is not None and (int(image_size[0]), int(image_size[1])) != size:
-        if swapped_shape(size, image_size):
-            raise CalibError(
-                "the frame (%sx%s) is a quarter turn of the calibration (%sx%s): load "
-                "without image_size and map the pixels instead of rescaling"
-                % (int(image_size[0]), int(image_size[1]), int(size[0]), int(size[1])))
-        K = scale_K(K, size, image_size)
-        size = (int(image_size[0]), int(image_size[1]))
-
-    return Calib(
+    calib = Calib(
         path=path,
         K=K,
         dist=dist,
@@ -188,6 +218,14 @@ def load(path, image_size=None) -> Calib:
         device=str(data.get("device", "")),
         raw=data,
     )
+    if image_size is not None and (int(image_size[0]), int(image_size[1])) != size:
+        if swapped_shape(size, image_size):
+            raise CalibError(
+                "the frame (%sx%s) is a quarter turn of the calibration (%sx%s): load "
+                "without image_size and map the pixels instead of rescaling"
+                % (int(image_size[0]), int(image_size[1]), int(size[0]), int(size[1])))
+        calib = calib.rescaled(image_size)
+    return calib
 
 
 def slug(text: str, fallback: str = "camera") -> str:
