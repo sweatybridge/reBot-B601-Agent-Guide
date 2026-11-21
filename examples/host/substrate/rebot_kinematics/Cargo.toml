@@ -21,6 +21,7 @@ pgrx = "=0.16.1"
 k = "0.32"
 nalgebra = "0.30"
 urdf-rs = "0.9"
+serde_json = "1"
 
 [dev-dependencies]
 pgrx-tests = "=0.16.1"

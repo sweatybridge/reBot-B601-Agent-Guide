@@ -222,6 +222,159 @@ fn rebot_path_safe(urdf: &str, a: Vec<f64>, b: Vec<f64>, samples: default!(i32, 
     path_safe_impl(&chain, &a, &b, samples as usize)
 }
 
+// --------------------------------------------------------------------------- //
+// Sag / gain residual map fitting — port of identify.fit_sag_map (§7.3b).
+// Huber IRLS affine per joint, hold-out validation, FK sensitivity for validated_mm.
+// --------------------------------------------------------------------------- //
+
+const SAG_HUBER_RAD: f64 = 0.010;
+const SAG_VALIDATE_MAX_MRAD: f64 = 15.0;
+const SAG_VALIDATE_RATIO: f64 = 2.0;
+const SAG_SPAN_RADIUS_M: f64 = 0.10;
+const SAG_SPAN_HEIGHT_M: f64 = 0.05;
+
+struct SagHold { q: Vec<f64>, tau: Vec<f64>, r: Vec<f64>, tip: Vec<f64> }
+
+fn json_f64_arr(v: &serde_json::Value) -> Vec<f64> {
+    v.as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default()
+}
+
+fn parse_holds(v: &serde_json::Value) -> Vec<SagHold> {
+    v.as_array().map(|arr| arr.iter().map(|h| SagHold {
+        q: json_f64_arr(&h["q"]), tau: json_f64_arr(&h["tau"]),
+        r: json_f64_arr(&h["r"]), tip: json_f64_arr(&h["tip"]),
+    }).collect()).unwrap_or_default()
+}
+
+/// Weighted least-squares affine y ~ a*x + b via 2x2 normal equations.
+fn wls_affine(x: &[f64], y: &[f64], w: &[f64]) -> (f64, f64) {
+    let (mut sxx, mut sx, mut sw, mut sxy, mut sy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for i in 0..x.len() {
+        let wi = w[i];
+        sxx += wi * x[i] * x[i]; sx += wi * x[i]; sw += wi;
+        sxy += wi * x[i] * y[i]; sy += wi * y[i];
+    }
+    let det = sxx * sw - sx * sx;
+    if det.abs() < 1e-12 { (0.0, sy / sw.max(1e-12)) }
+    else { ((sxy * sw - sy * sx) / det, (sxx * sy - sx * sxy) / det) }
+}
+
+/// Huber IRLS affine fit (identify._huber_affine): OLS then 20 reweight iterations.
+fn huber_affine(x: &[f64], y: &[f64]) -> (f64, f64) {
+    let n = x.len();
+    let ones = vec![1.0; n];
+    let mut coef = wls_affine(x, y, &ones);
+    for _ in 0..20 {
+        let w: Vec<f64> = (0..n).map(|i| {
+            let r = (y[i] - (coef.0 * x[i] + coef.1)).abs();
+            if r > SAG_HUBER_RAD { SAG_HUBER_RAD / r.max(1e-12) } else { 1.0 }
+        }).collect();
+        coef = wls_affine(x, y, &w);
+    }
+    coef
+}
+
+fn per_joint_rms(holds: &[SagHold], pm: &[(f64, f64); 6]) -> f64 {
+    if holds.is_empty() { return 0.0; }
+    let mut total = 0.0;
+    for h in holds {
+        for j in 0..6 {
+            let pred = pm[j].0 * h.tau[j] + pm[j].1;
+            total += (h.r[j] - pred).powi(2);
+        }
+    }
+    1000.0 * (total / (holds.len() * 6) as f64).sqrt()
+}
+
+/// Tip sensitivity per joint (m/rad) by finite difference of the FK (identify._tool_mm_per_rad).
+fn tool_mm_per_rad(urdf: &str, q6: &[f64]) -> [f64; 6] {
+    let fk = |q: &[f64]| -> nalgebra::Vector3<f64> {
+        let (_r, chain) = load_chain_arm(urdf, q);
+        let t = chain.find_link("gripper_end").unwrap().world_transform().unwrap();
+        t.translation.vector
+    };
+    let base = fk(q6);
+    let mut out = [0.0; 6];
+    for j in 0..6 {
+        let mut moved = q6.to_vec();
+        moved[j] += 1e-4;
+        out[j] = (fk(&moved) - base).norm() / 1e-4;
+    }
+    out
+}
+
+/// Fit the per-joint sag residual map from hold samples (identify.fit_sag_map).
+/// `holds` is a jsonb array of {q[7], tau[6], r[6], tip[3]}. Returns the fit doc.
+#[pg_extern]
+fn rebot_fit_sag_map(
+    urdf: &str, holds: pgrx::JsonB, kp_key: &str, rig_fingerprint: &str, zeros_key: &str,
+    min_holds: default!(i32, 30),
+) -> pgrx::JsonB {
+    use serde_json::json;
+    let hs = parse_holds(&holds.0);
+    let min_holds = min_holds as usize;
+    if hs.len() < min_holds {
+        return pgrx::JsonB(json!({"ok": false, "reasons": [
+            format!("only {} holds (need {}): let more executions accumulate", hs.len(), min_holds)]}));
+    }
+    let radius: Vec<f64> = hs.iter().map(|h| (h.tip[0].powi(2) + h.tip[1].powi(2)).sqrt()).collect();
+    let height: Vec<f64> = hs.iter().map(|h| h.tip[2]).collect();
+    let rmin = radius.iter().cloned().fold(f64::INFINITY, f64::min);
+    let rmax = radius.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let hmin = height.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hmax = height.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if rmax - rmin < SAG_SPAN_RADIUS_M || hmax - hmin < SAG_SPAN_HEIGHT_M {
+        return pgrx::JsonB(json!({"ok": false, "reasons": [
+            format!("the holds do not span the workspace (radius span {:.2} m, height span {:.2} m)", rmax - rmin, hmax - hmin)]}));
+    }
+    let train: Vec<&SagHold> = hs.iter().enumerate().filter(|(i, _)| i % 5 != 4).map(|(_, h)| h).collect();
+    let test: Vec<&SagHold> = hs.iter().enumerate().filter(|(i, _)| i % 5 == 4).map(|(_, h)| h).collect();
+    let mut pm = [(0.0_f64, 0.0_f64); 6];
+    for j in 0..6 {
+        let x: Vec<f64> = train.iter().map(|h| h.tau[j]).collect();
+        let y: Vec<f64> = train.iter().map(|h| h.r[j]).collect();
+        pm[j] = huber_affine(&x, &y);
+    }
+    let to_owned = |v: &[&SagHold]| -> Vec<SagHold> {
+        v.iter().map(|h| SagHold { q: h.q.clone(), tau: h.tau.clone(), r: h.r.clone(), tip: h.tip.clone() }).collect()
+    };
+    let train_rms = per_joint_rms(&to_owned(&train), &pm);
+    let test_rms = per_joint_rms(&to_owned(&test), &pm);
+    if test_rms > SAG_VALIDATE_MAX_MRAD || test_rms > (SAG_VALIDATE_RATIO * train_rms).max(1.0) {
+        return pgrx::JsonB(json!({"ok": false, "rms_mrad": (test_rms * 1000.0).round() / 1000.0,
+            "reasons": [format!("hold-out validation failed: {:.1} mrad held out vs {:.1} mrad train (an overfit map is not applied)", test_rms, train_rms)]}));
+    }
+    // envelope
+    let dof = hs[0].q.len();
+    let mut q_min = vec![f64::INFINITY; dof];
+    let mut q_max = vec![f64::NEG_INFINITY; dof];
+    for h in &hs { for j in 0..dof { q_min[j] = q_min[j].min(h.q[j]); q_max[j] = q_max[j].max(h.q[j]); } }
+    // validated_mm via FK sensitivity at the mean pose
+    let mean_q6: Vec<f64> = (0..6).map(|j| hs.iter().map(|h| h.q[j]).sum::<f64>() / hs.len() as f64).collect();
+    let sens = tool_mm_per_rad(urdf, &mean_q6);
+    let mut per_joint = [0.0_f64; 6];
+    for j in 0..6 {
+        let mut acc = 0.0;
+        for h in &test { let e = h.r[j] - (pm[j].0 * h.tau[j] + pm[j].1); acc += e * e; }
+        per_joint[j] = if test.is_empty() { 0.0 } else { (acc / test.len() as f64).sqrt() };
+    }
+    let validated_mm = 1000.0 * (0..6).map(|j| (per_joint[j] * sens[j]).powi(2)).sum::<f64>().sqrt();
+    let per_motor: serde_json::Map<String, serde_json::Value> = (0..6)
+        .map(|j| (format!("{}", j + 1), json!({"a": pm[j].0, "b": pm[j].1}))).collect();
+    pgrx::JsonB(json!({
+        "ok": true,
+        "rms_mrad": (test_rms * 1000.0).round() / 1000.0,
+        "train_rms_mrad": (train_rms * 1000.0).round() / 1000.0,
+        "map": {
+            "version": 1, "kp_key": kp_key, "rig_fingerprint": rig_fingerprint, "zeros_key": zeros_key,
+            "per_motor": per_motor, "samples": hs.len(),
+            "rms_mrad": (test_rms * 1000.0).round() / 1000.0,
+            "validated_mm": (validated_mm * 100.0).round() / 100.0,
+            "envelope": {"q_min": q_min, "q_max": q_max, "radius_m": [rmin, rmax], "height_m": [hmin, hmax]}
+        }
+    }))
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {

@@ -987,6 +987,22 @@ transaction; self-checking assertions pass):
   for a fold-down that dips below the worktop (`CLEARANCE=0.012`, per-link `RADII`,
   `LINK_RADIUS_MAX=0.85`, 40 samples).
 
+**Learning plane (Phase 1, ports validated against the Python reference):**
+- `oracle_attribute(jsonb)` (PLpgSQL, `0002`) reproduces `oracle.attribute` across all
+  seven residual branches (clean/sag/rig-mismatch/joint-zeros/abort/one-plane/tip-detector):
+  layer, confidence, and problem kinds/layers match.
+- `trace_redact(jsonb)` reproduces `trace._redact` (drops token/authorization/api_key
+  recursively, keeps usage counters, reduces llm_url to host).
+- `accuracy_cell_update` reproduces `identify.update_accuracy_map` (n/n_good/measured_mm/
+  validated_at per cell).
+- `rebot_fit_sag_map` (Rust) reproduces `identify.fit_sag_map` (Huber IRLS affine per
+  joint, span + hold-out gates, FK sensitivity for validated_mm); per-motor coefficients
+  match the reference (joint1's slope is unidentifiable — vertical axis, ~zero gravity
+  torque — and both implementations correctly return ~0).
+- `store.py` (psycopg3) is the PG-backed store seam: content-addressed blobs (hash-verified
+  on read), redacted append-only events with per-episode advisory-lock seq assignment,
+  episode/plan catalog. Round-trip tested.
+
 **Durable orchestration (pg_durable):** a workflow `df.start(df.sql('SELECT
 to_jsonb(rebot_fk(...))'))` ran to `status=completed` via the duroxide background
 worker; `df.result` returned `{"rows":[{"pose":[0.1355,…]}],"row_count":1}`.
@@ -1044,9 +1060,15 @@ substrate/
     src/lib.rs               # rebot_fk / rebot_ik / rebot_dof
     src/bin/pgrx_embed_rebot_kinematics.rs   # REQUIRED for cargo pgrx schema gen
   migrations/0001_substrate.sql   # the §4+§5 DDL in dependency order
+  migrations/0002_learning_functions.sql # oracle_attribute, trace_redact, accuracy_cell_update
+  store.py                        # PG-backed store seam (blobs/events/catalog), psycopg3
   tests/mechanism_tests.sql       # refcount/GC/invalidation/CHECK/cascade/HNSW
   tests/kinematics_tests.sql      # FK/IK round-trip on the real arm
   tests/gravity_collision_tests.sql # gravity + path_safe vs the numpy reference
+  tests/oracle_attribute_tests.sql  # oracle_attribute + trace_redact vs Python
+  tests/accuracy_cell_tests.sql   # accuracy_cell_update vs identify.update_accuracy_map
+  tests/sag_fit_tests.sql         # rebot_fit_sag_map vs identify.fit_sag_map
+  tests/test_store.py             # store seam round-trip (needs psycopg)
   tests/df_workflow.sql           # pg_durable workflow calling rebot_fk
 ```
 
