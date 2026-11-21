@@ -5584,6 +5584,164 @@ def test_identify_cad_climb(workdir: Path, model):
     check("identify_cad: no excitation -> all sag params unlearned", len(frozen_all) == 12)
 
 
+def test_identify_cad_rescale(workdir: Path, model):
+    """A bandwidth drop mid-run is the same camera coarser, not a lost hold.
+
+    K follows each hold's frame, the error converts back to native pixels, the
+    green area gate follows s^2, and an aspect change still refuses. Synthetic
+    video, pose log and corpus -- nothing here needs the arm or the phone.
+    """
+    import identify_cad
+
+    print("\nidentify_cad: rescaled holds are measured, not dropped")
+    size = (640, 480)
+    half = (320, 240)
+    K, dist = synthetic_camera(*size, f=600.0)
+    T_prior = look_at((0.5, 0.95, 0.45), (0.3, 0.0, 0.25))
+    kp = sweep.kp_vector()
+
+    # hold_camera: the native fit rescaled onto the frame's grid, provenance-safe.
+    q = np.asarray(sweep.POSES[2], float)
+    native_hold = identify_cad.Hold(q_cmd=q, q_meas=q,
+                                    frame=np.zeros((size[1], size[0], 3), np.uint8))
+    K_n, size_n, s_n = identify_cad.hold_camera(native_hold, K, size)
+    check("identify_cad: a native hold keeps the reference K and grid",
+          s_n == 1.0 and size_n == size and np.allclose(K_n, K))
+    small_hold = identify_cad.Hold(q_cmd=q, q_meas=q,
+                                   frame=np.zeros((half[1], half[0], 3), np.uint8))
+    K_h, size_h, s_h = identify_cad.hold_camera(small_hold, K, size)
+    check("identify_cad: a rescaled hold gets K on its own grid",
+          abs(s_h - 0.5) < 1e-9 and size_h == half
+          and np.allclose(K_h, calib_mod.scale_K(K, size, half)),
+          "scale %.3f, fx %.1f -> %.1f" % (s_h, K[0, 0], K_h[0, 0]))
+    crop_hold = identify_cad.Hold(q_cmd=q, q_meas=q,
+                                  frame=np.zeros((200, 320, 3), np.uint8))
+    try:
+        identify_cad.hold_camera(crop_hold, K, size)
+        check("identify_cad: an aspect change is refused, not rescaled", False)
+    except calib_mod.CalibError as error:
+        check("identify_cad: an aspect change is refused, not rescaled",
+              "aspect" in str(error))
+
+    # The objective reports native pixels whatever grid the hold arrived on.
+    theta_true = identify_cad.theta0()
+    # A ~10-20 px projection shift. The one-way error stays modest inside the
+    # dead zone (covers still containing the measured edge score ~0), but it
+    # must be clearly above the at-truth raster floor on BOTH grids.
+    theta_true[:3] = (0.030, -0.025, 0.035)
+    theta_true[3:6] = (0.020, -0.015, 0.020)
+    T_true = np.linalg.inv(identify_cad.rig_from_theta(theta_true, T_prior))
+    q_held = identify_cad.held_prediction(theta_true, q, kp)
+    mask = identify_cad.render_cover(model, q_held, K, dist, T_true, size, 1.0)
+    frame = np.full((size[1], size[0], 3), 200, np.uint8)
+    frame[mask > 0] = (0, 200, 0)
+    hold_n = identify_cad.Hold(q_cmd=q, q_meas=q_held, frame=frame)
+    hold_n.prepare(1.0)
+    frame_half = cv2.resize(frame, half, interpolation=cv2.INTER_AREA)
+    hold_s = identify_cad.Hold(q_cmd=q, q_meas=q_held, frame=frame_half)
+    hold_s.prepare(1.0)
+    mixed = identify_cad.Objective(model, [hold_n, hold_s], K, dist, T_prior, kp, size, 1.0)
+    per = mixed.per_hold(identify_cad.theta0())
+    check("identify_cad: both grids measure the injected rig error",
+          per[0] is not None and per[1] is not None
+          and per[0][0] > 0.5 and per[1][0] > 0.5,
+          "native %.3f px, rescaled %.3f px" % (per[0][0], per[1][0]))
+    check("identify_cad: a rescaled hold reports the same native-px error",
+          abs(per[0][0] - per[1][0]) <= max(0.75, 0.15 * per[0][0]),
+          "native %.3f px vs rescaled %.3f px" % (per[0][0], per[1][0]))
+    at_true = mixed.per_hold(theta_true)
+    check("identify_cad: the injected truth still scores near zero on both grids",
+          at_true[0][0] < 1.5 and at_true[1][0] < 1.5,
+          "%.3f / %.3f px" % (at_true[0][0], at_true[1][0]))
+
+    # The correspondence gate follows the grid: a background blob is dropped
+    # on the coarse grid exactly as on the native one.
+    polluted = frame_half.copy()
+    polluted[5:25, 5:25] = (0, 200, 0)
+    hold_p = identify_cad.Hold(q_cmd=q, q_meas=q_held, frame=polluted)
+    hold_p.prepare(1.0)
+    before = hold_p.green_px
+    dropped = identify_cad.clean_measured(hold_p, model, theta_true, K, dist, T_prior,
+                                          kp, size, 1.0)
+    check("identify_cad: background blob gated out on a rescaled grid",
+          dropped >= 1 and hold_p.green_px < before - 300,
+          "%d dropped, %d -> %d green px" % (dropped, before, hold_p.green_px))
+
+    # extract_holds end to end: two real video segments, the second a uniform
+    # rescale (a bandwidth drop starts a new segment), plus a cropped third.
+    fps = 15.0
+    t0 = time.time()
+    A = np.asarray(sweep.POSES[2], float)
+    B = np.asarray(sweep.POSES[4], float)
+    C = np.asarray(sweep.POSES[6], float)
+    zeros = np.zeros(6)
+
+    def ramp(a, b, t):
+        return a + (b - a) * t
+
+    schedule = []                          # (t, q) at 15 Hz for 10 s
+    for i in range(150):
+        t = i / fps
+        if t < 1.0:
+            pose = zeros
+        elif t < 2.0:
+            pose = ramp(zeros, A, t - 1.0)
+        elif t < 3.5:
+            pose = A
+        elif t < 4.5:
+            pose = ramp(A, B, t - 3.5)
+        elif t < 6.0:
+            pose = B
+        elif t < 7.5:
+            pose = ramp(B, C, (t - 6.0) / 1.5)
+        elif t < 9.0:
+            pose = C
+        else:
+            pose = ramp(C, zeros, t - 9.0)
+        schedule.append(pose)
+    log_path = workdir / "rescale-poses.jsonl"
+    with open(log_path, "w", encoding="utf-8") as handle:
+        for i, pose in enumerate(schedule):
+            handle.write(json.dumps({"i": i, "t": t0 + i / fps,
+                                     "q": [float(v) for v in pose]}) + "\n")
+
+    def write_segment(name, start, seconds, frame_size, blob_window, blob_half):
+        path = workdir / name
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, frame_size)
+        centre = (frame_size[0] // 2, frame_size[1] // 2)
+        for i in range(int(round(seconds * fps))):
+            t = i / fps
+            picture = np.full((frame_size[1], frame_size[0], 3), 200, np.uint8)
+            if blob_window[0] <= t < blob_window[1]:
+                u, v = centre
+                picture[v - blob_half:v + blob_half, u - blob_half:u + blob_half] = (0, 200, 0)
+            writer.write(picture)
+        writer.release()
+        return mediamtx.Segment(path=path, start=start)
+
+    segments = [
+        write_segment("rescale-seg-native.mp4", t0, 4.0, size, (2.0, 3.5), 40),
+        write_segment("rescale-seg-half.mp4", t0 + 4.0, 3.5, half, (0.5, 2.0), 20),
+        write_segment("rescale-seg-crop.mp4", t0 + 7.5, 2.5, (320, 200), (0.0, 1.5), 20),
+    ]
+    trajectory = {"waypoints": [{"q": list(map(float, p)) + [0.0]} for p in (A, B, C)]}
+    fake_bench = SimpleNamespace(calibration=SimpleNamespace(image_size=size),
+                                 upright=lambda frame, turn: frame)
+    holds, skipped = identify_cad.extract_holds(segments, log_path, trajectory, 0,
+                                                fake_bench, workdir)
+    check("identify_cad: a mid-run rescale keeps the hold",
+          len(holds) == 2 and holds[0].frame.shape[:2] == (480, 640)
+          and holds[1].frame.shape[:2] == (240, 320),
+          "%d holds, shapes %s" % (len(holds), [h.frame.shape[:2] for h in holds]))
+    check("identify_cad: the rescaled hold passes the s^2 green area gate",
+          len(holds) == 2 and holds[1].green_px >= auto_calibrate.MIN_GREEN_PX * 0.25,
+          "%d green px on the half grid" % (holds[1].green_px if len(holds) > 1 else -1))
+    check("identify_cad: the rescaled hold keeps its commanded pose",
+          len(holds) == 2 and np.max(np.abs(holds[1].q_cmd - B)) < 1e-6)
+    check("identify_cad: an aspect-changed segment is still skipped",
+          len(skipped) == 1 and "aspect" in skipped[0], str(skipped))
+
+
 def test_identify_cad_gates(workdir: Path, model):
     import identify_cad
 
@@ -5937,6 +6095,7 @@ def main(argv=None):
     test_accuracy_map(workdir)
     cad_model = test_identify_cad_model(workdir)
     test_identify_cad_climb(workdir, cad_model)
+    test_identify_cad_rescale(workdir, cad_model)
     test_identify_cad_gates(workdir, cad_model)
     test_identify_cad_plan_execute(workdir)
 
