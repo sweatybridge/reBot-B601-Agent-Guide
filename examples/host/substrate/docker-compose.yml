@@ -1,0 +1,31 @@
+# The durable substrate: pg_durable (orchestration) + pgvector (similarity) +
+# rebot_kinematics (openrr/k FK/IK). Data lives on a named volume, NOT a Windows
+# bind mount (WAL locking on Docker Desktop bind mounts is flaky).
+services:
+  substrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rebot-substrate:pg18
+    container_name: rebot-substrate
+    environment:
+      POSTGRES_PASSWORD: rebot
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432"
+    volumes:
+      # PG18+ images want the mount at /var/lib/postgresql (they create a
+      # major-version subdir); mounting .../data directly is rejected.
+      - rebot-pgdata:/var/lib/postgresql
+      - ./migrations:/migrations:ro
+      - ./tests:/tests:ro
+    # pg_durable must be preloaded; the image already sets this, restated for clarity.
+    command: ["postgres", "-c", "shared_preload_libraries=pg_durable"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  rebot-pgdata:
