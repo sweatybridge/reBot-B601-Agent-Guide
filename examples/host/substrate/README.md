@@ -26,7 +26,14 @@ validated against the pure-numpy reference. `rebot_path_safe` is the worktop
 table-clearance gate, not full two-arm self-collision (a later phase).
 
 SQL functions: `rebot_fk`, `rebot_ik`, `rebot_dof`, `rebot_gravity_torques`,
-`rebot_joint_points`, `rebot_path_safe`.
+`rebot_joint_points`, `rebot_path_safe`, `rebot_fit_sag_map` (extension);
+`oracle_attribute`, `trace_redact`, `accuracy_cell_update` (migration `0002`).
+
+Learning plane (Phase 1): `oracle_attribute` / `trace_redact` / `accuracy_cell_update`
+are SQL ports of `oracle.attribute` / `trace._redact` / `identify.update_accuracy_map`;
+`rebot_fit_sag_map` is a Rust port of `identify.fit_sag_map`. All validated against the
+Python reference. `store.py` (psycopg3) is the PG-backed store seam replacing the
+file-based trace writes: content-addressed blobs, redacted append-only events, catalog.
 
 ## Quickstart
 
@@ -49,8 +56,14 @@ docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/mechan
 docker cp ../app/cad/ReBot_Arm_RS.urdf rebot-substrate:/tmp/rebot.urdf
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/kinematics_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/gravity_collision_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/oracle_attribute_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/accuracy_cell_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/sag_fit_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
+python tests/test_store.py   # needs psycopg; container on localhost:5433
 ```
+
+Apply `0002_learning_functions.sql` after `0001` for the learning-plane SQL functions.
 
 All pass on PG 18.7: schema mechanisms, FK/IK round-trip on the real 6-DOF arm,
 gravity + collision matching the numpy reference, and a pg_durable workflow calling
