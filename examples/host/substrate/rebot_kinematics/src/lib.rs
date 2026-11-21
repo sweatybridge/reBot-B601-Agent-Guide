@@ -77,6 +77,151 @@ fn rebot_dof(urdf: &str) -> i32 {
     load_chain(urdf).dof() as i32
 }
 
+// --------------------------------------------------------------------------- //
+// Gravity dynamics + collision checking.
+// Ports of rebot_ik.gravity_torques and sweep.path_safe (pure numpy reference),
+// using openrr/k for the joint/link world frames. Memory-safe: bad input raises a
+// SQL ERROR, never a backend crash.
+// --------------------------------------------------------------------------- //
+
+const GRAVITY: f64 = 9.80665;
+const ARM_JOINTS: [&str; 6] = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"];
+
+// (link, mass kg, COM in that link frame) — matches rebot_ik.LINK_INERTIALS.
+// Gripper fingers omitted (<0.1 Nm); gripper_end is the lumped tool mass.
+const LINK_INERTIALS: [(&str, f64, [f64; 3]); 7] = [
+    ("link1", 0.4655, [0.00817652, 0.00122584, 0.03314197]),
+    ("link2", 1.5520, [-0.11786481, -0.00342226, -0.02715519]),
+    ("link3", 1.2520, [0.10342715, -0.06641379, -0.02710687]),
+    ("link4", 0.4600, [0.04755445, -0.04411135, -0.03141119]),
+    ("link5", 0.2012, [0.01144006, 0.00000479, 0.03804875]),
+    ("link6", 0.1000, [0.00001802, 0.00000002, 0.00434806]),
+    ("gripper_end", 0.6500, [-0.11275169, 0.00012844, -0.00000573]),
+];
+
+// sweep.py collision model: per-link capsule radii, worktop clearance, reach cap.
+const RADII: [f64; 7] = [0.055, 0.055, 0.050, 0.045, 0.035, 0.030, 0.020];
+const CLEARANCE: f64 = 0.012;
+const LINK_RADIUS_MAX: f64 = 0.85;
+
+/// Load the chain and set the 6 arm joints (gripper joints padded to 0).
+fn load_chain_arm(urdf: &str, q6: &[f64]) -> (urdf_rs::Robot, k::Chain<f64>) {
+    if q6.len() != 6 {
+        panic!("expected 6 arm joint angles, got {}", q6.len());
+    }
+    let robot = urdf_rs::read_from_string(urdf).unwrap_or_else(|e| panic!("URDF parse failed: {e}"));
+    let chain = k::Chain::<f64>::from(&robot);
+    let mut q = q6.to_vec();
+    while q.len() < chain.dof() {
+        q.push(0.0);
+    }
+    chain.set_joint_positions(&q).unwrap_or_else(|e| panic!("set_joint_positions: {e}"));
+    chain.update_transforms();
+    (robot, chain)
+}
+
+fn joint_axis(robot: &urdf_rs::Robot, name: &str) -> nalgebra::Vector3<f64> {
+    let j = robot.joints.iter().find(|j| j.name == name)
+        .unwrap_or_else(|| panic!("joint not in URDF: {name}"));
+    let a = *j.axis.xyz;
+    nalgebra::Vector3::new(a[0], a[1], a[2])
+}
+
+/// Joint origins (joint1..6) plus the gripper_end tool point, base frame (7x3).
+fn joint_points(chain: &k::Chain<f64>) -> Vec<[f64; 3]> {
+    let mut pts = Vec::with_capacity(7);
+    for name in ARM_JOINTS {
+        let node = chain.find(name).unwrap_or_else(|| panic!("joint not found: {name}"));
+        let p = node.world_transform().unwrap().translation.vector;
+        pts.push([p.x, p.y, p.z]);
+    }
+    let tool = chain.find_link("gripper_end").unwrap_or_else(|| panic!("gripper_end link not found"));
+    let p = tool.world_transform().unwrap().translation.vector;
+    pts.push([p.x, p.y, p.z]);
+    pts
+}
+
+/// tau_g = dU/dq: motor torque to hold the pose against gravity (6 arm joints).
+/// tau[j] = -sum_{links>=j} z_j . cross(p_com - p_j, [0,0,-m*g]).
+fn gravity_torques_impl(robot: &urdf_rs::Robot, chain: &k::Chain<f64>) -> Vec<f64> {
+    let mut coms: Vec<(f64, nalgebra::Vector3<f64>)> = Vec::with_capacity(7);
+    for (lname, mass, com) in LINK_INERTIALS {
+        let node = chain.find_link(lname).unwrap_or_else(|| panic!("link not found: {lname}"));
+        let t = node.world_transform().unwrap();
+        let p_com = t.rotation * nalgebra::Vector3::new(com[0], com[1], com[2]) + t.translation.vector;
+        coms.push((mass, p_com));
+    }
+    let mut tau = vec![0.0; 6];
+    for j in 0..6 {
+        let node = chain.find(ARM_JOINTS[j]).unwrap();
+        let t = node.world_transform().unwrap();
+        let p_j = t.translation.vector;
+        // Rotation about the joint axis leaves the axis invariant, so the
+        // post-rotation frame gives the same world axis as the origin frame.
+        let z_j = t.rotation * joint_axis(robot, ARM_JOINTS[j]);
+        let mut total = 0.0;
+        for (mass, p_com) in coms.iter().skip(j) {
+            let force = nalgebra::Vector3::new(0.0, 0.0, -mass * GRAVITY);
+            total += z_j.dot(&(p_com - p_j).cross(&force));
+        }
+        tau[j] = -total;
+    }
+    tau
+}
+
+/// sweep.path_safe: is the straight joint-space line a->b clear of the worktop?
+fn path_safe_impl(chain: &k::Chain<f64>, a: &[f64], b: &[f64], samples: usize) -> bool {
+    if samples < 2 {
+        panic!("samples must be >= 2");
+    }
+    for s in 0..samples {
+        let t = s as f64 / (samples as f64 - 1.0);
+        let mut q: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x + (y - x) * t).collect();
+        while q.len() < chain.dof() {
+            q.push(0.0);
+        }
+        chain.set_joint_positions(&q).unwrap_or_else(|e| panic!("set_joint_positions: {e}"));
+        chain.update_transforms();
+        let points = joint_points(chain);
+        for index in 1..points.len() {
+            let start = points[index - 1];
+            let end = points[index];
+            let radius = RADII[index.min(RADII.len() - 1)];
+            for fraction in [0.0, 0.5] {
+                let cz = start[2] + (end[2] - start[2]) * fraction;
+                if cz - radius < CLEARANCE {
+                    return false;
+                }
+            }
+            if (end[0] * end[0] + end[1] * end[1]).sqrt() > LINK_RADIUS_MAX {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Joint torques (Nm, 6 arm joints) to hold pose `q` against gravity.
+#[pg_extern]
+fn rebot_gravity_torques(urdf: &str, q: Vec<f64>) -> Vec<f64> {
+    let (robot, chain) = load_chain_arm(urdf, &q);
+    gravity_torques_impl(&robot, &chain)
+}
+
+/// Joint origins + tool point (7 points, flattened to 21 floats) at pose `q`.
+#[pg_extern]
+fn rebot_joint_points(urdf: &str, q: Vec<f64>) -> Vec<f64> {
+    let (_robot, chain) = load_chain_arm(urdf, &q);
+    joint_points(&chain).iter().flat_map(|p| p.iter().copied()).collect()
+}
+
+/// Is the straight joint-space interpolation a->b clear of the worktop (sweep.path_safe)?
+#[pg_extern]
+fn rebot_path_safe(urdf: &str, a: Vec<f64>, b: Vec<f64>, samples: default!(i32, 40)) -> bool {
+    let (_robot, chain) = load_chain_arm(urdf, &a);
+    path_safe_impl(&chain, &a, &b, samples as usize)
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
