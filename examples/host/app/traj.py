@@ -37,13 +37,18 @@ MIN_HZ, MAX_HZ = 5.0, 200.0
 # planned at another rate still plays; this is only the default.
 DEFAULT_HZ = 50.0
 
-# Velocity ramp at each end of a leg, seconds. The profile is trapezoid: short
-# linear velocity ramps into a constant-velocity cruise. The cosine ease this
-# replaces has sine velocity tails that scale with leg duration -- on a 25 s leg
-# the P-only drive spent ~2.5 s at each end below its stiction breakaway speed
-# (~0.2 rad/s at kp=50) and moved in stick-slip segments. The trapezoid crosses
-# that band in ramp * v_breakaway / v_cruise regardless of leg length; 0.15 s
-# keeps the ramp-end stall under ~0.2 s while ramp acceleration stays modest.
+# Velocity ramp at each end of a leg, seconds. The profile is an S-ramp
+# trapezoid: velocity rises as a smoothstep into a constant-velocity cruise,
+# so acceleration starts and ends at zero -- no acceleration step at
+# rest->ramp->cruise for the P-only drive to feel as a torque kick. The
+# smoothstep's area is 1/2, exactly the linear ramp's, so the ramp covers the
+# same distance in the same time and the cruise speed (travel / (T - ramp))
+# is unchanged. The cosine ease this replaces has sine velocity tails that
+# scale with leg duration -- on a 25 s leg the drive spent ~2.5 s at each end
+# below its stiction breakaway speed (~0.2 rad/s at kp=50) and moved in
+# stick-slip segments. The S-ramp leaves rest quadratically (a hair slower
+# than linear at the very start) but crosses the breakaway band in well under
+# the 0.2 s stall budget; 0.15 s keeps the whole ramp short.
 RAMP_S = 0.15
 
 
@@ -52,18 +57,24 @@ def _ramp_ratio(duration, ramp):
 
 
 def ease_fraction(u, duration, ramp=RAMP_S):
-    """Fraction of a leg's travel at normalized time u, trapezoid velocity.
+    """Fraction of a leg's travel at normalized time u, S-ramp trapezoid.
 
-    Legs shorter than 2*ramp degenerate to a triangle (no cruise); both shapes
-    start and end at rest. `duration` is the leg's scheduled time in seconds.
+    Velocity rises as a smoothstep (3x^2 - 2x^3) over the ramp: acceleration
+    is zero at rest and at cruise, continuous in between. The smoothstep's
+    area is 1/2, the linear ramp's, so ramp distance and cruise timing are
+    unchanged. Legs shorter than 2*ramp degenerate to a smooth bell (no
+    cruise); every shape starts and ends at rest. `duration` is the leg's
+    scheduled time in seconds.
     """
     r = _ramp_ratio(duration, ramp)
     vc = 1.0 / (1.0 - r)
     u = max(0.0, min(1.0, float(u)))
     if u <= r:
-        return vc * u * u / (2.0 * r)
+        x = u / r
+        return vc * r * (x ** 3 - 0.5 * x ** 4)
     if u >= 1.0 - r:
-        return 1.0 - vc * (1.0 - u) ** 2 / (2.0 * r)
+        y = (1.0 - u) / r
+        return 1.0 - vc * r * (y ** 3 - 0.5 * y ** 4)
     return vc * (u - 0.5 * r)
 
 
@@ -74,9 +85,11 @@ def ease_velocity(u, duration, ramp=RAMP_S):
     u = max(0.0, min(1.0, float(u)))
     duration = max(float(duration), 1e-9)
     if u <= r:
-        return vc * u / (r * duration)
+        x = u / r
+        return vc * (3.0 * x * x - 2.0 * x ** 3) / duration
     if u >= 1.0 - r:
-        return vc * (1.0 - u) / (r * duration)
+        y = (1.0 - u) / r
+        return vc * (3.0 * y * y - 2.0 * y ** 3) / duration
     return vc / duration
 
 
@@ -238,6 +251,17 @@ def joint_sequence(poses, seconds, hold_s=0.4, control_hz=DEFAULT_HZ, limits=Non
                  label or ("%d poses, one pass" % len(points)))
 
 
+# Corner fillet radius at via knots: joint-space arc cut from each adjacent
+# segment. A quadratic Bezier tangent to both segments rounds the corner, so
+# the direction change spreads over the fillet instead of one tick. The path
+# stays within radius/2 of the knot -- a few mm at the tip for typical turns,
+# below the arm's ~23 mm repeatability -- and at the 0.5 rad/s cruise cap the
+# centripetal budget s^2/r is a few rad/s^2 spread over ticks, not a spike.
+CORNER_RADIUS_RAD = 0.05
+CHAIN_LINE_SAMPLES = 40    # per straight portion: the path_safe gate's density
+CHAIN_FILLET_SAMPLES = 16
+
+
 def _chain_knots(poses):
     points = [np.asarray(p, dtype=float).reshape(-1) for p in poses]
     if len(points) < 2:
@@ -250,34 +274,81 @@ def _chain_knots(poses):
     return points
 
 
-def chain_travel(poses):
-    """The furthest-travelling joint's path length along the chain, rad.
+def _chain_path(poses, radius=CORNER_RADIUS_RAD):
+    """Dense samples + cumulative arc of the filleted knot path.
 
-    Straight segments: the exact sum of each joint's |delta| per segment. A
-    joint that reverses direction at a via travels more than its endpoint
-    delta; the speed policy must budget the whole path, not just the ends.
+    Straight portions are sampled at the capsule gate's own density and
+    interpolated exactly; each interior knot gets a tangent quadratic fillet
+    whose radius is clamped to half the shorter adjacent segment so fillets
+    never overlap. A degenerate corner (zero radius or a zero-length segment)
+    keeps the sharp knot.
     """
     points = _chain_knots(poses)
-    return float(np.max(np.sum(np.abs(np.diff(points, axis=0)), axis=0)))
+    lengths = [float(np.linalg.norm(b - a)) for a, b in zip(points, points[1:])]
+    samples = [points[0]]
+    cursor = points[0]
+    for index in range(1, len(points) - 1):
+        knot = points[index]
+        span_in, span_out = lengths[index - 1], lengths[index]
+        r = min(float(radius), span_in / 2.0, span_out / 2.0)
+        if r > 1e-9 and span_in > 1e-12 and span_out > 1e-12:
+            u_in = (knot - points[index - 1]) / span_in
+            u_out = (points[index + 1] - knot) / span_out
+            a = knot - u_in * r
+            b = knot + u_out * r
+            for step in range(1, CHAIN_LINE_SAMPLES + 1):
+                samples.append(cursor + (a - cursor) * (step / CHAIN_LINE_SAMPLES))
+            for step in range(1, CHAIN_FILLET_SAMPLES + 1):
+                t = step / CHAIN_FILLET_SAMPLES
+                samples.append((1.0 - t) ** 2 * a
+                               + 2.0 * t * (1.0 - t) * knot
+                               + t ** 2 * b)
+            cursor = b
+        else:
+            for step in range(1, CHAIN_LINE_SAMPLES + 1):
+                samples.append(cursor + (knot - cursor) * (step / CHAIN_LINE_SAMPLES))
+            cursor = knot
+    for step in range(1, CHAIN_LINE_SAMPLES + 1):
+        samples.append(cursor + (points[-1] - cursor) * (step / CHAIN_LINE_SAMPLES))
+    samples = np.asarray(samples)
+    arc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(samples, axis=0), axis=1))])
+    return samples, arc
 
 
-def chain_series(poses, seconds, control_hz=DEFAULT_HZ):
+def chain_samples(poses, radius=CORNER_RADIUS_RAD):
+    """Dense samples of the filleted path, for the worktop capsule gate: a
+    rounded corner leaves the chord near the knot, so the gate must see the
+    fillets, not just the straight segments."""
+    samples, _arc = _chain_path(poses, radius)
+    return samples
+
+
+def chain_travel(poses, radius=CORNER_RADIUS_RAD):
+    """The furthest-travelling joint's path length along the filleted path, rad.
+
+    A joint that reverses direction at a via travels more than its endpoint
+    delta; the speed policy must budget the whole path, corner cuts included.
+    """
+    samples, _arc = _chain_path(poses, radius)
+    return float(np.max(np.sum(np.abs(np.diff(samples, axis=0)), axis=0)))
+
+
+def chain_series(poses, seconds, control_hz=DEFAULT_HZ, radius=CORNER_RADIUS_RAD):
     """Joint poses for one continuous leg through `poses`, tick by tick.
 
-    The path is straight joint-space segments between consecutive knots -- the
-    same interpolation a marker-to-marker leg uses -- under ONE trapezoid time
-    law over the whole chain's arc length: start at rest at poses[0] (already
-    the caller's last waypoint), ramp up over RAMP_S, cruise through every
-    interior knot without stopping, ramp down to rest at poses[-1]. Speed is
-    continuous at the knots; the direction changes there (a corner, not a stop).
+    Straight joint-space segments with tangent quadratic fillets at the
+    interior knots, under ONE S-ramp trapezoid time law over the whole path's
+    arc length: start at rest at poses[0] (already the caller's last waypoint),
+    ramp up over RAMP_S, cruise through every via without stopping, ramp down
+    to rest at poses[-1]. The fillets spread each direction change over ticks;
+    a near-180 deg reversal still turns through zero speed -- unavoidable.
 
-    Returns `count` poses, the last exactly poses[-1]. Ticks lie on the segments
-    exactly; interior knots are straddled within half a tick of travel (the
-    player streams at control_hz, the same quantization every leg already has).
+    Returns `count` poses, the last exactly poses[-1]. Ticks on the straight
+    portions lie on the segments exactly; fillets are sampled at
+    CHAIN_FILLET_SAMPLES. Knots are passed within radius/2 (the fillet's
+    corner cut), the discrete ticks straddle within half a tick of travel.
     """
-    points = _chain_knots(poses)
-    deltas = np.diff(points, axis=0)
-    arc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(deltas, axis=1))])
+    samples, arc = _chain_path(poses, radius)
     total = float(arc[-1])
     hz = float(control_hz)
     count = max(2, int(round(max(0.2, float(seconds)) * hz)))
@@ -289,8 +360,8 @@ def chain_series(poses, seconds, control_hz=DEFAULT_HZ):
         slot = max(0, min(slot, len(arc) - 2))
         span = arc[slot + 1] - arc[slot]
         weight = 0.0 if span <= 1e-12 else (target - arc[slot]) / span
-        out.append(points[slot] + deltas[slot] * weight)
-    out[-1] = points[-1].copy()
+        out.append(samples[slot] + (samples[slot + 1] - samples[slot]) * weight)
+    out[-1] = samples[-1].copy()
     return out
 
 
