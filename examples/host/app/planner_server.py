@@ -228,6 +228,12 @@ def request_options(body):
         elif isinstance(default, dict):
             if not isinstance(value, dict):
                 raise GatewayError("option %r must be an object" % name)
+        elif default is None:
+            # Optional numeric option (close_width_mm): a number or null.
+            if value is not None and (isinstance(value, bool)
+                                      or not isinstance(value, (int, float))):
+                raise GatewayError("option %r must be a number or null" % name)
+            value = None if value is None else float(value)
         setattr(options, name, value)
     options.hover = True
     options.hover_m = 0.0

@@ -397,6 +397,12 @@ and **Run the sweep from this tap** starts the arm.
 The arm gateway has one planning route, `POST /plan`:
 `{targets:[{tip:[x,y,z]}], tip_offset_m, gripper, options}`. `gripper` is
 `"alternate"` for the marker sequence and `"none"` for `/live`'s one target.
+`options.close_width_mm` (a number or null) sets the jaw opening the gripper
+closes to -- the pick's close and the sequence's odd-marker close -- converted
+through the **uncalibrated** 0.412 rad/cm pinion initial value from the
+reference docs; it overrides `grasp_q` and the half-close, and a width outside
+the ~119 mm stroke is refused. Measure the stroke once with a ruler before
+trusting the millimetres on hardware.
 Hover mode is gone: `hover`, `hover_m` and `tip_m` options are refused, and the
 old `/plan-sequence` route answers `410`. The capture server is the adapter: it
 validates `min_z`, adds the host's `tip_offset_m`, and forwards only tip points.
@@ -620,8 +626,9 @@ Move arm
 ```
 
 The gripper starts fully open -- it opens before the arm leaves its first pose
--- half-closes at odd-numbered markers and opens at even-numbered ones. Odd
-markers are grasped with the pick's slide-in geometry: the arm first stages
+-- half-closes at odd-numbered markers and opens at even-numbered ones
+(`options.close_width_mm` replaces the half-close with a chosen jaw opening).
+Odd markers are grasped with the pick's slide-in geometry: the arm first stages
 `approach` metres in front of the marker (on the base side, at the marker's own
 height), then slides forward into it before half-closing; even markers keep the
 direct visit. The arm returns to its start pose and the gripper auto-closes to

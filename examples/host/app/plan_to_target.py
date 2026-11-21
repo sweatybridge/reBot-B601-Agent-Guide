@@ -68,6 +68,13 @@ MOTOR7_CLOSED = -0.015
 # Halfway between open and closed: the gesture the marker sequence makes on
 # odd-numbered markers.
 MOTOR7_HALF = (MOTOR7_OPEN + MOTOR7_CLOSED) / 2.0
+# Jaw travel <-> motor angle: the URDF does not model the pinion (it builds the
+# fingers as prismatic joints). The reference docs' initial value is ~0.412
+# rad/cm, linear from the measured closed stop. UNCALIBRATED -- measure once
+# with a ruler before trusting millimetres on hardware
+# (references/demo-validation-pi-zero.md).
+GRIPPER_RAD_PER_MM = 0.0412
+GRIPPER_MAX_WIDTH_MM = (MOTOR7_OPEN - MOTOR7_CLOSED) / GRIPPER_RAD_PER_MM
 TOOL_AXES = {
     "x+": (0, 1.0), "x-": (0, -1.0),
     "y+": (1, 1.0), "y-": (1, -1.0),
@@ -86,6 +93,10 @@ class Options:
     approach_s: float = 3.0
     slide_s: float = 1.5
     grasp_q: float = 2.45
+    # Jaw opening to close to, in mm, converted through GRIPPER_RAD_PER_MM.
+    # When set it overrides grasp_q (pick) and the half-close (sequence odd
+    # markers); None keeps those angle defaults.
+    close_width_mm: float | None = None
     open_q: float = MOTOR7_OPEN
     grasp_s: float = 1.2
     hold_s: float = 0.6
@@ -214,6 +225,19 @@ def stage_in_front(point, approach):
                         "standoff: no room to stage in front of it"
                         % (radius, approach * 1000))
     return point - np.array([point[0], point[1], 0.0]) * (approach / radius)
+
+
+def close_angle(options, default):
+    """The motor-7 close target: `close_width_mm` converted through the pinion
+    initial value when set, else the caller's angle default (grasp_q for a
+    pick, MOTOR7_HALF for a sequence's odd markers)."""
+    if options.close_width_mm is None:
+        return default
+    width = float(options.close_width_mm)
+    if not 0.0 <= width <= GRIPPER_MAX_WIDTH_MM:
+        raise PlanError("close_width_mm %.1f is outside the jaw stroke [0, %.1f] mm"
+                        % (width, GRIPPER_MAX_WIDTH_MM))
+    return MOTOR7_CLOSED + width * GRIPPER_RAD_PER_MM
 
 
 def posture(dump):
@@ -499,7 +523,8 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         if not sweep.path_safe(q_pre[:n_arm], seed[:n_arm]):
             raise PlanError("the slide-in to the target dips within a link radius of the "
                             "worktop; raise the target or move the arm clear")
-        gripper_leg(options.grasp_q, options.grasp_s)
+        grip_q = close_angle(options, options.grasp_q)
+        gripper_leg(grip_q, options.grasp_s)
         hold_start = state["t"]
         hold(options.hold_s)
         hold_end = state["t"]
@@ -548,9 +573,11 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
                  % (hover_m * 1000, point[0], point[1], point[2],
                     "" if options.no_return else ", then return"))
     else:
-        steps = ("tap target: stage %.0f mm in front of [%.3f %.3f %.3f], slide in, grip %.2f rad, "
+        grip_text = ("grip %.2f rad" % grip_q if options.close_width_mm is None
+                     else "grip %.1f mm (%.2f rad)" % (options.close_width_mm, grip_q))
+        steps = ("tap target: stage %.0f mm in front of [%.3f %.3f %.3f], slide in, %s, "
                  "lift %.0f mm%s" % (options.approach * 1000, point[0], point[1], point[2],
-                                     options.grasp_q, options.lift * 1000,
+                                     grip_text, options.lift * 1000,
                                      "" if options.no_return else ", return and open"))
     waypoints = compensate_waypoints(waypoints, options, model, n_arm, lower, upper)
     payload = traj.build(
@@ -774,6 +801,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     # windows to targets by these times -- exact, where joint proximity would
     # confuse a marker near the park pose with the start hold.
     marker_holds = []
+    odd_close = close_angle(options, MOTOR7_HALF)
     for index, point in enumerate(points, start=1):
         place = flange_points[index - 1]
         yaw_deg = math.degrees(math.atan2(float(point[1]), float(point[0])))
@@ -842,7 +870,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                 "marker %d" % index, gripper)
         hold_t0 = state["t"]
         hold(0.25, gripper)
-        next_gripper = MOTOR7_HALF if index % 2 == 1 else MOTOR7_OPEN
+        next_gripper = odd_close if index % 2 == 1 else MOTOR7_OPEN
         if abs(next_gripper - gripper) > 1e-6:
             gripper_leg(next_gripper, max(0.8, options.hold_s))
         gripper = next_gripper
@@ -862,9 +890,11 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     joint_leg(q_last, {index: q_home[index] - q_last[index] for index in range(n_arm)},
               sweep.seconds_for(q_last, q_home), "return", gripper)
 
+    close_text = ("half-close" if options.close_width_mm is None
+                  else "close to %.1f mm" % options.close_width_mm)
     steps = ("%d markers: stage %.0f mm in front and slide in on odd, direct on even; "
-             "gripper open, half-close on odd, open on even; return"
-             % (len(points), options.approach * 1000))
+             "gripper open, %s on odd, open on even; return"
+             % (len(points), options.approach * 1000, close_text))
     provenance = {
         "sequence": True,
         # Defaults for a CLI surface target; the gateway sends tip points with
@@ -894,7 +924,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         "yaw_deg": options.yaw,
         "marker_yaw_deg": yaw_degrees,
         "gripper": {"open": MOTOR7_OPEN, "half": MOTOR7_HALF,
-                    "closed": MOTOR7_CLOSED},
+                    "closed": MOTOR7_CLOSED, "odd_close": odd_close},
     }
     waypoints = compensate_waypoints(waypoints, options, model, n_arm, lower, upper)
     payload = traj.build(
@@ -1009,6 +1039,9 @@ def add_arguments(parser):
                         help="duration of the slide-in leg, s")
     parser.add_argument("--grasp-q", type=float, default=2.45,
                         help="motor 7 angle after closing, rad (6 cm is 2.46)")
+    parser.add_argument("--close-width-mm", type=float, default=None,
+                        help="jaw opening to close to, mm; overrides --grasp-q and the "
+                             "sequence half-close (uncalibrated pinion initial value)")
     parser.add_argument("--open-q", type=float, default=MOTOR7_OPEN)
     parser.add_argument("--grasp-s", type=float, default=1.2)
     parser.add_argument("--hold-s", type=float, default=0.6)
@@ -1045,6 +1078,7 @@ def options_from_args(args) -> Options:
     return Options(
         hz=args.hz, approach=args.approach, approach_s=args.approach_s,
         slide_s=args.slide_s, grasp_q=args.grasp_q, open_q=args.open_q,
+        close_width_mm=args.close_width_mm,
         grasp_s=args.grasp_s, hold_s=args.hold_s, lift=args.lift, lift_s=args.lift_s,
         return_s=args.return_s, tool_axis=args.tool_axis, yaw=args.yaw,
         payload=args.payload, min_z=min_z, max_z=args.max_z, max_reach=args.max_reach,

@@ -1681,6 +1681,7 @@ def _import_planner():
             hz = 30.0
             yaw = 0.0
             tool_axis = "current"
+            close_width_mm = None
 
         def _offline(*_args, **_kwargs):
             raise RuntimeError("planning needs Pinocchio; not under test here")
@@ -1755,6 +1756,18 @@ def test_planner_offline(workdir: Path):
                 check("request_options rejects a mistyped option", False, str(bad))
             except planner.GatewayError:
                 check("request_options rejects a mistyped option", True, str(bad))
+
+        # close_width_mm is optional: a number or null, nothing else.
+        opts = planner.request_options({"options": {"close_width_mm": 60}})
+        check("close_width_mm accepts a number", opts.close_width_mm == 60.0)
+        opts = planner.request_options({"options": {"close_width_mm": None}})
+        check("close_width_mm accepts null", opts.close_width_mm is None)
+        for bad in ({"close_width_mm": "wide"}, {"close_width_mm": True}):
+            try:
+                planner.request_options({"options": bad})
+                check("close_width_mm rejects a mistyped value", False, str(bad))
+            except planner.GatewayError:
+                check("close_width_mm rejects a mistyped value", True, str(bad))
 
         # execute_one persists the edge's log and relays the same block.
         plan_id = planner.new_id()
