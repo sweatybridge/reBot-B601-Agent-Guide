@@ -91,7 +91,7 @@ class PlanError(Exception):
 
 @dataclass
 class Options:
-    hz: float = 30.0
+    hz: float = traj.DEFAULT_HZ
     approach: float = 0.06
     approach_s: float = 3.0
     slide_s: float = 1.5
@@ -1149,7 +1149,8 @@ def add_arguments(parser):
     parser.add_argument("--target", default="", help="target.json from locate_target.py")
     parser.add_argument("--out", default="", help="trajectory JSON to write")
     parser.add_argument("--urdf", default="", help="override the URDF path")
-    parser.add_argument("--hz", type=float, default=30.0)
+    parser.add_argument("--hz", type=float, default=traj.DEFAULT_HZ,
+                        help="waypoint stream rate, Hz (default %.0f)" % traj.DEFAULT_HZ)
     parser.add_argument("--approach", type=float, default=0.06,
                         help="standoff in front of the target (toward the base), m; "
                              "the gripper slides forward into the grasp at the target's height")

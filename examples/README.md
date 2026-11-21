@@ -17,7 +17,7 @@ the edge only ever sends joint angles and torques it was handed.
 ```
   edge-rust dump          host/app/plan_with_pinocchio.py (container)        edge-rust
 arm ───────────► current.json ──────────────────────────────► seq.json ───────────► arm
-     (read 0x7019,          (their IK + Pinocchio g(q),         (30 Hz frames,
+     (read 0x7019,          (their IK + Pinocchio g(q),         (50 Hz frames,
       no torque)             one tau per waypoint)               dry run by default)
 ```
 
@@ -173,8 +173,9 @@ the CLIs. See [`host/README.md`](host/README.md) for the map and
   pinned and the dip grows to -18 mm; the elbow is the binding stop, and 8° over
   the jaw-opening leg removes the dip entirely.
 - **Dry run is the default.** Nothing moves without `--execute`.
-- **30 Hz needs no special frame path.** The Rust player builds MIT
-  frames directly and measured 33.3 ms mean tick spacing on the Zero W.
+- **The default 50 Hz stream needs no special frame path.** The Rust player
+  builds MIT frames directly and is timestamp-driven; on the Zero W it measured
+  20.0 ms mean ticks with 0 of 1100 late at 50 Hz (edge-rust README's rate table).
 - **`--payload kg`** on the planner folds a held mass into `tau` (1 kg at the tool
   adds -2.77 / +5.08 / +2.84 Nm on j2/j3/j4 at the parked pose).
 - **Limits are re-checked on the edge**; when the file's `limits` block matches

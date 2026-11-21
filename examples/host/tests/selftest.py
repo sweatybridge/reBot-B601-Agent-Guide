@@ -352,7 +352,7 @@ def test_schema():
     check("build derives v on every waypoint",
           all(len(point.get("v") or []) == 7 for point in payload["waypoints"]))
     move_wps = move["waypoints"]
-    hold_count = int(round(0.4 * 30))
+    hold_count = int(round(0.4 * traj.DEFAULT_HZ))
     check("a joint move holds at zero velocity",
           all(v == 0.0 for point in move_wps[-hold_count:] for v in point["v"]))
     # Trapezoid cruise speed: travel / (T - ramp); travel 0.4 rad over 1 s.
@@ -1678,7 +1678,7 @@ def _import_planner():
             tip_m = 0.0
             quiet = True
             ik_pos_tol = 0.001
-            hz = 30.0
+            hz = traj.DEFAULT_HZ
             yaw = 0.0
             tool_axis = "current"
             close_width_mm = None
