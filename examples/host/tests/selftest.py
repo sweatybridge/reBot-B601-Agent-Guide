@@ -393,18 +393,27 @@ def test_schema():
               abs(fr[0]) < 1e-12 and abs(fr[-1] - 1.0) < 1e-12
               and all(b >= a - 1e-12 for a, b in zip(fr, fr[1:])))
         r = min(0.5, traj.RAMP_S / duration)
-        err = max(abs((traj.ease_fraction((i + 1) / 200.0, duration)
-                       - traj.ease_fraction((i - 1) / 200.0, duration)) * 100.0 / duration
-                      - traj.ease_velocity(i / 200.0, duration))
-                  for i in range(1, 200)
-                  if abs(i / 200.0 - r) > 0.01 and abs(i / 200.0 - (1.0 - r)) > 0.01)
+        # Fine step: the S-ramp's fraction has a nonzero third derivative
+        # inside the ramp, so the central difference needs h^2 small enough
+        # to resolve it (the old linear ramp was exactly quadratic).
+        err = max(abs((traj.ease_fraction((i + 1) / 2000.0, duration)
+                       - traj.ease_fraction((i - 1) / 2000.0, duration)) * 1000.0 / duration
+                      - traj.ease_velocity(i / 2000.0, duration))
+                  for i in range(1, 2000)
+                  if abs(i / 2000.0 - r) > 0.01 and abs(i / 2000.0 - (1.0 - r)) > 0.01)
         check("the profile velocity is the fraction's derivative (T=%.1f)" % duration,
               err < 1e-3, "worst %.2e" % err)
     check("a long leg cruises at travel/(T-ramp)",
           abs(traj.ease_velocity(0.5, 10.0) - 1.0 / (10.0 - traj.RAMP_S)) < 1e-12)
-    check("a short leg degenerates to a triangle, still at rest at the ends",
+    check("a short leg degenerates to a smooth bell, still at rest at the ends",
           traj.ease_velocity(0.0, 0.2) == 0.0 and traj.ease_velocity(1.0, 0.2) == 0.0
           and abs(traj.ease_velocity(0.5, 0.2) - 2.0 / 0.2) < 1e-9)
+    check("the S-ramp meets cruise with no velocity step",
+          abs(traj.ease_velocity(traj.RAMP_S - 1e-9, 1.0)
+              - traj.ease_velocity(traj.RAMP_S + 1e-9, 1.0)) < 1e-6)
+    check("the S-ramp leaves and reaches rest with zero acceleration",
+          traj.ease_velocity(1e-9, 1.0) < 1e-6
+          and traj.ease_velocity(1.0 - 1e-9, 1.0) < 1e-6)
     rejects("rejects a joint outside its limit",
             lambda p: p["waypoints"][0]["q"].__setitem__(1, 2.9))
     rejects("rejects a 0.5 rad jump",
@@ -6063,12 +6072,16 @@ def test_via_chain(workdir: Path):
         w = 0.0 if denom <= 1e-24 else max(0.0, min(1.0, float((q - a) @ d) / denom))
         return float(np.linalg.norm(q - (a + d * w)))
 
-    check("every chain tick lies on a straight knot-to-knot segment",
-          all(min(on_segment(q, a, b) for a, b in zip(knots, knots[1:])) < 1e-9
-              for q in series))
+    devs = [min(on_segment(q, a, b) for a, b in zip(knots, knots[1:])) for q in series]
+    check("fillets stay within half the corner radius of the knot path",
+          max(devs) <= 0.5 * traj.CORNER_RADIUS_RAD + 1e-9,
+          "max deviation %.4f rad" % max(devs))
+    check("the segments between fillets are exactly straight",
+          sum(1 for d in devs if d < 1e-9) > len(series) // 2)
     near = min(float(np.max(np.abs(q - q1))) for q in series)
-    check("the discrete ticks straddle the via within half a tick of travel",
-          near < 0.02, "closest tick %.4f rad from the via" % near)
+    check("the ticks pass within the fillet tolerance of the via",
+          near < 0.5 * traj.CORNER_RADIUS_RAD + 0.02,
+          "closest tick %.4f rad from the via" % near)
     waypoints = [traj.waypoint(index / 30.0, list(q) + [4.9])
                  for index, q in enumerate(series, start=1)]
     payload = traj.build(waypoints, 30.0, None, "via chain test")
@@ -6078,12 +6091,16 @@ def test_via_chain(workdir: Path):
           min(cruise_v) > 0.05, "min cruise |v| %.3f rad/s" % min(cruise_v))
     check("chain payload passes the player's step gate",
           stats["max_step_rad"] <= traj.MAX_JOINT_STEP)
+    dv = [max(abs(a - b) for a, b in zip(w1["v"], w0["v"]))
+          for w0, w1 in zip(payload["waypoints"][5:-6], payload["waypoints"][6:-5])]
+    check("the corner's direction change spreads over ticks, not one",
+          max(dv) < 0.3, "max per-tick |dv| %.3f rad/s" % max(dv))
     back = [np.array([0.0, 0.5, 0.5, 0.0, 0.0, 0.0]),
             np.array([0.5, 0.5, 0.5, 0.0, 0.0, 0.0]),
             np.array([0.1, 0.5, 0.5, 0.0, 0.0, 0.0])]
     travel = traj.chain_travel(back)
-    check("chain travel is the exact joint path length (reversals included)",
-          abs(travel - 0.9) < 1e-9, "travel %.6f rad" % travel)
+    check("chain travel budgets the filleted path (corner cut included)",
+          abs(travel - 0.85) < 1e-9, "travel %.6f rad" % travel)
     dup = traj.chain_series([q0, q0, q2], 1.0, 30.0)
     check("duplicate knots collapse without breaking the chain",
           np.allclose(dup[-1], q2, atol=1e-12))
