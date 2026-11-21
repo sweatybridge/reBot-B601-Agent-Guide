@@ -200,10 +200,10 @@
           the gripper; green even markers open it, starting fully open. The pins are projected
           onto the worktop and follow it while Reach is on. The arm returns to where it began.
           <b>Clear marker</b> removes the last one; Move arm is disabled with none.</li>
-      <li><b>Via</b> turns taps into pass-through points for the last marker (up to 5,
+      <li><b>Via</b> turns taps into pass-through points for reaching the last marker (up to 5,
           dashed blue pins lettered 1a, 1b, ...). The arm travels through them without
-          stopping on the way to the next marker, keeping the gripper as it was. Place a
-          marker first; a via on the last marker of a run is refused by the planner.</li>
+          stopping on the way to that marker, keeping the gripper as it was. Marker 1's
+          vias shape the leg from the start pose.</li>
       <li>If the tag is not in frame a marker is refused rather than guessed. Turn the phone
           until it is, or switch to a fixed camera.</li>
       <li><b>Fixed camera (optional).</b> Fit the rig once from the workstation's
@@ -1012,7 +1012,7 @@ viaButton.addEventListener("click", () => {
   markersOverlay.setViaMode(next);
   viaButton.textContent = "Via: " + (next ? "on" : "off");
   viaButton.classList.toggle("on", next);
-  log(next ? "via mode: taps add pass-through points to the last marker"
+  log(next ? "via mode: taps add pass-through points on the way to the last marker"
            : "via mode off: taps add markers again", "warn");
 });
 // Which of the two ways in this phone uses. Handheld is the default: the tag on

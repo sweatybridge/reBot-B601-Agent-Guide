@@ -28,7 +28,7 @@ routes.
 The compact planner contract is tip-space only: `targets` is a list of
 `{tip: [x, y, z]}` objects (optional `pixel`/`tap`/`capture` provenance, and
 optional `via`: up to 5 `[x, y, z]` tip points the trajectory passes through
-without stopping on the way to the next marker), `tip_offset_m` is the physical
+without stopping on the way to that marker), `tip_offset_m` is the physical
 flange-to-tip distance for the whole request, and `gripper` is `"none"` (one
 target, no gripper motion) or `"alternate"` (close/open through a marker
 sequence). `hover`, `hover_m` and `tip_m` are deprecated; `min_z` defaults to
