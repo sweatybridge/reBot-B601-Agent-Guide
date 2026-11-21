@@ -30,6 +30,12 @@ MAX_JOINT_STEP = 0.5      # rad, between consecutive waypoints
 LIMIT_TOL = 0.002          # rad, encoders read a few mrad past a stop at rest
 MIT_POSITION_LIMIT = 4.0 * math.pi
 MIN_HZ, MAX_HZ = 5.0, 200.0
+# The default stream rate every producer inherits. 50 Hz is measured on the
+# reference board: 0 of 1100 ticks late, 20.0/20.0/21.8 ms, peak follow error
+# 0.0048 rad (edge-rust README's rate table) -- finer ticks than 30 Hz at no
+# timing cost. The player is timestamp-driven and accepts 5..200 Hz, so a file
+# planned at another rate still plays; this is only the default.
+DEFAULT_HZ = 50.0
 
 # Velocity ramp at each end of a leg, seconds. The profile is trapezoid: short
 # linear velocity ramps into a constant-velocity cruise. The cosine ease this
@@ -147,7 +153,7 @@ def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def joint_move(q_from, q_to, seconds, control_hz=30.0, hold_s=0.4, limits=None, label=None):
+def joint_move(q_from, q_to, seconds, control_hz=DEFAULT_HZ, hold_s=0.4, limits=None, label=None):
     """A joint-space move the player can replay, with a hold at the end.
 
     Used by the arm gateway's `/move` so a calibration sweep does not need a
@@ -193,7 +199,7 @@ def joint_move(q_from, q_to, seconds, control_hz=30.0, hold_s=0.4, limits=None, 
                             MAX_JOINT_STEP)) from error
 
 
-def joint_sequence(poses, seconds, hold_s=0.4, control_hz=30.0, limits=None, label=None):
+def joint_sequence(poses, seconds, hold_s=0.4, control_hz=DEFAULT_HZ, limits=None, label=None):
     """One file that walks through `poses` in order, holding at each.
 
     The player returns the arm to where the move started when the file ends, so a
@@ -297,7 +303,7 @@ def chain_travel(poses, per_leg=24):
     return float(np.max(np.sum(np.abs(np.diff(samples, axis=0)), axis=0)))
 
 
-def chain_series(poses, seconds, control_hz=30.0, per_leg=24):
+def chain_series(poses, seconds, control_hz=DEFAULT_HZ, per_leg=24):
     """Joint poses for one continuous leg through `poses`, tick by tick.
 
     Starts at rest at poses[0] (already the caller's last waypoint), ramps up
