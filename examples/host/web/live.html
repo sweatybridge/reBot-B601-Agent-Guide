@@ -1806,8 +1806,9 @@ viaModeButton.addEventListener("click", () => {
               : "via mode off: taps add markers again", "warn");
 });
 clearButton.addEventListener("click", () => {
-  if (markersOverlay.clearLast()) {
-    status("last marker cleared", "warn");
+  const removed = markersOverlay.clearLast();
+  if (removed) {
+    status("cleared " + removed, "warn");
   } else {
     status(markersOverlay.busy ? "still locating a marker" : "no markers to clear", "warn");
   }
