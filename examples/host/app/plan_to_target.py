@@ -645,11 +645,11 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     from the start pose for marker 1. Vias do not count as markers: they never
     touch the odd/even gripper parity, get no hold and no gripper action, and
     they are solved in the destination marker's work orientation. The leg in
-    becomes one smooth joint-space chain (traj.chain_series): ramp up from the
-    previous pose, cruise through every via, ramp down onto this marker's
-    staging point (odd) or pose (even). Every chain is gated on its own curve
-    by the worktop capsule model and paced by the same speed policy as a plain
-    leg.
+    becomes one continuous chain of straight joint-space segments
+    (traj.chain_series): ramp up from the previous pose, cruise through every
+    via without stopping, ramp down onto this marker's staging point (odd) or
+    pose (even). Every segment gets the same worktop capsule gate as a plain
+    leg, and the chain is paced by the same speed policy.
     """
     if not isinstance(targets, (list, tuple)) or not targets:
         raise PlanError("a marker sequence needs at least one target")
@@ -829,10 +829,11 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         return pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float), n_arm)
 
     def chain_leg(knots, into_marker, gripper):
-        """One continuous pass through the knots: ramp up from the first, cruise
-        every interior via without stopping, ramp down onto the last. The curve
-        is gated on itself (a spline can bulge off its chords), and the speed
-        policy budgets the whole path, not just the endpoint delta."""
+        """One continuous pass through the knots: straight joint-space segments,
+        the same interpolation as a marker-to-marker leg, under one trapezoid
+        time law so the arm does not stop at the vias. Every segment gets the
+        same worktop capsule gate as a plain leg, and the speed policy budgets
+        the whole path, not just the endpoint delta."""
         unique = [np.asarray(knots[0], dtype=float)]
         for knot in knots[1:]:
             knot = np.asarray(knot, dtype=float)
@@ -841,10 +842,11 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         if len(unique) < 2:
             return pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float),
                                    n_arm)
-        if not sweep.samples_safe(traj.chain_samples(unique)):
-            raise PlanError(
-                "the via chain into marker %d dips within a link radius of the "
-                "worktop; raise the via points or move the arm clear" % into_marker)
+        for start, end in zip(unique, unique[1:]):
+            if not sweep.path_safe(start, end):
+                raise PlanError(
+                    "the via chain into marker %d dips within a link radius of the "
+                    "worktop; raise the via points or move the arm clear" % into_marker)
         seconds = sweep.seconds_for_travel(traj.chain_travel(unique))
         count = 0
         for q_chain in traj.chain_series(unique, seconds, options.hz):
