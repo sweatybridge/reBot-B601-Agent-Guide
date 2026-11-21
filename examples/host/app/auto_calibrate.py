@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,6 +44,7 @@ import numpy as np
 
 import extrinsics as ex
 import base_marker
+import calib as calib_mod
 import locate_target
 import mediamtx
 import rebot_ik
@@ -220,6 +221,25 @@ class DetectOptions:
     # background, and it falls back to the silhouette where the colour is absent.
     green: bool = True
 
+    def scaled(self, scale: float) -> "DetectOptions":
+        """The same detector on a uniformly rescaled grid.
+
+        Lengths follow the grid (x s), areas follow its square (x s^2); the
+        grey threshold and the scores are dimensionless and stay. Without
+        this a bandwidth drop shrinks the cover blob below the area gates
+        and the arm is refused as "not the arm" at a correct projection.
+        """
+        s = float(scale)
+        if abs(s - 1.0) < 1e-9:
+            return self
+        return replace(self,
+                       roi_px=max(8, int(round(self.roi_px * s))),
+                       profile_px=self.profile_px * s,
+                       min_area=self.min_area * s * s,
+                       max_offset_px=self.max_offset_px * s,
+                       band_px=self.band_px * s,
+                       patch_px=max(8, int(round(self.patch_px * s))))
+
 
 @dataclass
 class Options:
@@ -339,7 +359,8 @@ def _profile_tip(difference, wrist_local, direction, options: DetectOptions):
     return wrist_local + float(distances[end]) * direction
 
 
-def detect_tip(gray, behind, q, K, dist, T_base_cam, t_tip, options: DetectOptions, size):
+def detect_tip(gray, behind, q, K, dist, T_base_cam, t_tip, options: DetectOptions, size,
+               scale=1.0):
     """The tip of the arm in this frame, or raise with what was wrong.
 
     `behind` is the same view with the arm out of the way: either a frame taken
@@ -349,7 +370,11 @@ def detect_tip(gray, behind, q, K, dist, T_base_cam, t_tip, options: DetectOptio
     The tip is the blob's extreme point along the last link. That criterion does
     not care about a constant offset in the bootstrap pose -- only a constant
     *rotation* would matter, and the second pass fixes that.
+
+    `scale` is the frame grid's ratio to the calibration grid the pixel gates
+    were tuned on (`Calib.scale`); 1.0 is the native grid.
     """
+    options = options.scaled(scale)
     wrist, tip, joint6 = _tool_pixels(q, K, dist, T_base_cam, t_tip)
     if tip is None or wrist is None:
         raise AutoError("the tool projects behind the camera; check --camera-at")
@@ -525,8 +550,9 @@ def match_tip(gray, templates, centre, expected, options: DetectOptions, size):
 
 
 def detect_tip_template(gray, templates, centre, q, K, dist, T_base_cam, t_tip,
-                        options: DetectOptions, size):
+                        options: DetectOptions, size, scale=1.0):
     """The tip by template matching around where the camera says it should be."""
+    options = options.scaled(scale)
     _wrist, tip, _sixth = _tool_pixels(q, K, dist, T_base_cam, t_tip)
     if tip is None:
         raise AutoError("the tool projects behind the camera; check the plane and the rig")
@@ -542,11 +568,11 @@ def detect_tip_template(gray, templates, centre, q, K, dist, T_base_cam, t_tip,
 
 
 def detect_all_template(frames, poses, K, dist, T_base_cam, t_tip, templates, centre,
-                        options: DetectOptions, size):
+                        options: DetectOptions, size, scale=1.0):
     results = []
     for index, (frame, q) in enumerate(zip(frames, poses)):
         found = detect_tip_template(_gray(frame), templates, centre, q, K, dist, T_base_cam,
-                                    t_tip, options, size)
+                                    t_tip, options, size, scale=scale)
         found.pose = index + 1
         results.append(found)
     return results
@@ -599,11 +625,18 @@ def green_tip(mask, expected, direction, options: DetectOptions, size):
 
 
 def detect_tip_green(frame, q, K, dist, T_base_cam, t_tip, options: DetectOptions, size,
-                     mask=None):
-    """The tip by colour: the arm's green, at the end the tool axis points to."""
+                     mask=None, scale=1.0):
+    """The tip by colour: the arm's green, at the end the tool axis points to.
+
+    `scale` is the frame grid's ratio to the calibration grid (`Calib.scale`):
+    the pixel gates follow the grid, areas by its square, so a bandwidth drop
+    does not shrink the cover below the blob gate.
+    """
+    options = options.scaled(scale)
+    area_scale = float(scale) * float(scale)
     if mask is None:
         mask = green_mask(frame)
-    if int(mask.sum()) // 255 < MIN_GREEN_PX:
+    if int(mask.sum()) // 255 < MIN_GREEN_PX * area_scale:
         raise AutoError("no green arm in this frame (%d green pixels): the colour detector "
                         "needs the arm's covers in view" % (int(mask.sum()) // 255))
     wrist, tip, joint6 = _tool_pixels(q, K, dist, T_base_cam, t_tip)
@@ -625,7 +658,7 @@ def detect_tip_green(frame, q, K, dist, T_base_cam, t_tip, options: DetectOption
     # Accept only what looks like the arm: a sizeable blob sitting close to where
     # the camera says the tip is. A stray greenish patch in a busy scene satisfies
     # "some green exists" but not this, and falling back is better than a false tip.
-    if area < max(float(options.min_area), GREEN_MIN_BLOB_PX) or \
+    if area < max(float(options.min_area), GREEN_MIN_BLOB_PX * area_scale) or \
             nearest > float(options.max_offset_px) * GREEN_NEAREST:
         raise AutoError("the green near the projected tip is not the arm (area %.0f px, %.0f px "
                         "away); falling back to the silhouette" % (area, nearest))
@@ -634,7 +667,7 @@ def detect_tip_green(frame, q, K, dist, T_base_cam, t_tip, options: DetectOption
 
 
 def detect_all_green(frames, poses, K, dist, T_base_cam, t_tip, options: DetectOptions, size,
-                     backgrounds=None, masks=None):
+                     backgrounds=None, masks=None, scale=1.0):
     """The green detector per pose, falling back to the silhouette where it fails."""
     if masks is None:
         masks = [green_mask(frame) for frame in frames]
@@ -642,12 +675,12 @@ def detect_all_green(frames, poses, K, dist, T_base_cam, t_tip, options: DetectO
     for index, (frame, q) in enumerate(zip(frames, poses)):
         try:
             found = detect_tip_green(frame, q, K, dist, T_base_cam, t_tip, options, size,
-                                     mask=masks[index])
+                                     mask=masks[index], scale=scale)
         except AutoError:
             if backgrounds is None:
                 backgrounds = backgrounds_for(frames)
             found = detect_tip(_gray(frame), backgrounds[index], q, K, dist, T_base_cam,
-                               t_tip, options, size)
+                               t_tip, options, size, scale=scale)
         found.pose = index + 1
         results.append(found)
     return results
@@ -664,14 +697,14 @@ def backgrounds_for(frames, background=None):
 
 
 def detect_all(frames, poses, K, dist, T_base_cam, t_tip, options: DetectOptions, size,
-               background=None, backgrounds=None):
+               background=None, backgrounds=None, scale=1.0):
     grays = [_gray(frame) for frame in frames]
     if backgrounds is None:
         backgrounds = backgrounds_for(frames, background)
     results = []
     for index, (gray, q) in enumerate(zip(grays, poses)):
         found = detect_tip(gray, backgrounds[index], q, K, dist, T_base_cam, t_tip,
-                           options, size)
+                           options, size, scale=scale)
         found.pose = index + 1
         results.append(found)
     return results
@@ -736,7 +769,8 @@ def click_seeds(click, K, dist):
     return seeds
 
 
-def bootstrap_from_click(frames, poses, click, K, dist, options: "Options", size, background=None):
+def bootstrap_from_click(frames, poses, click, K, dist, options: "Options", size, background=None,
+                         scale=1.0):
     """Pick the seed whose sweep is most self-consistent.
 
     The score is how many poses the candidate finds the tip in *where it says the
@@ -762,13 +796,14 @@ def bootstrap_from_click(frames, poses, click, K, dist, options: "Options", size
         try:
             if templates is not None:
                 detections = detect_all_template(frames, poses, K, dist, guess, (0.0, 0.0, 0.0),
-                                                 templates, centre, options.detect, size)
+                                                 templates, centre, options.detect, size,
+                                                 scale=scale)
             elif masks is not None:
                 detections = detect_all_green(frames, poses, K, dist, guess, (0.0, 0.0, 0.0),
-                                              options.detect, size, masks=masks)
+                                              options.detect, size, masks=masks, scale=scale)
             else:
                 detections = detect_all(frames, poses, K, dist, guess, (0.0, 0.0, 0.0),
-                                        options.detect, size, background=background)
+                                        options.detect, size, background=background, scale=scale)
             fitted = ex.fit([ex.Observation(q=np.asarray(q, dtype=float), uv=(d.u, d.v))
                              for q, d in zip(poses, detections)],
                             K, dist, ex.FitOptions(plane_z=float(options.plane_z),
@@ -785,7 +820,7 @@ def bootstrap_from_click(frames, poses, click, K, dist, options: "Options", size
         # consistently and fit it beautifully, which is how a 100 px rig once
         # scored best. Ties are broken by the median offset, then by the fit.
         offsets = [float(d.offset_px) for d in detections]
-        close = sum(1 for value in offsets if value <= CLOSE_PX)
+        close = sum(1 for value in offsets if value <= CLOSE_PX * float(scale))
         score = (close, -float(np.median(offsets)), -float(fitted.rig.rms_px))
         if best is None or score > best[0]:
             best = (score, guess)
@@ -978,10 +1013,16 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
     if any((frame.shape[1], frame.shape[0]) != size for frame in frames):
         raise AutoError("the frames changed size during the sweep; is the stream renegotiating?")
     if (int(calibration.image_size[0]), int(calibration.image_size[1])) != size:
-        raise AutoError(
-            "the frames are %dx%d but the intrinsics are for %dx%d: load the calibration at the "
-            "capture size (calib.load scales it when the aspect ratio matches)"
-            % (size[0], size[1], calibration.image_size[0], calibration.image_size[1]))
+        # A uniform rescale (WebRTC saving bandwidth) is the same camera on a
+        # coarser grid: follow it with K instead of refusing the pass. A crop
+        # or aspect change is a different camera and still fails here.
+        try:
+            calibration = calibration.rescaled(size)
+        except calib_mod.CalibError as error:
+            raise AutoError(
+                "the frames are %dx%d but the intrinsics are for %dx%d: %s"
+                % (size[0], size[1], calibration.image_size[0], calibration.image_size[1],
+                   error)) from error
 
     K, dist = calibration.K, calibration.dist
     T_guess = None if seed_T is None else np.asarray(seed_T, dtype=float)
@@ -1015,7 +1056,7 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
                             % error)
     if T_guess is None:
         T_guess = bootstrap_from_click(frames, poses, options.click, K, dist, options, size,
-                                       background=background)
+                                       background=background, scale=calibration.scale)
     note(0, "fitting")
     fit_options = ex.FitOptions(plane_z=float(options.plane_z), image_size=size,
                                 work_radius=float(options.work_radius),
@@ -1040,20 +1081,20 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
     def detect_pass(T_base_cam, t_tip):
         if templates is not None:
             return detect_all_template(frames, poses, K, dist, T_base_cam, t_tip, templates,
-                                       centre, options.detect, size)
+                                       centre, options.detect, size, scale=calibration.scale)
         if masks is not None:
             return detect_all_green(frames, poses, K, dist, T_base_cam, t_tip, options.detect,
-                                    size, masks=masks)
+                                    size, masks=masks, scale=calibration.scale)
         return detect_all(frames, poses, K, dist, T_base_cam, t_tip, options.detect, size,
-                          background=background)
+                          background=background, scale=calibration.scale)
 
     first = detect_pass(T_guess, (0.0, 0.0, 0.0))
     observations = [ex.Observation(q=q, uv=(d.u, d.v), capture=directory.name)
                     for q, d, directory in zip(poses, first, captures)]
     try:
         coarse = ex.fit(observations, K, dist, fit_options,
-                        calib_fingerprint=calibration.fingerprint, device=calibration.device,
-                        mount=mount)
+                        calib_fingerprint=calibration.source_fingerprint,
+                        device=calibration.device, mount=mount)
     except ex.ExtrinsicsError as error:
         names = _save_debug(frames, poses, [d.uv for d in observations], T_guess, (0.0, 0.0, 0.0),
                             K, dist, options.detect, size, recording, range(len(frames)))
@@ -1072,8 +1113,8 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
                     for q, d, directory in zip(poses, refined, captures)]
     try:
         final = ex.fit(observations, K, dist, fit_options,
-                       calib_fingerprint=calibration.fingerprint, device=calibration.device,
-                       mount=mount)
+                       calib_fingerprint=calibration.source_fingerprint,
+                       device=calibration.device, mount=mount)
     except ex.ExtrinsicsError as error:
         names = _save_debug(frames, poses, [d.uv for d in observations],
                             coarse.rig.T_base_cam, coarse.rig.tip_offset, K, dist,
@@ -1096,7 +1137,7 @@ def run(arm, eye, calibration, options: Options, captures_dir, recorder, mount="
         seen = ex.pixel(point, K, dist, ex.invert(final.rig.T_base_cam))
         error = float("inf") if seen is None else float(
             math.hypot(seen[0] - observation.uv[0], seen[1] - observation.uv[1]))
-        if error > CLOSE_PX:
+        if error > CLOSE_PX * calibration.scale:
             far.append((number, error))
     if len(far) >= 2:
         names = _save_debug(frames, poses, [item.uv for item in observations],
@@ -1214,7 +1255,7 @@ def solve_marker(frame, calibration, marker, plane_z=0.0, mount="fixed"):
     size = (int(frame.shape[1]), int(frame.shape[0]))
     rig = ex.Rig(
         T_base_cam=matrix,
-        calib_fingerprint=calibration.fingerprint,
+        calib_fingerprint=calibration.source_fingerprint,
         image_size=size,
         plane_z=float(plane_z),
         tip_offset=np.zeros(3),
