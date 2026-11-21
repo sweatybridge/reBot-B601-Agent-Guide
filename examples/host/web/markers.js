@@ -224,13 +224,28 @@
     }
 
     function clearLast() {
+      // Undo in placement order: a via was added after its marker, so the last
+      // marker's last via goes first; the marker itself only goes once it has
+      // no vias left. Returns a description of what went, or false.
       if (busy) return false;
       if (!markers.length) return false;
       generation += 1;
-      markers.pop();
+      const owner = markers[markers.length - 1];
+      let removed;
+      if (owner.vias && owner.vias.length) {
+        const viaIndex = owner.vias.length - 1;
+        owner.vias.pop();
+        if (owner.vias.length) owner.target.via = owner.vias.map((via) => via.tip);
+        else delete owner.target.via;
+        removed = "via " + String.fromCharCode(97 + viaIndex)
+          + " of marker " + markers.length;
+      } else {
+        markers.pop();
+        removed = "marker " + (markers.length + 1);
+      }
       render();
       onChange();
-      return true;
+      return removed;
     }
 
     return {
