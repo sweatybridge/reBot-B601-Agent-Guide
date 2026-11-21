@@ -1,0 +1,3 @@
+_spool/
+__pycache__/
+*.pyc

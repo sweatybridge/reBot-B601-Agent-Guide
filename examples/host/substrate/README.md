@@ -35,6 +35,11 @@ are SQL ports of `oracle.attribute` / `trace._redact` / `identify.update_accurac
 Python reference. `store.py` (psycopg3) is the PG-backed store seam replacing the
 file-based trace writes: content-addressed blobs, redacted append-only events, catalog.
 
+Media + similarity (Phase 3): `ingest.py` moves MediaMTX HLS fragments into the catalog
+(safe byte-shuffle, no decode); `embed.py` provides a pluggable `Embedder` (deterministic
+`HistogramEmbedder` default for offline tests; production CLIP/ONNX runs isolated) and
+populates pgvector. The embedding model is a deployment fork; the pipeline is model-agnostic.
+
 ## Quickstart
 
 ```bash
@@ -61,9 +66,10 @@ docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/accura
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/sag_fit_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
 python tests/test_store.py   # needs psycopg; container on localhost:5433
+python tests/test_ingest_embed.py tests/_spool/ep_ingest   # HLS ingest + similarity
 ```
 
-Apply `0002_learning_functions.sql` after `0001` for the learning-plane SQL functions.
+Apply `0002_learning_functions.sql` and `0003_coordination.sql` after `0001`.
 
 All pass on PG 18.7: schema mechanisms, FK/IK round-trip on the real 6-DOF arm,
 gravity + collision matching the numpy reference, and a pg_durable workflow calling

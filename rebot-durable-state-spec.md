@@ -1018,6 +1018,19 @@ transaction; self-checking assertions pass):
 - `rendezvous_transition` (`0003`): guarded state machine; release only from `confirmed`
   (both arms present), so premature release / double-grasp are impossible by construction.
 
+**Media + similarity (Phase 3, validated):**
+- `ingest.py`: HLS fragment ingester — MediaMTX spool (`playlist.m3u8` + segments) →
+  `evidence.blob` + `evidence.media_fragment`, with `#EXTINF` timing. Safe byte-shuffle
+  + hash + INSERT, **no decode** (FFmpeg stays an isolated activity). Content-addressed,
+  idempotent per (episode, seq); blobs are bit-identical to the source segments.
+- `embed.py`: pluggable `Embedder` interface + a deterministic `HistogramEmbedder`
+  default for offline tests. A production CLIP/ONNX embedder implements the interface
+  and runs as an isolated activity. Embeddings normalized (non-zero) before insert.
+- `store.py` similarity methods populate `search.frame_embedding` (pgvector) and run
+  `<=>` cosine search; an identical query returns distance ~0 and the correct nearest.
+- The embedding-model choice remains a deployment fork (§10); the pipeline is model-
+  agnostic.
+
 **Durable orchestration (pg_durable):** a workflow `df.start(df.sql('SELECT
 to_jsonb(rebot_fk(...))'))` ran to `status=completed` via the duroxide background
 worker; `df.result` returned `{"rows":[{"pose":[0.1355,…]}],"row_count":1}`.
@@ -1078,6 +1091,8 @@ substrate/
   migrations/0002_learning_functions.sql # oracle_attribute, trace_redact, accuracy_cell_update
   migrations/0003_coordination.sql  # clearance_cell_update, coordination_oracle, rendezvous_transition
   store.py                        # PG-backed store seam (blobs/events/catalog), psycopg3
+  ingest.py                       # HLS fragment ingester (no decode)
+  embed.py                        # pluggable embedder + pgvector population
   tests/mechanism_tests.sql       # refcount/GC/invalidation/CHECK/cascade/HNSW
   tests/kinematics_tests.sql      # FK/IK round-trip on the real arm
   tests/gravity_collision_tests.sql # gravity + path_safe vs the numpy reference
@@ -1087,6 +1102,7 @@ substrate/
   tests/self_collision_tests.sql  # capsule self-collision vs Python model
   tests/coordination_tests.sql    # clearance/oracle/rendezvous primitives
   tests/test_store.py             # store seam round-trip (needs psycopg)
+  tests/test_ingest_embed.py      # HLS ingest + embedding + similarity (needs psycopg)
   tests/df_workflow.sql           # pg_durable workflow calling rebot_fk
 ```
 
