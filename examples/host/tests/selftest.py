@@ -6043,6 +6043,119 @@ def test_uniform_rescale(workdir: Path, geometry):
               str(error)[:60])
 
 
+def test_via_chain(workdir: Path):
+    print("\nvia chains: continuous pass-through primitive, capsule gate, wire contract")
+    # The chain primitive is pure numpy: knot passage, no stop at the via, and
+    # the player's gates. plan_sequence's via IK needs Pinocchio -- that part is
+    # verified by a dry /plan on the Pi, not here (the offline stub refuses).
+    q0 = np.array([0.10, 0.50, 0.50, 0.00, 0.00, 0.00])
+    q1 = np.array([0.45, 0.80, 0.60, 0.10, 0.20, 0.00])
+    q2 = np.array([0.20, 0.60, 0.90, 0.00, 0.10, 0.00])
+    knots = [q0, q1, q2]
+    samples = traj.chain_samples(knots)
+    check("chain samples interpolate every knot exactly",
+          np.allclose(samples[0], q0, atol=1e-12)
+          and np.allclose(samples[24], q1, atol=1e-12)
+          and np.allclose(samples[48], q2, atol=1e-12))
+    series = traj.chain_series(knots, 2.0, 30.0)
+    check("chain series ends exactly on the last knot",
+          len(series) == 60 and np.allclose(series[-1], q2, atol=1e-12))
+    near = min(float(np.max(np.abs(q - q1))) for q in series)
+    check("the discrete ticks straddle the via within half a tick of travel",
+          near < 0.02, "closest tick %.4f rad from the via" % near)
+    waypoints = [traj.waypoint(index / 30.0, list(q) + [4.9])
+                 for index, q in enumerate(series, start=1)]
+    payload = traj.build(waypoints, 30.0, None, "via chain test")
+    stats = traj.validate(payload)
+    cruise_v = [max(abs(v) for v in wp["v"]) for wp in payload["waypoints"][5:-5]]
+    check("the arm does not stop at the via (cruise velocity throughout)",
+          min(cruise_v) > 0.05, "min cruise |v| %.3f rad/s" % min(cruise_v))
+    check("chain payload passes the player's step gate",
+          stats["max_step_rad"] <= traj.MAX_JOINT_STEP)
+    back = [np.array([0.0, 0.5, 0.5, 0.0, 0.0, 0.0]),
+            np.array([0.5, 0.5, 0.5, 0.0, 0.0, 0.0]),
+            np.array([0.1, 0.5, 0.5, 0.0, 0.0, 0.0])]
+    travel = traj.chain_travel(back)
+    check("chain travel counts a joint's reversal at the via",
+          travel >= 0.9, "travel %.3f rad" % travel)
+    dup = traj.chain_series([q0, q0, q2], 1.0, 30.0)
+    check("duplicate knots collapse without breaking the chain",
+          np.allclose(dup[-1], q2, atol=1e-12))
+
+    # The capsule gate on a sample series is the straight-line gate's own test:
+    # identical on a linspace, and a folded pose at the table is refused by both.
+    a, b = np.asarray(sweep.HOME), np.asarray(sweep.POSES[0])
+    line = [a + (b - a) * t for t in np.linspace(0.0, 1.0, 40)]
+    check("samples_safe is path_safe on a straight joint line",
+          sweep.samples_safe(line) == sweep.path_safe(a, b))
+    bad = None
+    for j1 in (-0.5, 0.0, 0.5):
+        for j2 in np.linspace(0.5, 2.8, 8):
+            for j3 in np.linspace(0.5, 3.0, 8):
+                q = np.array([j1, j2, j3, 0.0, 0.0, 0.0])
+                if not sweep.samples_safe([q]):
+                    bad = q
+                    break
+            if bad is not None:
+                break
+        if bad is not None:
+            break
+    check("a folded pose at the table exists to test the gate", bad is not None)
+    if bad is not None:
+        check("path_safe and samples_safe agree on the refused pose",
+              not sweep.path_safe(bad, bad))
+    check("seconds_for_travel applies the peak cap and the ramp",
+          abs(sweep.seconds_for_travel(1.0)
+              - (1.0 / sweep.PEAK_SPEED + traj.RAMP_S)) < 1e-9)
+    check("seconds_for_travel floors tiny nudges",
+          sweep.seconds_for_travel(0.001) == sweep.MIN_SECONDS)
+    check("seconds_for agrees with the travel policy on a plain leg",
+          sweep.seconds_for(a, b)
+          == sweep.seconds_for_travel(float(np.max(np.abs(b - a)))))
+
+    # The gateway wire contract: via rides on its marker, gripper parity intact.
+    planner = _import_planner()
+    tip = [0.30, 0.10, 0.05]
+    targets, gripper = planner.compact_targets({
+        "targets": [{"tip": tip, "via": [[0.32, 0.12, 0.15]]},
+                    {"tip": [0.35, -0.10, 0.05]}],
+        "gripper": "alternate"})
+    check("the gateway passes via points through as tip triples",
+          gripper == "alternate" and targets[0]["via"] == [[0.32, 0.12, 0.15]]
+          and "via" not in targets[1])
+    legacy = planner.compact_targets(
+        {"targets": [{"tip": tip}], "gripper": "alternate"})[0]
+    check("a target without vias keeps the legacy wire form", "via" not in legacy[0])
+
+    def refused(body, fragment):
+        try:
+            planner.compact_targets(body)
+            return False
+        except planner.GatewayError as error:
+            return fragment in str(error)
+
+    check("via points are refused with gripper none",
+          refused({"targets": [{"tip": tip, "via": [[0.3, 0.1, 0.1]]}],
+                   "gripper": "none"}, "alternate"))
+    check("more than 5 vias per marker are refused",
+          refused({"targets": [{"tip": tip, "via": [[0.3, 0.1, 0.1]] * 6},
+                               {"tip": tip}], "gripper": "alternate"}, "at most"))
+    check("a malformed via point is refused",
+          refused({"targets": [{"tip": tip, "via": [[0.3, 0.1]]},
+                               {"tip": tip}], "gripper": "alternate"}, "[x, y, z]"))
+    check("a non-finite via point is refused",
+          refused({"targets": [{"tip": tip, "via": [[float("nan"), 0.1, 0.1]]},
+                               {"tip": tip}], "gripper": "alternate"}, "non-finite"))
+
+    # The capture server forwards vias on the marker's own wire object.
+    import capture_server as cs
+    wire = cs.compact_target(tip, {"via": [[0.32, 0.12, 0.15]], "pixel": [100, 200]})
+    check("the capture server forwards vias on the marker's wire object",
+          wire["via"] == [[0.32, 0.12, 0.15]] and wire["pixel"] == [100, 200])
+    check("compact_target without vias is unchanged",
+          "via" not in cs.compact_target(tip, {"pixel": [1, 2]}))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Offline selftest for the capture pipeline.")
     parser.add_argument("--keep", action="store_true", help="keep the work directory")
@@ -6066,6 +6179,7 @@ def main(argv=None):
     test_oracle_detect(workdir)
     test_trace_triage(workdir)
     test_planner_offline(workdir)
+    test_via_chain(workdir)
     test_mock_tape(workdir)
     if not args.skip_server:
         asyncio.run(test_server(workdir, geometry))

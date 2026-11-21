@@ -65,6 +65,9 @@ from sweep import DEFAULT_MIN_Z  # noqa: E402  (single source; see sweep.py)
 
 MOTOR7_OPEN = 4.90
 MOTOR7_CLOSED = -0.015
+# Via points per marker: intermediate tip points the trajectory passes through
+# on the way to the next marker, without stopping (traj.chain_series).
+MAX_VIAS = 5
 # Halfway between open and closed: a reference angle kept in the sequence
 # provenance. The odd-marker close itself defaults to grasp_q, not this.
 MOTOR7_HALF = (MOTOR7_OPEN + MOTOR7_CLOSED) / 2.0
@@ -636,6 +639,17 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     keep the direct visit. The motion is the same cosine-eased joint-space leg
     the single-tap plan uses, so the speeds and the edge's step checks are
     unchanged.
+
+    A marker may carry `via`: up to MAX_VIAS tip points the arm passes through
+    on the leg from that marker to the next, without stopping. Vias do not
+    count as markers -- they never touch the odd/even gripper parity, get no
+    hold and no gripper action -- and they keep the owning marker's work
+    orientation (the carrying attitude). The leg becomes one smooth joint-space
+    chain (traj.chain_series): ramp up from the marker, cruise through every
+    via, ramp down onto the next marker's staging point (odd) or pose (even).
+    Every chain is gated on its own curve by the worktop capsule model and
+    paced by the same speed policy as a plain leg. A via on the last marker is
+    refused: there is no following marker to travel to.
     """
     if not isinstance(targets, (list, tuple)) or not targets:
         raise PlanError("a marker sequence needs at least one target")
@@ -671,6 +685,8 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     hovers = []
     tip_offsets = []
     flange_points = []
+    vias = []
+    via_flange_points = []
     for index, target in enumerate(targets, start=1):
         point = validate_target_meta(target)
         hover_m = target_hover(target, options.hover_m)
@@ -688,10 +704,50 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         if radius > options.max_reach:
             raise PlanError("marker %d: target is %.3f m from the base axis, above "
                             "--max-reach %.2f" % (index, radius, options.max_reach))
+        # Via points follow the marker's own frame convention (tip for the
+        # gateway, surface+hover for a CLI target) and face the same gates.
+        via_raw = target.get("via")
+        if via_raw is None:
+            via_raw = []
+        if not isinstance(via_raw, list) or len(via_raw) > MAX_VIAS:
+            raise PlanError("marker %d: 'via' must be a list of at most %d [x, y, z] points"
+                            % (index, MAX_VIAS))
+        marker_vias = []
+        marker_via_flanges = []
+        for via_index, via in enumerate(via_raw, start=1):
+            if not isinstance(via, (list, tuple)) or len(via) != 3:
+                raise PlanError("marker %d via %d: must be [x, y, z]" % (index, via_index))
+            try:
+                via_point = np.array([float(value) for value in via])
+            except (TypeError, ValueError) as error:
+                raise PlanError("marker %d via %d: non-numeric point"
+                                % (index, via_index)) from error
+            if not np.all(np.isfinite(via_point)):
+                raise PlanError("marker %d via %d: non-finite point" % (index, via_index))
+            if not is_tip:
+                via_point = via_point + np.array([0.0, 0.0, hover_m])
+            if via_point[2] < options.min_z - 1e-9:
+                raise PlanError("marker %d via %d: tip z %.4f is below the minimum %.4f"
+                                % (index, via_index, via_point[2], options.min_z))
+            if via_point[2] > options.max_z:
+                raise PlanError("marker %d via %d: tip z %.3f is above --max-z %.3f"
+                                % (index, via_index, via_point[2], options.max_z))
+            if float(np.linalg.norm(via_point[:2])) > options.max_reach:
+                raise PlanError("marker %d via %d: point is %.3f m from the base axis, "
+                                "above --max-reach %.2f"
+                                % (index, via_index,
+                                   float(np.linalg.norm(via_point[:2])), options.max_reach))
+            marker_vias.append(via_point)
+            marker_via_flanges.append(via_point + np.array([0.0, 0.0, tip_offset_m]))
+        if marker_vias and index == len(targets):
+            raise PlanError("marker %d: via points need a following marker to travel to"
+                            % index)
         points.append(tip_point)
         hovers.append(0.0 if is_tip else hover_m)
         tip_offsets.append(tip_offset_m)
         flange_points.append(flange_point)
+        vias.append(marker_vias)
+        via_flange_points.append(marker_via_flanges)
 
     # With `--tool-axis current` the single-tap plan holds the start
     # orientation, including its yaw. A marker sequence can do better: the
@@ -775,6 +831,33 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             log("  %-11s: %d waypoints" % (label, count))
         return pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float), n_arm)
 
+    def chain_leg(knots, into_marker, gripper):
+        """One continuous pass through the knots: ramp up from the first, cruise
+        every interior via without stopping, ramp down onto the last. The curve
+        is gated on itself (a spline can bulge off its chords), and the speed
+        policy budgets the whole path, not just the endpoint delta."""
+        unique = [np.asarray(knots[0], dtype=float)]
+        for knot in knots[1:]:
+            knot = np.asarray(knot, dtype=float)
+            if float(np.max(np.abs(knot - unique[-1]))) > 1e-6:
+                unique.append(knot)
+        if len(unique) < 2:
+            return pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float),
+                                   n_arm)
+        if not sweep.samples_safe(traj.chain_samples(unique)):
+            raise PlanError(
+                "the via chain into marker %d dips within a link radius of the "
+                "worktop; raise the via points or move the arm clear" % into_marker)
+        seconds = sweep.seconds_for_travel(traj.chain_travel(unique))
+        count = 0
+        for q_chain in traj.chain_series(unique, seconds, options.hz):
+            state["t"] += period
+            append(pad_q_for_model(model, q_chain, n_arm), gripper)
+            count += 1
+        if not options.quiet:
+            log("  %-11s: %d waypoints" % ("via %d" % into_marker, count))
+        return pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float), n_arm)
+
     # The edge starts from the arm's current gripper angle, so a closed gripper
     # would jump open on the first waypoint. Hold still and ramp it open first.
     gripper_start = float(gripper_start)
@@ -797,11 +880,15 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     # The oracle compares FK(q_ik) against the requested flange point to measure
     # the solver's own residual, separately from the arm's hold error (§7.4).
     marker_q_ik = []
+    # Each marker's via IK solutions, pre-compensation, in travel order.
+    via_q_ik = [[] for _ in points]
     # Each marker's hold span on the plan's own clock. The oracle matches hold
     # windows to targets by these times -- exact, where joint proximity would
     # confuse a marker near the park pose with the start hold.
     marker_holds = []
     odd_close = close_angle(options, options.grasp_q)
+    # The previous marker's via poses, waiting for the leg into this one.
+    pending_via_qs = []
     for index, point in enumerate(points, start=1):
         place = flange_points[index - 1]
         yaw_deg = math.degrees(math.atan2(float(point[1]), float(point[0])))
@@ -819,16 +906,11 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             target = ik_to(place, R_marker, start_seed, "marker %d" % index)
         marker_q_ik.append([float(v) for v in target[:n_arm]])
         current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
-        # Policy-paced, exactly as on /move: the speed policy (peak cap plus a
-        # cruise floor above stiction breakaway) sets the leg time. approach_s
-        # belongs to the single-tap Cartesian approach; as a floor here it
-        # stretched short legs into a sub-breakaway crawl.
         if index % 2 == 1:
             # Odd markers are grasped: stage `approach` m in front and slide
             # forward into the marker, the same geometry as the single-tap
-            # pick. Even markers keep the direct visit. Both legs get the
-            # worktop capsule gate -- a low horizontal slide is a new way to
-            # dip a link into the table.
+            # pick. A via chain delivers the arm to the staging point; the
+            # slide-in itself is unchanged.
             try:
                 stage_point = stage_in_front(point, options.approach)
             except PlanError as error:
@@ -838,6 +920,21 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                 stage_q = ik_to(stage_place, R_marker, seed, "stage %d" % index)
             except PlanError:
                 stage_q = ik_to(stage_place, R_marker, start_seed, "stage %d" % index)
+            arrival_q = stage_q
+        else:
+            arrival_q = target
+        # The leg in, policy-paced exactly as on /move: the speed policy (peak
+        # cap plus a cruise floor above stiction breakaway) sets the leg time.
+        # approach_s belongs to the single-tap Cartesian approach; as a floor
+        # here it stretched short legs into a sub-breakaway crawl. With vias
+        # pending, one continuous chain replaces the plain joint leg; both get
+        # the worktop capsule gate -- a low horizontal move is a way to dip a
+        # link into the table.
+        if pending_via_qs:
+            seed = chain_leg([current_q] + pending_via_qs + [arrival_q[:n_arm]],
+                             index, gripper)
+            pending_via_qs = []
+        elif index % 2 == 1:
             if not sweep.path_safe(current_q, stage_q[:n_arm]):
                 raise PlanError(
                     "the leg to the staging point for marker %d dips within a link "
@@ -848,16 +945,6 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                 {joint: stage_q[joint] - current_q[joint] for joint in range(n_arm)},
                 sweep.seconds_for(current_q, stage_q[:n_arm]),
                 "stage %d" % index, gripper)
-            current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
-            if not sweep.path_safe(current_q, target[:n_arm]):
-                raise PlanError(
-                    "the slide-in to marker %d dips within a link radius of the "
-                    "worktop; raise the marker or move the arm clear" % index)
-            seed = joint_leg(
-                current_q,
-                {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
-                sweep.seconds_for(current_q, target[:n_arm]),
-                "slide %d" % index, gripper)
         else:
             if not sweep.path_safe(current_q, target[:n_arm]):
                 raise PlanError(
@@ -868,6 +955,17 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                 {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
                 sweep.seconds_for(current_q, target[:n_arm]),
                 "marker %d" % index, gripper)
+        if index % 2 == 1:
+            current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+            if not sweep.path_safe(current_q, target[:n_arm]):
+                raise PlanError(
+                    "the slide-in to marker %d dips within a link radius of the "
+                    "worktop; raise the marker or move the arm clear" % index)
+            seed = joint_leg(
+                current_q,
+                {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
+                sweep.seconds_for(current_q, target[:n_arm]),
+                "slide %d" % index, gripper)
         hold_t0 = state["t"]
         hold(0.25, gripper)
         next_gripper = odd_close if index % 2 == 1 else MOTOR7_OPEN
@@ -876,6 +974,18 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         gripper = next_gripper
         hold(0.25, gripper)
         marker_holds.append((hold_t0, state["t"]))
+        # This marker's vias, solved for the leg out: endpoint-first like every
+        # pose, in the marker's own work orientation -- the carrying attitude,
+        # no re-yaw mid-leg. A failure here aborts the whole plan before any
+        # motion, exactly like a marker IK failure.
+        for via_index, via_place in enumerate(via_flange_points[index - 1], start=1):
+            label = "via %d.%d" % (index, via_index)
+            try:
+                via_q = ik_to(via_place, R_marker, seed, label)
+            except PlanError:
+                via_q = ik_to(via_place, R_marker, start_seed, label)
+            pending_via_qs.append(np.array(via_q[:n_arm], dtype=float))
+            via_q_ik[index - 1].append([float(v) for v in via_q[:n_arm]])
 
     # Return in joint space. A Cartesian return to the parked pose is the one
     # leg where IK can fail on the last millimetres (the parked pose sits on
@@ -892,9 +1002,12 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
 
     close_text = ("close to %.2f rad" % odd_close if options.close_width_mm is None
                   else "close to %.1f mm" % options.close_width_mm)
+    total_vias = sum(len(marker_vias) for marker_vias in vias)
     steps = ("%d markers: stage %.0f mm in front and slide in on odd, direct on even; "
              "gripper open, %s on odd, open on even; return"
              % (len(points), options.approach * 1000, close_text))
+    if total_vias:
+        steps += "; %d via points passed through without stopping" % total_vias
     provenance = {
         "sequence": True,
         # Defaults for a CLI surface target; the gateway sends tip points with
@@ -911,6 +1024,12 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
              "capture": targets[index].get("capture"),
              "source": targets[index].get("source"),
              "tap": targets[index].get("tap"),
+             # Via points travelled after this marker, before the next: tip
+             # points, flange points, and the raw IK solutions pre-compensation.
+             "via": [[float(v) for v in via] for via in vias[index]],
+             "via_flange_points": [[float(v) for v in via]
+                                   for via in via_flange_points[index]],
+             "via_q_ik": via_q_ik[index],
              # The raw IK solution at this marker, pre-compensation: the oracle
              # measures |FK(q_ik) - flange_point| as the solver's residual.
              "q_ik": marker_q_ik[index],
@@ -948,6 +1067,9 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         "targets": [[float(v) for v in point] for point in points],
         "flange_points": [[float(v) for v in point] for point in flange_points],
         "q_ik": marker_q_ik,
+        "via_counts": [len(marker_vias) for marker_vias in vias],
+        "via_points": total_vias,
+        "via_q_ik": via_q_ik,
         "radii": [float(np.linalg.norm(point[:2])) for point in points],
         "hover_m": float(options.hover_m),
         "hovers_m": [float(value) for value in hovers],
@@ -984,9 +1106,12 @@ def describe_sequence(summary):
         else:
             height_text = ""
         tip_text = "" if tip_offset is None else ", tip +%.0f mm" % (float(tip_offset) * 1000)
+        via_counts = summary.get("via_counts") or []
+        via_count = via_counts[index - 1] if index <= len(via_counts) else 0
+        via_text = "" if not via_count else ", %d via" % via_count
         lines.append("  marker %2d : [%+.4f %+.4f %+.4f] m (%.3f m from the base axis), "
-                     "%s%s" % (index, point[0], point[1], point[2], radius,
-                               height_text, tip_text))
+                     "%s%s%s" % (index, point[0], point[1], point[2], radius,
+                                 height_text, tip_text, via_text))
     lines += [
         "  waypoints  : %d over %.2f s" % (summary["waypoints"], summary["duration_s"]),
         "  worst IK   : %.4f m at %s" % (summary["worst_ik_m"],
