@@ -2060,6 +2060,50 @@ async def test_oracle_server(workdir: Path, geometry):
                   and all(h.get("pixel_error_mm") is not None
                           and h["pixel_error_mm"] < 10.0 for h in holds),
                   str([(h.get("detector"), h.get("pixel_error_mm")) for h in holds]))
+            check("the native run records its grid",
+                  all(h.get("image_size") == [image.shape[1], image.shape[0]]
+                      and h.get("grid_scale") == 1.0 for h in holds)
+                  and doc.get("pre_grid_scale") == 1.0,
+                  str([(h.get("image_size"), h.get("grid_scale")) for h in holds]))
+
+            # A bandwidth drop mid-run: the pre-still arrives native, every
+            # hold and the post-still at half size. The oracle compensates K
+            # per frame, keeps the evidence, and maps the diff across grids.
+            small_frame = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2),
+                                     interpolation=cv2.INTER_AREA)
+            reads = {"n": 0}
+
+            def mixed_open(url, **kw):
+                def read():
+                    reads["n"] += 1
+                    # pre-still native; hold grabs (two per hold) and post half.
+                    return frame.copy() if reads["n"] == 1 else small_frame.copy()
+                return SimpleNamespace(read=read, close=lambda: None)
+
+            camera_mod.open_source = mixed_open
+            rescaled = await client.post("/execute", json={"id": plan_id}, headers=headers)
+            await asyncio.gather(*list(app["oracle_tasks"]))
+            doc3 = json.loads(doc_path.read_text(encoding="utf-8"))
+            holds3 = doc3.get("holds") or []
+            check("a rescaled stream never fails /execute",
+                  rescaled.status == 200 and (await rescaled.json()).get("executed") is True)
+            check("the rescaled holds are measured on their own grid",
+                  len(holds3) == 2
+                  and all(h.get("image_size") == [small_frame.shape[1], small_frame.shape[0]]
+                          and h.get("grid_scale") == 0.5 for h in holds3)
+                  and doc3.get("pre_image_size") == [image.shape[1], image.shape[0]]
+                  and doc3.get("pre_grid_scale") == 1.0,
+                  str([(h.get("image_size"), h.get("grid_scale")) for h in holds3]))
+            check("the green detector still finds the tool at half size",
+                  all(h.get("detector") == "green" for h in holds3)
+                  and all(h.get("pixel_error_mm") is not None
+                          and h["pixel_error_mm"] < 10.0 for h in holds3),
+                  str([(h.get("detector"), h.get("pixel_error_mm")) for h in holds3]))
+            check("the pre/post diff survives the grid change",
+                  all(h.get("pre_post_diff") is not None for h in holds3),
+                  str([h.get("pre_post_diff") for h in holds3]))
+            camera_mod.open_source = lambda url, **kw: SimpleNamespace(
+                read=lambda: frame.copy(), close=lambda: None)
 
             # §8.4: no telemetry -> the doc still lands, /execute still passes.
             del edge_state.telemetry[plan_id]
@@ -5672,6 +5716,175 @@ def test_oracle_detect(workdir: Path):
           cs._oracle_detect(blank, q, K, dist, T, t_tip) is None)
 
 
+def test_uniform_rescale(workdir: Path, geometry):
+    """A WebRTC bandwidth drop is the same camera on a coarser grid.
+
+    K follows the frame, provenance keeps the native fit id, the pixel gates
+    follow the grid (areas by s^2), and the witness regrids instead of
+    refusing. Nothing here needs the arm or the phone.
+    """
+    print("\nuniform rescale: K follows the frame, provenance keeps the fit")
+    import capture_server as cs
+
+    size = (geometry["image"].shape[1], geometry["image"].shape[0])
+    calib_path = workdir / "rescale-calib.json"
+    calib_path.write_text(json.dumps({
+        "format": "rebot-camera-calib", "version": 1, "device": "synthetic",
+        "image_size": list(size), "K": geometry["K"].tolist(),
+        "dist": geometry["dist"].tolist(), "rms": 0.2,
+    }), encoding="utf-8")
+    native = calib_mod.load(calib_path)
+    half_size = (size[0] // 2, size[1] // 2)
+    half = calib_mod.load(calib_path, image_size=half_size)
+    check("load rescales K by the width ratio",
+          np.allclose(half.K, calib_mod.scale_K(native.K, size, half_size))
+          and half.image_size == half_size
+          and abs(half.scale - 0.5) < 1e-9,
+          "fx %.1f -> %.1f, scale %.2f" % (native.K[0, 0], half.K[0, 0], half.scale))
+    check("the rescaled fit keeps the native provenance id",
+          half.source_fingerprint == native.fingerprint
+          and half.fingerprint != native.fingerprint,
+          "%s vs %s" % (half.source_fingerprint, native.fingerprint))
+    back = half.rescaled(size)
+    check("rescaling round-trips to the native grid",
+          np.allclose(back.K, native.K) and abs(back.scale - 1.0) < 1e-9
+          and back.source_fingerprint == native.fingerprint)
+    check("rescaling to the same grid is a no-op", native.rescaled(size) is native)
+    try:
+        calib_mod.load(calib_path, image_size=(half_size[0], half_size[0]))
+        check("an aspect change is refused, not rescaled", False)
+    except calib_mod.CalibError as error:
+        check("an aspect change is refused, not rescaled", "aspect" in str(error),
+              str(error)[:60])
+
+    # The one seam: a frame that arrives at half the calibration size gets K
+    # at half size, turn or no turn, and every projection stays on the truth.
+    small = cv2.resize(geometry["image"], half_size, interpolation=cv2.INTER_AREA)
+    upright, up_calib, turn = locate.upright_frame(calib_path, small)
+    check("upright_frame rescales K without a turn",
+          turn == 0 and up_calib.image_size == half_size
+          and np.allclose(up_calib.K, calib_mod.scale_K(native.K, size, half_size))
+          and up_calib.source_fingerprint == native.fingerprint,
+          "size %s, scale %.2f" % (up_calib.image_size, up_calib.scale))
+    pixel = locate.project(up_calib.K, geometry["T_base_cam"], geometry["point"],
+                           up_calib.dist)
+    check("a known point projects to the scaled pixel",
+          pixel is not None
+          and abs(pixel[0] - geometry["pixel"][0] * 0.5) < 0.5
+          and abs(pixel[1] - geometry["pixel"][1] * 0.5) < 0.5,
+          str(pixel))
+    try:
+        locate.upright_frame(calib_path, small[:, :half_size[1]])
+        check("upright_frame refuses a crop", False)
+    except calib_mod.CalibError:
+        check("upright_frame refuses a crop", True)
+
+    # A tag solve on the rescaled frame writes a rig keyed to the NATIVE fit:
+    # a bandwidth drop must not re-key the sag maps and accuracy cells.
+    marker = base_marker.parse_spec("%g,%g,%g,%g" % (0.36, -0.10, 0.12, 180.0), 0.080)
+    marker["id"] = 3
+    run = auto_calibrate.solve_marker(upright, up_calib, marker, plane_z=0.0)
+    position = float(np.linalg.norm(
+        np.asarray(run.rig.T_base_cam)[:3, 3] - geometry["T_base_cam"][:3, 3]))
+    check("the tag still solves on the coarser grid", position < 0.008,
+          "%.2f mm" % (position * 1000))
+    check("the rescaled solve keeps the native rig key",
+          run.rig.calib_fingerprint == native.fingerprint,
+          run.rig.calib_fingerprint)
+
+    # The stream-turn hint: same aspect at another size is turn 0 with a real
+    # tag error; a quarter turn of a rescaled frame composes with the rescale.
+    app = {"camera": "", "marker": marker,
+           "rig": extrinsics.Rig(T_base_cam=geometry["T_base_cam"], image_size=size,
+                                 tip_offset=np.zeros(3))}
+    measured = cs.measure_stream_turn(app, native, frame=small)
+    check("the turn hint measures the tag on the rescaled grid",
+          measured is not None and measured["turns"] == 0
+          and measured["error_px"] < 5.0 and measured["size"] == list(half_size),
+          str(measured))
+    turned = cv2.rotate(small, cv2.ROTATE_90_CLOCKWISE)
+    measured = cs.measure_stream_turn(app, native, frame=turned)
+    check("a quarter turn of a rescaled frame still measures",
+          measured is not None and measured["turns"] == 3
+          and measured["error_px"] < 5.0,
+          str(measured))
+
+    # The pixel gates follow the grid: the same cover that passes at native
+    # is refused as 'no green arm' at half size without the scale, and passes
+    # with it. Areas scale by s^2, lengths by s.
+    options = auto_calibrate.DetectOptions()
+    scaled_options = options.scaled(0.5)
+    check("DetectOptions scales lengths by s and areas by s^2",
+          scaled_options.roi_px == 170 and abs(scaled_options.min_area - 30.0) < 1e-9
+          and abs(scaled_options.max_offset_px - 130.0) < 1e-9
+          and abs(scaled_options.band_px - 3.0) < 1e-9
+          and options.scaled(1.0) is options)
+    dsize = (640, 480)
+    K, dist = synthetic_camera(*dsize, f=600.0)
+    T = look_at((0.5, 0.95, 0.45), (0.3, 0.0, 0.25))
+    q = np.asarray(sweep.POSES[0], float)
+    t_tip = np.array([0.0, 0.0, -0.035])
+    wrist, tip, j6 = auto_calibrate._tool_pixels(q, K, dist, T, t_tip)
+    direction = np.asarray(tip, float) - np.asarray(j6 or wrist, float)
+    direction = direction / np.linalg.norm(direction)
+    frame = np.full((480, 640, 3), 200, np.uint8)
+
+    def paint(centre, half):
+        u, v = int(centre[0]), int(centre[1])
+        frame[v - half:v + half, u - half:u + half] = (0, 200, 0)
+
+    paint(np.asarray(tip) + 52 * direction, 9)
+    paint(np.asarray(tip) + 95 * direction, 24)
+    dsmall = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA)
+    Ks = calib_mod.scale_K(K, dsize, (320, 240))
+    cover_half = (np.asarray(tip) + 95 * direction) * 0.5
+    found = cs._oracle_detect(dsmall, q, Ks, dist, T, t_tip, scale=0.5)
+    check("the oracle detects the cover on the half-size grid",
+          found is not None and found["detector"] == "green"
+          and np.hypot(found["uv"][0] - cover_half[0],
+                       found["uv"][1] - cover_half[1]) < 20.0
+          and np.hypot(found["uv"][0] - tip[0] * 0.5,
+                       found["uv"][1] - tip[1] * 0.5) > 30.0,
+          str(found))
+    check("without the scale the same frame is refused, not guessed",
+          cs._oracle_detect(dsmall, q, Ks, dist, T, t_tip) is None)
+
+    # The witness regrids with the capture: an unmoved camera passes at any
+    # uniform scale, a knock is caught against the scaled limit, and an
+    # aspect change is still a setup error.
+    reference = witness.build(textured_frame())
+    ref_half = cv2.resize(reference.gray, (reference.gray.shape[1] // 2,
+                                           reference.gray.shape[0] // 2),
+                          interpolation=cv2.INTER_AREA)
+    clean = witness.check(reference, ref_half)
+    check("the witness passes an unmoved camera at half size",
+          clean["ok"] and clean["drift_px"] < 0.5
+          and abs(clean["grid_scale"] - 0.5) < 1e-9
+          and abs(clean["scale"] - 1.0) < 0.05,
+          "drift %.2f px, grid %.2f, fov %.3f"
+          % (clean["drift_px"], clean["grid_scale"], clean["scale"]))
+    shift = np.float32([[1.0, 0.0, 3.5], [0.0, 1.0, -2.5]])
+    moved = cv2.warpAffine(ref_half, shift, (ref_half.shape[1], ref_half.shape[0]),
+                           borderMode=cv2.BORDER_REFLECT)
+    drift = witness.check(reference, moved)
+    check("a knock is caught against the scaled drift limit",
+          not drift["ok"] and 3.8 < drift["drift_px"] < 4.9
+          and "limit 1.0" in (drift.get("reason") or ""),
+          "%.2f px, %s" % (drift["drift_px"], drift.get("reason")))
+    ref_up = cv2.resize(reference.gray, (reference.gray.shape[1] * 3 // 2,
+                                         reference.gray.shape[0] * 3 // 2),
+                        interpolation=cv2.INTER_LINEAR)
+    check("the witness also regrids upwards",
+          witness.check(reference, ref_up)["ok"]
+          and abs(witness.check(reference, ref_up)["grid_scale"] - 1.5) < 1e-9)
+    try:
+        witness.check(reference, cv2.resize(reference.gray, (800, 800)))
+        check("the witness refuses an aspect change", False)
+    except witness.WitnessError as error:
+        check("the witness refuses an aspect change", "aspect" in str(error),
+              str(error)[:60])
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Offline selftest for the capture pipeline.")
     parser.add_argument("--keep", action="store_true", help="keep the work directory")
@@ -5706,6 +5919,7 @@ def main(argv=None):
     if calibration:
         test_locate_cli(workdir, geometry)
     test_rotation(workdir, geometry)
+    test_uniform_rescale(workdir, geometry)
     test_fixed_rig(workdir)
     test_base_marker()
     test_marker_still_commit_flag(workdir)
