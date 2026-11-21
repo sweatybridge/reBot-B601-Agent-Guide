@@ -50,6 +50,8 @@
   }
   .seq-pin.half { border-color: #f0b429; color: #f0b429; }
   .seq-pin.far { outline: 2px solid #ff6b6b; outline-offset: 2px; }
+  .seq-pin.via { border-color: #4ea1ff; color: #4ea1ff; border-style: dashed;
+    width: 26px; height: 26px; margin: -13px 0 0 -13px; font-size: 11px; }
   #hint { position: absolute; inset: 0; display: flex; align-items: center;
     justify-content: center; color: #9aa4b2; text-align: center; padding: 24px;
     pointer-events: none; }
@@ -151,6 +153,7 @@
           title="Drag up or down in the preview to set the arm height">4 cm</span>
     <button class="chip" id="reach" type="button">Reach: off</button>
     <button class="chip" id="tapMode" type="button">Tap: plan</button>
+    <button class="chip" id="viaMode" type="button" hidden>Via: off</button>
     <button class="chip" id="clear" type="button" disabled>Clear marker</button>
   </span>
   <span id="state">idle</span>
@@ -211,6 +214,7 @@ const disconnectButton = $("#disconnect");
 const moveButton = $("#move");
 const reachButton = $("#reach");
 const tapModeButton = $("#tapMode");
+const viaModeButton = $("#viaMode");
 const clearButton = $("#clear");
 const reachCanvas = $("#reachCanvas");
 const markersContainer = $("#markers");
@@ -384,7 +388,8 @@ const heightControl = window.HeightControl.create({
       return;
     }
     if (state.tapMode === "markers") {
-      markersOverlay.addAt(x, y);
+      if (markersOverlay.viaMode) markersOverlay.addViaAt(x, y);
+      else markersOverlay.addAt(x, y);
       return;
     }
     const tapped = RebotVideo.videoPoint(video, x, y);
@@ -453,10 +458,12 @@ async function locateHere(tap, height) {
 function renderAction() {
   const markers = state.tapMode === "markers";
   moveButton.hidden = !markers;
+  viaModeButton.hidden = !markers;
   moveButton.textContent = state.busy ? (state.busyText || "Planning...") : "Move arm";
   moveButton.disabled = state.busy || markersOverlay.busy || markersOverlay.count === 0;
   clearButton.disabled = state.busy || markersOverlay.count === 0;
   tapModeButton.disabled = state.busy;
+  viaModeButton.disabled = state.busy;
 }
 
 function applyTapMode() {
@@ -466,9 +473,12 @@ function applyTapMode() {
   markersOverlay.setEnabled(markers);
   // Each mode's targets must not survive the switch: a stale "Move the arm"
   // panel, or markers for points the operator has moved past, is worse than
-  // starting clean.
+  // starting clean. Via mode is a markers-mode tap modifier; it resets too.
   if (markers) planner.clear();
   else markersOverlay.clear();
+  markersOverlay.setViaMode(false);
+  viaModeButton.textContent = "Via: off";
+  viaModeButton.classList.remove("on");
   renderAction();
 }
 
@@ -620,6 +630,22 @@ const AGENT_TOOLS = [
           u: { type: "number", description: "image column in pixels" },
           v: { type: "number", description: "image row in pixels" },
           height_m: { type: "number", description: "approach height above the worktop, metres; omit for the page's badge height" },
+        },
+        required: ["u", "v"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "add_via",
+      description: "Attach a pass-through point to the last queued marker, at an image pixel. The arm travels through it without stopping on the way to the next marker, gripper unchanged. Up to 5 per marker; needs a marker placed first, and a following marker to travel to. Use it to route a carry over or around an obstacle.",
+      parameters: {
+        type: "object",
+        properties: {
+          u: { type: "number", description: "image column in pixels" },
+          v: { type: "number", description: "image row in pixels" },
+          height_m: { type: "number", description: "pass-through height above the worktop, metres; omit for the page's badge height" },
         },
         required: ["u", "v"],
       },
@@ -939,6 +965,8 @@ function systemPrompt() {
     "- pixel_to_arm(u, v, height_m): the tool-tip point for a pixel, and whether it is reachable.",
     "- arm_to_pixel(x, y, z): where an arm point lands in the image; use it to check yourself.",
     "- add_marker(u, v, height_m): queue a numbered target; markers are visited in order.",
+    "- add_via(u, v, height_m): attach a pass-through point to the last marker; the arm",
+    "  crosses it without stopping on the way to the next marker (max 5, needs a next marker).",
     "- clear_markers(): drop the queued targets.",
     "- move_arm(execute): plan the markers; execute=false plans without moving.",
     "- capture_view(): get a fresh frame, delivered in the next user message.",
@@ -1074,6 +1102,7 @@ async function toolRig() {
     badge_height_m: round3(height),
     reach_band_m: reachBandFor(config, height),
     markers: markersOverlay.count,
+    vias: markersOverlay.viaCount,
   };
 }
 
@@ -1162,6 +1191,42 @@ async function toolAddMarker(args) {
   return report;
 }
 
+async function toolAddVia(args) {
+  const config = await loadRigConfig();
+  const u = Number(args.u);
+  const v = Number(args.v);
+  if (!Number.isFinite(u) || !Number.isFinite(v)) throw new Error("u and v must be image pixels");
+  if (markersOverlay.count === 0) {
+    return { ok: false, error: "place a marker first: vias attach to the last marker",
+      count: 0 };
+  }
+  const height = heightFrom(args);
+  ensureMarkersMode();
+  const at = RebotVideo.viewportPoint(video, u, v);
+  if (!at) throw new Error("that pixel is outside the video frame");
+  const placed = await markersOverlay.addViaAt(at.x, at.y);
+  if (!placed || !placed.ok) {
+    return { ok: false, error: (placed && placed.error) || "the via was refused",
+      count: markersOverlay.count };
+  }
+  const report = tipReport(config, placed.marker.target.via[placed.via - 1], height,
+    { u: u, v: v });
+  report.index = placed.index;
+  report.via = placed.via;
+  report.count = markersOverlay.count;
+  RebotTrace.trace("via_solved", {
+    u: round3(u), v: round3(v),
+    height_m: report.height_m, tip_m: report.tip_m,
+    turns: streamTurn(),
+    rig_fingerprint: (config.rig && config.rig.fingerprint) || null,
+    inside_band: report.inside_band, above_floor: report.above_floor,
+  });
+  markersOverlay.redraw();
+  pushChat("meta", "via " + placed.via + " after marker " + placed.index
+    + " pinned at (" + round3(u) + ", " + round3(v) + ")");
+  return report;
+}
+
 async function toolMoveArm(args) {
   const execute = !(args && args.execute === false);
   const result = await runSequence(execute);
@@ -1185,7 +1250,7 @@ async function toolMoveArm(args) {
   };
 }
 
-// One wrapper covers all seven tools: the page executes them, so the server
+// One wrapper covers all eight tools: the page executes them, so the server
 // never sees a tool result -- the trace is the only record of what ran (§4.4).
 async function runTool(name, args) {
   const started = performance.now();
@@ -1214,6 +1279,7 @@ async function runToolDispatch(name, args) {
     case "pixel_to_arm": return toolPixelToArm(args);
     case "arm_to_pixel": return toolArmToPixel(args);
     case "add_marker": return toolAddMarker(args);
+    case "add_via": return toolAddVia(args);
     case "clear_markers":
       markersOverlay.clear();
       return { ok: true, count: 0 };
@@ -1726,6 +1792,18 @@ tapModeButton.addEventListener("click", () => {
   status(state.tapMode === "markers"
     ? "taps add numbered markers; Move arm runs them in order"
     : "taps plan one point; Move the arm from the plan panel", "warn");
+});
+viaModeButton.addEventListener("click", () => {
+  if (state.busy) {
+    status("wait for the sequence to finish", "warn");
+    return;
+  }
+  const next = !markersOverlay.viaMode;
+  markersOverlay.setViaMode(next);
+  viaModeButton.textContent = "Via: " + (next ? "on" : "off");
+  viaModeButton.classList.toggle("on", next);
+  status(next ? "via mode: taps add pass-through points to the last marker"
+              : "via mode off: taps add markers again", "warn");
 });
 clearButton.addEventListener("click", () => {
   if (markersOverlay.clearLast()) {

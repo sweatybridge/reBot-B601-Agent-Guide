@@ -984,6 +984,11 @@ def compact_target(tip, source=None):
         for key in ("pixel", "tap", "capture"):
             if source.get(key) is not None:
                 result[key] = source[key]
+        # Via points are validated tip triples by handle_sequence before this
+        # runs; they ride to the planner on the marker they belong to.
+        if source.get("via") is not None:
+            result["via"] = [[float(point[0]), float(point[1]), float(point[2])]
+                             for point in source["via"]]
     return result
 
 
@@ -1093,6 +1098,35 @@ async def handle_sequence(request: web.Request) -> web.Response:
                 "error": "marker %d: tip z %.3f m is below the minimum %.3f m"
                          % (index, tip[2], app["min_z"]),
             }, status=422)
+    # Via points: the same tip-space contract and the same height floor as the
+    # markers they belong to. The planner re-checks reach and IK before motion.
+    for index, target in enumerate(targets, start=1):
+        via = target.get("via") if isinstance(target, dict) else None
+        if via is None:
+            continue
+        if not isinstance(via, list) or len(via) > 5:
+            raise web.HTTPBadRequest(
+                text="marker %d: 'via' must be a list of at most 5 [x, y, z] tip points"
+                     % index)
+        for via_index, via_point in enumerate(via, start=1):
+            if not isinstance(via_point, list) or len(via_point) != 3:
+                raise web.HTTPBadRequest(
+                    text="marker %d via %d has no [x, y, z] tip" % (index, via_index))
+            try:
+                point = [float(value) for value in via_point]
+            except (TypeError, ValueError) as error:
+                raise web.HTTPBadRequest(
+                    text="marker %d via %d has a non-numeric tip"
+                         % (index, via_index)) from error
+            if not all(math.isfinite(value) for value in point):
+                raise web.HTTPBadRequest(
+                    text="marker %d via %d has a non-finite tip" % (index, via_index))
+            if point[2] < app["min_z"] - 1e-9:
+                return web.json_response({
+                    "ok": False, "stage": "target",
+                    "error": "marker %d via %d: tip z %.3f m is below the minimum %.3f m"
+                             % (index, via_index, point[2], app["min_z"]),
+                }, status=422)
 
     plan_options = {
         "tool_axis": app["tool_axis"],

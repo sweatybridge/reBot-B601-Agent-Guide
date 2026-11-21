@@ -232,6 +232,102 @@ def joint_sequence(poses, seconds, hold_s=0.4, control_hz=30.0, limits=None, lab
                  label or ("%d poses, one pass" % len(points)))
 
 
+def _chain_curve(poses, per_leg=24):
+    """Catmull-Rom curve through joint-space knots, chord-length parameterized.
+
+    Returns (samples, arc): dense samples including every knot exactly, and the
+    cumulative chord length at each sample. The curve is C1 at the knots, so a
+    velocity profile over its arc length crosses a via point without a stop or
+    a velocity-direction jump -- the continuous pass-through a via chain needs.
+    """
+    points = [np.asarray(p, dtype=float).reshape(-1) for p in poses]
+    if len(points) < 2:
+        raise ValueError("a chain needs at least two poses, got %d" % len(points))
+    size = points[0].size
+    if any(p.size != size for p in points):
+        raise ValueError("chain poses must all have the same joint count")
+    if not all(np.all(np.isfinite(p)) for p in points):
+        raise ValueError("chain poses must be finite")
+    # Tangents: central differences inside, one-sided at the ends (the endpoint
+    # duplication that keeps the first and last segment from overshooting).
+    tangents = []
+    for index in range(len(points)):
+        if index == 0:
+            tangents.append(points[1] - points[0])
+        elif index == len(points) - 1:
+            tangents.append(points[-1] - points[-2])
+        else:
+            tangents.append((points[index + 1] - points[index - 1]) * 0.5)
+    samples = [points[0]]
+    for index in range(len(points) - 1):
+        p0, p1 = points[index], points[index + 1]
+        m0, m1 = tangents[index], tangents[index + 1]
+        for step in range(1, per_leg + 1):
+            t = step / per_leg
+            t2, t3 = t * t, t * t * t
+            # Hermite basis; at t=1 the coefficients are exactly (0,0,1,0),
+            # so every knot lands on its pose bit-for-bit.
+            samples.append((2.0 * t3 - 3.0 * t2 + 1.0) * p0
+                           + (t3 - 2.0 * t2 + t) * m0
+                           + (-2.0 * t3 + 3.0 * t2) * p1
+                           + (t3 - t2) * m1)
+    samples = np.asarray(samples)
+    arc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(samples, axis=0), axis=1))])
+    return samples, arc
+
+
+def chain_samples(poses, per_leg=24):
+    """Dense joint-space samples of the smooth chain through `poses`.
+
+    The worktop capsule gate must see the curve itself: a Catmull-Rom segment
+    can bulge away from its chord, so checking only the knots (or the straight
+    lines between them) would miss a dip that happens mid-segment.
+    """
+    samples, _arc = _chain_curve(poses, per_leg)
+    return samples
+
+
+def chain_travel(poses, per_leg=24):
+    """The furthest-travelling joint's path length along the chain, rad.
+
+    A joint that reverses direction at a via travels more than its endpoint
+    delta; the speed policy must budget the whole path, not just the ends.
+    """
+    samples, _arc = _chain_curve(poses, per_leg)
+    return float(np.max(np.sum(np.abs(np.diff(samples, axis=0)), axis=0)))
+
+
+def chain_series(poses, seconds, control_hz=30.0, per_leg=24):
+    """Joint poses for one continuous leg through `poses`, tick by tick.
+
+    Starts at rest at poses[0] (already the caller's last waypoint), ramps up
+    over RAMP_S, cruises through every interior knot without stopping, and
+    ramps down to rest at poses[-1]: the same trapezoid time law a single leg
+    gets from ease_fraction, applied over the whole chain's arc length. The
+    chord-length parameterization keeps cruise near a constant joint speed.
+
+    Returns `count` poses, the last exactly poses[-1]. Interior knots lie on
+    the curve exactly; the discrete ticks straddle each within half a tick of
+    travel (the player streams at control_hz, the same quantization every leg
+    already has).
+    """
+    samples, arc = _chain_curve(poses, per_leg)
+    total = float(arc[-1])
+    hz = float(control_hz)
+    count = max(2, int(round(max(0.2, float(seconds)) * hz)))
+    duration = count / hz
+    out = []
+    for index in range(1, count + 1):
+        target = ease_fraction(index / count, duration) * total
+        slot = int(np.searchsorted(arc, target, side="right")) - 1
+        slot = max(0, min(slot, len(arc) - 2))
+        span = arc[slot + 1] - arc[slot]
+        weight = 0.0 if span <= 1e-12 else (target - arc[slot]) / span
+        out.append(samples[slot] + (samples[slot + 1] - samples[slot]) * weight)
+    out[-1] = samples[-1].copy()
+    return out
+
+
 def validate(payload):
     """Raise ValueError with the first thing the player would refuse."""
     if payload.get("format") != FORMAT:
