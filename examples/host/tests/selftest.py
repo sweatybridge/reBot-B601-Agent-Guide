@@ -6045,21 +6045,27 @@ def test_uniform_rescale(workdir: Path, geometry):
 
 def test_via_chain(workdir: Path):
     print("\nvia chains: continuous pass-through primitive, capsule gate, wire contract")
-    # The chain primitive is pure numpy: knot passage, no stop at the via, and
-    # the player's gates. plan_sequence's via IK needs Pinocchio -- that part is
-    # verified by a dry /plan on the Pi, not here (the offline stub refuses).
+    # The chain primitive is pure numpy: straight segments, no stop at the via,
+    # and the player's gates. plan_sequence's via IK needs Pinocchio -- that part
+    # is verified by a dry /plan in the planner container, not here (the offline
+    # stub refuses).
     q0 = np.array([0.10, 0.50, 0.50, 0.00, 0.00, 0.00])
     q1 = np.array([0.45, 0.80, 0.60, 0.10, 0.20, 0.00])
     q2 = np.array([0.20, 0.60, 0.90, 0.00, 0.10, 0.00])
     knots = [q0, q1, q2]
-    samples = traj.chain_samples(knots)
-    check("chain samples interpolate every knot exactly",
-          np.allclose(samples[0], q0, atol=1e-12)
-          and np.allclose(samples[24], q1, atol=1e-12)
-          and np.allclose(samples[48], q2, atol=1e-12))
     series = traj.chain_series(knots, 2.0, 30.0)
     check("chain series ends exactly on the last knot",
           len(series) == 60 and np.allclose(series[-1], q2, atol=1e-12))
+
+    def on_segment(q, a, b):
+        d = b - a
+        denom = float(d @ d)
+        w = 0.0 if denom <= 1e-24 else max(0.0, min(1.0, float((q - a) @ d) / denom))
+        return float(np.linalg.norm(q - (a + d * w)))
+
+    check("every chain tick lies on a straight knot-to-knot segment",
+          all(min(on_segment(q, a, b) for a, b in zip(knots, knots[1:])) < 1e-9
+              for q in series))
     near = min(float(np.max(np.abs(q - q1))) for q in series)
     check("the discrete ticks straddle the via within half a tick of travel",
           near < 0.02, "closest tick %.4f rad from the via" % near)
@@ -6076,8 +6082,8 @@ def test_via_chain(workdir: Path):
             np.array([0.5, 0.5, 0.5, 0.0, 0.0, 0.0]),
             np.array([0.1, 0.5, 0.5, 0.0, 0.0, 0.0])]
     travel = traj.chain_travel(back)
-    check("chain travel counts a joint's reversal at the via",
-          travel >= 0.9, "travel %.3f rad" % travel)
+    check("chain travel is the exact joint path length (reversals included)",
+          abs(travel - 0.9) < 1e-9, "travel %.6f rad" % travel)
     dup = traj.chain_series([q0, q0, q2], 1.0, 30.0)
     check("duplicate knots collapse without breaking the chain",
           np.allclose(dup[-1], q2, atol=1e-12))
