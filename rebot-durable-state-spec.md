@@ -87,10 +87,11 @@ one invariant this design will not trade away.
 - **Kinematics:** [`openrr/k`](https://github.com/openrr/k) 0.32 (Apache-2.0),
   pure-Rust FK/IK/URDF on nalgebra 0.30, wrapped as the `rebot_kinematics` pgrx
   extension (`rebot_fk`, `rebot_ik`, `rebot_dof`). Memory-safe: bad input → SQL
-  ERROR (pgrx catches the panic), never a backend crash. **Gaps:** `k` has no
-  collision checking and no gravity dynamics — `sweep.path_safe` (capsule gate)
-  and `rebot_ik.gravity_torques` need separate Rust implementations (or remain
-  isolated activities) and are NOT provided by `k`.
+  ERROR (pgrx catches the panic), never a backend crash. `k` itself provides FK/IK
+  only; **collision checking and gravity dynamics are added as Rust ports** in the
+  same extension — `rebot_path_safe` / `rebot_joint_points` (port of `sweep.path_safe`)
+  and `rebot_gravity_torques` (port of `rebot_ik.gravity_torques`), validated against
+  the pure-numpy reference (§9.1).
 - **Similarity:** pgvector 0.8.7 (HNSW).
 
 ## 3. Filesystem layout (flattened)
@@ -977,6 +978,15 @@ transaction; self-checking assertions pass):
   `[0.2, 0.3, 0.4, 0.2, 0.1, 0]`, within 1e-3).
 - Joint limits are enforced (an out-of-limit seed raises a SQL ERROR, not a crash).
 
+**Gravity + collision (Rust ports of the numpy reference):**
+- `rebot_gravity_torques` matches `rebot_ik.gravity_torques` to ~1e-6 Nm at
+  `q=[0.2,0.3,0.4,0.2,0.1,0]` (ref `[0, 1.845377, 5.741341, 1.520166, -0.019008,
+  -0.000782]`); uses the same 7-link inertial table and `g=9.80665`.
+- `rebot_joint_points` reproduces the 7 joint/tool points (tool within 1e-3 m).
+- `rebot_path_safe` reproduces `sweep.path_safe`: true for a high pose→itself, false
+  for a fold-down that dips below the worktop (`CLEARANCE=0.012`, per-link `RADII`,
+  `LINK_RADIUS_MAX=0.85`, 40 samples).
+
 **Durable orchestration (pg_durable):** a workflow `df.start(df.sql('SELECT
 to_jsonb(rebot_fk(...))'))` ran to `status=completed` via the duroxide background
 worker; `df.result` returned `{"rows":[{"pose":[0.1355,…]}],"row_count":1}`.
@@ -996,11 +1006,11 @@ worker; `df.result` returned `{"rows":[{"pose":[0.1355,…]}],"row_count":1}`.
 6. nalgebra `UnitQuaternion::from_quaternion` takes a `Quaternion`, not a `Vector4`.
 
 **Not yet built (gaps / later phases):**
-- Collision checking (`sweep.path_safe` capsule gate) and gravity dynamics
-  (`rebot_ik.gravity_torques`) — `openrr/k` provides neither; separate Rust impls or
-  isolated activities are required.
 - Isolated decode/embed/OpenCV activities and the `df.http()` sandboxed service.
 - The full app migration (§8): dual-write, backfill, cutover, flatten.
+- General self-collision / obstacle collision beyond the worktop capsule model
+  (`rebot_path_safe` ports the existing `sweep.path_safe` table-clearance gate, not
+  full capsule-capsule self-collision needed for two-arm cooperation).
 
 **Reproduction:** see §11 (build the image, `docker compose up -d`, run the migration
 and the three test files under `examples/host/substrate/tests/`).
@@ -1036,6 +1046,7 @@ substrate/
   migrations/0001_substrate.sql   # the §4+§5 DDL in dependency order
   tests/mechanism_tests.sql       # refcount/GC/invalidation/CHECK/cascade/HNSW
   tests/kinematics_tests.sql      # FK/IK round-trip on the real arm
+  tests/gravity_collision_tests.sql # gravity + path_safe vs the numpy reference
   tests/df_workflow.sql           # pg_durable workflow calling rebot_fk
 ```
 
@@ -1067,6 +1078,7 @@ docker exec rebot-substrate psql -U postgres --single-transaction -v ON_ERROR_ST
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/mechanism_tests.sql
 docker cp ../app/cad/ReBot_Arm_RS.urdf rebot-substrate:/tmp/rebot.urdf
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/kinematics_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/gravity_collision_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
 ```
 
@@ -1087,7 +1099,8 @@ SELECT df.result(:'iid');     -- {"rows":[{"pose":[...]}],"row_count":1}
   (`pg_durable.worker_role`) must be a superuser.
 - `rebot_kinematics` parses the URDF per call (correctness-first); cache the loaded
   chain per session for hot IK loops.
-- `k` covers FK/IK only. Collision (`path_safe`) and gravity dynamics are separate
-  work (§9.1 gaps) — do not assume the planner is complete because FK/IK validate.
+- `k` covers FK/IK; collision (`rebot_path_safe`) and gravity (`rebot_gravity_torques`)
+  are Rust ports of the numpy reference in the same extension (§9.1). `rebot_path_safe`
+  is the worktop table-clearance gate, not full two-arm self-collision (still a gap).
 - Data on a named volume, never a Windows bind mount (WAL locking). Disk headroom
   matters: the Rust builder layer is multi-GB; prune build cache if the host is tight.

@@ -19,8 +19,14 @@ proves the extensions compose; it does not yet wire the live capture/planner pat
 | Similarity | `postgresql-18-pgvector` (apt) | pgvector 0.8.7 |
 | Server | PostgreSQL | 18.7 |
 
-`k` provides FK/IK/URDF only. Collision checking (`sweep.path_safe`) and gravity
-dynamics (`rebot_ik.gravity_torques`) are **not** in `k` and remain separate work.
+`k` provides FK/IK/URDF. Collision checking and gravity dynamics are added as Rust
+ports in the same extension: `rebot_path_safe` / `rebot_joint_points` (from
+`sweep.path_safe`) and `rebot_gravity_torques` (from `rebot_ik.gravity_torques`),
+validated against the pure-numpy reference. `rebot_path_safe` is the worktop
+table-clearance gate, not full two-arm self-collision (a later phase).
+
+SQL functions: `rebot_fk`, `rebot_ik`, `rebot_dof`, `rebot_gravity_torques`,
+`rebot_joint_points`, `rebot_path_safe`.
 
 ## Quickstart
 
@@ -42,11 +48,18 @@ docker exec rebot-substrate psql -U postgres --single-transaction \
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/mechanism_tests.sql
 docker cp ../app/cad/ReBot_Arm_RS.urdf rebot-substrate:/tmp/rebot.urdf
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/kinematics_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/gravity_collision_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
 ```
 
-All three pass on PG 18.7: schema mechanisms, FK/IK round-trip on the real 6-DOF arm,
-and a pg_durable workflow calling `rebot_fk` to completion.
+All pass on PG 18.7: schema mechanisms, FK/IK round-trip on the real 6-DOF arm,
+gravity + collision matching the numpy reference, and a pg_durable workflow calling
+`rebot_fk` to completion.
+
+Note: after rebuilding the image with new functions, re-create the extension in the
+running DB so it picks up the new SQL: `DROP EXTENSION rebot_kinematics CASCADE;
+CREATE EXTENSION rebot_kinematics;` (the version is unchanged, so `CREATE EXTENSION
+IF NOT EXISTS` alone will not refresh it).
 
 ## Notes / gotchas
 
