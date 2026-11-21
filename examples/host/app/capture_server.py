@@ -1831,7 +1831,7 @@ async def _oracle_hold_grabs(app, prep):
         logging.warning("oracle hold grabs for %s failed: %s", prep["plan_id"], exc)
 
 
-def _oracle_detect(frame, q6, K, dist, T_base_cam, t_tip):
+def _oracle_detect(frame, q6, K, dist, T_base_cam, t_tip, scale=1.0):
     """The tip pixel: green, with a fragment-cleaned retry. None, never a guess.
 
     A failed detection is `detected: null` (§5.3): the oracle reports what it
@@ -1847,14 +1847,18 @@ def _oracle_detect(frame, q6, K, dist, T_base_cam, t_tip):
     sliver below GREEN_MIN_BLOB_PX while the substantial cover sits a little
     farther out. The retry keeps only sizeable blobs -- still colour evidence
     from this frame, never background, never another frame.
+
+    `scale` is the frame grid's ratio to the calibration grid (`Calib.scale`):
+    a WebRTC bandwidth drop shrinks every blob, so the area gates follow s^2.
     """
     import cv2
 
     options = auto_calibrate.DetectOptions()
+    area_scale = float(scale) * float(scale)
     size = (int(frame.shape[1]), int(frame.shape[0]))
     try:
         found = auto_calibrate.detect_tip_green(frame, q6, K, dist, T_base_cam, t_tip,
-                                                options, size)
+                                                options, size, scale=scale)
         return {"detector": "green", "uv": [found.u, found.v], "score": found.score}
     except auto_calibrate.AutoError:
         pass
@@ -1862,13 +1866,13 @@ def _oracle_detect(frame, q6, K, dist, T_base_cam, t_tip):
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
     clean = np.zeros_like(mask)
     for index in range(1, count):
-        if stats[index, cv2.CC_STAT_AREA] >= auto_calibrate.GREEN_MIN_BLOB_PX:
+        if stats[index, cv2.CC_STAT_AREA] >= auto_calibrate.GREEN_MIN_BLOB_PX * area_scale:
             clean[labels == index] = 255
-    if int(clean.sum()) // 255 < auto_calibrate.MIN_GREEN_PX:
+    if int(clean.sum()) // 255 < auto_calibrate.MIN_GREEN_PX * area_scale:
         return None
     try:
         found = auto_calibrate.detect_tip_green(frame, q6, K, dist, T_base_cam, t_tip,
-                                                options, size, mask=clean)
+                                                options, size, mask=clean, scale=scale)
     except auto_calibrate.AutoError:
         return None
     return {"detector": "green", "uv": [found.u, found.v], "score": found.score}
@@ -1931,6 +1935,8 @@ async def oracle_finish(app, prep, sid):
             # pre-still back the same way the hold frames are turned.
             pre_image, _pre_calib, _pre_turn = locator.upright_frame(
                 resolve_calibration(app), pre_image, turn)
+            doc["pre_image_size"] = [int(pre_image.shape[1]), int(pre_image.shape[0])]
+            doc["pre_grid_scale"] = round(float(_pre_calib.scale), 4)
             if app["witness"] is not None and doc["witness"] is None:
                 try:
                     doc["witness"] = witness.check(app["witness"], pre_image,
@@ -2005,6 +2011,10 @@ async def oracle_finish(app, prep, sid):
                         resolve_calibration(app), frame, turn)
                     K = np.asarray(calibration.K, dtype=float)
                     dist = np.asarray(calibration.dist, dtype=float).reshape(-1)
+                    # The grid this hold was measured on: a bandwidth drop can
+                    # rescale the stream between the pre-still and any hold.
+                    hold["image_size"] = [int(frame.shape[1]), int(frame.shape[0])]
+                    hold["grid_scale"] = round(float(calibration.scale), 4)
                     # The point the detector looks for: FK tip plus the tool
                     # offset, in the base frame (locate_target.project).
                     rotation = rebot_ik.forward(np.asarray(hold["q_meas"][:6]))[:3, :3]
@@ -2013,7 +2023,8 @@ async def oracle_finish(app, prep, sid):
                     hold["predicted_tip_px"] = (list(predicted) if predicted else None)
                     found = await asyncio.to_thread(
                         _oracle_detect, frame, np.asarray(hold["q_meas"][:6]),
-                        K, dist, np.asarray(rig.T_base_cam, dtype=float), t_tip)
+                        K, dist, np.asarray(rig.T_base_cam, dtype=float), t_tip,
+                        calibration.scale)
                     hold["detected_tip_px"] = found["uv"] if found else None
                     hold["detector"] = found["detector"] if found else None
                     hold["detector_score"] = found["score"] if found else None
@@ -2043,12 +2054,25 @@ async def oracle_finish(app, prep, sid):
                     resolve_calibration(app), post, turn)
                 pre_gray = cv2.cvtColor(pre_image, cv2.COLOR_BGR2GRAY)
                 post_gray = cv2.cvtColor(post_upright, cv2.COLOR_BGR2GRAY)
+                # A bandwidth drop between the two stills is a uniform rescale:
+                # put the post on the pre's grid instead of dropping the diff.
+                if pre_gray.shape != post_gray.shape and calib_mod.same_shape(
+                        (pre_gray.shape[1], pre_gray.shape[0]),
+                        (post_gray.shape[1], post_gray.shape[0])):
+                    post_gray = cv2.resize(post_gray,
+                                           (pre_gray.shape[1], pre_gray.shape[0]),
+                                           interpolation=cv2.INTER_AREA)
                 if pre_gray.shape == post_gray.shape:
                     for hold in doc["holds"]:
                         pixel = hold.get("predicted_tip_px")
                         if not pixel:
                             continue
-                        u, v = int(pixel[0]), int(pixel[1])
+                        # The prediction is on the hold's grid; the diff is on
+                        # the pre-still's. They differ only by a uniform scale.
+                        hold_size = hold.get("image_size")
+                        factor = (pre_gray.shape[1] / float(hold_size[0])
+                                  if hold_size else 1.0)
+                        u, v = int(pixel[0] * factor), int(pixel[1] * factor)
                         half = 40
                         box_pre = pre_gray[max(0, v - half):v + half,
                                            max(0, u - half):u + half]
@@ -2737,6 +2761,22 @@ def measure_stream_turn(app, calibration, frame=None):
     size = (int(frame.shape[1]), int(frame.shape[0]))
     if calib_mod.turns_for_shapes(calibration.image_size, size) == 0:
         measured = {"turns": 0, "error_px": 0.0, "size": list(size), "at": time.time()}
+        if size != (int(calibration.image_size[0]), int(calibration.image_size[1])):
+            # Same crop, coarser grid: the turn is certain from the shape, but
+            # the tag error is only real with K on the frame's grid. A missing
+            # tag leaves the error at 0 -- the orientation is still known.
+            try:
+                scaled = calibration.rescaled(size)
+                marker_id = marker.get("id")
+                marker_id = base_marker.MARKER_ID if marker_id is None else int(marker_id)
+                corners = base_marker.detect(frame, marker_id)
+                centre = np.asarray(corners, dtype=float).reshape(-1, 2).mean(axis=0)
+                predicted = np.asarray(locator.project(scaled.K, rig.T_base_cam,
+                                                       np.asarray(marker["at"], dtype=float)),
+                                       dtype=float)
+                measured["error_px"] = float(np.linalg.norm(predicted - centre))
+            except Exception as error:      # noqa: BLE001 - a hint must never break the caller
+                logging.info("stream turn tag check skipped: %s", error)
         app["measured_turn"] = measured
         return measured
     try:
@@ -2745,7 +2785,11 @@ def measure_stream_turn(app, calibration, frame=None):
         marker_id = base_marker.MARKER_ID if marker_id is None else int(marker_id)
         corners = base_marker.detect(frame, marker_id)
         centre = np.asarray(corners, dtype=float).reshape(-1, 2).mean(axis=0)
-        predicted = np.asarray(locator.project(calibration.K, rig.T_base_cam,
+        # Both candidate turns exchange the sides, so the upright grid is the
+        # delivered size swapped -- at the native resolution or a rescale of it.
+        upright_size = (size[1], size[0])
+        scaled = calibration.rescaled(upright_size)
+        predicted = np.asarray(locator.project(scaled.K, rig.T_base_cam,
                                                np.asarray(marker["at"], dtype=float)),
                                dtype=float)
     except Exception as error:
@@ -2753,10 +2797,10 @@ def measure_stream_turn(app, calibration, frame=None):
         return None
     best = None
     for turn in (1, 3):
-        # The prediction is in the calibration grid; the detection is in the
+        # The prediction is in the upright grid; the detection is in the
         # delivered frame, so the forward direction is 4 - turn.
         placed = np.asarray(calib_mod.map_pixel(predicted[0], predicted[1],
-                                                calibration.image_size,
+                                                upright_size,
                                                 (4 - turn) % 4),
                             dtype=float)
         error = float(np.linalg.norm(placed - centre))
