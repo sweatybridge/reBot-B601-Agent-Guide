@@ -620,13 +620,17 @@ Move arm
 ```
 
 The gripper starts fully open -- it opens before the arm leaves its first pose
--- half-closes at odd-numbered markers and opens at even-numbered ones. The arm
-returns to its start pose and the gripper auto-closes to its pre-sequence angle
-at three times the old return speed (about 7.3 s from open, about 3.7 s from
-half), so odd/even on screen is the whole rule. A stalled gripper holds the
-measured blocked opening instead of pressing further. Between markers the arm moves in joint space (checked against the table
-capsule), and the tool yaw follows each marker's direction from the base, which
-is the free-yaw envelope the reach band draws.
+-- half-closes at odd-numbered markers and opens at even-numbered ones. Odd
+markers are grasped with the pick's slide-in geometry: the arm first stages
+`approach` metres in front of the marker (on the base side, at the marker's own
+height), then slides forward into it before half-closing; even markers keep the
+direct visit. The arm returns to its start pose and the gripper auto-closes to
+its pre-sequence angle at three times the old return speed (about 7.3 s from
+open, about 3.7 s from half), so odd/even on screen is the whole rule. A stalled
+gripper holds the measured blocked opening instead of pressing further. Between
+markers the arm moves in joint space (every leg, staging and slide included, is
+checked against the table capsule), and the tool yaw follows each marker's
+direction from the base, which is the free-yaw envelope the reach band draws.
 
 By default Reach uses the **tag pose only**: the ArUco solve at each camera frame
 is the live camera pose, and no motion permission is requested. This is the

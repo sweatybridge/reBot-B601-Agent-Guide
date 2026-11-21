@@ -12,8 +12,12 @@ Two callers share this module:
 
 The motion is deliberately simple and repeatable:
 
-    start pose -> unpark (joint space) -> pre-grasp above the target -> descend
+    start pose -> unpark (joint space) -> stage in front of the target -> slide in
     -> close -> lift -> back to the start pose -> open -> park
+
+"In front" is on the base side of the target: the staging point sits
+`--approach` metres closer to the base axis at the target's own height, and the
+gripper slides forward horizontally into the grasp instead of descending onto it.
 
 The orientation is the start pose's, rotated so the chosen tool axis points at
 the table (`--tool-axis`, see `--inspect`), then yawed by `--yaw`. Holding the
@@ -80,7 +84,7 @@ class Options:
     hz: float = 30.0
     approach: float = 0.06
     approach_s: float = 3.0
-    descend_s: float = 1.5
+    slide_s: float = 1.5
     grasp_q: float = 2.45
     open_q: float = MOTOR7_OPEN
     grasp_s: float = 1.2
@@ -197,6 +201,19 @@ def blend_rotation(a, b, fraction):
                      [-axis[1], axis[0], 0.0]])
     step = angle * fraction
     return a @ (np.eye(3) + math.sin(step) * skew + (1.0 - math.cos(step)) * (skew @ skew))
+
+
+def stage_in_front(point, approach):
+    """The staging point `approach` metres in front of a target: back along the
+    horizontal base->target direction, at the target's own height. The gripper
+    slides forward from here into the target instead of descending onto it.
+    Shared by the single-tap pick and the odd markers of a sequence."""
+    radius = float(np.linalg.norm(point[:2]))
+    if radius <= approach:
+        raise PlanError("target is %.3f m from the base axis, inside the %.0f mm approach "
+                        "standoff: no room to stage in front of it"
+                        % (radius, approach * 1000))
+    return point - np.array([point[0], point[1], 0.0]) * (approach / radius)
 
 
 def posture(dump):
@@ -414,7 +431,9 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
             waypoints.append(traj.waypoint(state["t"], waypoints[-1]["q"], waypoints[-1]["tau"]))
 
     seed = q.copy()
-    pre = point + np.array([0.0, 0.0, options.approach])
+    # Stage in front of the target and slide forward into the grasp at the
+    # target's own height (see stage_in_front).
+    pre = stage_in_front(point, options.approach)
     unpark = {1: math.radians(options.unpark_j2), 2: math.radians(options.unpark_j3)}
     unparked = any(abs(value) > 1e-9 for value in unpark.values())
     if unparked:
@@ -425,7 +444,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
 
     if options.hover:
         # One leg out, a hold, and the way back. The tap meant "this place": the
-        # arm visits it and stops, with no descend, grip or lift.
+        # arm visits it and stops, with no slide-in, grip or lift.
         #
         # Endpoint-first, exactly like a one-marker sequence: solve the hover
         # pose once, then interpolate joint space. The incremental Cartesian
@@ -467,8 +486,19 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
                       sweep.seconds_for(q_last, start_seed[:n_arm]), "return")
     else:
         report_axis, report_yaw = options.tool_axis, options.yaw
+        # Both legs now run at the target's height, so both get the same
+        # worktop capsule gate the hover branch uses -- a low horizontal slide
+        # is a new way to dip a link into the table.
+        q_stage = seed.copy()
         seed = cartesian(p0, pre, R0, R_work, options.approach_s, 0.4, seed, "approach")
-        seed = cartesian(pre, point, R_work, R_work, options.descend_s, 1.0, seed, "descend")
+        if not sweep.path_safe(q_stage[:n_arm], seed[:n_arm]):
+            raise PlanError("the approach to the staging point dips within a link radius "
+                            "of the worktop; move the arm clear and retry")
+        q_pre = seed.copy()
+        seed = cartesian(pre, point, R_work, R_work, options.slide_s, 1.0, seed, "slide")
+        if not sweep.path_safe(q_pre[:n_arm], seed[:n_arm]):
+            raise PlanError("the slide-in to the target dips within a link radius of the "
+                            "worktop; raise the target or move the arm clear")
         gripper_leg(options.grasp_q, options.grasp_s)
         hold_start = state["t"]
         hold(options.hold_s)
@@ -518,7 +548,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
                  % (hover_m * 1000, point[0], point[1], point[2],
                     "" if options.no_return else ", then return"))
     else:
-        steps = ("tap target: approach %.0f mm above [%.3f %.3f %.3f], descend, grip %.2f rad, "
+        steps = ("tap target: stage %.0f mm in front of [%.3f %.3f %.3f], slide in, grip %.2f rad, "
                  "lift %.0f mm%s" % (options.approach * 1000, point[0], point[1], point[2],
                                      options.grasp_q, options.lift * 1000,
                                      "" if options.no_return else ", return and open"))
@@ -573,7 +603,10 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     surface point and let the options lift it. The arm holds at each point while
     the gripper moves, and the pass finishes back at the pose it started from.
     The gripper starts fully open; it half-closes at odd-numbered markers and
-    opens at even-numbered ones. The motion is the same cosine-eased Cartesian leg
+    opens at even-numbered ones. Odd markers are grasped with the single-tap
+    pick's geometry: stage `approach` metres in front (base side, at the
+    marker's own height) and slide forward into it; even markers keep the
+    direct visit. The motion is the same cosine-eased joint-space leg
     the single-tap plan uses, so the speeds and the edge's step checks are
     unchanged.
     """
@@ -758,19 +791,55 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             target = ik_to(place, R_marker, start_seed, "marker %d" % index)
         marker_q_ik.append([float(v) for v in target[:n_arm]])
         current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
-        if not sweep.path_safe(current_q, target[:n_arm]):
-            raise PlanError(
-                "the leg to marker %d dips within a link radius of the worktop; "
-                "space the markers further apart or move the arm clear" % index)
         # Policy-paced, exactly as on /move: the speed policy (peak cap plus a
         # cruise floor above stiction breakaway) sets the leg time. approach_s
         # belongs to the single-tap Cartesian approach; as a floor here it
         # stretched short legs into a sub-breakaway crawl.
-        leg_seconds = sweep.seconds_for(current_q, target[:n_arm])
-        seed = joint_leg(
-            current_q,
-            {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
-            leg_seconds, "marker %d" % index, gripper)
+        if index % 2 == 1:
+            # Odd markers are grasped: stage `approach` m in front and slide
+            # forward into the marker, the same geometry as the single-tap
+            # pick. Even markers keep the direct visit. Both legs get the
+            # worktop capsule gate -- a low horizontal slide is a new way to
+            # dip a link into the table.
+            try:
+                stage_point = stage_in_front(point, options.approach)
+            except PlanError as error:
+                raise PlanError("marker %d: %s" % (index, error)) from error
+            stage_place = stage_point + np.array([0.0, 0.0, tip_offsets[index - 1]])
+            try:
+                stage_q = ik_to(stage_place, R_marker, seed, "stage %d" % index)
+            except PlanError:
+                stage_q = ik_to(stage_place, R_marker, start_seed, "stage %d" % index)
+            if not sweep.path_safe(current_q, stage_q[:n_arm]):
+                raise PlanError(
+                    "the leg to the staging point for marker %d dips within a link "
+                    "radius of the worktop; space the markers further apart or move "
+                    "the arm clear" % index)
+            seed = joint_leg(
+                current_q,
+                {joint: stage_q[joint] - current_q[joint] for joint in range(n_arm)},
+                sweep.seconds_for(current_q, stage_q[:n_arm]),
+                "stage %d" % index, gripper)
+            current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+            if not sweep.path_safe(current_q, target[:n_arm]):
+                raise PlanError(
+                    "the slide-in to marker %d dips within a link radius of the "
+                    "worktop; raise the marker or move the arm clear" % index)
+            seed = joint_leg(
+                current_q,
+                {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
+                sweep.seconds_for(current_q, target[:n_arm]),
+                "slide %d" % index, gripper)
+        else:
+            if not sweep.path_safe(current_q, target[:n_arm]):
+                raise PlanError(
+                    "the leg to marker %d dips within a link radius of the worktop; "
+                    "space the markers further apart or move the arm clear" % index)
+            seed = joint_leg(
+                current_q,
+                {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
+                sweep.seconds_for(current_q, target[:n_arm]),
+                "marker %d" % index, gripper)
         hold_t0 = state["t"]
         hold(0.25, gripper)
         next_gripper = MOTOR7_HALF if index % 2 == 1 else MOTOR7_OPEN
@@ -793,8 +862,9 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     joint_leg(q_last, {index: q_home[index] - q_last[index] for index in range(n_arm)},
               sweep.seconds_for(q_last, q_home), "return", gripper)
 
-    steps = ("%d markers: move each tip to its arm-space point; gripper open, "
-             "half-close on odd, open on even; return" % len(points))
+    steps = ("%d markers: stage %.0f mm in front and slide in on odd, direct on even; "
+             "gripper open, half-close on odd, open on even; return"
+             % (len(points), options.approach * 1000))
     provenance = {
         "sequence": True,
         # Defaults for a CLI surface target; the gateway sends tip points with
@@ -932,9 +1002,11 @@ def add_arguments(parser):
     parser.add_argument("--urdf", default="", help="override the URDF path")
     parser.add_argument("--hz", type=float, default=30.0)
     parser.add_argument("--approach", type=float, default=0.06,
-                        help="pre-grasp height above the target, m")
+                        help="standoff in front of the target (toward the base), m; "
+                             "the gripper slides forward into the grasp at the target's height")
     parser.add_argument("--approach-s", type=float, default=3.0)
-    parser.add_argument("--descend-s", type=float, default=1.5)
+    parser.add_argument("--slide-s", type=float, default=1.5,
+                        help="duration of the slide-in leg, s")
     parser.add_argument("--grasp-q", type=float, default=2.45,
                         help="motor 7 angle after closing, rad (6 cm is 2.46)")
     parser.add_argument("--open-q", type=float, default=MOTOR7_OPEN)
@@ -972,7 +1044,7 @@ def options_from_args(args) -> Options:
     min_z = DEFAULT_MIN_Z if args.min_z is None else args.min_z
     return Options(
         hz=args.hz, approach=args.approach, approach_s=args.approach_s,
-        descend_s=args.descend_s, grasp_q=args.grasp_q, open_q=args.open_q,
+        slide_s=args.slide_s, grasp_q=args.grasp_q, open_q=args.open_q,
         grasp_s=args.grasp_s, hold_s=args.hold_s, lift=args.lift, lift_s=args.lift_s,
         return_s=args.return_s, tool_axis=args.tool_axis, yaw=args.yaw,
         payload=args.payload, min_z=min_z, max_z=args.max_z, max_reach=args.max_reach,
