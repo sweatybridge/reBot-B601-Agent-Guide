@@ -100,3 +100,41 @@ class SubstrateStore:
                 (plan_id, episode_id, group_id, arm_id, blob_sha,
                  json.dumps(metadata or {}), json.dumps(snapshot or {})),
             )
+
+    # -- media fragments ------------------------------------------------ #
+    def add_fragment(self, episode_id: str, sha: str, seq: int, t_start: float, t_end: float,
+                     codec=None, width=None, height=None) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO evidence.media_fragment(episode_id, sha256, seq, t_start, t_end, codec, width, height) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (episode_id, seq) DO NOTHING",
+                (episode_id, sha, seq, t_start, t_end, codec, width, height),
+            )
+
+    # -- similarity (pgvector) ------------------------------------------ #
+    def register_embedding_model(self, model_id: str, name: str, version: str, dim: int, kind: str = "frame") -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO search.embedding_model(model_id, name, version, dim, kind) "
+                "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (model_id) DO NOTHING",
+                (model_id, name, version, dim, kind),
+            )
+
+    def put_frame_embedding(self, still_sha: str, model_id: str, embedding) -> None:
+        vec = "[" + ",".join(repr(float(x)) for x in embedding) + "]"
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO search.frame_embedding(still_sha, model_id, embedding) "
+                "VALUES (%s, %s, %s::vector) ON CONFLICT (still_sha, model_id) DO NOTHING",
+                (still_sha, model_id, vec),
+            )
+
+    def search_similar(self, query_embedding, model_id: str, k: int = 5):
+        vec = "[" + ",".join(repr(float(x)) for x in query_embedding) + "]"
+        with self._conn() as c:
+            return c.execute(
+                "SELECT still_sha, embedding <=> %s::vector AS distance "
+                "FROM search.frame_embedding WHERE model_id=%s "
+                "ORDER BY embedding <=> %s::vector LIMIT %s",
+                (vec, model_id, vec, k),
+            ).fetchall()
