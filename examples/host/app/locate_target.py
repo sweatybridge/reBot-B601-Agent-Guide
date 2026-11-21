@@ -364,7 +364,7 @@ def locate(image, meta, calibration, options: Options):
         "version": 1,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "source": source,
-        "calib_fingerprint": calibration.fingerprint,
+        "calib_fingerprint": calibration.source_fingerprint,
         "image_size": [int(width), int(height)],
         "tap": {"u": float(tap[0]), "v": float(tap[1])} if tap is not None else None,
         "plane_z": float(options.plane_z),
@@ -498,8 +498,11 @@ def upright_frame(calib_path, frame, turn=None):
     turn = turn_back({}, (frame.shape[1], frame.shape[0]), calibration, turn)
     if turn:
         frame = rotate_image(frame, turn)
-        calibration = calib_mod.load(calib_path,
-                                     image_size=(frame.shape[1], frame.shape[0]))
+    # K follows the frame's grid, turn or no turn: a WebRTC bandwidth drop
+    # delivers the same crop at another size, and the native K on a smaller
+    # frame is wrong by the width ratio -- silently, in every projection.
+    # `rescaled` is a no-op at the native size and refuses an aspect change.
+    calibration = calibration.rescaled((frame.shape[1], frame.shape[0]))
     return frame, calibration, turn
 
 
