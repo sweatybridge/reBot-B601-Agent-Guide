@@ -255,17 +255,20 @@ def clean_measured(hold, model, theta, K, dist, T_prior, kp, size, scale):
     """
     if hold.meas_mask is None:
         return 0
+    K_h, size_h, grid_scale = hold_camera(hold, K, size)
     T_cam = ex.invert(rig_from_theta(theta, T_prior))
     q_pred = held_prediction(theta, hold.q_cmd, kp)
-    pred = render_cover(model, q_pred, K, dist, T_cam, size, scale)
+    pred = render_cover(model, q_pred, K_h, dist, T_cam, size_h, scale)
     dt = cv2.distanceTransform((pred == 0).astype(np.uint8), cv2.DIST_L2, 3)
     count, labels, stats, _cent = cv2.connectedComponentsWithStats(hold.meas_mask, 8)
     keep = np.zeros_like(hold.meas_mask)
     dropped = 0
-    gate = MEAS_GATE_PX * scale
+    # Pixel gates follow the frame's grid, area gates by its square -- the same
+    # rule the detector path applies to a rescaled stream.
+    gate = MEAS_GATE_PX * scale * grid_scale
     for index in range(1, count):
         blob = labels == index
-        if int(blob.sum()) < 25:
+        if int(blob.sum()) < 25 * grid_scale * grid_scale:
             continue
         edge = blob & (cv2.erode(blob.astype(np.uint8), np.ones((3, 3), np.uint8)) == 0)
         if not edge.any():
@@ -378,8 +381,32 @@ class Hold:
         self.meas_dt = cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 3)
 
 
+def hold_camera(hold, K, size):
+    """(K, grid, scale) for this hold's frame: the native fit rescaled onto the
+    frame's own grid, exactly as the detector and oracle paths do. A WebRTC
+    bandwidth drop delivers the same sensor crop coarser; K follows the frame,
+    the native fit is never rewritten, and `scale` converts the frame's pixels
+    back to native ones (areas go by scale**2). Holds without a frame (synthetic
+    corpora) measure on the reference grid itself.
+    """
+    if hold.frame is None:
+        return K, (int(size[0]), int(size[1])), 1.0
+    frame_size = (int(hold.frame.shape[1]), int(hold.frame.shape[0]))
+    reference = (int(size[0]), int(size[1]))
+    if frame_size == reference:
+        return K, reference, 1.0
+    return (calib_mod.scale_K(K, reference, frame_size), frame_size,
+            frame_size[0] / float(reference[0]))
+
+
 class Objective:
-    """Mean whole-pose projection error over a corpus of holds, at one scale."""
+    """Mean whole-pose projection error over a corpus of holds, at one scale.
+
+    K and the grid are the NATIVE reference; each hold is measured on its own
+    frame's grid (`hold_camera`) and its distances are converted back to native
+    pixels, so a corpus mixed across a bandwidth drop stays comparable -- and
+    comparable with earlier sessions -- in one unit.
+    """
 
     def __init__(self, model, holds, K, dist, T_prior, kp, size, scale=0.5):
         self.model, self.holds = model, holds
@@ -397,7 +424,9 @@ class Objective:
         the prediction for surfaces the camera cannot see, and its floor is
         segmentation noise, not geometry. Every measured green pixel must lie
         on the predicted arm; a wrong rig or sag moves the whole surface away
-        from them, which is exactly the signal being climbed.
+        from them, which is exactly the signal being climbed. Distances are
+        native-reference pixels at the optimisation scale, whatever grid the
+        hold's frame arrived on.
         """
         T_cam = ex.invert(rig_from_theta(theta, self.T_prior))
         out = []
@@ -405,17 +434,18 @@ class Objective:
             if hold.meas_mask is None:
                 out.append(None)
                 continue
+            K_h, size_h, grid_scale = hold_camera(hold, self.K, self.size)
             q_pred = held_prediction(theta, hold.q_cmd, self.kp)
-            pred = render_cover(self.model, q_pred, self.K, self.dist, T_cam,
-                                self.size, self.scale)
+            pred = render_cover(self.model, q_pred, K_h, self.dist, T_cam,
+                                size_h, self.scale)
             pe = pred > 0
             if int(pe.sum()) < 40 or not hold.meas_edge.any():
                 out.append(None)
                 continue
             dt_p = cv2.distanceTransform((~pe).astype(np.uint8), cv2.DIST_L2, 3)
-            oneway = float(dt_p[hold.meas_edge].mean())
+            oneway = float(dt_p[hold.meas_edge].mean()) / grid_scale
             e_p = mask_edges(pred)
-            twoway = 0.5 * (oneway + float(hold.meas_dt[e_p].mean()))
+            twoway = 0.5 * (oneway + float(hold.meas_dt[e_p].mean()) / grid_scale)
             iou = float((pe & (hold.meas_mask > 0)).sum()) / float(
                 (pe | (hold.meas_mask > 0)).sum())
             out.append((oneway, iou, twoway))
@@ -592,16 +622,19 @@ class Bench:
             eye.close()
 
     def grab_upright(self, turn, tries=12):
-        """A still on the calibration grid, turned back. The phone renegotiates
-        its stream size now and then (a 762x1356 window was observed mid-run);
-        K belongs to the calibration grid, so wait for a frame that is on it."""
+        """A still on the calibration crop, turned back -- at the native grid or
+        a uniform rescale of it. The phone renegotiates its stream size now and
+        then (a 762x1356 window was observed mid-run); that is the same sensor
+        crop coarser, not another camera, so it is compensated, not waited out.
+        K belongs to the frame's grid: callers rescale with `calib.rescaled`.
+        An aspect change is a crop/zoom and still refuses -- recalibrate."""
         expected = (int(self.calibration.image_size[0]), int(self.calibration.image_size[1]))
         for _ in range(max(1, tries)):
             frame = self.upright(self.grab(), turn)
-            if (frame.shape[1], frame.shape[0]) == expected:
+            if calib_mod.same_shape(expected, (frame.shape[1], frame.shape[0])):
                 return frame
             time.sleep(0.5)
-        raise IdentifyError("the stream stayed off the calibration grid %dx%d; "
+        raise IdentifyError("the stream stayed off the calibration crop %dx%d; "
                             "cannot verify against the tag" % expected)
 
     def measure_turn(self, frame):
@@ -609,25 +642,50 @@ class Bench:
 
         The shape alone cannot tell 90 from 270 (locate_target.turn_back); the
         tag is a known point, so only the real correction lands the rig's
-        prediction on it. Same test capture_server.measure_stream_turn runs.
+        prediction on it. Same test capture_server.measure_stream_turn runs,
+        including its rescale rule: the prediction is made with K on the
+        frame's own grid (upright, at the delivered resolution or a rescale of
+        it), never with the native K on a coarser frame.
         """
         size = (int(frame.shape[1]), int(frame.shape[0]))
-        if calib_mod.turns_for_shapes(self.calibration.image_size, size) == 0:
-            return 0, 0.0
+        native = (int(self.calibration.image_size[0]), int(self.calibration.image_size[1]))
+        turns = calib_mod.turns_for_shapes(self.calibration.image_size, size)
+        if turns == 0:
+            if size == native or self.marker is None:
+                return 0, 0.0
+            # Same crop, coarser grid: the turn is certain from the shape, but
+            # the tag error is only real with K on the frame's grid.
+            scaled = self.calibration.rescaled(size)
+            try:
+                marker_id = (base_marker.MARKER_ID if self.marker.get("id") is None
+                             else int(self.marker["id"]))
+                corners = base_marker.detect(frame, marker_id)
+                centre = np.asarray(corners, float).reshape(-1, 2).mean(axis=0)
+                predicted = ex.pixel(np.asarray(self.marker["at"], float), scaled.K,
+                                     scaled.dist, ex.invert(self.rig.T_base_cam))
+            except base_marker.MarkerError:
+                return 0, 0.0
+            if predicted is None:
+                return 0, 0.0
+            return 0, float(np.linalg.norm(np.asarray(predicted) - centre))
         if self.marker is None:
             raise IdentifyError("the stream is a quarter turn from the calibration and "
                                 "there is no base tag to decide which way")
         marker_id = base_marker.MARKER_ID if self.marker.get("id") is None else int(self.marker["id"])
         corners = base_marker.detect(frame, marker_id)
         centre = np.asarray(corners, float).reshape(-1, 2).mean(axis=0)
-        predicted = ex.pixel(np.asarray(self.marker["at"], float), self.calibration.K,
-                             self.calibration.dist, ex.invert(self.rig.T_base_cam))
+        # Both candidate turns exchange the sides, so the upright grid is the
+        # delivered size swapped -- at the native resolution or a rescale of it.
+        upright_size = (size[1], size[0])
+        scaled = self.calibration.rescaled(upright_size)
+        predicted = ex.pixel(np.asarray(self.marker["at"], float), scaled.K,
+                             scaled.dist, ex.invert(self.rig.T_base_cam))
         if predicted is None:
             raise IdentifyError("the rig projects the base tag behind the camera")
         best = None
         for turn in (1, 3):
             placed = calib_mod.map_pixel(predicted[0], predicted[1],
-                                         self.calibration.image_size, (4 - turn) % 4)
+                                         upright_size, (4 - turn) % 4)
             error = float(np.linalg.norm(np.asarray(placed) - centre))
             if best is None or error < best[1]:
                 best = (turn, error)
@@ -680,9 +738,11 @@ def extract_holds(segments, log_path, trajectory, turn, bench, workdir,
     Holds are found by stillness in the pose log (sweep_video), matched forward
     to the nearest commanded waypoint -- the sag offset is tens of mrad, the
     markers are radians apart -- and the frame at the middle of each window is
-    turned onto the calibration grid and segmented. Each segment is decoded
-    once, in order: seeking by frame number is unreliable across containers
-    (the same reason sweep_video.extract reads sequentially).
+    turned onto the calibration crop and segmented on its own grid (the native
+    one, or a uniform rescale of it after a bandwidth drop; `hold_camera`
+    carries K onto that grid and the error back to native pixels). Each segment
+    is decoded once, in order: seeking by frame number is unreliable across
+    containers (the same reason sweep_video.extract reads sequentially).
     """
     entries = sweep_video.load_log(log_path)
     times = np.asarray([e["t"] for e in entries], float)
@@ -745,16 +805,24 @@ def extract_holds(segments, log_path, trajectory, turn, bench, workdir,
             skipped.append("no recorded frame for the stop at t=%.1f" % item["t"])
             continue
         frame = bench.upright(item["frame"], turn)
-        if (frame.shape[1], frame.shape[0]) != expected:
-            skipped.append("stop at t=%.1f: frame %dx%d is not the calibration grid %dx%d "
-                           "(the stream changed shape)" % (item["t"], frame.shape[1],
-                                                           frame.shape[0], *expected))
+        frame_size = (int(frame.shape[1]), int(frame.shape[0]))
+        # A uniform rescale of the calibration crop is the same camera coarser
+        # (a WebRTC bandwidth drop): the hold is measured on its own grid and
+        # converted back to native pixels downstream, not dropped. An aspect
+        # change is a crop/zoom -- a different camera, and still a skip.
+        if not calib_mod.same_shape(expected, frame_size):
+            skipped.append("stop at t=%.1f: frame %dx%d is not the calibration crop %dx%d "
+                           "(aspect changed; recalibrate)" % (item["t"], frame_size[0],
+                                                              frame_size[1], *expected))
             continue
+        grid_scale = frame_size[0] / float(expected[0])
         hold = Hold(q_cmd=item["q_cmd"], q_meas=item["q_meas"], frame=frame)
         mask = auto_calibrate.green_mask(frame)
         hold.green_px = int(mask.sum()) // 255
-        if hold.green_px < min_green:
-            skipped.append("stop at t=%.1f shows only %d green px" % (item["t"], hold.green_px))
+        # The green-pixel floor is an area gate: it follows the grid by s^2.
+        if hold.green_px < min_green * grid_scale * grid_scale:
+            skipped.append("stop at t=%.1f shows only %d green px on a %.2fx grid"
+                           % (item["t"], hold.green_px, grid_scale))
             continue
         holds.append(hold)
     return holds, skipped
@@ -770,7 +838,10 @@ RUN_TIPS = (
     (0.42, -0.20, 0.24),
     (0.44, +0.22, 0.32),
     (0.30, +0.05, 0.20),
-    (0.32, -0.10, 0.18),
+    # Moved out from (0.32, -0.10): the slide-in staging point 60 mm base-side
+    # of the old tip sat at r=0.275 m, inside the tool-down annulus (stage 5 IK
+    # refused, 26 mm off). The tip itself was reachable; only the staging was not.
+    (0.36, -0.11, 0.18),
     (0.28, -0.30, 0.22),
     (0.46, +0.28, 0.34),
     (0.38, -0.32, 0.28),
@@ -808,8 +879,11 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
     frame = bench.grab()
     turn, turn_err = bench.measure_turn(frame)
     print("stream turn: %d quarter turn(s), tag error %.1f px" % (turn, turn_err))
-    upright = bench.grab_upright(turn)
-    size = (upright.shape[1], upright.shape[0])
+    bench.grab_upright(turn)
+    # The reference grid is the NATIVE calibration, whatever grid the stream
+    # happens to deliver right now: each hold's frame carries its own grid
+    # (hold_camera), and errors are reported in native pixels throughout.
+    size = (int(bench.calibration.image_size[0]), int(bench.calibration.image_size[1]))
     K, dist = bench.calibration.K, bench.calibration.dist
     T_prior = np.asarray(bench.rig.T_base_cam, float)
     theta = theta0()
@@ -884,6 +958,11 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
         print("  %d holds (%d fit / %d holdout); telemetry sag gains %s (samples %s)"
               % (len(usable), len(fit), len(val), np.round(gains, 3), counts))
         print("  unlearned sag joints: %s" % (", ".join(unlearned) or "none"))
+        off_grid = [round(hold_camera(h, K, size)[2], 3) for h in usable
+                    if hold_camera(h, K, size)[2] != 1.0]
+        if off_grid:
+            print("  %d hold(s) on a rescaled grid %s: measured on their own grid, "
+                  "reported in native px" % (len(off_grid), off_grid))
 
         obj_fit = Objective(model, fit, K, dist, T_prior, bench.kp, size, scale)
         obj_val = Objective(model, val, K, dist, T_prior, bench.kp, size, scale)
@@ -920,6 +999,7 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
             "changes": [vars(c) for c in changes],
             "theta_after": [float(v) for v in theta],
             "hold_q": [[float(v) for v in h.q_cmd] for h in usable],
+            "hold_grids": [round(hold_camera(h, K, size)[2], 4) for h in usable],
             "per_hold_px": [None if v is None else round(v[0], 3)
                             for v in obj_all.per_hold(theta)],
             "seconds": round(time.time() - started, 1),
@@ -951,9 +1031,10 @@ def _save_round_overlay(bench, model, holds, theta, K, dist, T_prior, size, turn
     hold = holds[0]
     if hold.frame is None:
         return
+    K_h, size_h, _grid_scale = hold_camera(hold, K, size)
     T_cam = ex.invert(rig_from_theta(theta, T_prior))
     q_pred = held_prediction(theta, hold.q_cmd, bench.kp)
-    pred = render_cover(model, q_pred, K, dist, T_cam, size, 1.0)
+    pred = render_cover(model, q_pred, K_h, dist, T_cam, size_h, 1.0)
     overlay = hold.frame.copy()
     contours, _ = cv2.findContours(pred, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2)
@@ -972,10 +1053,17 @@ def _finalise(bench, model, theta, trace, session, K, dist, T_prior, size, turn)
     more than the PnP noise, but not by centimetres.
     """
     frame = bench.grab_upright(turn)
+    # The verify still may arrive on a rescaled grid: solve and reproject with
+    # K on the frame's own grid, and report the pixel quantities in native
+    # pixels so the gate and the trace stay comparable across grids.
+    frame_size = (int(frame.shape[1]), int(frame.shape[0]))
+    grid_scale = frame_size[0] / float(size[0])
+    calib_f = bench.calibration.rescaled(frame_size)
     T_climbed = rig_from_theta(theta, T_prior)
-    result = {"theta": [float(v) for v in theta], "verify_ok": False}
+    result = {"theta": [float(v) for v in theta], "verify_ok": False,
+              "verify_grid_scale": round(grid_scale, 4)}
     try:
-        run = auto_calibrate.solve_marker(frame, bench.calibration, bench.marker,
+        run = auto_calibrate.solve_marker(frame, calib_f, bench.marker,
                                           plane_z=float(bench.rig.plane_z))
         evidence = run.evidence
         marker_id = (base_marker.MARKER_ID if bench.marker.get("id") is None
@@ -986,11 +1074,13 @@ def _finalise(bench, model, theta, trace, session, K, dist, T_prior, size, turn)
                                                    float(bench.marker.get("yaw", 0.0)),
                                                    mode="vertical")
         T_cam_marker = ex.invert(T_climbed) @ from_marker
-        projected, valid = project_points(object_pts, K, dist, T_cam_marker)
+        projected, valid = project_points(object_pts, calib_f.K, dist, T_cam_marker)
         rms = float(np.sqrt(np.mean(np.sum((projected[valid] - corners[valid]) ** 2, axis=1))))
         side = float(np.mean(np.linalg.norm(np.roll(corners, -1, axis=0) - corners, axis=1)))
+        rms /= grid_scale
+        side /= grid_scale
         result.update(tag_rms_px=round(rms, 3), tag_side_px=round(side, 1),
-                      tag_solve_rms_px=round(float(evidence["rms_px"]), 3),
+                      tag_solve_rms_px=round(float(evidence["rms_px"]) / grid_scale, 3),
                       tag_grazing_deg=round(float(evidence["grazing_deg"]), 1))
         gate = (rms <= CLIMB_TAG_MAX_PX
                 and side >= auto_calibrate.MARKER_MIN_SIDE_PX
@@ -1055,7 +1145,7 @@ def dry_run(bench, model, session_dir=None):
     frame = bench.grab()
     turn, turn_err = bench.measure_turn(frame)
     upright = bench.grab_upright(turn)
-    size = (upright.shape[1], upright.shape[0])
+    size = (int(bench.calibration.image_size[0]), int(bench.calibration.image_size[1]))
     pose = bench.arm.pose()
     q = np.asarray(pose["q"][:6], float)
     print("stream turn %d (tag error %.1f px); arm at [%s]"
@@ -1066,8 +1156,14 @@ def dry_run(bench, model, session_dir=None):
              plan.get("execute")))
     T_cam = ex.invert(bench.rig.T_base_cam)
     K, dist = bench.calibration.K, bench.calibration.dist
+    # The preview is drawn on the delivered frame, which may be a uniform
+    # rescale of the calibration grid: render with K on that frame's grid, and
+    # report the baseline error in native pixels like every other number here.
+    preview_size = (int(upright.shape[1]), int(upright.shape[0]))
+    grid_scale = preview_size[0] / float(size[0])
+    K_p = calib_mod.scale_K(K, size, preview_size) if preview_size != size else K
     # Whole-arm CAD overlay at the current pose: every visual mesh, not the tip.
-    full = render_parts(model, model.parts, q, K, dist, T_cam, size, 1.0)
+    full = render_parts(model, model.parts, q, K_p, dist, T_cam, preview_size, 1.0)
     overlay = upright.copy()
     green_fill = np.zeros_like(overlay)
     green_fill[full > 0] = (0, 200, 0)
@@ -1075,7 +1171,7 @@ def dry_run(bench, model, session_dir=None):
     contours, _ = cv2.findContours(full, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2)
     cv2.imwrite(str(session / "cad-preview.jpg"), overlay, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    green = render_cover(model, q, K, dist, T_cam, size, 1.0)
+    green = render_cover(model, q, K_p, dist, T_cam, preview_size, 1.0)
     meas = auto_calibrate.green_mask(upright)
     hold = Hold(q_cmd=q, q_meas=q, frame=upright)
     hold.meas_mask = meas
@@ -1086,10 +1182,11 @@ def dry_run(bench, model, session_dir=None):
     err = oneway_error(green, hold.meas_mask)
     iou = mask_error(green, hold.meas_mask)
     report = {"turns": turn, "turn_error_px": round(turn_err, 2),
+              "grid_scale": round(grid_scale, 4),
               "plan_id": plan["id"], "q": [float(v) for v in q],
               "green_px_measured": hold.green_px, "blobs_dropped": dropped,
               "green_px_predicted": int(green.sum()) // 255,
-              "baseline_chamfer_px": None if err is None else round(err, 3),
+              "baseline_chamfer_px": None if err is None else round(err / grid_scale, 3),
               "baseline_iou": None if iou is None else round(iou[1], 4),
               "preview": str(session / "cad-preview.jpg")}
     (session / "dry-run.json").write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
