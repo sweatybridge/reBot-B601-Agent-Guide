@@ -1,0 +1,33 @@
+[package]
+name = "rebot_kinematics"
+version = "0.1.0"
+edition = "2021"
+description = "reBot kinematics (openrr/k) as a memory-safe pgrx Postgres extension"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18"]
+pg_test = []
+
+[dependencies]
+# Pin pgrx to the version pg_durable uses (PG17/18 support).
+pgrx = "=0.16.1"
+# openrr/k 0.32 — pure-Rust FK/IK/URDF on nalgebra 0.30. Match its public deps
+# exactly so the nalgebra/urdf-rs types are the same crates k compiles against.
+k = "0.32"
+nalgebra = "0.30"
+urdf-rs = "0.9"
+
+[dev-dependencies]
+pgrx-tests = "=0.16.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+# pgrx catches panics at the FFI boundary and turns them into SQL ERRORs; this
+# requires unwind (never set panic = "abort").
+panic = "unwind"

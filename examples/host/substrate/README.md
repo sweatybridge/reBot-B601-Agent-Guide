@@ -1,0 +1,59 @@
+# reBot durable substrate
+
+Single-substrate Postgres backend for the reBot arm stack: durable orchestration
+(`microsoft/pg_durable` / duroxide), memory-safe kinematics (`openrr/k` as the
+`rebot_kinematics` pgrx extension), similarity search (pgvector), and the full
+state/learning/evidence schema. Design and rationale: `rebot-durable-state-spec.md`
+(repo root), especially §11 (build & deployment) and §9.1 (validation status).
+
+This is the **substrate foundation** (spec §8 step 1). It stands up the database and
+proves the extensions compose; it does not yet wire the live capture/planner path
+(dual-write/backfill/cutover are later phases) and does not move the arm.
+
+## Stack
+
+| Component | Source | Version |
+|---|---|---|
+| Orchestration | prebuilt `ghcr.io/microsoft/pg_durable:pg18` | pg_durable 0.2.9 |
+| Kinematics | `rebot_kinematics/` (pgrx wrapper over `openrr/k`) | k 0.32, pgrx 0.16.1 |
+| Similarity | `postgresql-18-pgvector` (apt) | pgvector 0.8.7 |
+| Server | PostgreSQL | 18.7 |
+
+`k` provides FK/IK/URDF only. Collision checking (`sweep.path_safe`) and gravity
+dynamics (`rebot_ik.gravity_torques`) are **not** in `k` and remain separate work.
+
+## Quickstart
+
+```bash
+cd examples/host/substrate
+docker build -t rebot-substrate:pg18 .
+docker compose up -d                       # named volume; host port 5433
+# psql "postgresql://postgres@localhost:5433/postgres"
+
+docker exec rebot-substrate psql -U postgres \
+  -c "CREATE EXTENSION IF NOT EXISTS rebot_kinematics;"
+docker exec rebot-substrate psql -U postgres --single-transaction \
+  -v ON_ERROR_STOP=1 -f /migrations/0001_substrate.sql
+```
+
+## Tests
+
+```bash
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/mechanism_tests.sql
+docker cp ../app/cad/ReBot_Arm_RS.urdf rebot-substrate:/tmp/rebot.urdf
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/kinematics_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
+```
+
+All three pass on PG 18.7: schema mechanisms, FK/IK round-trip on the real 6-DOF arm,
+and a pg_durable workflow calling `rebot_fk` to completion.
+
+## Notes / gotchas
+
+- Data lives on a Docker **named volume**, never a Windows bind mount (WAL locking).
+  PG18 images require the mount at `/var/lib/postgresql` (not `.../data`).
+- The `rebot_kinematics` crate must include `src/bin/pgrx_embed_rebot_kinematics.rs`
+  or `cargo pgrx install` fails at SQL generation.
+- pg_durable step results cannot be `FLOAT8[]`; wrap kinematics output in `to_jsonb()`.
+- The published pg_durable image is for evaluation, not production (superuser durable
+  instances). Harden before production use (spec §11 caveats).

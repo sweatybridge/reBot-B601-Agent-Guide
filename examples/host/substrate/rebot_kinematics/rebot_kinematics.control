@@ -1,0 +1,5 @@
+comment = 'reBot kinematics (openrr/k) — memory-safe FK/IK as SQL functions'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/rebot_kinematics'
+relocatable = false
+superuser = false
