@@ -26,12 +26,14 @@ routes.
     POST /fk                  {q: [7 floats]} -> tool tip and joint origins, read-only
 
 The compact planner contract is tip-space only: `targets` is a list of
-`{tip: [x, y, z]}` objects (optional `pixel`/`tap`/`capture` provenance),
-`tip_offset_m` is the physical flange-to-tip distance for the whole request, and
-`gripper` is `"none"` (one target, no gripper motion) or `"alternate"`
-(close/open through a marker sequence). `hover`, `hover_m` and `tip_m` are
-deprecated; `min_z` defaults to the default hover height and the capture server
-sends its value with every request. The old `/plan-sequence` route answers 410.
+`{tip: [x, y, z]}` objects (optional `pixel`/`tap`/`capture` provenance, and
+optional `via`: up to 5 `[x, y, z]` tip points the trajectory passes through
+without stopping on the way to that marker), `tip_offset_m` is the physical
+flange-to-tip distance for the whole request, and `gripper` is `"none"` (one
+target, no gripper motion) or `"alternate"` (close/open through a marker
+sequence). `hover`, `hover_m` and `tip_m` are deprecated; `min_z` defaults to
+the default hover height and the capture server sends its value with every
+request. The old `/plan-sequence` route answers 410.
 
 `/execute` refuses unless REBOT_EXECUTE=1. The file it sends was produced by the
 same `plan()` the CLI uses, and the edge re-checks limits and steps before any
@@ -242,7 +244,7 @@ def request_options(body):
 
 
 def compact_targets(body):
-    """`targets: [{tip:[x,y,z], pixel?, tap?, capture?}]` -> internal targets."""
+    """`targets: [{tip:[x,y,z], via?, pixel?, tap?, capture?}]` -> internal targets."""
     items = body.get("targets")
     if not isinstance(items, list) or not items:
         raise GatewayError("'targets' must be a non-empty list of tip targets")
@@ -263,6 +265,28 @@ def compact_targets(body):
             raise GatewayError("target %d has a non-finite tip" % index)
         target = {"format": "rebot-target", "version": 1,
                   "point_frame": "tip", "point": point}
+        via = item.get("via")
+        if via is not None:
+            # Same cap as plan_to_target.MAX_VIAS; the planner re-checks the
+            # height/reach gates on every via point before any motion.
+            if not isinstance(via, list) or len(via) > 5:
+                raise GatewayError("target %d 'via' must be a list of at most "
+                                   "5 [x, y, z] points" % index)
+            cleaned = []
+            for via_index, via_point in enumerate(via, start=1):
+                if not isinstance(via_point, list) or len(via_point) != 3:
+                    raise GatewayError("target %d via %d has no [x, y, z] point"
+                                       % (index, via_index))
+                try:
+                    values = [float(value) for value in via_point]
+                except (TypeError, ValueError) as error:
+                    raise GatewayError("target %d via %d has a non-numeric point"
+                                       % (index, via_index)) from error
+                if not all(math.isfinite(value) for value in values):
+                    raise GatewayError("target %d via %d has a non-finite point"
+                                       % (index, via_index))
+                cleaned.append(values)
+            target["via"] = cleaned
         for key in ("pixel", "tap", "capture"):
             if item.get(key) is not None:
                 target[key] = item[key]
@@ -270,6 +294,8 @@ def compact_targets(body):
     gripper = body.get("gripper")
     if gripper not in ("none", "alternate"):
         raise GatewayError("'gripper' must be \"none\" or \"alternate\"")
+    if gripper == "none" and any(target.get("via") for target in targets):
+        raise GatewayError("via points need gripper \"alternate\" (a marker sequence)")
     return targets, gripper
 
 

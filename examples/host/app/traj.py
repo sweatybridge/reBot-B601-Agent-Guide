@@ -30,6 +30,12 @@ MAX_JOINT_STEP = 0.5      # rad, between consecutive waypoints
 LIMIT_TOL = 0.002          # rad, encoders read a few mrad past a stop at rest
 MIT_POSITION_LIMIT = 4.0 * math.pi
 MIN_HZ, MAX_HZ = 5.0, 200.0
+# The default stream rate every producer inherits. 50 Hz is measured on the
+# reference board: 0 of 1100 ticks late, 20.0/20.0/21.8 ms, peak follow error
+# 0.0048 rad (edge-rust README's rate table) -- finer ticks than 30 Hz at no
+# timing cost. The player is timestamp-driven and accepts 5..200 Hz, so a file
+# planned at another rate still plays; this is only the default.
+DEFAULT_HZ = 50.0
 
 # Velocity ramp at each end of a leg, seconds. The profile is trapezoid: short
 # linear velocity ramps into a constant-velocity cruise. The cosine ease this
@@ -147,7 +153,7 @@ def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def joint_move(q_from, q_to, seconds, control_hz=30.0, hold_s=0.4, limits=None, label=None):
+def joint_move(q_from, q_to, seconds, control_hz=DEFAULT_HZ, hold_s=0.4, limits=None, label=None):
     """A joint-space move the player can replay, with a hold at the end.
 
     Used by the arm gateway's `/move` so a calibration sweep does not need a
@@ -193,7 +199,7 @@ def joint_move(q_from, q_to, seconds, control_hz=30.0, hold_s=0.4, limits=None, 
                             MAX_JOINT_STEP)) from error
 
 
-def joint_sequence(poses, seconds, hold_s=0.4, control_hz=30.0, limits=None, label=None):
+def joint_sequence(poses, seconds, hold_s=0.4, control_hz=DEFAULT_HZ, limits=None, label=None):
     """One file that walks through `poses` in order, holding at each.
 
     The player returns the arm to where the move started when the file ends, so a
@@ -230,6 +236,62 @@ def joint_sequence(poses, seconds, hold_s=0.4, control_hz=30.0, limits=None, lab
 
     return build(waypoints, hz, limits,
                  label or ("%d poses, one pass" % len(points)))
+
+
+def _chain_knots(poses):
+    points = [np.asarray(p, dtype=float).reshape(-1) for p in poses]
+    if len(points) < 2:
+        raise ValueError("a chain needs at least two poses, got %d" % len(points))
+    size = points[0].size
+    if any(p.size != size for p in points):
+        raise ValueError("chain poses must all have the same joint count")
+    if not all(np.all(np.isfinite(p)) for p in points):
+        raise ValueError("chain poses must be finite")
+    return points
+
+
+def chain_travel(poses):
+    """The furthest-travelling joint's path length along the chain, rad.
+
+    Straight segments: the exact sum of each joint's |delta| per segment. A
+    joint that reverses direction at a via travels more than its endpoint
+    delta; the speed policy must budget the whole path, not just the ends.
+    """
+    points = _chain_knots(poses)
+    return float(np.max(np.sum(np.abs(np.diff(points, axis=0)), axis=0)))
+
+
+def chain_series(poses, seconds, control_hz=DEFAULT_HZ):
+    """Joint poses for one continuous leg through `poses`, tick by tick.
+
+    The path is straight joint-space segments between consecutive knots -- the
+    same interpolation a marker-to-marker leg uses -- under ONE trapezoid time
+    law over the whole chain's arc length: start at rest at poses[0] (already
+    the caller's last waypoint), ramp up over RAMP_S, cruise through every
+    interior knot without stopping, ramp down to rest at poses[-1]. Speed is
+    continuous at the knots; the direction changes there (a corner, not a stop).
+
+    Returns `count` poses, the last exactly poses[-1]. Ticks lie on the segments
+    exactly; interior knots are straddled within half a tick of travel (the
+    player streams at control_hz, the same quantization every leg already has).
+    """
+    points = _chain_knots(poses)
+    deltas = np.diff(points, axis=0)
+    arc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(deltas, axis=1))])
+    total = float(arc[-1])
+    hz = float(control_hz)
+    count = max(2, int(round(max(0.2, float(seconds)) * hz)))
+    duration = count / hz
+    out = []
+    for index in range(1, count + 1):
+        target = ease_fraction(index / count, duration) * total
+        slot = int(np.searchsorted(arc, target, side="right")) - 1
+        slot = max(0, min(slot, len(arc) - 2))
+        span = arc[slot + 1] - arc[slot]
+        weight = 0.0 if span <= 1e-12 else (target - arc[slot]) / span
+        out.append(points[slot] + deltas[slot] * weight)
+    out[-1] = points[-1].copy()
+    return out
 
 
 def validate(payload):

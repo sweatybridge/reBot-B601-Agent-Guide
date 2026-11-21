@@ -130,18 +130,14 @@ def pose_ok(q):
             and math.hypot(tip[0], tip[1]) < RADIUS_MAX)
 
 
-def path_safe(a, b, samples=40):
-    """Is the straight joint-space interpolation between two poses clear?
-
-    Straight lines in joint space are convex in the limits, but not in the
-    table: the tool can dip on the way even when both ends are high, which is
-    exactly what a calibration sweep does as it crosses the work area.
+def samples_safe(samples):
+    """The capsule test on a dense joint-space sample series: no link centre
+    passes within its own radius of the worktop, and none leaves the cell's
+    radial bound. `path_safe` is this test on a straight-line linspace; a
+    curved leg (a via chain) must be gated on its own curve, not its chords.
     """
-    a = np.asarray(a, dtype=float).reshape(6)
-    b = np.asarray(b, dtype=float).reshape(6)
-    delta = b - a
-    for t in np.linspace(0.0, 1.0, int(samples)):
-        points = joint_points(a + delta * t)
+    for q in samples:
+        points = joint_points(np.asarray(q, dtype=float).reshape(6))
         for index in range(1, len(points)):
             start, end = points[index - 1], points[index]
             radius = RADII[min(index, len(RADII) - 1)]
@@ -152,6 +148,19 @@ def path_safe(a, b, samples=40):
             if math.hypot(end[0], end[1]) > LINK_RADIUS_MAX:
                 return False
     return True
+
+
+def path_safe(a, b, samples=40):
+    """Is the straight joint-space interpolation between two poses clear?
+
+    Straight lines in joint space are convex in the limits, but not in the
+    table: the tool can dip on the way even when both ends are high, which is
+    exactly what a calibration sweep does as it crosses the work area.
+    """
+    a = np.asarray(a, dtype=float).reshape(6)
+    b = np.asarray(b, dtype=float).reshape(6)
+    delta = b - a
+    return samples_safe(a + delta * t for t in np.linspace(0.0, 1.0, int(samples)))
 
 
 def legs(park):
@@ -447,6 +456,21 @@ def sag_compensator(kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
     return compensate
 
 
+def seconds_for_travel(travel, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SECONDS):
+    """The speed policy on a path length, rad: cruise = travel / (T - ramp).
+
+    The peak cap is travel / peak + ramp. The cruise floor is an upper bound on
+    T -- if the maximum clamp would make a huge leg crawl below stiction
+    breakaway, the leg is shortened to keep cruise >= MIN_CRUISE_SPEED. The
+    caller's minimum is the triangle floor for tiny nudges. A via chain budgets
+    its whole curved path here, not just the endpoint delta.
+    """
+    travel = float(travel)
+    peak_time = travel / float(peak_speed) + traj.RAMP_S
+    cruise_cap = travel / MIN_CRUISE_SPEED + traj.RAMP_S
+    return max(minimum, min(maximum, peak_time, cruise_cap))
+
+
 def seconds_for(a, b, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SECONDS):
     """How long a leg should take, from the furthest-travelling joint.
 
@@ -457,9 +481,7 @@ def seconds_for(a, b, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SE
     is the triangle floor for tiny nudges.
     """
     travel = float(np.max(np.abs(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))))
-    peak_time = travel / float(peak_speed) + traj.RAMP_S
-    cruise_cap = travel / MIN_CRUISE_SPEED + traj.RAMP_S
-    return max(minimum, min(maximum, peak_time, cruise_cap))
+    return seconds_for_travel(travel, peak_speed, minimum, maximum)
 
 
 def gripper_seconds(travel, peak_speed=GRIPPER_PEAK_SPEED):

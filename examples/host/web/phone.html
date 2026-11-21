@@ -103,6 +103,10 @@
   .seq-pin.half { border-color: var(--warn); color: var(--warn); }
   .seq-pin.open { border-color: var(--good); color: var(--good); }
   .seq-pin.far { outline: 2px solid var(--bad); outline-offset: 2px; }
+  .seq-pin.via {
+    border-color: var(--accent); color: var(--accent); border-style: dashed;
+    width: 26px; height: 26px; margin: -13px 0 0 -13px; font-size: 11px;
+  }
   #hint {
     position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
     text-align: center; padding: 24px; color: var(--dim); font-size: 14px; pointer-events: none;
@@ -178,6 +182,7 @@
     <button class="chip" id="live">Live preview: off</button>
     <button class="chip" id="lock">Lock focus: -</button>
     <button class="chip" id="clear">Clear marker</button>
+    <button class="chip" id="via">Via: off</button>
   </div>
   <details>
     <summary>How to use</summary>
@@ -194,7 +199,12 @@
       <li><b>Move arm</b> plans and runs the markers in order. Amber odd markers close
           the gripper; green even markers open it, starting fully open. The pins are projected
           onto the worktop and follow it while Reach is on. The arm returns to where it began.
-          <b>Clear marker</b> removes the last one; Move arm is disabled with none.</li>
+          <b>Clear marker</b> undoes the last placement -- the last marker's last via first,
+          then the marker itself; Move arm is disabled with none.</li>
+      <li><b>Via</b> turns taps into pass-through points for reaching the last marker (up to 5,
+          dashed blue pins lettered 1a, 1b, ...). The arm travels through them without
+          stopping on the way to that marker, keeping the gripper as it was. Marker 1's
+          vias shape the leg from the start pose.</li>
       <li>If the tag is not in frame a marker is refused rather than guessed. Turn the phone
           until it is, or switch to a fixed camera.</li>
       <li><b>Fixed camera (optional).</b> Fit the rig once from the workstation's
@@ -241,6 +251,7 @@ const calibButton = $("#calib");
 const liveButton = $("#live");
 const lockButton = $("#lock");
 const clearButton = $("#clear");
+const viaButton = $("#via");
 const reachButton = $("#reach");
 const reachCanvas = $("#reachCanvas");
 const markersContainer = $("#markers");
@@ -903,7 +914,8 @@ const heightControl = window.HeightControl.create({
       log("not marking: " + escapeHtml(wrongFrame), "warn");
       return;
     }
-    markersOverlay.addAt(x, y);
+    if (markersOverlay.viaMode) markersOverlay.addViaAt(x, y);
+    else markersOverlay.addAt(x, y);
   },
   onChange: (height) => reachOverlay.setHeight(height),
   onStatus: (message, kind) => log(escapeHtml(message), kind),
@@ -985,12 +997,25 @@ shotButton.addEventListener("click", () => {
   else startSequence();
 });
 clearButton.addEventListener("click", () => {
-  if (markersOverlay.clearLast()) {
-    log("last marker cleared", "warn");
+  const removed = markersOverlay.clearLast();
+  if (removed) {
+    log("cleared " + removed, "warn");
   } else {
     log(markersOverlay.busy ? "still locating a marker" : "no markers to clear", "warn");
   }
   updateStartButton();
+});
+viaButton.addEventListener("click", () => {
+  if (state.busy) {
+    log("wait for the sequence to finish", "warn");
+    return;
+  }
+  const next = !markersOverlay.viaMode;
+  markersOverlay.setViaMode(next);
+  viaButton.textContent = "Via: " + (next ? "on" : "off");
+  viaButton.classList.toggle("on", next);
+  log(next ? "via mode: taps add pass-through points on the way to the last marker"
+           : "via mode off: taps add markers again", "warn");
 });
 // Which of the two ways in this phone uses. Handheld is the default: the tag on
 // the base sets the camera for each marker. "Fixed rig" uses the pose a sweep fitted.

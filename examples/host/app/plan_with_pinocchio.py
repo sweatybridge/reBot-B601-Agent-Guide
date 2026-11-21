@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Plan the 30 Hz transfer with Seeed's Pinocchio stack and write our JSON.
+"""Plan the default-rate (50 Hz) transfer with Seeed's Pinocchio stack and write our JSON.
 
 HOST - runs inside the Pinocchio container (see Dockerfile.pinocchio); the ARM
 comes from Seeed's `reBotArm_control_py`, the report format is this repo's
@@ -68,7 +68,7 @@ def main(argv=None):
     parser.add_argument("--joints", required=True, help="rebot-edge dump output")
     parser.add_argument("--out", required=True, help="trajectory JSON to write")
     parser.add_argument("--urdf", default="", help="override the URDF path")
-    parser.add_argument("--hz", type=float, default=30.0)
+    parser.add_argument("--hz", type=float, default=traj.DEFAULT_HZ)
     parser.add_argument("--dx", type=float, default=0.20)
     parser.add_argument("--dy", type=float, default=0.0)
     parser.add_argument("--dz", type=float, default=0.30)

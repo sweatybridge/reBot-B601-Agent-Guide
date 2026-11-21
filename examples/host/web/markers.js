@@ -10,13 +10,15 @@
  * The page owns what Start does. This module only answers: how many markers,
  * which targets, and is a locate still in flight? It also no longer listens for
  * pointerdown itself: the page routes a tap here from the height control, so a
- * tap and a tap-and-drag can be told apart.
+ * tap and a tap-and-drag can be told apart. In via mode a tap attaches a
+ * pass-through point to the last marker -- on the way to it, not after it.
  */
 (function () {
   "use strict";
 
   const videoTools = (typeof window !== "undefined" && window.RebotVideo) || null;
   const MAX_MARKERS = 10;
+  const MAX_VIAS = 5;
 
   function create(options) {
     const video = options.video;
@@ -32,13 +34,14 @@
     let busy = false;
     let enabled = true;
     let calibrating = false;
+    let viaMode = false;            // taps attach vias to the last marker
     let generation = 0;             // invalidates a locate that a clear overtook
     let projectionTimer = 0;
 
-    function projectedPixel(marker) {
+    function pixelOf(entry, tip) {
       if (projectPoint) {
         try {
-          const live = projectPoint(marker.target.tip);
+          const live = projectPoint(tip);
           if (live && Number.isFinite(live[0]) && Number.isFinite(live[1])) {
             return live;
           }
@@ -46,10 +49,14 @@
           // Fall back to the capture's own projection/tap.
         }
       }
-      if (marker.pixel && Number.isFinite(marker.pixel[0]) && Number.isFinite(marker.pixel[1])) {
-        return marker.pixel;
+      if (entry.pixel && Number.isFinite(entry.pixel[0]) && Number.isFinite(entry.pixel[1])) {
+        return entry.pixel;
       }
-      return [marker.u, marker.v];
+      return [entry.u, entry.v];
+    }
+
+    function projectedPixel(marker) {
+      return pixelOf(marker, marker.target.tip);
     }
 
     function scheduleProjection() {
@@ -78,6 +85,22 @@
         pin.title = (index + 1) + " · " + ((index + 1) % 2 === 1
           ? "close" : "open");
         container.appendChild(pin);
+        // Via pins: dashed blue, lettered after their marker (1a, 1b, ...).
+        // The arm passes through them without stopping, on the way to that
+        // marker; they never change the gripper parity.
+        (marker.vias || []).forEach((via, viaIndex) => {
+          const viaPixel = pixelOf(via, via.tip);
+          const viaPoint = videoTools.screenPoint(video, stage, viaPixel[0], viaPixel[1]);
+          if (!viaPoint) return;
+          const viaPin = document.createElement("div");
+          viaPin.className = "seq-pin via";
+          viaPin.style.left = viaPoint.x + "px";
+          viaPin.style.top = viaPoint.y + "px";
+          viaPin.textContent = (index + 1) + String.fromCharCode(97 + viaIndex);
+          viaPin.title = "via " + String.fromCharCode(97 + viaIndex)
+            + " to reach marker " + (index + 1) + " · pass-through";
+          container.appendChild(viaPin);
+        });
       });
       container.hidden = calibrating;
       container.classList.toggle("disabled", !enabled || busy);
@@ -136,6 +159,62 @@
       }
     }
 
+    async function addViaAt(clientX, clientY) {
+      // A via attaches to the last placed marker as its destination: the arm
+      // passes through it, without stopping, on the leg into that marker
+      // (from the previous marker, or the start pose for marker 1). Same
+      // locate and frozen tap height as a marker; it never counts as one.
+      if (!enabled) return { ok: false, error: "markers are off: switch the page to markers" };
+      if (calibrating) return { ok: false, error: "calibration mode is on" };
+      if (busy) return { ok: false, error: "a marker is still being located" };
+      if (!markers.length) {
+        return { ok: false, error: "place a marker first: vias attach to the last marker" };
+      }
+      if (!locate) {
+        status("marker locate is not available in this page", "bad");
+        return { ok: false, error: "this page has no locator" };
+      }
+      const owner = markers[markers.length - 1];
+      if ((owner.vias || []).length >= MAX_VIAS) {
+        status(MAX_VIAS + " vias per marker is the limit", "warn");
+        return { ok: false, error: MAX_VIAS + " vias per marker is the limit" };
+      }
+      const tapped = videoTools.videoPoint(video, clientX, clientY);
+      if (!tapped) return { ok: false, error: "that point is outside the video frame" };
+      const tapHeight = typeof heightAt === "function" ? Number(heightAt()) : NaN;
+
+      const current = generation;
+      busy = true;
+      onChange();
+      try {
+        const target = await locate(tapped, Number.isFinite(tapHeight) ? tapHeight : 0);
+        if (current !== generation) return { ok: false, error: "the markers were cleared" };
+        if (!target || !Array.isArray(target.tip) || target.tip.length !== 3) {
+          throw new Error("the locator returned no [x, y, z] tip point");
+        }
+        const pixel = Array.isArray(target.pixel) ? target.pixel : [tapped.u, tapped.v];
+        if (!owner.vias) owner.vias = [];
+        owner.vias.push({ u: tapped.u, v: tapped.v, pixel: pixel, tip: target.tip });
+        // The wire form rides on the marker's own target object.
+        owner.target.via = owner.vias.map((via) => via.tip);
+        const point = target.tip.map((value) => Number(value).toFixed(3)).join(", ");
+        const heightText = Number.isFinite(tapHeight)
+          ? " · " + Math.round(tapHeight * 1000) + " mm up" : "";
+        status("via " + owner.vias.length + " to reach marker " + markers.length
+          + " at tip [" + point + "] m" + heightText + " · pass-through", "good");
+        render();
+        onChange();
+        return { ok: true, index: markers.length, via: owner.vias.length, marker: owner };
+      } catch (error) {
+        status("via not added: " + error.message, "bad");
+        return { ok: false, error: error.message };
+      } finally {
+        busy = false;
+        render();
+        onChange();
+      }
+    }
+
     window.addEventListener("resize", render);
     video.addEventListener("loadedmetadata", render);
     video.addEventListener("resize", render);
@@ -145,17 +224,33 @@
     }
 
     function clearLast() {
+      // Undo in placement order: a via was added after its marker, so the last
+      // marker's last via goes first; the marker itself only goes once it has
+      // no vias left. Returns a description of what went, or false.
       if (busy) return false;
       if (!markers.length) return false;
       generation += 1;
-      markers.pop();
+      const owner = markers[markers.length - 1];
+      let removed;
+      if (owner.vias && owner.vias.length) {
+        const viaIndex = owner.vias.length - 1;
+        owner.vias.pop();
+        if (owner.vias.length) owner.target.via = owner.vias.map((via) => via.tip);
+        else delete owner.target.via;
+        removed = "via " + String.fromCharCode(97 + viaIndex)
+          + " of marker " + markers.length;
+      } else {
+        markers.pop();
+        removed = "marker " + (markers.length + 1);
+      }
       render();
       onChange();
-      return true;
+      return removed;
     }
 
     return {
       addAt: addAt,
+      addViaAt: addViaAt,
       clearLast: clearLast,
       clear: function () {
         generation += 1;
@@ -171,14 +266,21 @@
         calibrating = Boolean(value);
         render();
       },
+      setViaMode: function (value) {
+        viaMode = Boolean(value);
+      },
       // A caller that adds a marker without a gesture (the chat sidebar) can ask
       // for the pins to be laid out again once its own state has settled.
       redraw: function () { render(); },
       get count() { return markers.length; },
+      get viaCount() {
+        return markers.reduce((total, marker) => total + ((marker.vias || []).length), 0);
+      },
+      get viaMode() { return viaMode; },
       get targets() { return markers.map((marker) => marker.target); },
       get busy() { return busy; },
     };
   }
 
-  window.MarkerSequence = { create: create, MAX_MARKERS: MAX_MARKERS };
+  window.MarkerSequence = { create: create, MAX_MARKERS: MAX_MARKERS, MAX_VIAS: MAX_VIAS };
 })();
