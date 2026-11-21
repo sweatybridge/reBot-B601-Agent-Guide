@@ -66,7 +66,7 @@ from sweep import DEFAULT_MIN_Z  # noqa: E402  (single source; see sweep.py)
 MOTOR7_OPEN = 4.90
 MOTOR7_CLOSED = -0.015
 # Via points per marker: intermediate tip points the trajectory passes through
-# on the way to the next marker, without stopping (traj.chain_series).
+# without stopping on the way to that marker (traj.chain_series).
 MAX_VIAS = 5
 # Halfway between open and closed: a reference angle kept in the sequence
 # provenance. The odd-marker close itself defaults to grasp_q, not this.
@@ -641,15 +641,15 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     unchanged.
 
     A marker may carry `via`: up to MAX_VIAS tip points the arm passes through
-    on the leg from that marker to the next, without stopping. Vias do not
-    count as markers -- they never touch the odd/even gripper parity, get no
-    hold and no gripper action -- and they keep the owning marker's work
-    orientation (the carrying attitude). The leg becomes one smooth joint-space
-    chain (traj.chain_series): ramp up from the marker, cruise through every
-    via, ramp down onto the next marker's staging point (odd) or pose (even).
-    Every chain is gated on its own curve by the worktop capsule model and
-    paced by the same speed policy as a plain leg. A via on the last marker is
-    refused: there is no following marker to travel to.
+    on the way TO that marker, without stopping -- from the previous marker, or
+    from the start pose for marker 1. Vias do not count as markers: they never
+    touch the odd/even gripper parity, get no hold and no gripper action, and
+    they are solved in the destination marker's work orientation. The leg in
+    becomes one smooth joint-space chain (traj.chain_series): ramp up from the
+    previous pose, cruise through every via, ramp down onto this marker's
+    staging point (odd) or pose (even). Every chain is gated on its own curve
+    by the worktop capsule model and paced by the same speed policy as a plain
+    leg.
     """
     if not isinstance(targets, (list, tuple)) or not targets:
         raise PlanError("a marker sequence needs at least one target")
@@ -739,9 +739,6 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                                    float(np.linalg.norm(via_point[:2])), options.max_reach))
             marker_vias.append(via_point)
             marker_via_flanges.append(via_point + np.array([0.0, 0.0, tip_offset_m]))
-        if marker_vias and index == len(targets):
-            raise PlanError("marker %d: via points need a following marker to travel to"
-                            % index)
         points.append(tip_point)
         hovers.append(0.0 if is_tip else hover_m)
         tip_offsets.append(tip_offset_m)
@@ -887,8 +884,6 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     # confuse a marker near the park pose with the start hold.
     marker_holds = []
     odd_close = close_angle(options, options.grasp_q)
-    # The previous marker's via poses, waiting for the leg into this one.
-    pending_via_qs = []
     for index, point in enumerate(points, start=1):
         place = flange_points[index - 1]
         yaw_deg = math.degrees(math.atan2(float(point[1]), float(point[0])))
@@ -923,17 +918,28 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             arrival_q = stage_q
         else:
             arrival_q = target
+        # This marker's vias: the approach to it, solved endpoint-first like
+        # every pose, in its own work orientation. A failure here aborts the
+        # whole plan before any motion, exactly like a marker IK failure.
+        via_qs = []
+        for via_index, via_place in enumerate(via_flange_points[index - 1], start=1):
+            label = "via %d.%d" % (index, via_index)
+            try:
+                via_q = ik_to(via_place, R_marker, seed, label)
+            except PlanError:
+                via_q = ik_to(via_place, R_marker, start_seed, label)
+            via_qs.append(np.array(via_q[:n_arm], dtype=float))
+            via_q_ik[index - 1].append([float(v) for v in via_q[:n_arm]])
         # The leg in, policy-paced exactly as on /move: the speed policy (peak
         # cap plus a cruise floor above stiction breakaway) sets the leg time.
         # approach_s belongs to the single-tap Cartesian approach; as a floor
-        # here it stretched short legs into a sub-breakaway crawl. With vias
-        # pending, one continuous chain replaces the plain joint leg; both get
-        # the worktop capsule gate -- a low horizontal move is a way to dip a
+        # here it stretched short legs into a sub-breakaway crawl. With vias,
+        # one continuous chain replaces the plain joint leg; both get the
+        # worktop capsule gate -- a low horizontal move is a way to dip a
         # link into the table.
-        if pending_via_qs:
-            seed = chain_leg([current_q] + pending_via_qs + [arrival_q[:n_arm]],
+        if via_qs:
+            seed = chain_leg([current_q] + via_qs + [arrival_q[:n_arm]],
                              index, gripper)
-            pending_via_qs = []
         elif index % 2 == 1:
             if not sweep.path_safe(current_q, stage_q[:n_arm]):
                 raise PlanError(
@@ -974,18 +980,6 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         gripper = next_gripper
         hold(0.25, gripper)
         marker_holds.append((hold_t0, state["t"]))
-        # This marker's vias, solved for the leg out: endpoint-first like every
-        # pose, in the marker's own work orientation -- the carrying attitude,
-        # no re-yaw mid-leg. A failure here aborts the whole plan before any
-        # motion, exactly like a marker IK failure.
-        for via_index, via_place in enumerate(via_flange_points[index - 1], start=1):
-            label = "via %d.%d" % (index, via_index)
-            try:
-                via_q = ik_to(via_place, R_marker, seed, label)
-            except PlanError:
-                via_q = ik_to(via_place, R_marker, start_seed, label)
-            pending_via_qs.append(np.array(via_q[:n_arm], dtype=float))
-            via_q_ik[index - 1].append([float(v) for v in via_q[:n_arm]])
 
     # Return in joint space. A Cartesian return to the parked pose is the one
     # leg where IK can fail on the last millimetres (the parked pose sits on
@@ -1024,8 +1018,8 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
              "capture": targets[index].get("capture"),
              "source": targets[index].get("source"),
              "tap": targets[index].get("tap"),
-             # Via points travelled after this marker, before the next: tip
-             # points, flange points, and the raw IK solutions pre-compensation.
+             # Via points travelled on the way to this marker: tip points,
+             # flange points, and the raw IK solutions pre-compensation.
              "via": [[float(v) for v in via] for via in vias[index]],
              "via_flange_points": [[float(v) for v in via]
                                    for via in via_flange_points[index]],

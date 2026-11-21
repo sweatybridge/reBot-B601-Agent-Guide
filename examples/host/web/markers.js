@@ -11,7 +11,7 @@
  * which targets, and is a locate still in flight? It also no longer listens for
  * pointerdown itself: the page routes a tap here from the height control, so a
  * tap and a tap-and-drag can be told apart. In via mode a tap attaches a
- * pass-through point to the last marker instead of adding a new marker.
+ * pass-through point to the last marker -- on the way to it, not after it.
  */
 (function () {
   "use strict";
@@ -86,8 +86,8 @@
           ? "close" : "open");
         container.appendChild(pin);
         // Via pins: dashed blue, lettered after their marker (1a, 1b, ...).
-        // The arm passes through them without stopping, on the way to the
-        // next marker; they never change the gripper parity.
+        // The arm passes through them without stopping, on the way to that
+        // marker; they never change the gripper parity.
         (marker.vias || []).forEach((via, viaIndex) => {
           const viaPixel = pixelOf(via, via.tip);
           const viaPoint = videoTools.screenPoint(video, stage, viaPixel[0], viaPixel[1]);
@@ -98,7 +98,7 @@
           viaPin.style.top = viaPoint.y + "px";
           viaPin.textContent = (index + 1) + String.fromCharCode(97 + viaIndex);
           viaPin.title = "via " + String.fromCharCode(97 + viaIndex)
-            + " after marker " + (index + 1) + " · pass-through";
+            + " to reach marker " + (index + 1) + " · pass-through";
           container.appendChild(viaPin);
         });
       });
@@ -160,8 +160,9 @@
     }
 
     async function addViaAt(clientX, clientY) {
-      // A via attaches to the last placed marker: the arm passes through it,
-      // without stopping, on the leg from that marker to the next. Same
+      // A via attaches to the last placed marker as its destination: the arm
+      // passes through it, without stopping, on the leg into that marker
+      // (from the previous marker, or the start pose for marker 1). Same
       // locate and frozen tap height as a marker; it never counts as one.
       if (!enabled) return { ok: false, error: "markers are off: switch the page to markers" };
       if (calibrating) return { ok: false, error: "calibration mode is on" };
@@ -199,7 +200,7 @@
         const point = target.tip.map((value) => Number(value).toFixed(3)).join(", ");
         const heightText = Number.isFinite(tapHeight)
           ? " · " + Math.round(tapHeight * 1000) + " mm up" : "";
-        status("via " + owner.vias.length + " after marker " + markers.length
+        status("via " + owner.vias.length + " to reach marker " + markers.length
           + " at tip [" + point + "] m" + heightText + " · pass-through", "good");
         render();
         onChange();

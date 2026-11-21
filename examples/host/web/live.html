@@ -639,7 +639,7 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "add_via",
-      description: "Attach a pass-through point to the last queued marker, at an image pixel. The arm travels through it without stopping on the way to the next marker, gripper unchanged. Up to 5 per marker; needs a marker placed first, and a following marker to travel to. Use it to route a carry over or around an obstacle.",
+      description: "Attach a pass-through point to the last queued marker, at an image pixel. The arm travels through it without stopping on the way to that marker (from the previous marker, or the start pose for marker 1), gripper unchanged. Up to 5 per marker; needs a marker placed first. Use it to route an approach over or around an obstacle.",
       parameters: {
         type: "object",
         properties: {
@@ -966,7 +966,7 @@ function systemPrompt() {
     "- arm_to_pixel(x, y, z): where an arm point lands in the image; use it to check yourself.",
     "- add_marker(u, v, height_m): queue a numbered target; markers are visited in order.",
     "- add_via(u, v, height_m): attach a pass-through point to the last marker; the arm",
-    "  crosses it without stopping on the way to the next marker (max 5, needs a next marker).",
+    "  crosses it without stopping on the way to that marker (max 5 per marker).",
     "- clear_markers(): drop the queued targets.",
     "- move_arm(execute): plan the markers; execute=false plans without moving.",
     "- capture_view(): get a fresh frame, delivered in the next user message.",
@@ -1222,7 +1222,7 @@ async function toolAddVia(args) {
     inside_band: report.inside_band, above_floor: report.above_floor,
   });
   markersOverlay.redraw();
-  pushChat("meta", "via " + placed.via + " after marker " + placed.index
+  pushChat("meta", "via " + placed.via + " to reach marker " + placed.index
     + " pinned at (" + round3(u) + ", " + round3(v) + ")");
   return report;
 }
@@ -1802,7 +1802,7 @@ viaModeButton.addEventListener("click", () => {
   markersOverlay.setViaMode(next);
   viaModeButton.textContent = "Via: " + (next ? "on" : "off");
   viaModeButton.classList.toggle("on", next);
-  status(next ? "via mode: taps add pass-through points to the last marker"
+  status(next ? "via mode: taps add pass-through points on the way to the last marker"
               : "via mode off: taps add markers again", "warn");
 });
 clearButton.addEventListener("click", () => {
