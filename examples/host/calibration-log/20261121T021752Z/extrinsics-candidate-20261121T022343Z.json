@@ -1,0 +1,57 @@
+{
+  "format": "rebot-extrinsics",
+  "version": 1,
+  "T_base_cam": [
+    [
+      0.09796191839677688,
+      -0.9646763711224658,
+      0.24454644046073157,
+      0.0633351032253447
+    ],
+    [
+      -0.4304478299156539,
+      -0.26262583205167495,
+      -0.8635637429049865,
+      0.9565284688645861
+    ],
+    [
+      0.8972837501397917,
+      -0.020668123697045713,
+      -0.44097018084890516,
+      0.5563488721937881
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "calib_fingerprint": "9acd8707e4ad",
+  "image_size": [
+    1080,
+    1920
+  ],
+  "plane_z": 0.0,
+  "tip_offset": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "joint_zeros": null,
+  "method": "hillclimb",
+  "rms_px": 2.542,
+  "rms_mm": 0.0,
+  "max_px": 0.0,
+  "sigma": {},
+  "weakest": {},
+  "predicted": {},
+  "device": "4f68b7f34a702b1c043f44fcf805ac9a63e2a3d9",
+  "mount": "fixed",
+  "fitted": "2026-11-21T02:23:43Z",
+  "iterations": 0,
+  "converged": true,
+  "fingerprint": "8751ebed3c47",
+  "witness": null,
+  "observations": []
+}
