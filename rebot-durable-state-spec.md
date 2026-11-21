@@ -1003,6 +1003,21 @@ transaction; self-checking assertions pass):
   on read), redacted append-only events with per-episode advisory-lock seq assignment,
   episode/plan catalog. Round-trip tested.
 
+**Two-arm coordination (Phase 2, validated):**
+- `rebot_self_collision_free` / `rebot_min_self_clearance` / `rebot_path_collision_free`
+  (Rust): capsule-capsule check over non-adjacent links (sweep `RADII`), via an Ericson
+  segment-distance primitive. Matches an independent Python capsule model to 1e-4 m.
+  Deliberate contacts (parked j4-on-j2) must be excepted by the caller.
+- `rebot_seg_seg_distance`: the segment-distance primitive, also used for inter-arm
+  clearance (clearance = dist − radius_a − radius_b).
+- `clearance_cell_update` (`0003`): folds inter-arm clearance into the pair-specific
+  map, keyed on relative-tip-pose (position bins; extensible to full 6D). Validates at
+  n≥3, tracks the worst gap.
+- `coordination_oracle` (`0003`): attributes coordination residuals (clearance-violation,
+  rendezvous-miss, sync-offset, handoff-drop, sync-fault).
+- `rendezvous_transition` (`0003`): guarded state machine; release only from `confirmed`
+  (both arms present), so premature release / double-grasp are impossible by construction.
+
 **Durable orchestration (pg_durable):** a workflow `df.start(df.sql('SELECT
 to_jsonb(rebot_fk(...))'))` ran to `status=completed` via the duroxide background
 worker; `df.result` returned `{"rows":[{"pose":[0.1355,…]}],"row_count":1}`.
@@ -1061,6 +1076,7 @@ substrate/
     src/bin/pgrx_embed_rebot_kinematics.rs   # REQUIRED for cargo pgrx schema gen
   migrations/0001_substrate.sql   # the §4+§5 DDL in dependency order
   migrations/0002_learning_functions.sql # oracle_attribute, trace_redact, accuracy_cell_update
+  migrations/0003_coordination.sql  # clearance_cell_update, coordination_oracle, rendezvous_transition
   store.py                        # PG-backed store seam (blobs/events/catalog), psycopg3
   tests/mechanism_tests.sql       # refcount/GC/invalidation/CHECK/cascade/HNSW
   tests/kinematics_tests.sql      # FK/IK round-trip on the real arm
@@ -1068,6 +1084,8 @@ substrate/
   tests/oracle_attribute_tests.sql  # oracle_attribute + trace_redact vs Python
   tests/accuracy_cell_tests.sql   # accuracy_cell_update vs identify.update_accuracy_map
   tests/sag_fit_tests.sql         # rebot_fit_sag_map vs identify.fit_sag_map
+  tests/self_collision_tests.sql  # capsule self-collision vs Python model
+  tests/coordination_tests.sql    # clearance/oracle/rendezvous primitives
   tests/test_store.py             # store seam round-trip (needs psycopg)
   tests/df_workflow.sql           # pg_durable workflow calling rebot_fk
 ```

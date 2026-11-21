@@ -375,6 +375,129 @@ fn rebot_fit_sag_map(
     }))
 }
 
+// --------------------------------------------------------------------------- //
+// Capsule-capsule self-collision (two-arm cooperation prerequisite).
+// Links are capsules between consecutive joint points with the sweep RADII;
+// non-adjacent pairs are checked (adjacent links share a joint by construction).
+// Deliberate contacts (e.g. the parked j4 hinge on the j2 casing) must be excepted
+// by the caller — this reports geometric intersection, not intent.
+// --------------------------------------------------------------------------- //
+
+type V3 = nalgebra::Vector3<f64>;
+
+/// Closest distance between segments p1-q1 and p2-q2 (Ericson, Real-Time Collision
+/// Detection). Used for capsule-capsule clearance.
+fn seg_seg_distance(p1: V3, q1: V3, p2: V3, q2: V3) -> f64 {
+    let d1 = q1 - p1;
+    let d2 = q2 - p2;
+    let r = p1 - p2;
+    let a = d1.dot(&d1);
+    let e = d2.dot(&d2);
+    let f = d2.dot(&r);
+    let eps = 1e-12;
+    let (mut s, mut t);
+    if a <= eps && e <= eps {
+        return r.norm();
+    }
+    if a <= eps {
+        s = 0.0;
+        t = (f / e).clamp(0.0, 1.0);
+    } else {
+        let c = d1.dot(&r);
+        if e <= eps {
+            t = 0.0;
+            s = (-c / a).clamp(0.0, 1.0);
+        } else {
+            let b = d1.dot(&d2);
+            let denom = a * e - b * b;
+            s = if denom.abs() > eps { ((b * f - c * e) / denom).clamp(0.0, 1.0) } else { 0.0 };
+            t = (b * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            }
+        }
+    }
+    let c1 = p1 + d1 * s;
+    let c2 = p2 + d2 * t;
+    (c1 - c2).norm()
+}
+
+fn v3(p: [f64; 3]) -> V3 { V3::new(p[0], p[1], p[2]) }
+
+/// True if no non-adjacent link capsules intersect at this pose.
+fn self_collision_free(chain: &k::Chain<f64>) -> bool {
+    let pts = joint_points(chain);
+    for i in 1..pts.len() {
+        for j in (i + 2)..pts.len() {
+            let dist = seg_seg_distance(v3(pts[i - 1]), v3(pts[i]), v3(pts[j - 1]), v3(pts[j]));
+            if dist < RADII[i] + RADII[j] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Minimum clearance (m) between any non-adjacent link capsules (surface gap).
+fn min_self_clearance(chain: &k::Chain<f64>) -> f64 {
+    let pts = joint_points(chain);
+    let mut best = f64::INFINITY;
+    for i in 1..pts.len() {
+        for j in (i + 2)..pts.len() {
+            let dist = seg_seg_distance(v3(pts[i - 1]), v3(pts[i]), v3(pts[j - 1]), v3(pts[j]));
+            best = best.min(dist - RADII[i] - RADII[j]);
+        }
+    }
+    best
+}
+
+/// Is the pose free of (non-adjacent) link self-collision? Deliberate contacts must
+/// be excepted by the caller.
+#[pg_extern]
+fn rebot_self_collision_free(urdf: &str, q: Vec<f64>) -> bool {
+    let (_robot, chain) = load_chain_arm(urdf, &q);
+    self_collision_free(&chain)
+}
+
+/// Closest distance between two segments (each given as [x,y,z] endpoints). The
+/// primitive for inter-arm capsule clearance: clearance = dist - radius_a - radius_b.
+#[pg_extern]
+fn rebot_seg_seg_distance(p1: Vec<f64>, q1: Vec<f64>, p2: Vec<f64>, q2: Vec<f64>) -> f64 {
+    let v = |a: Vec<f64>| {
+        if a.len() != 3 { panic!("segment endpoint must be [x,y,z]"); }
+        V3::new(a[0], a[1], a[2])
+    };
+    seg_seg_distance(v(p1), v(q1), v(p2), v(q2))
+}
+
+/// Minimum surface gap (m) between non-adjacent link capsules; negative = intersecting.
+#[pg_extern]
+fn rebot_min_self_clearance(urdf: &str, q: Vec<f64>) -> f64 {
+    let (_robot, chain) = load_chain_arm(urdf, &q);
+    min_self_clearance(&chain)
+}
+
+/// Is the straight joint-space line a->b free of self-collision at every sample?
+#[pg_extern]
+fn rebot_path_collision_free(urdf: &str, a: Vec<f64>, b: Vec<f64>, samples: default!(i32, 40)) -> bool {
+    let (_robot, chain) = load_chain_arm(urdf, &a);
+    let samples = samples as usize;
+    if samples < 2 { panic!("samples must be >= 2"); }
+    for s in 0..samples {
+        let t = s as f64 / (samples as f64 - 1.0);
+        let mut q: Vec<f64> = a.iter().zip(b.iter()).map(|(x, y)| x + (y - x) * t).collect();
+        while q.len() < chain.dof() { q.push(0.0); }
+        chain.set_joint_positions(&q).unwrap_or_else(|e| panic!("set_joint_positions: {e}"));
+        chain.update_transforms();
+        if !self_collision_free(&chain) { return false; }
+    }
+    true
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
