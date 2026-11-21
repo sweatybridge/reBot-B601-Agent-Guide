@@ -68,7 +68,7 @@
         const point = videoTools.screenPoint(video, stage, pixel[0], pixel[1]);
         if (!point) return;
         const pin = document.createElement("div");
-        // Amber for odd (half-close), green for even (open); a red outline only
+        // Amber for odd (close), green for even (open); a red outline only
         // marks a target outside the planner's reach gate.
         pin.className = "seq-pin " + ((index + 1) % 2 === 1 ? "half" : "open")
           + (marker.radius > 0.75 ? " far" : "");
@@ -76,7 +76,7 @@
         pin.style.top = point.y + "px";
         pin.textContent = String(index + 1);
         pin.title = (index + 1) + " · " + ((index + 1) % 2 === 1
-          ? "half-close" : "open");
+          ? "close" : "open");
         container.appendChild(pin);
       });
       container.hidden = calibrating;
@@ -121,7 +121,7 @@
         const heightText = Number.isFinite(tapHeight)
           ? " · " + Math.round(tapHeight * 1000) + " mm up" : "";
         status("marker " + markers.length + " at tip [" + point + "] m" + heightText +
-          (markers.length % 2 === 1 ? " · gripper will half-close" : " · gripper will open"),
+          (markers.length % 2 === 1 ? " · gripper will close" : " · gripper will open"),
           markers.length % 2 === 1 ? "warn" : "good");
         render();
         onChange();

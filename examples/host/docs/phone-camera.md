@@ -400,7 +400,8 @@ The arm gateway has one planning route, `POST /plan`:
 `options.close_width_mm` (a number or null) sets the jaw opening the gripper
 closes to -- the pick's close and the sequence's odd-marker close -- converted
 through the **uncalibrated** 0.412 rad/cm pinion initial value from the
-reference docs; it overrides `grasp_q` and the half-close, and a width outside
+reference docs; it overrides `grasp_q` (the default close for the pick and the
+sequence's odd markers), and a width outside
 the ~119 mm stroke is refused. Measure the stroke once with a ruler before
 trusting the millimetres on hardware.
 Hover mode is gone: `hover`, `hover_m` and `tip_m` options are refused, and the
@@ -586,7 +587,7 @@ On the phone a tap pins a marker rather than planning. It grabs the exact frame 
 solves the camera pose and the tap ray in the page, computes the arm-space tip,
 and pins a numbered marker on the preview. Up to ten; **Clear marker** removes the
 last one. **Move arm** is disabled until at least one marker is on screen. Odd
-markers are amber (the gripper will half-close); even markers are green (it will
+markers are amber (the gripper will close); even markers are green (it will
 open).
 
 **Tap and drag to set the height.** A press that stays put adds a marker. Once
@@ -626,8 +627,8 @@ Move arm
 ```
 
 The gripper starts fully open -- it opens before the arm leaves its first pose
--- half-closes at odd-numbered markers and opens at even-numbered ones
-(`options.close_width_mm` replaces the half-close with a chosen jaw opening).
+-- closes at odd-numbered markers (`grasp_q`, default 2.0 rad, about 49 mm of
+jaw opening; `options.close_width_mm` picks another) and opens at even-numbered ones.
 Odd markers are grasped with the pick's slide-in geometry: the arm first stages
 `approach` metres in front of the marker (on the base side, at the marker's own
 height), then slides forward into it before half-closing; even markers keep the
@@ -1114,7 +1115,7 @@ browser harness), streaming, and the arm actually moving. Those stay in
   phone's deliberate **Move arm** are there to make an accidental tap harmless,
   not to make the arm safe.
 - **The gripper is position-controlled, not force-controlled.** If a marker
-  sequence closes on something wider than the half-close opening, the jaw will
+  sequence closes on something wider than the commanded opening, the jaw will
   press against it. The edge's `--gripper-stall 0.3` (enabled by the shipped
   systemd unit) aborts when motor 7 has a >0.15 rad position error and is moving
   <0.08 rad/s for 0.3 s, holds the measured opening for the return ramp, then

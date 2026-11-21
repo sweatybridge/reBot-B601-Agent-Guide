@@ -467,8 +467,8 @@ def gripper_seconds(travel, peak_speed=GRIPPER_PEAK_SPEED):
 
     A floor, never a ceiling: callers take max(their own seconds, this), so a
     caller asking for a slower grasp still gets it. Same cosine-peak inversion
-    as `seconds_for`, without the sweep's 3 s minimum -- a 2.45 rad half-close
-    wants 1.3 s at the cap, not three.
+    as `seconds_for`, without the sweep's 3 s minimum -- a 2.90 rad close
+    wants 1.5 s at the cap, not three.
     """
     travel = abs(float(travel))
     if not math.isfinite(travel):

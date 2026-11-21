@@ -65,8 +65,8 @@ from sweep import DEFAULT_MIN_Z  # noqa: E402  (single source; see sweep.py)
 
 MOTOR7_OPEN = 4.90
 MOTOR7_CLOSED = -0.015
-# Halfway between open and closed: the gesture the marker sequence makes on
-# odd-numbered markers.
+# Halfway between open and closed: a reference angle kept in the sequence
+# provenance. The odd-marker close itself defaults to grasp_q, not this.
 MOTOR7_HALF = (MOTOR7_OPEN + MOTOR7_CLOSED) / 2.0
 # Jaw travel <-> motor angle: the URDF does not model the pinion (it builds the
 # fingers as prismatic joints). The reference docs' initial value is ~0.412
@@ -92,10 +92,10 @@ class Options:
     approach: float = 0.06
     approach_s: float = 3.0
     slide_s: float = 1.5
-    grasp_q: float = 2.45
+    grasp_q: float = 2.0
     # Jaw opening to close to, in mm, converted through GRIPPER_RAD_PER_MM.
-    # When set it overrides grasp_q (pick) and the half-close (sequence odd
-    # markers); None keeps those angle defaults.
+    # When set it overrides grasp_q, the close angle shared by the pick and the
+    # sequence's odd markers; None keeps that default.
     close_width_mm: float | None = None
     open_q: float = MOTOR7_OPEN
     grasp_s: float = 1.2
@@ -229,8 +229,8 @@ def stage_in_front(point, approach):
 
 def close_angle(options, default):
     """The motor-7 close target: `close_width_mm` converted through the pinion
-    initial value when set, else the caller's angle default (grasp_q for a
-    pick, MOTOR7_HALF for a sequence's odd markers)."""
+    initial value when set, else the caller's angle default (grasp_q, shared
+    by the pick and the sequence's odd markers)."""
     if options.close_width_mm is None:
         return default
     width = float(options.close_width_mm)
@@ -629,11 +629,11 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     offset in `tip_offset_m`, so `point` is the tip; the CLI may still pass a
     surface point and let the options lift it. The arm holds at each point while
     the gripper moves, and the pass finishes back at the pose it started from.
-    The gripper starts fully open; it half-closes at odd-numbered markers and
-    opens at even-numbered ones. Odd markers are grasped with the single-tap
-    pick's geometry: stage `approach` metres in front (base side, at the
-    marker's own height) and slide forward into it; even markers keep the
-    direct visit. The motion is the same cosine-eased joint-space leg
+    The gripper starts fully open; it closes at odd-numbered markers (grasp_q,
+    default 2.0 rad) and opens at even-numbered ones. Odd markers are grasped
+    with the single-tap pick's geometry: stage `approach` metres in front (base
+    side, at the marker's own height) and slide forward into it; even markers
+    keep the direct visit. The motion is the same cosine-eased joint-space leg
     the single-tap plan uses, so the speeds and the edge's step checks are
     unchanged.
     """
@@ -801,7 +801,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     # windows to targets by these times -- exact, where joint proximity would
     # confuse a marker near the park pose with the start hold.
     marker_holds = []
-    odd_close = close_angle(options, MOTOR7_HALF)
+    odd_close = close_angle(options, options.grasp_q)
     for index, point in enumerate(points, start=1):
         place = flange_points[index - 1]
         yaw_deg = math.degrees(math.atan2(float(point[1]), float(point[0])))
@@ -890,7 +890,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     joint_leg(q_last, {index: q_home[index] - q_last[index] for index in range(n_arm)},
               sweep.seconds_for(q_last, q_home), "return", gripper)
 
-    close_text = ("half-close" if options.close_width_mm is None
+    close_text = ("close to %.2f rad" % odd_close if options.close_width_mm is None
                   else "close to %.1f mm" % options.close_width_mm)
     steps = ("%d markers: stage %.0f mm in front and slide in on odd, direct on even; "
              "gripper open, %s on odd, open on even; return"
@@ -969,7 +969,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
 
 
 def describe_sequence(summary):
-    lines = ["Marker sequence: %d markers, gripper open -> half/odd -> open/even"
+    lines = ["Marker sequence: %d markers, gripper open -> close/odd -> open/even"
              % summary["markers"]]
     for index, (point, radius) in enumerate(zip(summary["targets"], summary["radii"]),
                                             start=1):
@@ -1037,11 +1037,12 @@ def add_arguments(parser):
     parser.add_argument("--approach-s", type=float, default=3.0)
     parser.add_argument("--slide-s", type=float, default=1.5,
                         help="duration of the slide-in leg, s")
-    parser.add_argument("--grasp-q", type=float, default=2.45,
+    parser.add_argument("--grasp-q", type=float, default=2.0,
                         help="motor 7 angle after closing, rad (6 cm is 2.46)")
     parser.add_argument("--close-width-mm", type=float, default=None,
-                        help="jaw opening to close to, mm; overrides --grasp-q and the "
-                             "sequence half-close (uncalibrated pinion initial value)")
+                        help="jaw opening to close to, mm; overrides --grasp-q for the "
+                             "pick and the sequence's odd markers (uncalibrated pinion "
+                             "initial value)")
     parser.add_argument("--open-q", type=float, default=MOTOR7_OPEN)
     parser.add_argument("--grasp-s", type=float, default=1.2)
     parser.add_argument("--hold-s", type=float, default=0.6)

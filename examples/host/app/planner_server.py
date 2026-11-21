@@ -29,7 +29,7 @@ The compact planner contract is tip-space only: `targets` is a list of
 `{tip: [x, y, z]}` objects (optional `pixel`/`tap`/`capture` provenance),
 `tip_offset_m` is the physical flange-to-tip distance for the whole request, and
 `gripper` is `"none"` (one target, no gripper motion) or `"alternate"`
-(half-close/open through a marker sequence). `hover`, `hover_m` and `tip_m` are
+(close/open through a marker sequence). `hover`, `hover_m` and `tip_m` are
 deprecated; `min_z` defaults to the default hover height and the capture server
 sends its value with every request. The old `/plan-sequence` route answers 410.
 
