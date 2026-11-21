@@ -30,6 +30,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+import calib as calib_mod
 import rebot_ik
 
 # The same capsule radii the manuals' collision probe uses
@@ -167,39 +168,55 @@ def check(reference: Reference, image, max_drift_px=2.0):
 
     Returns a dict rather than raising for a normal drift: the caller decides
     whether 1.2 px is a warning or a refusal. A *failed* comparison (nothing
-    tracked, a different image size) is an exception, because that is a setup
-    error and not a measurement.
+    tracked, an aspect change) is an exception, because that is a setup error
+    and not a measurement.
+
+    A uniform rescale of the capture (WebRTC saving bandwidth) is not a setup
+    error: the reference is regridded to the capture's size, the drift limit
+    follows the grid, and the report carries `grid_scale`. The homography
+    `scale` still measures a real field-of-view change (focus or zoom).
     """
     if image is None:
         raise WitnessError("no frame to check the mount against")
     gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if gray.shape != reference.gray.shape:
-        raise WitnessError("the capture is %dx%d but the witness frame is %dx%d: the capture "
-                           "size changed, which invalidates the rig anyway"
-                           % (gray.shape[1], gray.shape[0],
-                              reference.gray.shape[1], reference.gray.shape[0]))
+    ref_gray, ref_points = reference.gray, reference.points
+    drift_limit = float(max_drift_px)
+    grid_scale = 1.0
+    if gray.shape != ref_gray.shape:
+        ref_size = (int(ref_gray.shape[1]), int(ref_gray.shape[0]))
+        new_size = (int(gray.shape[1]), int(gray.shape[0]))
+        if not calib_mod.same_shape(ref_size, new_size):
+            raise WitnessError("the capture is %dx%d but the witness frame is %dx%d: the aspect "
+                               "changed, which is a crop, not a rescale"
+                               % (new_size[0], new_size[1], ref_size[0], ref_size[1]))
+        grid_scale = new_size[0] / float(ref_size[0])
+        ref_gray = cv2.resize(ref_gray, new_size,
+                              interpolation=(cv2.INTER_AREA if grid_scale < 1.0
+                                             else cv2.INTER_LINEAR))
+        ref_points = reference.points * grid_scale
+        drift_limit = float(max_drift_px) * grid_scale
 
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
     forward, status, _error = cv2.calcOpticalFlowPyrLK(
-        reference.gray, gray, reference.points, None, winSize=(21, 21), maxLevel=3,
+        ref_gray, gray, ref_points, None, winSize=(21, 21), maxLevel=3,
         criteria=criteria)
     if forward is None:
         raise WitnessError("optical flow failed")
     back, status_back, _error = cv2.calcOpticalFlowPyrLK(
-        gray, reference.gray, forward, None, winSize=(21, 21), maxLevel=3, criteria=criteria)
+        gray, ref_gray, forward, None, winSize=(21, 21), maxLevel=3, criteria=criteria)
     if back is None:
         raise WitnessError("optical flow failed on the way back")
     forward = forward.reshape(-1, 2)
     back = back.reshape(-1, 2)
 
     keep = ((status.reshape(-1) == 1) & (status_back.reshape(-1) == 1)
-            & (np.linalg.norm(back - reference.points, axis=1) < 0.6))
-    source = reference.points[keep]
+            & (np.linalg.norm(back - ref_points, axis=1) < 0.6 * grid_scale))
+    source = ref_points[keep]
     target = forward[keep]
     if len(source) < 8:
         raise WitnessError("only %d of %d witness patches are still visible: the view changed "
                            "enough that the mount cannot be verified"
-                           % (len(source), len(reference.points)))
+                           % (len(source), len(ref_points)))
 
     homography, inliers = cv2.findHomography(source.reshape(-1, 1, 2),
                                              target.reshape(-1, 1, 2), cv2.RANSAC, 2.0)
@@ -219,8 +236,8 @@ def check(reference: Reference, image, max_drift_px=2.0):
     scale = float(np.sqrt(abs(np.linalg.det(homography[:2, :2]))))
 
     reasons = []
-    if drift > max_drift_px:
-        reasons.append("%.1f px of drift (limit %.1f)" % (drift, max_drift_px))
+    if drift > drift_limit:
+        reasons.append("%.1f px of drift (limit %.1f)" % (drift, drift_limit))
     if abs(scale - 1.0) > 0.05:
         reasons.append("the field of view changed by %.0f%% (focus or zoom)"
                        % (100.0 * (scale - 1.0)))
@@ -230,6 +247,7 @@ def check(reference: Reference, image, max_drift_px=2.0):
         "max_px": round(float(np.max(displacement)), 2),
         "fit_px": round(float(np.median(fit_error)), 2),
         "scale": round(scale, 4),
+        "grid_scale": round(grid_scale, 4),
         "inliers": int(inlier_mask.sum()),
         "patches": int(len(source)),
         "reference": str(reference.path) if reference.path else None,
