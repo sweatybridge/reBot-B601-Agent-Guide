@@ -89,3 +89,124 @@ IF NOT EXISTS` alone will not refresh it).
 - pg_durable step results cannot be `FLOAT8[]`; wrap kinematics output in `to_jsonb()`.
 - The published pg_durable image is for evaluation, not production (superuser durable
   instances). Harden before production use (spec §11 caveats).
+
+## FAQ — design tradeoffs and deciding factors
+
+These capture the alternatives considered and why the design landed where it did.
+Full reasoning is in the spec; this is the short version.
+
+**Q: Why move to Postgres at all — weren't files fine?**
+For the *evidence plane* (immutable captures, frames, traces), files are still the right
+shape: keyed access, write-once immutability, self-contained bundles, bit-identical
+replay, inspectable with ordinary tools. What changed the calculus was the roadmap —
+an arm running daily for **years**, learning continuously from failures. The *learning
+plane* (accuracy cells, sag maps, failure signatures, case lifecycle) is permanent,
+incrementally updated, and queried across the whole history. Files give neither
+transactional consistency nor efficient cross-session queries; the accuracy map's
+read-modify-write per execution is a latent race. So: files for evidence, a database
+for learning. The two-plane split is the core decision.
+
+**Q: Why Postgres and not SQLite?**
+SQLite was the initial recommendation: single machine, single writer, zero operational
+surface, backup = copy one file. Three things tipped it to Postgres: (1) the coordinator
+as a **transactional state machine** shared across separate processes (rendezvous,
+ownership) needs concurrent writers + row locking; (2) `LISTEN/NOTIFY`-style event
+signaling and `pg_durable`'s background-worker runtime; (3) **pgvector** for similarity
+search. SQLite's single-writer model and lack of these features became the friction.
+SQLite is still the right answer for a single-process, single-bench setup; Postgres is
+the answer once coordination, durable orchestration, and vector search share a substrate.
+
+**Q: Why not keep media in a blob store (or files) and only metadata in Postgres?**
+That was the first position, on grounds of WAL amplification, backup bloat, cache
+pollution, and the FFmpeg crash risk. The deciding factor was **actual volume**: we
+record only executed trajectories (~30 min/day, one shared camera), not 24/7 — roughly
+120–250 GB/year, sub-TB over the system's life. At that bounded volume, media-in-Postgres
+is viable and buys **true FK/ACID integrity** between vectors and media (no cross-system
+integrity protocol). HLS fragments (small, append-only, surgical time-range access) fit
+Postgres far better than whole-video blobs. If volume were 24/7 multi-TB, the answer
+would flip back to a blob store + content-addressed references.
+
+**Q: Why permanent retention instead of the spec's 30-day prune?**
+Human review is asynchronous — a failure may be investigated months later — and improved
+methods must be able to **re-process old episodes** (e.g. re-embed with a better model).
+A 30-day window assumes timely review and fixed methods; neither holds for years-long
+continuous learning. So the visual record is permanent; the 30-day default is overridden.
+
+**Q: Stills vs video — what does learning actually consume?**
+Learning consumes **stills + telemetry + events**, never video. The oracle measures
+hold-window stills; sag/clearance fit from telemetry; perception/eval cases are fed
+bit-identical stills. Video is a *forensic / re-extraction* source (scrubbing inter-hold
+dynamics, pulling a frame at a new timestamp later), not a learning input. This is why
+stills are the kept evidence and recordings can be treated as a re-extractable source.
+
+**Q: Why pgvector / HNSW, and how often is the index refreshed?**
+pgvector gives similarity search over the permanent corpus ("have we seen this failure
+before?"). HNSW is chosen over IVFFlat because it builds **incrementally on insert** — no
+scheduled rebuild as the corpus grows. There is no refresh cron: new data appends
+continuously; recall is monitored conditionally; the only substantial refresh is
+**re-embedding on a model upgrade** (version-driven, rare). Two gotchas: HNSW needs a
+fixed-dimension column (`vector(768)`), and cosine distance is undefined for zero vectors
+(normalize embeddings before insert).
+
+**Q: How is referential integrity between vectors and media handled?**
+Because media bytes live in `evidence.blob`, every reference is a real **foreign key** —
+true ACID integrity, cascade deletes, no orphan/dangling protocol. (Had media stayed in a
+blob store, integrity would be eventual: content-addressed sha256, blob-first writes /
+row-first deletes, grace-period GC, and hash-verification scrub — crash-safe but not a
+single transaction.) In-Postgres media is what lets us use plain FKs.
+
+**Q: Why openrr/k (Rust) instead of Pinocchio?**
+Pinocchio is C++; calling it from Postgres means FFI, and a deterministic crash in a
+postmaster child resets the whole cluster (see next question). `openrr/k` is pure Rust
+(nalgebra) — memory-safe, so a bad input raises a SQL ERROR (pgrx catches the panic),
+never a backend crash. The tradeoff: `k` provides FK/IK/URDF only, **no collision checking
+or gravity dynamics**, so those were ported to Rust (`rebot_path_safe`, `rebot_gravity_torques`,
+capsule self-collision) and validated against the numpy reference.
+
+**Q: Why must native compute be isolated? (the crash-isolation invariant)**
+A deterministic crash in unsafe native code (C++ Pinocchio via FFI, FFmpeg decode, native
+ONNX/PyTorch) running in a postmaster child resets the entire cluster; durable retry then
+replays the same input → **crash-loop**. This is the one invariant the design won't trade
+away. So: memory-safe Rust numerics (kinematics, sag/accuracy fitting) run in-worker;
+unsafe/heavy native compute (decode, embedding inference, OpenCV) runs as **isolated
+activities** whose failure fails the job, never the cluster. FFmpeg is never in the hot
+ingest path — ingest is safe byte-shuffling; decode is retrospective and isolated.
+
+**Q: Why pg_durable instead of cron + workers or Temporal?**
+`pg_durable` (duroxide runtime) gives durable execution **inside** Postgres: workflows
+defined in SQL (`df.start`, `df.sql`, `df.seq`), checkpointed per step, resumable after
+crashes/restarts, with state in `df.*`/`duroxide.*`. No extra service infrastructure
+(Redis/Temporal/queues), same auth/backup model as the data. It replaces the
+cron + jobs-table + polling-worker pattern. The published image is evaluation-only;
+production needs hardening (superuser worker, HTTP policy, `df.grant_usage`).
+
+**Q: Is the coordinator realtime? Can it plan offline?**
+The coordinator is a **planner**, and planning is offline — exactly like the existing
+single-arm planner (compute a trajectory, hand it to the edge to play back). Only the
+**edge control loop** is realtime. Simultaneous two-arm motion makes planning harder
+(coupled, time-parameterized collision checking) but not realtime. The execution-time
+rendezvous handshake ("A confirms → B grasps") is **edge-to-edge**, never via Postgres;
+the durable `coord.rendezvous` row records the schedule/outcome, not the millisecond signal.
+
+**Q: How does multi-arm cooperation change the design?**
+The target is physical cooperation: one shared overhead camera, simultaneous motion,
+offline planning, no live object tracking. The world model is **static config + immutable
+plans** — no hot shared mutable state — so it doesn't force a realtime store. Learning
+splits into three tiers: **arm** (sag/accuracy/zeros — physical, never merges across arms),
+**pair** (exchange poses, clearance, rendezvous — specific to an arm pair + workspace),
+**fleet** (protocol/perception cases — arm-independent, aggregates). A shared-rig refit
+cascades invalidation to both arms' cells and the pair map. Clearance cells key on
+relative-tip-pose (position bins implemented; full 6D orientation extensible).
+
+**Q: Which embedding model?**
+Left as a **deployment fork** — the pipeline is model-agnostic (`embed.py`'s `Embedder`
+interface). A deterministic `HistogramEmbedder` is the offline default so the pipeline is
+testable without a model; a production CLIP/ONNX embedder implements the interface and
+runs isolated. The choice determines re-embed cost per upgrade, so decide before ingest.
+
+**Q: What stayed out of scope?**
+The §8 app migration (dual-write → backfill → cutover → flatten `state/` into
+`config/` + `export/`); hardware-dependent steps; full 6D clearance orientation; and
+deliberate-contact exceptions for self-collision (the parked j4-on-j2 hinge contact).
+`rebot_path_safe` is the worktop table-clearance gate, not general obstacle collision.
+The substrate moves no arm and does not yet wire the live capture/planner path.
