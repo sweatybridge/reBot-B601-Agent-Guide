@@ -248,6 +248,22 @@ class SubstrateStore:
             c.execute("SELECT accuracy_cell_update(%s, %s, %s::jsonb, %s)",
                       (arm_id, rig_fingerprint, json.dumps(doc), threshold_mm))
 
+    def read_accuracy_map(self, arm_id: str, rig_fingerprint: str) -> dict:
+        """Reconstruct the identify.load_accuracy_map doc from PG cells."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT cell_key, predicted_mm, measured_mm, n, n_good, validated_at "
+                "FROM learning.accuracy_cell WHERE arm_id=%s AND rig_fingerprint=%s",
+                (arm_id, rig_fingerprint)).fetchall()
+        cells = {}
+        for r in rows:
+            cells[r["cell_key"]] = {
+                "predicted_mm": r["predicted_mm"], "measured_mm": r["measured_mm"],
+                "n": r["n"], "n_good": r["n_good"],
+                "validated_at": r["validated_at"].isoformat() if r["validated_at"] else None,
+            }
+        return {"version": 1, "cells": cells}
+
     def add_telemetry(self, exec_id: str, plan_id: str, arm_id: str, blob_sha: str,
                       kp_key: str, summary: dict) -> None:
         with self._conn() as c:

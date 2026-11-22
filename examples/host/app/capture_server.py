@@ -579,7 +579,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 def _accuracy_health(app):
     try:
-        map_doc = identify_mod.load_accuracy_map(app["accuracy_map_path"])
+        map_doc = _accuracy_map(app)
     except Exception:  # noqa: BLE001 - health must survive a broken map file
         return {"cells": 0, "validated": 0, "validated_fraction": 0.0}
     cells = map_doc.get("cells") or {}
@@ -1182,7 +1182,7 @@ async def handle_sequence(request: web.Request) -> web.Response:
     # band, min_z, IK) stay where they are; a missing or broken map degrades to
     # no warning, never to a failed plan (§8.4).
     try:
-        map_doc = identify_mod.load_accuracy_map(app["accuracy_map_path"])
+        map_doc = _accuracy_map(app)
         warnings = identify_mod.accuracy_warnings(map_doc, tips)
     except Exception as exc:  # noqa: BLE001
         logging.warning("accuracy map read failed: %s", exc)
@@ -2467,7 +2467,7 @@ async def run_coverage(app, body, sid):
         raise identify_mod.IdentifyError("coverage measures against a rig: capture the base "
                                          "marker first")
     arm = auto_calibrate.ArmGateway(app["planner"], app["planner_token"])
-    map_doc = identify_mod.load_accuracy_map(app["accuracy_map_path"])
+    map_doc = _accuracy_map(app)
     tip = _oracle_tool_tip(app, rig)
     start = await asyncio.to_thread(arm.pose)
     q = np.asarray(start["q"], dtype=float).reshape(-1)
@@ -2529,7 +2529,7 @@ async def run_cartesian_coverage(app, body, sid):
     if rig is None:
         raise identify_mod.IdentifyError("coverage measures against a rig: capture the base "
                                          "marker first")
-    map_doc = identify_mod.load_accuracy_map(app["accuracy_map_path"])
+    map_doc = _accuracy_map(app)
     wanted = int(body.get("poses", identify_mod.COVERAGE_MAX_POSES))
     # Screen the whole grid, keep the first `wanted` survivors. The need-then-
     # cell order puts the inner band first, and whole rings can be unreachable
@@ -2749,7 +2749,7 @@ async def handle_identify_status(request: web.Request) -> web.Response:
     try:
         gaps = identify_mod.unlearned(
             identify_mod.active_sag_map(app["calib"], sweep.KP_DEFAULT),
-            identify_mod.load_accuracy_map(app["accuracy_map_path"]))
+            _accuracy_map(app))
     except Exception as exc:  # noqa: BLE001 - a report never fails the route
         logging.warning("the unlearned report failed: %s", exc)
         gaps = []
@@ -3017,6 +3017,18 @@ def _pg_mirror_sag(app, map_doc):
             mirror.mirror_sag(app.get("arm_id", "b601"), map_doc)
         except Exception as exc:  # noqa: BLE001
             logging.warning("sag mirror failed: %s", exc)
+
+
+def _accuracy_map(app):
+    """PG-primary accuracy envelope (learning read cutover); file fallback."""
+    store = app.get("pg_store")
+    rig = app.get("rig")
+    if store is not None and rig is not None:
+        try:
+            return store.read_accuracy_map(app.get("arm_id", "b601"), rig.fingerprint)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("accuracy map PG read failed: %s", exc)
+    return _accuracy_map(app)
 
 
 def grab_one(app, camera_url, commit=True):
