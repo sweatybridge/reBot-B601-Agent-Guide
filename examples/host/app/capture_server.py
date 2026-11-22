@@ -2127,6 +2127,14 @@ async def oracle_finish(app, prep, sid):
                 if out_path.is_file():
                     mirror.mirror_plan(plan_id, sid, arm_id, out_path.read_bytes(),
                                        snapshot={"rig": rig_fp})
+                if telemetry:
+                    mirror.mirror_telemetry(
+                        plan_id, plan_id, arm_id,
+                        json.dumps(telemetry).encode("utf-8"),
+                        kp_key=str(telemetry.get("kp", "default")),
+                        summary={"abort": telemetry.get("abort"),
+                                 "gripper_stall": telemetry.get("gripper_stall"),
+                                 "tick": telemetry.get("tick")})
                 mirror.mirror_oracle(plan_id, arm_id, doc, rig_fingerprint=rig_fp)
             try:
                 await asyncio.to_thread(_mirror_oracle)
