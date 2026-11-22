@@ -255,6 +255,26 @@ def main(argv=None):
     out_path = out_dir / ("%s.json" % device)
     out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     print("\n  wrote  : %s" % out_path)
+    try:
+        import os
+        dsn = os.environ.get("REBOT_PG_DSN", "")
+        if dsn:
+            import sys
+            sub = str(Path(__file__).resolve().parent.parent / "substrate")
+            if sub not in sys.path:
+                sys.path.insert(0, sub)
+            from store import SubstrateStore
+            import calib as calib_mod
+            calib_obj = calib_mod.load(out_path)
+            store = SubstrateStore(dsn)
+            store.ensure_calibration(calib_obj.fingerprint, K=payload["K"], dist=payload["dist"],
+                                     image_size=payload["image_size"], calib_doc=payload)
+            corners = out_dir / "corners.jpg"
+            if corners.is_file():
+                store.put_blob(corners.read_bytes(), "other")
+            print("  mirrored intrinsics to substrate (%s)" % calib_obj.fingerprint)
+    except Exception as exc:  # noqa: BLE001 - mirror never fails calibration
+        print("  warning: intrinsics PG mirror failed: %s" % exc)
     return 0
 
 

@@ -1020,6 +1020,16 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
 
     trace["final"] = _finalise(bench, model, theta, trace, session, K, dist, T_prior, size, turn)
     (session / "trace.json").write_text(json.dumps(trace, indent=1) + "\n", encoding="utf-8")
+    try:
+        import sys
+        sub = str(Path(__file__).resolve().parent.parent / "substrate")
+        if sub not in sys.path:
+            sys.path.insert(0, sub)
+        import pg_cli
+        pg_cli.mirror_session(session.name, meta={"final": trace.get("final")},
+                              files=list(session.glob("*.json")) + list(session.glob("*.jpg")))
+    except Exception as exc:  # noqa: BLE001 - mirror never fails the climb
+        print("  warning: session PG mirror failed: %s" % exc)
     print("\nsession: %s" % session)
     print("final: %s" % json.dumps({k: trace["final"][k] for k in
                                     ("err_all_px", "tag_rms_px", "verify_ok", "candidate")}))

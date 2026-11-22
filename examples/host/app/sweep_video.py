@@ -269,4 +269,13 @@ def extract(segments, directory, targets, still_rad=STILL_RAD,
     result = [saved[number] for number in range(1, len(targets) + 1)]
     (directory / "poses.json").write_text(json.dumps(result, indent=2, default=str) + "\n",
                                           encoding="utf-8")
+    try:
+        import sys
+        sub = str(Path(__file__).resolve().parent.parent / "substrate")
+        if sub not in sys.path:
+            sys.path.insert(0, sub)
+        import pg_cli
+        pg_cli.mirror_session(directory.name, files=[directory / "poses.json"])
+    except Exception as exc:  # noqa: BLE001 - mirror never fails the sweep
+        print("  warning: sweep poses PG mirror failed: %s" % exc)
     return result
