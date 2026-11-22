@@ -82,7 +82,7 @@ python tests/test_embed_activity.py   # isolated embed activity via df.http()
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 ```
 
-Apply migrations `0001`–`0010` in order (each is idempotent).
+Apply migrations `0001`–`0011` in order (each is idempotent).
 
 Full offline app suite (file mode; 646 checks) — run inside the capture container with
 the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
@@ -167,7 +167,7 @@ named volume). From `examples/host`:
 
 1. `docker compose up -d --build` — substrate + mediamtx + capture + planner; capture/planner
    wait for substrate healthy. `REBOT_PG_DSN` defaults to the compose-network DSN.
-2. Apply migrations `0001`–`0010` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+2. Apply migrations `0001`–`0011` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
    Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
    capture upload → PG, and `/trace` → PG. Re-verify the arm parked read-only.
@@ -251,23 +251,30 @@ no separate planner round trip for the compute. Two layers:
   adaptive damping, active joint-limit constraints, backtracking line search — *not*
   openrr/k's different solver), the orientation/staging helpers, trapezoid legs, sag
   compensation, and `traj.build`/`validate`. Refusals panic → SQL ERROR → rollback.
+- **`rebot_plan_sequence(urdf, dump, targets, options, snap)`** — the multi-marker
+  core (port of `plan_to_target.plan_sequence`, the gateway `gripper="alternate"`
+  path): endpoint-first per marker, gripper open/close on odd/even, stage-and-slide
+  on odd markers, joint-space return. Shares the CLIK/leg/sag/build helpers.
 - **`plan_one(workspace, pose, target, options, arm_id)`** — thin PL/pgSQL wrapper
-  (migration `0010`): gathers a consistent snapshot (URDF from `world.robot_model` +
-  active rig + keyed sag map), calls the core in **one transaction**, persists the
-  trajectory to `evidence.plan` + blob, returns `{plan_id, summary}`. The gateway
-  becomes a thin HTTP→SQL adapter; the CLI can call the same function.
+  (migrations `0010`/`0011`): gathers a consistent snapshot (URDF from
+  `world.robot_model` + active rig + keyed sag map), **dispatches on the target type**
+  (object → `rebot_plan`, array → `rebot_plan_sequence`), calls the core in **one
+  transaction**, persists the trajectory to `evidence.plan` + blob, returns
+  `{plan_id, summary}`. The gateway becomes a thin HTTP→SQL adapter; the CLI can call
+  the same function.
 
-**Parity (validated, `tests/plan_parity.py`, run in the planner container):** joint
-commands match the Pinocchio reference to **~3e-15 rad** (machine precision), tau to
-**~2e-3 Nm** (URDF RNEA gravity), velocity/time at rounding precision; identical
-waypoint counts, durations, and worst-IK. Iterative IK is not literally byte-identical
-across solvers, so parity is physical equivalence within the acceptance band.
+**Parity (validated, `tests/plan_parity.py`, run in the planner container):** both
+hover (3 seeds) and sequence (2 marker sets, 401/469 waypoints) match the Pinocchio
+reference — joint commands to **~6e-15 rad** (machine precision), tau to **~2e-3 Nm**
+(URDF RNEA gravity), velocity/time at rounding precision; identical waypoint counts,
+durations, and worst-IK. Iterative IK is not literally byte-identical across solvers,
+so parity is physical equivalence within the acceptance band.
 
-**Scope / follow-ups:** the hover single-target branch is implemented and validated.
-The CLI-only Cartesian **pick** branch and **`plan_sequence`** (multi-marker) are
-follow-ups (the gripper/orientation-blend helpers are staged). The live gateway is
-**not** switched to `plan_one` yet — that changes the motion path and needs bench
-validation + arm-parked go-ahead. `world.robot_model` must be seeded with the URDF
+**Scope / follow-ups:** hover single-target and multi-marker sequence are implemented
+and validated (both live gateway paths). The CLI-only Cartesian **pick** branch is a
+follow-up (the orientation-blend helper is staged). The live gateway is **not**
+switched to `plan_one` yet — that changes the motion path and needs bench validation
++ arm-parked go-ahead. `world.robot_model` must be seeded with the URDF
 (`tests/test_plan_one.py` does this).
 
 ```bash

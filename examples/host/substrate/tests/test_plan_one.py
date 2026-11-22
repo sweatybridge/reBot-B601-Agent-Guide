@@ -56,4 +56,24 @@ try:
 except psycopg.Error as e:
     conn.rollback()
     print("refusal OK:", str(e).splitlines()[0][:70])
+
+# sequence dispatch: an array target -> plan_sequence (gripper alternate path)
+seq_targets = [{"format": "rebot-target",
+                "point": [float(tip[0] + dx), float(tip[1] + dy), float(tip[2]) - 0.035],
+                "point_frame": "tip", "tip_offset_m": 0.035}
+               for dx, dy in [[0.02, 0.02], [-0.02, 0.02], [0.0, -0.03]]]
+srow = conn.execute("SELECT plan_one(%s,%s,%s,%s,%s)",
+                    ("ws_plan_test", json.dumps(pose), json.dumps(seq_targets),
+                     json.dumps(options), "b601")).fetchone()
+sres = srow[0]
+assert sres["summary"]["markers"] == 3, "sequence markers wrong"
+sp = conn.execute("SELECT blob_sha, status FROM evidence.plan WHERE plan_id=%s",
+                  (sres["plan_id"],)).fetchone()
+assert sp is not None and sp[1] == "planned"
+sb = conn.execute("SELECT bytes FROM evidence.blob WHERE sha256=%s", (sp[0],)).fetchone()
+spayload = json.loads(bytes(sb[0]).decode())
+assert spayload["capture"]["sequence"] is True
+assert len(spayload["capture"]["targets"]) == 3
+print("sequence OK:", sres["plan_id"], "markers", sres["summary"]["markers"],
+      "waypoints", sres["summary"]["waypoints"], "dur %.3f" % sres["summary"]["duration_s"])
 print("PLAN_ONE OK")
