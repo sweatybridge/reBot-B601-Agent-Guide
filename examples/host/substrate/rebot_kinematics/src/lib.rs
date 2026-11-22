@@ -16,6 +16,7 @@ use nalgebra::{Isometry3, Translation3, UnitQuaternion};
 pg_module_magic!();
 
 mod plan;
+mod calib;
 
 fn load_chain(urdf: &str) -> k::Chain<f64> {
     let robot = urdf_rs::read_from_string(urdf)
@@ -676,7 +677,7 @@ fn undistort(xd: f64, yd: f64, dist: &[f64]) -> (f64, f64) {
 /// row-major 4x4 (16). Returns {point:[x,y,z], distance, grazing_deg}.
 /// Degenerate/parallel/away rays raise a SQL ERROR (Python: ExtrinsicsError).
 #[pg_extern]
-fn rebot_ray_plane(k: Vec<f64>, dist: Vec<f64>, t_base_cam: Vec<f64>,
+pub(crate) fn rebot_ray_plane(k: Vec<f64>, dist: Vec<f64>, t_base_cam: Vec<f64>,
                    u: f64, v: f64, plane_z: f64) -> pgrx::JsonB {
     if k.len() != 9 || t_base_cam.len() != 16 {
         panic!("K must be 9, T_base_cam 16");
@@ -747,3 +748,4 @@ mod tests {
         assert!((pose[2] - 0.6).abs() < 1e-9, "tip z = {}", pose[2]);
     }
 }
+
