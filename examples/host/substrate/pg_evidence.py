@@ -50,7 +50,7 @@ class PgEvidenceMirror:
         self.store.add_telemetry(exec_id, plan_id, arm_id, sha, kp_key, summary or {})
         return sha
 
-    def mirror_rig(self, rig) -> None:
+    def mirror_rig(self, rig, witness_sha=None) -> None:
         """Mirror an extrinsics.Rig as the active shared rig (numpy -> lists)."""
         def lst(x):
             return x.tolist() if hasattr(x, "tolist") else x
@@ -61,7 +61,8 @@ class PgEvidenceMirror:
             rms_px=getattr(rig, "rms_px", None), rms_mm=getattr(rig, "rms_mm", None),
             witness=getattr(rig, "witness", None),
             provenance=rig.provenance() if hasattr(rig, "provenance") else None,
-            rig_doc=rig.to_dict() if hasattr(rig, "to_dict") else None)
+            rig_doc=rig.to_dict() if hasattr(rig, "to_dict") else None,
+            witness_sha=witness_sha)
 
     def mirror_sag(self, arm_id: str, map_doc: dict) -> None:
         self.store.ensure_arm(arm_id)

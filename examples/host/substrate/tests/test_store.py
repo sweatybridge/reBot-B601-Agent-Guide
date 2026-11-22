@@ -28,6 +28,9 @@ assert store.blob_exists(sha)
 
 # episode + redacted append-only events
 sid = "20261122T000000Z-store1"
+# rerun-safe: clear this test episode's events so seq starts at 1
+with store._conn() as c:
+    c.execute("DELETE FROM evidence.event WHERE episode_id=%s", (sid,))
 store.create_episode(sid, "ws_store", ["arm_store"])
 s1 = store.record_event(sid, "page", "user_message",
                         {"text": "hi", "api_key": "SECRET", "total_tokens": 5})

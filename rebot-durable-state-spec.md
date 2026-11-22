@@ -939,6 +939,20 @@ Phased, each step gated by the previous step's tests staying green:
 
 Motion-affecting cutover steps require explicit user go-ahead with the arm parked.
 
+**Execution status (done):** steps 2–3 were skipped by directive (non-production bench;
+old file state discarded, no backfill). The cutover went straight to PG-only writes/reads
+in PG mode, and the flatten is complete: `state/` removed; `config/` (tls + bootstrap)
+and `export/` (derived bundles) remain; disposable `work/` scratch holds cv2
+materializations, the MediaMTX spool (ingested into PG then deleted), and file-mode
+artifacts for offline tests. The rig/witness/intrinsics/sag caches rematerialize from PG
+at startup (`rig_doc`, `witness_sha` migration 0009, `calib_doc`, `learning.sag_map`), so
+wiping `work/` loses nothing authoritative. File mode (no `REBOT_PG_DSN`) survives for the
+offline selftest under `work/`. Validated: 646-check offline selftest (file mode) + live
+PG-mode dry checks (synthetic-pose `/plan` → `evidence.plan`, capture upload/serving/list
+from PG with no file writes, `/trace` → `evidence.event`, rig seeded into
+`world.shared_rig`). The arm was never commanded; motor reads were unavailable (unpowered)
+during the work, and no motion path was exercised.
+
 ## 9. Test plan
 
 - **Schema/integrity (offline):** FK cascade, blob refcount triggers, orphan GC grace,
@@ -1080,13 +1094,22 @@ worker; `df.result` returned `{"rows":[{"pose":[0.1355,…]}],"row_count":1}`.
 - Isolated decode/OpenCV activities (FFmpeg frame re-extraction, calibration feature
   matching, detector) as `df.http()` services — the embed activity is the proven pattern.
 - The production embedding model choice (§10 fork); the pipeline is model-agnostic.
-- The final physical `state/` removal (§8): reads are PG-primary with file fallback and
-  `config/`+`export/` exist, but the fallback writes and MediaMTX spool still use `state/`.
 - General obstacle collision beyond the worktop capsule model and deliberate-contact
   exceptions for two-arm self-collision.
 
+**Flatten validation (added):** the full offline selftest passes (646 checks, 0 failed)
+in file mode with the flattened `work/` root, run inside the capture container with the
+workdir on container-local storage. Two environment traps found: (1) the selftest's
+`O_APPEND` event log is unreliable on the Windows Docker bind mount (spurious empty
+lines / partial appends) — run it with `--workdir /tmp/...` (container-local fs);
+(2) the CAD-mesh and commissioned-rig tests need gitignored assets provisioned
+(`app/cad/meshes/`, a fitted rig in the default calib dir). Live PG-mode dry checks
+passed: synthetic-pose `/plan` persisted to `evidence.plan` (no file written), capture
+upload/serving/list PG-only (bit-identical frame, no scratch file), `/trace` →
+`evidence.event`, rig + witness schema seeded into `world.shared_rig`.
+
 **Reproduction:** see §11 (build the image, `docker compose up -d`, apply migrations
-`0001`–`0008`, run the SQL + Python suites under `examples/host/substrate/tests/`).
+`0001`–`0009`, run the SQL + Python suites under `examples/host/substrate/tests/`).
 
 ## 10. Open forks / decisions
 

@@ -62,7 +62,10 @@ VERSION = "0.2.0"
 HERE = Path(__file__).resolve().parent      # app/
 ROOT = HERE.parent                          # the host directory
 WEB_DIR = ROOT / "web"
-STATE = ROOT / "state"                       # captures, calib, tls, tags, out, work
+# Flattened layout (§8): no state/. Authoritative data lives in the substrate
+# (PG); work/ holds only disposable scratch — cv2 materializations, the MediaMTX
+# spool, and file-mode artifacts when no substrate is configured (offline tests).
+WORK = ROOT / "work"
 
 CAPTURE_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -111,13 +114,37 @@ def read_meta(directory: Path) -> dict:
         return {}
 
 
+def capture_frame_bytes(app, capture_id):
+    """The capture's JPEG: the PG blob in PG mode, the file otherwise. None if absent."""
+    store = app.get("pg_store")
+    if store is not None:
+        return store.read_capture_frame(capture_id)
+    path = Path(app["captures"]) / capture_id / "frame.jpg"
+    return path.read_bytes() if path.is_file() else None
+
+
+def materialize_capture_frame(app, capture_id):
+    """A file path for cv2. PG mode materializes the blob into the scratch cache
+    (captures are content-addressed and immutable, so a cached copy is exact)."""
+    directory = Path(app["captures"]) / capture_id
+    path = directory / "frame.jpg"
+    if path.is_file():
+        return path
+    data = capture_frame_bytes(app, capture_id)
+    if data is None:
+        return None
+    directory.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
 @web.middleware
 async def json_errors(request: web.Request, handler):
     """Every error leaves as JSON, with its reason in `error`.
 
     aiohttp's `HTTPUnprocessableEntity(text=...)` answers `text/plain`, and the
     panel parses JSON -- so a 422 with a perfectly good explanation ("no
-    calibration in /app/state/calib: run calibrate_intrinsics.py once") arrived
+    calibration in /app/work/calib: run calibrate_intrinsics.py once") arrived
     as the useless "server said 422". JSON is the contract for this API.
     """
     try:
@@ -814,7 +841,6 @@ async def handle_capture(request: web.Request) -> web.Response:
                     or not all(isinstance(tap[k], (int, float)) for k in "uv")):
                 raise web.HTTPBadRequest(text="tap must be {u: number, v: number}")
 
-        partial.replace(frame_path)
         record = dict(meta)
         record["frame"] = "frame.jpg"
         record["server"] = {
@@ -830,15 +856,30 @@ async def handle_capture(request: web.Request) -> web.Response:
             # The pose is taken here, not by the client: a calibration click is
             # only worth anything if the joints are the ones the arm had.
             record["server"]["pose"] = await capture_pose(app)
-        (directory / "meta.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         mirror = app.get("pg_mirror")
         if mirror is not None:
+            # PG mode: the substrate is the only capture store. The streamed
+            # partial is scratch — persist it, then remove it. A capture that
+            # cannot be persisted is refused, not stranded on disk.
+            kind = "calibration" if purpose in ("extrinsics", "calib") else "execution"
             try:
-                kind = "calibration" if purpose in ("extrinsics", "calib") else "execution"
-                mirror.mirror_capture(directory.name, record, frame_path.read_bytes(),
+                mirror.mirror_capture(directory.name, record, partial.read_bytes(),
                                       kind=kind, image_size=meta.get("image_size"))
-            except Exception as exc:  # noqa: BLE001 - mirror never breaks the upload (§8.4)
-                logging.warning("capture mirror for %s failed: %s", directory.name, exc)
+            except Exception as exc:  # noqa: BLE001
+                partial.unlink(missing_ok=True)
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+                raise web.HTTPServiceUnavailable(text="capture store unavailable: %s" % exc)
+            partial.unlink(missing_ok=True)
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        else:
+            partial.replace(frame_path)
+            (directory / "meta.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
     except Exception:
         (directory / "meta.json").unlink(missing_ok=True)
@@ -1814,10 +1855,17 @@ async def oracle_prepare(app, plan_id):
     try:
         if not app["camera"]:
             return None
-        path = app["out_dir"] / ("%s.json" % plan_id)
-        if not path.is_file():
-            return None
-        trajectory = json.loads(path.read_text(encoding="utf-8"))
+        store = app.get("pg_store")
+        if store is not None:
+            raw = await asyncio.to_thread(store.read_plan_blob, plan_id)
+            if raw is None:
+                return None
+            trajectory = json.loads(raw)
+        else:
+            path = app["out_dir"] / ("%s.json" % plan_id)
+            if not path.is_file():
+                return None
+            trajectory = json.loads(path.read_text(encoding="utf-8"))
         windows = oracle_mod.hold_windows(trajectory.get("waypoints") or [])
         if not windows:
             return None
@@ -1826,8 +1874,12 @@ async def oracle_prepare(app, plan_id):
         # residual (§7.4). /move plans have no such list -- empty, not an error.
         targets = ((trajectory.get("capture") or {}).get("targets")) or []
         pre = await asyncio.to_thread(grab_one, app, app["camera"], False)
-        frame_path = app["captures"] / pre["id"] / "frame.jpg"
-        pre_bytes = await asyncio.to_thread(frame_path.read_bytes)
+        pre_bytes = await asyncio.to_thread(capture_frame_bytes, app, pre["id"])
+        if pre_bytes is None:
+            return None
+        # cv2 reads a path: the scratch materialization of the PG blob (PG mode)
+        # or the capture file (file mode). The authoritative copy is the blob.
+        frame_path = await asyncio.to_thread(materialize_capture_frame, app, pre["id"])
         directory = app["oracle_dir"] / plan_id
         await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread((directory / "pre.jpg").write_bytes, pre_bytes)
@@ -1880,8 +1932,19 @@ async def _oracle_hold_grabs(app, prep):
             if not ok:
                 continue
             data = buffer.tobytes()
+            # Scratch materialization for cv2; the authoritative copy is the PG
+            # blob, cataloged as a hold still so retention refcounts protect it.
             await asyncio.to_thread(path.write_bytes, data)
-            prep["holds"][number] = {"path": str(path), "blob": await trace_blob(app, data)}
+            blob = await trace_blob(app, data)
+            mirror = app.get("pg_mirror")
+            if mirror is not None:
+                try:
+                    await asyncio.to_thread(
+                        mirror.mirror_still, prep["plan_id"], data, "hold",
+                        app.get("arm_id", "b601"), midpoint)
+                except Exception as exc:  # noqa: BLE001 - a missed catalog row is not fatal
+                    logging.warning("hold still catalog for %s failed: %s", prep["plan_id"], exc)
+            prep["holds"][number] = {"path": str(path), "blob": blob}
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - a missed hold is a missed sample
@@ -2103,8 +2166,17 @@ async def oracle_finish(app, prep, sid):
             ok, buffer = cv2.imencode(".jpg", post, [cv2.IMWRITE_JPEG_QUALITY, 92])
             if ok:
                 data = buffer.tobytes()
-                await asyncio.to_thread(
-                    (app["oracle_dir"] / plan_id / "post.jpg").write_bytes, data)
+                mirror = app.get("pg_mirror")
+                if mirror is not None:
+                    try:
+                        await asyncio.to_thread(
+                            mirror.mirror_still, plan_id, data, "post_exec",
+                            app.get("arm_id", "b601"))
+                    except Exception as exc:  # noqa: BLE001
+                        logging.warning("post still catalog for %s failed: %s", plan_id, exc)
+                else:
+                    await asyncio.to_thread(
+                        (app["oracle_dir"] / plan_id / "post.jpg").write_bytes, data)
                 doc["post_frame"] = await trace_blob(app, data)
             if pre_image is not None:
                 post_upright, _calib, _turn = locator.upright_frame(
@@ -2143,41 +2215,34 @@ async def oracle_finish(app, prep, sid):
         if radii:
             doc["max_radius_m"] = round(max(radii), 4)
         doc["verdict"] = oracle_mod.attribute(doc)
-        await asyncio.to_thread(
-            (app["oracle_dir"] / ("%s.json" % plan_id)).write_text,
-            json.dumps(doc, indent=2) + "\n", encoding="utf-8")
         mirror = app.get("pg_mirror")
         if mirror is not None:
+            # PG mode: the verdict doc is persisted to the substrate only. The
+            # plan and telemetry are already there (the planner persists them).
             def _mirror_oracle():
                 arm_id = app.get("arm_id", "b601")
                 mirror.store.ensure_arm(arm_id)
                 rig_fp = rig.fingerprint if rig is not None else None
                 mirror.store.create_episode(sid, mirror.workspace_id, [arm_id], kind="execution")
-                out_path = app["out_dir"] / ("%s.json" % plan_id)
-                if out_path.is_file():
-                    mirror.mirror_plan(plan_id, sid, arm_id, out_path.read_bytes(),
-                                       snapshot={"rig": rig_fp})
-                if telemetry:
-                    mirror.mirror_telemetry(
-                        plan_id, plan_id, arm_id,
-                        json.dumps(telemetry).encode("utf-8"),
-                        kp_key=str(telemetry.get("kp", "default")),
-                        summary={"abort": telemetry.get("abort"),
-                                 "gripper_stall": telemetry.get("gripper_stall"),
-                                 "tick": telemetry.get("tick")})
                 mirror.mirror_oracle(plan_id, arm_id, doc, rig_fingerprint=rig_fp)
             try:
                 await asyncio.to_thread(_mirror_oracle)
-            except Exception as exc:  # noqa: BLE001 - the mirror never breaks /execute (§8.4)
-                logging.warning("oracle mirror for %s failed: %s", plan_id, exc)
+            except Exception as exc:  # noqa: BLE001 - the oracle never breaks /execute (§8.4)
+                logging.warning("oracle persist for %s failed: %s", plan_id, exc)
+        else:
+            await asyncio.to_thread(
+                (app["oracle_dir"] / ("%s.json" % plan_id)).write_text,
+                json.dumps(doc, indent=2) + "\n", encoding="utf-8")
         await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=doc["verdict"],
                           holds=len(doc["holds"]),
                           telemetry=bool(telemetry), error=None)
         # §7.4/§7.1: the oracle's holds populate the accuracy envelope, and the
         # monitor watches them for identification proposals. Both are strictly
         # additive (§8.4): a failure here never touches the doc or the execution.
+        # PG mode: the cells were already updated by mirror_oracle; no file map.
         try:
-            identify_mod.update_accuracy_map(app["accuracy_map_path"], doc, rig=rig)
+            if app.get("pg_mirror") is None:
+                identify_mod.update_accuracy_map(app["accuracy_map_path"], doc, rig=rig)
         except Exception as exc:  # noqa: BLE001
             logging.warning("accuracy map update for %s failed: %s", plan_id, exc)
         try:
@@ -2197,9 +2262,18 @@ async def oracle_finish(app, prep, sid):
         logging.warning("oracle for %s failed: %s", plan_id, exc)
         doc["error"] = "%s: %s" % (type(exc).__name__, exc)
         try:
-            await asyncio.to_thread(
-                (app["oracle_dir"] / ("%s.json" % plan_id)).write_text,
-                json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+            mirror = app.get("pg_mirror")
+            if mirror is not None:
+                def _mirror_error():
+                    arm_id = app.get("arm_id", "b601")
+                    mirror.store.ensure_arm(arm_id)
+                    mirror.store.create_episode(sid, mirror.workspace_id, [arm_id], kind="execution")
+                    mirror.mirror_oracle(plan_id, arm_id, doc)
+                await asyncio.to_thread(_mirror_error)
+            else:
+                await asyncio.to_thread(
+                    (app["oracle_dir"] / ("%s.json" % plan_id)).write_text,
+                    json.dumps(doc, indent=2) + "\n", encoding="utf-8")
             await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=None,
                               holds=len(doc["holds"]), error=doc["error"])
         except Exception as inner:  # noqa: BLE001 - not even the report is fatal
@@ -3018,7 +3092,19 @@ def _pg_mirror_rig(app, rig):
     mirror = app.get("pg_mirror")
     if mirror is not None and rig is not None:
         try:
-            mirror.mirror_rig(rig)
+            # The witness reference frame is evidence too: store it as a blob so
+            # the scratch cache can be rematerialized after a wipe (§8 flatten).
+            witness_sha = None
+            record = getattr(rig, "witness", None) or {}
+            image = record.get("image")
+            base = Path(app.get("extrinsics_path") or ".").resolve().parent
+            if image:
+                wpath = Path(image)
+                if not wpath.is_absolute():
+                    wpath = base / wpath
+                if wpath.is_file():
+                    witness_sha = mirror.store.put_blob(wpath.read_bytes(), "still")
+            mirror.mirror_rig(rig, witness_sha=witness_sha)
         except Exception as exc:  # noqa: BLE001 - mirror never breaks the rig path (§8.4)
             logging.warning("rig mirror failed: %s", exc)
 
@@ -3033,7 +3119,8 @@ def _pg_mirror_sag(app, map_doc):
 
 
 def _accuracy_map(app):
-    """PG-primary accuracy envelope (learning read cutover); file fallback."""
+    """The accuracy envelope: PG-only in PG mode (the cells are the record);
+    the file map only in file mode."""
     store = app.get("pg_store")
     rig = app.get("rig")
     if store is not None and rig is not None:
@@ -3041,19 +3128,37 @@ def _accuracy_map(app):
             return store.read_accuracy_map(app.get("arm_id", "b601"), rig.fingerprint)
         except Exception as exc:  # noqa: BLE001
             logging.warning("accuracy map PG read failed: %s", exc)
+            return {}
     return identify_mod.load_accuracy_map(app["accuracy_map_path"])
 
 
 def _load_active_rig(app):
-    """Reconstruct the active rig from PG (lossless rig_doc); None if absent/error."""
+    """Reconstruct the active rig from PG (lossless rig_doc); None if absent/error.
+
+    Materializes the rig doc + witness frame into the scratch calib cache so the
+    file-based consumers (witness.load_for, the trace manifest's rig copy) work
+    after a cache wipe. PG remains the system of record."""
     store = app.get("pg_store")
     if store is None:
         return None
     try:
-        doc = store.read_active_rig_doc(app.get("pg_workspace", "default"))
-        if doc is None:
+        row = store.read_active_rig_row(app.get("pg_workspace", "default"))
+        if row is None or row["rig_doc"] is None:
             return None
-        return extrinsics.Rig.from_dict(doc)
+        doc = row["rig_doc"]
+        rig = extrinsics.Rig.from_dict(doc)
+        calib = Path(app["calib"])
+        calib.mkdir(parents=True, exist_ok=True)
+        (calib / "extrinsics-fixed.json").write_text(json.dumps(doc), encoding="utf-8")
+        record = getattr(rig, "witness", None) or {}
+        image = record.get("image")
+        if image and row["witness_sha"]:
+            data = store.get_blob(row["witness_sha"])
+            name = Path(image).name
+            (calib / name).write_bytes(data)
+            if Path(image).is_absolute():
+                Path(image).write_bytes(data)
+        return rig
     except Exception as exc:  # noqa: BLE001
         logging.warning("PG rig load failed: %s", exc)
         return None
@@ -3079,24 +3184,25 @@ def grab_one(app, camera_url, commit=True):
 
     def save_capture(pose):
         capture_id = new_capture_id()
-        directory = Path(app["captures"]) / capture_id
-        directory.mkdir(parents=True, exist_ok=False)
-        cv2.imwrite(str(directory / "frame.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
         record = {"id": capture_id, "pose": pose, "captured_at": utc_now(),
                   "source": "capture-pose"}
         if pose is None:
             record["pose_note"] = "not read: the base tag solved the camera"
         meta = {"purpose": "extrinsics", "image_size": size, "server": record}
-        (directory / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
         mirror = app.get("pg_mirror")
         if mirror is not None:
-            try:
-                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-                if ok:
-                    mirror.mirror_capture(capture_id, meta, buf.tobytes(),
-                                          kind="calibration", image_size=size)
-            except Exception as exc:  # noqa: BLE001 - the mirror never breaks capture (§8.4)
-                logging.warning("capture mirror for %s failed: %s", capture_id, exc)
+            # PG mode: the substrate is the only capture store; cv2 consumers
+            # materialize the blob on demand (materialize_capture_frame).
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            if not ok:
+                raise auto_calibrate.AutoError("cannot encode the capture frame")
+            mirror.mirror_capture(capture_id, meta, buf.tobytes(),
+                                  kind="calibration", image_size=size)
+            return capture_id
+        directory = Path(app["captures"]) / capture_id
+        directory.mkdir(parents=True, exist_ok=False)
+        cv2.imwrite(str(directory / "frame.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        (directory / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
         return capture_id
 
     marker_payload = None
@@ -3186,11 +3292,19 @@ async def handle_file(request: web.Request) -> web.StreamResponse:
     if not CAPTURE_ID.match(capture_id) or not SAFE_NAME.match(name):
         raise web.HTTPNotFound()
     store = app.get("pg_store")
-    if store is not None and name == "frame.jpg":
-        data = await asyncio.to_thread(store.read_capture_frame, capture_id)
-        if data is not None:
+    if store is not None:
+        # PG mode: the catalog serves the frame and meta; no file fallback.
+        if name == "frame.jpg":
+            data = await asyncio.to_thread(store.read_capture_frame, capture_id)
+            if data is None:
+                raise web.HTTPNotFound()
             return web.Response(body=data, content_type="image/jpeg",
                                 headers={"Cache-Control": "no-store"})
+        if name == "meta.json":
+            meta = await asyncio.to_thread(store.read_capture_meta, capture_id)
+            if meta is None:
+                raise web.HTTPNotFound()
+            return web.json_response(meta, headers={"Cache-Control": "no-store"})
     path = (app["captures"] / capture_id / name).resolve()
     root = app["captures"].resolve()
     if root not in path.parents or not path.is_file():
@@ -3229,7 +3343,14 @@ async def recordings_ingest_loop(app):
                     ep = "rec-" + mp4.stem
                     mirror.store.create_episode(ep, app.get("pg_workspace", "default"), [], kind="execution")
                     await asyncio.to_thread(mirror.mirror_recording, ep, mp4)
-                    seen.add(key)
+                    # The spool is transient: remove the file after the confirmed
+                    # PG write. If it is still open, retry next pass — re-ingest
+                    # is idempotent (content-addressed blob, fixed episode/seq).
+                    try:
+                        await asyncio.to_thread(mp4.unlink)
+                        seen.add(key)
+                    except OSError:
+                        pass
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -3293,7 +3414,7 @@ def build_app(args) -> web.Application:
     app["mediamtx_api"] = (getattr(args, "mediamtx_api", "")
                            or os.environ.get("REBOT_MEDIAMTX_API", "http://127.0.0.1:9997")).rstrip("/")
     app["recordings"] = Path(getattr(args, "recordings", "")
-                             or os.environ.get("REBOT_RECORDINGS", str(STATE / "recordings"))).resolve()
+                             or os.environ.get("REBOT_RECORDINGS", str(WORK / "recordings"))).resolve()
     # "x,y,z,yaw" in metres and degrees: where the tag sits on the base, in the
     # robot's own frame. A capture that sees it writes the rig with no arm
     # motion; a sweep can also use it instead of a tap.
@@ -3373,13 +3494,13 @@ def build_app(args) -> web.Application:
     # Session traces (§4). getattr defaults keep older callers (the selftest's
     # hand-built args) working: tracing is on unless --no-trace says otherwise.
     app["trace_retention_days"] = int(getattr(args, "trace_retention_days", 30) or 30)
-    app["traces_dir"] = Path(getattr(args, "traces_dir", "") or STATE / "traces").resolve()
+    app["traces_dir"] = Path(getattr(args, "traces_dir", "") or WORK / "traces").resolve()
     app["tool_schemas_sha256"] = None
     if getattr(args, "no_trace", False):
         app["traces"] = None
         app["pg_mirror"] = None
     elif getattr(args, "pg_dsn", ""):
-        # §8 cutover: traces go to the substrate (PG), not state/traces/. The
+        # §8 cutover: traces go to the substrate (PG), not the file log. The
         # store seam lives in examples/host/substrate; psycopg must be installed.
         import sys
         substrate_dir = str(ROOT / "substrate")
@@ -3398,10 +3519,38 @@ def build_app(args) -> web.Application:
         app["traces"] = PgTraceRecorder(
             pg_store, workspace_id=pg_workspace,
             snapshot=lambda sid: trace_manifest(app, sid))
-        # Startup rig: PG-primary if PG has an active rig; else seed PG from the file.
+        # Startup rig: PG is the system of record. _load_active_rig materializes
+        # the rig doc + witness into the scratch cache; with no PG rig yet, seed
+        # PG from a file-mode rig if one exists.
+        try:
+            # Intrinsics too: the vision flow reads a calib file, so materialize
+            # the newest PG calibration into the cache after a wipe.
+            crow = pg_store.read_latest_calib_doc()
+            if crow and crow["calib_doc"]:
+                cdoc = crow["calib_doc"]
+                cname = str(cdoc.get("device") or crow["calib_fingerprint"])
+                cpath = Path(app["calib"]) / ("%s.json" % cname)
+                if not cpath.is_file():
+                    cpath.parent.mkdir(parents=True, exist_ok=True)
+                    cpath.write_text(json.dumps(cdoc, indent=2) + "\n", encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("intrinsics cache materialization failed: %s", exc)
         pg_rig = _load_active_rig(app)
         if pg_rig is not None:
             app["rig"] = pg_rig
+            app["extrinsics_path"] = str(Path(app["calib"]) / "extrinsics-fixed.json")
+            try:
+                app["witness"] = witness.load_for(pg_rig, Path(app["calib"]))
+            except witness.WitnessError as error:
+                logging.warning("the PG rig's witness cannot be used: %s", error)
+                app["witness"] = None
+            try:
+                smap = pg_store.read_sag_map_doc(app.get("arm_id", "b601"))
+                if smap:
+                    (Path(app["calib"]) / ("sag-%s.json" % smap["rig_fingerprint"])).write_text(
+                        json.dumps(smap), encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("sag cache materialization failed: %s", exc)
         elif app.get("rig") is not None:
             _pg_mirror_rig(app, app["rig"])
         # Mirror the base marker spec into world.tag; restore the llm context cache.
@@ -3426,8 +3575,8 @@ def build_app(args) -> web.Application:
         app["pg_mirror"] = None
     app["captures"].mkdir(parents=True, exist_ok=True)
     app["calib"].mkdir(parents=True, exist_ok=True)
-    # The oracle's evidence (§5.3) lives beside the captures, under the same
-    # state root the planner writes out/ to (a shared bind mount in production).
+    # Scratch dirs for cv2 materializations and file-mode artifacts (§8 flatten):
+    # in PG mode the authoritative records are in the substrate, these are cache.
     # Deriving from --captures keeps a test workdir entirely self-contained.
     app["out_dir"] = app["captures"].parent / "out"
     app["oracle_dir"] = app["captures"].parent / "oracle"
@@ -3502,7 +3651,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Phone capture endpoint for the B601 host.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.environ.get("REBOT_PORT", "8443")))
-    parser.add_argument("--captures", default=str(STATE / "captures"))
+    parser.add_argument("--captures", default=str(WORK / "captures"))
     parser.add_argument("--cert", default=os.environ.get("REBOT_CERT", ""),
                         help="PEM certificate chain (TLS)")
     parser.add_argument("--key", default=os.environ.get("REBOT_KEY", ""),
@@ -3519,7 +3668,7 @@ def main(argv=None):
     parser.add_argument("--execute", action="store_true",
                         default=os.environ.get("REBOT_EXECUTE", "0") == "1",
                         help="allow /execute to move the arm (also needs the gateway's flag)")
-    parser.add_argument("--calib-dir", default=os.environ.get("REBOT_CALIB_DIR", str(STATE / "calib")))
+    parser.add_argument("--calib-dir", default=os.environ.get("REBOT_CALIB_DIR", str(WORK / "calib")))
     parser.add_argument("--calib", default=os.environ.get("REBOT_CALIB", ""),
                         help="calibration JSON; default is the newest in --calib-dir")
     parser.add_argument("--marker-at", default=os.environ.get("REBOT_MARKER_AT", ""),
@@ -3542,7 +3691,7 @@ def main(argv=None):
                                                                  "http://127.0.0.1:9997"),
                         help="MediaMTX control API, used to record a sweep")
     parser.add_argument("--recordings", default=os.environ.get("REBOT_RECORDINGS",
-                                                               str(STATE / "recordings")),
+                                                               str(WORK / "recordings")),
                         help="where MediaMTX writes its recordings")
     parser.add_argument("--witness-max-px", type=float,
                         default=float(os.environ.get("REBOT_WITNESS_MAX_PX", "2.0")),
@@ -3574,7 +3723,7 @@ def main(argv=None):
                         help="seconds to wait for one model turn")
     parser.add_argument("--max-mb", type=int, default=25, help="largest accepted frame, MB")
     parser.add_argument("--traces-dir", default=os.environ.get("REBOT_TRACES_DIR",
-                                                               str(STATE / "traces")),
+                                                               str(WORK / "traces")),
                         help="where session traces and their blobs are written")
     parser.add_argument("--trace-retention-days", type=int,
                         default=int(os.environ.get("REBOT_TRACE_RETENTION_DAYS", "30")),
@@ -3583,7 +3732,7 @@ def main(argv=None):
                         help="disable session trace collection entirely (sensitive deployments)")
     parser.add_argument("--pg-dsn", default=os.environ.get("REBOT_PG_DSN", ""),
                         help="substrate Postgres DSN; when set, traces go to PG (the new stack) "
-                             "instead of state/traces/ (spec §8 cutover)")
+                             "instead of the file log (spec §8 cutover)")
     parser.add_argument("--pg-workspace", default=os.environ.get("REBOT_PG_WORKSPACE", "default"),
                         help="workspace id for trace sessions in the substrate")
     parser.add_argument("--quiet", action="store_true")
