@@ -6,9 +6,10 @@ Single-substrate Postgres backend for the reBot arm stack: durable orchestration
 state/learning/evidence schema. Design and rationale: `rebot-durable-state-spec.md`
 (repo root), especially §11 (build & deployment) and §9.1 (validation status).
 
-This is the **substrate foundation** (spec §8 step 1). It stands up the database and
-proves the extensions compose; it does not yet wire the live capture/planner path
-(dual-write/backfill/cutover are later phases) and does not move the arm.
+This is the **durable substrate** (spec §8). It stands up the database, proves the
+extensions compose, and carries the app cutover: with `REBOT_PG_DSN` set, the
+capture/planner path reads and writes PG-only and `state/` is flattened away
+(`config/` + `export/` + disposable `work/` scratch). It moves no arm.
 
 ## Stack
 
@@ -78,7 +79,19 @@ python tests/test_ingest_embed.py tests/_spool/ep_ingest   # HLS ingest + simila
 python tests/test_embed_activity.py   # isolated embed activity via df.http()
 ```
 
-Apply migrations `0001`–`0008` in order (each is idempotent).
+Apply migrations `0001`–`0009` in order (each is idempotent).
+
+Full offline app suite (file mode; 646 checks) — run inside the capture container with
+the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
+atomicity and produces spurious empty lines in the event log):
+
+```bash
+docker run --rm -v "<examples/host>:/app" -w /app rebot-capture:local \
+  python tests/selftest.py --workdir /tmp/selftest-work
+```
+
+Needs the gitignored assets provisioned: `app/cad/meshes/` (app/cad/fetch.py) and a
+fitted rig in the default calib dir for the environment-dependent Bench tests.
 
 All pass on PG 18.7: schema mechanisms, FK/IK round-trip on the real 6-DOF arm,
 gravity + collision matching the numpy reference, and a pg_durable workflow calling
@@ -92,7 +105,7 @@ IF NOT EXISTS` alone will not refresh it).
 ## App cutover (§8) — status
 
 The trace/evidence pipeline is cut over to the substrate. Run the capture server with
-`--pg-dsn` (or `REBOT_PG_DSN`) and traces go to Postgres instead of `state/traces/`:
+`--pg-dsn` (or `REBOT_PG_DSN`) and traces go to Postgres instead of the file log:
 
 ```bash
 python app/capture_server.py --pg-dsn "postgresql://postgres@localhost:5433/postgres"
@@ -109,73 +122,54 @@ python app/capture_server.py --pg-dsn "postgresql://postgres@localhost:5433/post
 - Validated: `tests/test_pg_trace.py` (events/blobs/manifest round-trip, redaction,
   bit-identical blobs, write-once manifest, seq continuation across restart).
 
-**Deeper paths — additive evidence mirror.** The capture/calibration/serving flow is
-deeply file-coupled (`click_for` passes `frame.jpg` paths to the detector; image URLs
-serve files; the rig hot-reload reads calib files), so a PG-only replacement would break
-it. Instead, `pg_evidence.py:PgEvidenceMirror` mirrors evidence into the substrate as it
-is produced — PG is the learning system of record, files stay the realtime serving cache.
-Wired so far (additive, wrapped so a PG failure never breaks the arm/chat, §8.4):
-- **Capture** (`save_capture`): meta/frames → `evidence.episode`/`still`/`blob` + manifest.
-- **Oracle** (verdict write): plan trajectory → `evidence.plan`, verdict →
-  `evidence.oracle_verdict`, holds → `accuracy_cell_update`, telemetry →
-  `evidence.telemetry`. The plan is mirrored first to satisfy the `oracle_verdict.plan_id` FK.
-- **Calib**: rig load/hot-reload (calibration, identification, capture-pose, startup) →
-  `world.shared_rig` (active rig superseded); sag fit → `learning.sag_map`. Accuracy cells
-  arrive via the oracle mirror.
-- Validated: `tests/test_pg_evidence.py` (capture/plan/oracle/telemetry/rig/sag round-trip
-  in FK order; accuracy cells validate).
+**Deeper paths — PG-only in PG mode.** With `--pg-dsn` set, the substrate is the system
+of record and the authoritative writes/reads are PG-only (no file fallback):
+- **Capture** (`handle_capture`, `grab_one`): meta/frames → `evidence.episode`/`still`/`blob`
+  + manifest; a capture that cannot be persisted is refused (503), not stranded on disk.
+  `handle_captures` lists from PG; `handle_file` serves frame/meta from PG; `click_for`
+  reads meta from PG and materializes the blob for the detector.
+- **Oracle**: plan read from `evidence.plan`; verdict → `evidence.oracle_verdict` (the
+  mirror IS the write); hold/pre/post frames cataloged as `evidence.still` rows (refcount-
+  protected) with scratch materializations for cv2; accuracy cells via `update_accuracy_cells`.
+- **Planner**: plans/telemetry written and read PG-only (`evidence.plan`/`telemetry`); plan
+  age from the catalog `created_at`; `/health` reports PG counts. The pure planner paths
+  (plan_to_target/sweep) keep their file contract via a rig+sag read-cache materialized
+  from PG per plan/move (`refresh_calib_cache`).
+- **Calib**: rig is PG-authoritative (`world.shared_rig.rig_doc`, lossless `Rig.from_dict`);
+  the witness reference frame is a blob (`witness_sha`, migration `0009`); intrinsics
+  (`calib_doc`) and the sag map are materialized into the scratch cache at startup, so a
+  cache wipe loses nothing. Accuracy reads are PG-only.
+- Validated: `tests/test_pg_evidence.py`, `tests/test_pg_trace.py`, and the full offline
+  selftest (646 checks, file mode) + live PG-mode dry checks (plan/capture/trace round-trips).
 
-**Remaining: the flatten.** `state/` → `config/` + `export/` is gated on a *full* serving
-cutover. The mirror is additive — the file-based realtime serving/calibration flow still
-reads/writes `state/` (image URLs, `click_for` frame paths, rig hot-reload). Flattening now
-would break it. The flatten requires rewiring those readers to PG (a separate, larger
-effort); until then `state/` stays the serving cache and PG is the learning system of record.
-Old file state can be discarded (non-production); no backfill needed.
+### The flatten — complete
 
-### Cutover status (what is PG-primary vs still file-based)
+`state/` is gone. The layout is now:
+- **PG (named volume)** — all authoritative state: traces, captures, oracle, plans,
+  telemetry, rig/witness/intrinsics, accuracy, sag, tags, monitor/KV, orchestration.
+- **`config/`** — tls + bootstrap (deploy secrets, read at startup).
+- **`export/`** — derived handoff bundles (staging; graduated cases live in git).
+- **`work/`** — disposable scratch (gitignored): cv2 materializations, the MediaMTX
+  recording spool (ingested into PG then deleted), and file-mode artifacts when no
+  substrate is configured (offline selftest). Wiping `work/` loses nothing authoritative;
+  the calib/rig/witness/sag caches rematerialize from PG at startup.
 
-PG-primary when `--pg-dsn` is set (file fallback otherwise):
-- **Traces** — full switch (`PgTraceRecorder`); reads from PG.
-- **Capture catalog** — `handle_captures` lists from PG; `handle_file` serves frames from
-  PG blobs; `click_for` reads meta from PG and materializes the frame blob for the detector.
-- **Capture upload** — `handle_capture` mirrors meta/frame into PG (files still written).
-- **Accuracy envelope** — `_accuracy_map` reads cells from PG (`read_accuracy_map`).
-- **Learning writes** — oracle verdict/plan/telemetry/rig/sag mirrored as produced.
+File mode (no `REBOT_PG_DSN`) still works for offline development/tests, with its
+artifacts under `work/` instead of `state/`.
 
-Still file-based (the remaining flatten work):
-- **Calib/rig reads** — `extrinsics.load_rig` reads the rig file. A PG cutover needs a
-  schema expansion: `world.shared_rig` lacks `joint_zeros`/`sigma`/`weakest`/`predicted`
-  that the live `Rig` object needs, so reconstruction is lossy until those are stored.
-- **Planner `out/` + `telemetry/` reads** — the planner reads/writes trajectory files.
-- **Directory move** — `state/tls` → `config/tls`, bootstrap → `config/`, bundles →
-  `export/`; requires updating the live stack's compose env (`REBOT_CERT`/`REBOT_KEY` etc.).
+### Deployment (arm parked)
 
-The flatten (removing `state/` as source of truth) completes once those reads are cut over
-and the directory move is deployed. Deployment restarts the live capture/planner containers
-and is gated on the arm parked + explicit go-ahead (arm verified parked at q≈0 during this
-work).
+The host compose includes the `substrate` service (reuses the `substrate_rebot-pgdata`
+named volume). From `examples/host`:
 
-### Deployment procedure (post-merge, arm parked)
+1. `docker compose up -d --build` — substrate + mediamtx + capture + planner; capture/planner
+   wait for substrate healthy. `REBOT_PG_DSN` defaults to the compose-network DSN.
+2. Apply migrations `0001`–`0009` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
+   capture upload → PG, and `/trace` → PG. Re-verify the arm parked read-only.
 
-The live stack runs from the **main checkout**; these changes ship via the PR and deploy
-after merge (worktree files are never copied into main). Steps, with the arm parked:
-
-1. **Bring up the substrate** (if not already): `cd examples/host/substrate && docker compose up -d`
-   (PG on `localhost:5433`, named volume). Apply migrations `0001`–`0004`.
-2. **Move tls**: `state/tls/` → `config/tls/` (compose `REBOT_CERT`/`REBOT_KEY` now point there).
-3. **Rebuild images** (psycopg + substrate baked in): `docker compose build capture planner`.
-4. **Restart**: `docker compose up -d` (recreates capture/planner with the substrate mount +
-   `REBOT_PG_DSN`). Verify `/health` and a read-only `/pose` (arm still parked).
-5. **Verify cutover**: take a capture, confirm it lands in PG (`evidence.episode/still/blob`);
-   `/captures.json` lists from PG; a plan mirrors to `evidence.plan`; the rig reconstructs
-   from `world.shared_rig.rig_doc`.
-
-`state/` stays as the realtime serving/cache dir (captures materialization, calib fallback,
-MediaMTX recordings) until the full flatten removes the file fallback and relocates
-recordings. PG is the learning system of record throughout.
-
-**Rollback**: unset `REBOT_PG_DSN` (or empty it) and restart — every read falls back to the
-file path, which is still written (additive mirror). No data loss.
+**Rollback**: unset `REBOT_PG_DSN` and restart — the servers run in file mode under `work/`.
+PG data is untouched; switching back resumes from the substrate.
 
 ### What lives in PG now (comprehensive move)
 
@@ -374,8 +368,9 @@ testable without a model; a production CLIP/ONNX embedder implements the interfa
 runs isolated. The choice determines re-embed cost per upgrade, so decide before ingest.
 
 **Q: What stayed out of scope?**
-The §8 app migration (dual-write → backfill → cutover → flatten `state/` into
-`config/` + `export/`); hardware-dependent steps; full 6D clearance orientation; and
-deliberate-contact exceptions for self-collision (the parked j4-on-j2 hinge contact).
-`rebot_path_safe` is the worktop table-clearance gate, not general obstacle collision.
-The substrate moves no arm and does not yet wire the live capture/planner path.
+Hardware-dependent steps (the arm never moves in this work); the production embedding
+model choice; full 6D clearance orientation; deliberate-contact exceptions for
+self-collision (the parked j4-on-j2 hinge contact); and general obstacle collision
+beyond the worktop capsule gate (`rebot_path_safe`). The §8 app migration itself is
+done: PG-only reads/writes in PG mode, `state/` flattened into `config/` + `export/`
++ disposable `work/` scratch, MediaMTX spool ingested-then-deleted.

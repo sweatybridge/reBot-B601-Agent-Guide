@@ -68,14 +68,19 @@ import sweep  # noqa: E402
 import traj  # noqa: E402
 
 ROOT = HERE.parent
-OUT_DIR = Path(os.environ.get("REBOT_OUT", str(ROOT / "state" / "out")))
+# Flattened layout (§8): no state/. File mode (no substrate; offline selftest)
+# keeps its artifacts under work/ (transient, gitignored). PG mode persists
+# plans/telemetry to the substrate only, and materializes a local read-cache of
+# the active rig + sag map so the pure planner paths keep their file contract.
+WORK = ROOT / "work"
+OUT_DIR = Path(os.environ.get("REBOT_OUT", str(WORK / "out")))
 # The edge's structured playback logs, one per execution (§5.2). The capture
 # server's oracle reads them back after /execute; the 4000-char stdout tail in
 # the response stays for humans.
-TELEMETRY_DIR = Path(os.environ.get("REBOT_TELEMETRY", str(ROOT / "state" / "telemetry")))
+TELEMETRY_DIR = Path(os.environ.get("REBOT_TELEMETRY", str(WORK / "telemetry")))
 # The learned sag residual maps (§7.3b), keyed by rig fingerprint. The capture
 # server's /identify/sag fits them; /move applies the one the active rig names.
-CALIB_DIR = Path(os.environ.get("REBOT_CALIB", str(ROOT / "state" / "calib")))
+CALIB_DIR = Path(os.environ.get("REBOT_CALIB", str(WORK / "calib")))
 EDGE_URL = os.environ.get("REBOT_EDGE_URL", "http://raspberrypi:8081").rstrip("/")
 EDGE_TOKEN = os.environ.get("REBOT_EDGE_TOKEN", "")
 TOKEN = os.environ.get("REBOT_PLANNER_TOKEN", "")
@@ -84,12 +89,15 @@ KP = os.environ.get("REBOT_KP", "50,2:150,3:150")
 KD = os.environ.get("REBOT_KD", "3,2:10,3:10,4:5,5:4,6:4,7:4")
 MAX_AGE_S = float(os.environ.get("REBOT_PLAN_MAX_AGE", "600"))
 
-# §8 cutover: when REBOT_PG_DSN is set, plans/telemetry are mirrored into the
-# substrate and reads are PG-primary (file fallback). The substrate seam lives in
+# §8 flatten: when REBOT_PG_DSN is set, the substrate is the system of record —
+# plans/telemetry are written and read there ONLY (no file fallback). The pure
+# planner paths (plan_to_target/sweep) still consume rig/sag files, so PG mode
+# materializes a read-cache refreshed per plan/move. The substrate seam lives in
 # examples/host/substrate (mounted at /app/substrate); psycopg must be installed.
 PG_DSN = os.environ.get("REBOT_PG_DSN", "")
 PG_WORKSPACE = os.environ.get("REBOT_PG_WORKSPACE", "default")
 PG_ARM = os.environ.get("REBOT_PG_ARM", "b601")
+PG_CALIB_CACHE = WORK / "calib-cache"
 _pg_mirror = None
 
 
@@ -109,17 +117,48 @@ def pg_mirror():
 
 
 def _mirror_plan(plan_id, payload, summary=None):
+    """Persist a plan into the substrate. Returns True on success; a plan that
+    cannot be persisted cannot be executed, so callers in PG mode refuse it."""
     mirror = pg_mirror()
     if mirror is None:
-        return
+        return False
     try:
         mirror.store.ensure_arm(PG_ARM)
         mirror.store.create_episode(plan_id, PG_WORKSPACE, [PG_ARM], kind="execution")
         mirror.mirror_plan(plan_id, plan_id, PG_ARM,
                            json.dumps(payload, separators=(",", ":")).encode("utf-8"),
                            metadata=summary or {}, snapshot={})
-    except Exception as exc:  # noqa: BLE001 - mirror never fails a plan (§8.4)
-        logging.warning("plan mirror for %s failed: %s", plan_id, exc)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("plan persist for %s failed: %s", plan_id, exc)
+        return False
+
+
+def refresh_calib_cache():
+    """The calib dir the pure planner paths should read. File mode: the shared
+    calib dir. PG mode: a local read-cache materialized from the substrate's
+    active rig + sag map (refreshed per plan/move, so a refit takes effect on
+    the next plan without signaling between processes)."""
+    mirror = pg_mirror()
+    if mirror is None:
+        return str(CALIB_DIR)
+    try:
+        store = mirror.store
+        PG_CALIB_CACHE.mkdir(parents=True, exist_ok=True)
+        rig_doc = store.read_active_rig_doc(PG_WORKSPACE)
+        if rig_doc:
+            (PG_CALIB_CACHE / "extrinsics-fixed.json").write_text(
+                json.dumps(rig_doc), encoding="utf-8")
+            fp = str(rig_doc.get("fingerprint") or "")
+            map_doc = store.read_sag_map_doc(PG_ARM) if fp else None
+            sag_path = PG_CALIB_CACHE / ("sag-%s.json" % fp)
+            if map_doc:
+                sag_path.write_text(json.dumps(map_doc), encoding="utf-8")
+            elif sag_path.is_file():
+                sag_path.unlink()  # invalidated map: no learned term, never a stale one
+    except Exception as exc:  # noqa: BLE001 - a stale cache beats a failed plan
+        logging.warning("calib cache refresh failed: %s", exc)
+    return str(PG_CALIB_CACHE)
 
 PLAN_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
 
@@ -173,29 +212,32 @@ def new_id() -> str:
 
 
 def save_telemetry(entry_id, telemetry):
-    """Persist the edge's playback log; §8.4: a full disk never fails a move.
+    """Persist the edge's playback log; §8.4: a storage failure never fails a move.
 
     The block is stored exactly as the edge sent it (samples already thinned to
     the wire budget, hold windows intact); GET /telemetry/{id} reads it back.
+    PG mode: the substrate only. File mode: work/telemetry.
     """
     if not isinstance(telemetry, dict):
         return None
+    raw = json.dumps(telemetry, separators=(",", ":"))
+    mirror = pg_mirror()
+    if mirror is not None:
+        try:
+            mirror.mirror_telemetry(
+                entry_id, entry_id, PG_ARM, raw.encode("utf-8"),
+                kp_key=str(telemetry.get("kp", "default")),
+                summary={"abort": telemetry.get("abort"),
+                         "gripper_stall": telemetry.get("gripper_stall"),
+                         "tick": telemetry.get("tick")})
+            return entry_id
+        except Exception as exc:  # noqa: BLE001 - never fail a move (§8.4)
+            logging.warning("telemetry persist for %s failed: %s", entry_id, exc)
+            return None
     try:
         TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
         path = TELEMETRY_DIR / ("%s.json" % entry_id)
-        raw = json.dumps(telemetry, separators=(",", ":"))
         path.write_text(raw, encoding="utf-8")
-        mirror = pg_mirror()
-        if mirror is not None:
-            try:
-                mirror.mirror_telemetry(
-                    entry_id, entry_id, PG_ARM, raw.encode("utf-8"),
-                    kp_key=str(telemetry.get("kp", "default")),
-                    summary={"abort": telemetry.get("abort"),
-                             "gripper_stall": telemetry.get("gripper_stall"),
-                             "tick": telemetry.get("tick")})
-            except Exception as exc:  # noqa: BLE001 - mirror never fails a move (§8.4)
-                logging.warning("telemetry mirror for %s failed: %s", entry_id, exc)
         return path
     except OSError as error:
         logging.warning("cannot write telemetry for %s: %s", entry_id, error)
@@ -207,10 +249,11 @@ def read_telemetry(entry_id):
     if mirror is not None:
         try:
             doc = mirror.store.read_telemetry_doc(entry_id)
-            if doc is not None:
-                return doc
-        except Exception as exc:  # noqa: BLE001 - fall back to the file
-            logging.warning("telemetry PG read for %s failed: %s", entry_id, exc)
+        except Exception as exc:  # noqa: BLE001
+            raise GatewayError("telemetry store unavailable: %s" % exc, 503) from exc
+        if doc is None:
+            raise GatewayError("no telemetry %s in the substrate" % entry_id, 404)
+        return doc
     path = TELEMETRY_DIR / ("%s.json" % entry_id)
     if not path.is_file():
         raise GatewayError("no telemetry %s on disk" % entry_id, 404)
@@ -371,7 +414,7 @@ def plan_targets(body):
     # trajectory will be played at, plus the learned residual where a keyed map
     # exists for the active rig.
     options.kp_spec = str(body.get("kp") or KP)
-    options.calib_dir = str(CALIB_DIR)
+    options.calib_dir = refresh_calib_cache()
 
     # Every hover plan -- single tap or marker sequence -- drives the same
     # Cartesian approach, which passes close to the reach boundary mid-leg:
@@ -392,11 +435,19 @@ def plan_targets(body):
     except planner.PlanError as error:
         raise GatewayError(str(error), 422) from error
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
     plan_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
-    path = OUT_DIR / ("%s.json" % plan_id)
-    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-    _mirror_plan(plan_id, payload, summary)
+    raw = json.dumps(payload, separators=(",", ":"))
+    if pg_mirror() is not None:
+        # PG mode: the substrate is the only persistence. A plan that cannot be
+        # persisted cannot be executed, so refuse it rather than strand it.
+        if not _mirror_plan(plan_id, payload, summary):
+            raise GatewayError("cannot persist plan %s to the substrate" % plan_id, 503)
+        location, size = "pg:evidence.plan/%s" % plan_id, len(raw.encode("utf-8"))
+    else:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        path = OUT_DIR / ("%s.json" % plan_id)
+        path.write_text(raw, encoding="utf-8")
+        location, size = str(path), path.stat().st_size
 
     if label == "sequence":
         tap_heights = summary.get("tap_heights_m") or []
@@ -418,7 +469,7 @@ def plan_targets(body):
                      summary["duration_s"], time.time() - started)
 
     summary["compute_s"] = round(time.time() - started, 2)
-    return {"ok": True, "id": plan_id, "path": str(path), "bytes": path.stat().st_size,
+    return {"ok": True, "id": plan_id, "path": location, "bytes": size,
             "summary": summary, "execute": EXECUTE}
 
 
@@ -522,12 +573,13 @@ def move_one(body):
     # in the file, and a 6 deg set-down is 60 mm at the tool.
     kp_spec = str(body.get("kp") or KP)
     kp = sweep.kp_vector(kp_spec)
+    calib_dir = refresh_calib_cache()
     commands = []
     applied = []
     for index, target in enumerate(targets):
         # The learned residual term (§7.3b), when a validated map exists for the
         # active rig and these gains; zeros otherwise. aim() clips the total.
-        extra = sweep.active_sag_extra(target, kp_spec, CALIB_DIR)
+        extra = sweep.active_sag_extra(target, kp_spec, calib_dir)
         command = sweep.aim(target, kp, extra_sag=extra)
         clipped = np.clip(command, rebot_ik.LIMITS[:, 0], rebot_ik.LIMITS[:, 1])
         if not np.allclose(clipped, command, atol=1e-9):
@@ -576,15 +628,22 @@ def move_one(body):
 
     # Persist the trajectory beside the telemetry it is about to produce, exactly
     # as /plan persists a plan. The oracle reads the hold windows out of this
-    # file, so a move's holds are measurable the same way a plan's are (§5.2) --
+    # record, so a move's holds are measurable the same way a plan's are (§5.2) --
     # and a dry run lets the caller read the REAL windows before the arm moves,
     # which is what schedules the coverage session's hold grabs (§7.4).
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = OUT_DIR / ("%s.json" % move_id)
-    path.write_text(json.dumps(trajectory, separators=(",", ":")), encoding="utf-8")
+    raw = json.dumps(trajectory, separators=(",", ":"))
+    if pg_mirror() is not None:
+        if not _mirror_plan(move_id, trajectory, {"kind": "move", "poses": len(targets)}):
+            raise GatewayError("cannot persist move %s to the substrate" % move_id, 503)
+        location, size = "pg:evidence.plan/%s" % move_id, len(raw.encode("utf-8"))
+    else:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        path = OUT_DIR / ("%s.json" % move_id)
+        path.write_text(raw, encoding="utf-8")
+        location, size = str(path), path.stat().st_size
     if body.get("dry_run"):
-        return {"ok": True, "id": move_id, "dry_run": True, "path": str(path),
-                "bytes": path.stat().st_size, "poses": len(targets),
+        return {"ok": True, "id": move_id, "dry_run": True, "path": location,
+                "bytes": size, "poses": len(targets),
                 "seconds": [round(float(value), 3) for value in seconds], "hold": hold,
                 "waypoints": len(trajectory["waypoints"]),
                 "duration_s": trajectory.get("duration_s")}
@@ -625,21 +684,28 @@ def execute_one(body):
     plan_id = str(body.get("id") or "")
     if not PLAN_ID.match(plan_id):
         raise GatewayError("'id' must be a plan id")
-    path = OUT_DIR / ("%s.json" % plan_id)
     mirror = pg_mirror()
-    trajectory = None
     if mirror is not None:
+        # PG mode: the substrate is the only plan store; age comes from the
+        # catalog row, not a file mtime.
         try:
             raw = mirror.store.read_plan_blob(plan_id)
-            if raw is not None:
-                trajectory = json.loads(raw)
-        except Exception as exc:  # noqa: BLE001 - fall back to the file
-            logging.warning("plan PG read for %s failed: %s", plan_id, exc)
-    if trajectory is None:
+            created = mirror.store.read_plan_created_at(plan_id)
+        except Exception as exc:  # noqa: BLE001
+            raise GatewayError("plan store unavailable: %s" % exc, 503) from exc
+        if raw is None:
+            raise GatewayError("no plan %s in the substrate" % plan_id, 404)
+        trajectory = json.loads(raw)
+        if created is not None:
+            age = time.time() - created.timestamp()
+            if age > MAX_AGE_S:
+                raise GatewayError("plan %s is %.0f s old (limit %.0f s): plan again"
+                                   % (plan_id, age, MAX_AGE_S), 409)
+    else:
+        path = OUT_DIR / ("%s.json" % plan_id)
         if not path.is_file():
             raise GatewayError("no plan %s on disk" % plan_id, 404)
         trajectory = json.loads(path.read_text(encoding="utf-8"))
-    if path.is_file():
         age = time.time() - path.stat().st_mtime
         if age > MAX_AGE_S:
             raise GatewayError("plan %s is %.0f s old (limit %.0f s): plan again" % (plan_id, age, MAX_AGE_S),
@@ -714,13 +780,23 @@ class Handler(BaseHTTPRequestHandler):
                         edge[key] = payload.get(key)
                 except GatewayError as error:
                     edge["error"] = str(error)
+                mirror = pg_mirror()
+                if mirror is not None:
+                    try:
+                        plans = mirror.store.count_plans()
+                    except Exception:  # noqa: BLE001
+                        plans = -1
+                    stores = {"out": "pg:evidence.plan", "telemetry": "pg:evidence.telemetry"}
+                else:
+                    plans = len(list(OUT_DIR.glob("*.json"))) if OUT_DIR.is_dir() else 0
+                    stores = {"out": str(OUT_DIR), "telemetry": str(TELEMETRY_DIR)}
                 self._send(200, {
                     "ok": True,
                     "execute": EXECUTE,
                     "edge": edge,
-                    "out": str(OUT_DIR),
-                    "telemetry": str(TELEMETRY_DIR),
-                    "plans": len(list(OUT_DIR.glob("*.json"))) if OUT_DIR.is_dir() else 0,
+                    "out": stores["out"],
+                    "telemetry": stores["telemetry"],
+                    "plans": plans,
                 })
             elif self.path == "/pose":
                 self._send(200, {"ok": True, "pose": dump_pose()})
@@ -766,10 +842,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get("REBOT_PLANNER_PORT", "8000"))
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    logging.info("arm gateway on :%d, edge=%s, execute=%s, edge_token=%s",
+    if pg_mirror() is None:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+    logging.info("arm gateway on :%d, edge=%s, execute=%s, edge_token=%s, store=%s",
                  port, EDGE_URL, "on" if EXECUTE else "off (REBOT_EXECUTE=1 to enable)",
-                 "set" if EDGE_TOKEN else "none")
+                 "set" if EDGE_TOKEN else "none",
+                 "substrate" if PG_DSN else "work/ (file mode)")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 

@@ -7,7 +7,7 @@ captures. Point it at a printed board in 15-20 different poses -- tilt it, put i
 in the corners, fill the frame and then pull back -- and run this on the host:
 
     python examples/host/app/calibrate_intrinsics.py \
-        --captures examples/host/state/captures --cols 9 --rows 6 --square 0.025
+        --captures examples/host/work/captures --cols 9 --rows 6 --square 0.025
 
 Output is `calib/<device>.json`, which `locate_target.py` reads. The RMS gate
 matters more than the number of views: a 0.5 px fit on 12 good views beats
@@ -129,7 +129,7 @@ def annotate(image, corners, cols, rows):
 
 def main(argv=None):
     here = Path(__file__).resolve().parent
-    state = here.parent / "state"
+    state = here.parent / "work"  # flattened (§8): transient tool scratch
     parser = argparse.ArgumentParser(description="Fit phone-camera intrinsics from checkerboard captures.")
     parser.add_argument("--captures", default=str(state / "captures"),
                         help="capture root written by capture_server.py")
@@ -264,7 +264,6 @@ def main(argv=None):
             if sub not in sys.path:
                 sys.path.insert(0, sub)
             from store import SubstrateStore
-            import calib as calib_mod
             calib_obj = calib_mod.load(out_path)
             store = SubstrateStore(dsn)
             store.ensure_calibration(calib_obj.fingerprint, K=payload["K"], dist=payload["dist"],
@@ -280,3 +279,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+

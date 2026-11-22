@@ -3859,16 +3859,16 @@ def test_auto_sweep(workdir: Path):
     # One still + its pose is the first half, and it resolves into a seed.
     import camera as camera_mod
 
-    saved_state = extrinsics_cli.STATE
+    saved_state = extrinsics_cli.WORK
     original_gateway = auto_calibrate.ArmGateway
     original_source = camera_mod.open_source
-    extrinsics_cli.STATE = workdir / "cli-state"
+    extrinsics_cli.WORK = workdir / "cli-state"
     auto_calibrate.ArmGateway = lambda *a, **k: arm
     camera_mod.open_source = lambda *a, **k: eye
     try:
         code = extrinsics_cli.main(["--capture-pose", "--camera", "rtsp://fake", "--quiet"])
     finally:
-        extrinsics_cli.STATE = saved_state
+        extrinsics_cli.WORK = saved_state
         auto_calibrate.ArmGateway = original_gateway
         camera_mod.open_source = original_source
     stills = sorted((workdir / "cli-state" / "captures").glob("*/frame.jpg"))
@@ -4415,8 +4415,8 @@ def test_marker_rig(workdir: Path):
 
         # The same short path on the command line: --capture-pose with the tag
         # configured writes the rig instead of printing tap instructions.
-        saved_state = extrinsics_cli.STATE
-        extrinsics_cli.STATE = workdir / "marker-cli-state"
+        saved_state = extrinsics_cli.WORK
+        extrinsics_cli.WORK = workdir / "marker-cli-state"
         eye.image = frame.copy()
         cli_rig = workdir / "marker-cli-rig.json"
         poses_before_cli = arm.poses
@@ -4429,7 +4429,7 @@ def test_marker_rig(workdir: Path):
                 "--out", str(cli_rig), "--quiet",
             ])
         finally:
-            extrinsics_cli.STATE = saved_state
+            extrinsics_cli.WORK = saved_state
         check("--capture-pose writes the rig from the tag",
               code == 0 and cli_rig.is_file()
               and extrinsics.load_rig(cli_rig).method == "base-marker",
@@ -6250,3 +6250,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+

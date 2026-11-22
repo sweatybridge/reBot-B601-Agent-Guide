@@ -10,6 +10,7 @@ examples/edge-rust/.bench/
 # Host local state (examples/host): captures, certs, per-phone calibration,
 # printable tags and generated plans are machine-specific
 examples/host/state/
+examples/host/work/
 examples/host/.env
 examples/host/tests/.selftest-work/
 examples/host/tests/.browser-check-work/

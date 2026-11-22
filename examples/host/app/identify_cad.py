@@ -86,7 +86,7 @@ import rebot_ik  # noqa: E402
 import sweep  # noqa: E402
 import sweep_video  # noqa: E402
 
-STATE = Path(os.environ.get("REBOT_STATE", HERE.parent / "state"))
+STATE = Path(os.environ.get("REBOT_STATE", HERE.parent / "work"))
 CAD_DIR = HERE / "cad"
 
 

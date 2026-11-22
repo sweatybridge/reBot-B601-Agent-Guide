@@ -16,8 +16,10 @@
 # sends RTP straight to <REBOT_HOST_IP>:8189. Also published: 8554 (RTSP, for
 # host-run tools) and the control API on 127.0.0.1:9997 (host loopback only).
 #
-# Everything that persists lives in ./state/{captures,calib,tls,tags,out,work},
-# mounted at /app/state so the paths are the same inside and outside.
+# Everything authoritative lives in the substrate (Postgres). The only bind
+# mounts are config/ (tls + bootstrap), export/ (derived handoff bundles), and
+# work/ — disposable scratch: cv2 materializations, the MediaMTX spool, and
+# file-mode artifacts when no substrate is configured. No state/ directory.
 name: rebot-capture
 
 services:
@@ -63,9 +65,9 @@ services:
       MTX_WEBRTCADDITIONALHOSTS: ${REBOT_HOST_IP:-}
     volumes:
       - ./deploy/mediamtx.yml:/mediamtx.yml:ro
-      # Calibration sweeps are recorded here by MediaMTX and read back by the
-      # capture server, which mounts ./state at /app/state.
-      - ./state/recordings:/recordings
+      # Calibration sweeps are recorded here by MediaMTX (transient spool); the
+      # capture server ingests completed recordings into PG and deletes them.
+      - ./work/recordings:/recordings
     ports:
       # RTSP is published so a host-run tool (or a debugger) can read the same
       # stream the capture server uses: rtsp://127.0.0.1:8554/phone.
@@ -97,9 +99,9 @@ services:
       REBOT_TOKEN: ${REBOT_TOKEN:-}
       REBOT_MEDIAMTX: http://mediamtx:8889
       REBOT_PLANNER: http://planner:8000
-      # Where a sweep is recorded (MediaMTX writes it; this server reads it) and
-      # the API that starts and stops that recording.
-      REBOT_RECORDINGS: /app/state/recordings
+      # Where a sweep is recorded (MediaMTX writes it; this server ingests it
+      # into PG and deletes the spool file) and the API that starts/stops it.
+      REBOT_RECORDINGS: /app/work/recordings
       REBOT_MEDIAMTX_API: http://mediamtx:9997
       # A 4 cm ArUco tag on the base: where it sits in the robot's frame,
       # "x,y,z[,yaw[,id]]" in metres and degrees. Handheld mode reads it on every tap;
@@ -112,9 +114,9 @@ services:
       REBOT_TIP_MM: ${REBOT_TIP_MM:-35}
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_EXECUTE: ${REBOT_EXECUTE:-0}
-      # A fitted rig is read from /app/state/calib/extrinsics-fixed.json at
-      # startup; a tag capture or a sweep writes it there, so nothing to set here.
-      REBOT_CALIB_DIR: /app/state/calib
+      # A fitted rig is read from the substrate (PG) at startup; the scratch
+      # cache under /app/work/calib is materialized from it.
+      REBOT_CALIB_DIR: /app/work/calib
       REBOT_WITNESS_MAX_PX: ${REBOT_WITNESS_MAX_PX:-2.0}
       # Where the automatic calibration sweep reads its stills.
       REBOT_CAMERA: ${REBOT_CAMERA:-rtsp://mediamtx:8554/phone}
@@ -145,7 +147,9 @@ services:
       - ./app:/app/app:ro
       - ./web:/app/web:ro
       - ./substrate:/app/substrate:ro
-      - ./state:/app/state
+      # Disposable scratch (§8 flatten): cv2 materializations + spool. PG is
+      # the system of record; wiping work/ loses nothing authoritative.
+      - ./work:/app/work
       # Flatten (§8): tls/bootstrap live in config/, handoff bundles in export/.
       - ./config:/app/config
       - ./export:/app/export
@@ -176,7 +180,6 @@ services:
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_KP: ${REBOT_KP:-50,2:150,3:150}
       REBOT_KD: ${REBOT_KD:-3,2:10,3:10,4:5,5:4,6:4,7:4}
-      REBOT_OUT: /app/state/out
       REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:rebot@substrate:5432/postgres}
       REBOT_PG_WORKSPACE: ${REBOT_PG_WORKSPACE:-default}
     extra_hosts:
@@ -184,7 +187,7 @@ services:
     volumes:
       - ./app:/app/app:ro
       - ./substrate:/app/substrate:ro
-      - ./state:/app/state
+      - ./work:/app/work
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 30s
@@ -201,7 +204,7 @@ services:
     environment:
       REBOT_HOST_IP: ${REBOT_HOST_IP:-}
     volumes:
-      - ./state:/app/state
+      - ./work:/app/work
 
 volumes:
   # Created by the substrate standalone compose (examples/host/substrate);

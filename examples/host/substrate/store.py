@@ -202,7 +202,8 @@ class SubstrateStore:
 
     def upsert_rig(self, rig_fingerprint: str, workspace_id: str, calib_fingerprint: str,
                    T_base_cam, image_size, tip_offset, method="base-marker",
-                   rms_px=None, rms_mm=None, witness=None, provenance=None, rig_doc=None) -> None:
+                   rms_px=None, rms_mm=None, witness=None, provenance=None, rig_doc=None,
+                   witness_sha=None) -> None:
         """Mirror a rig as the active shared rig; supersede prior active rigs."""
         self.ensure_calibration(calib_fingerprint)
         with self._conn() as c:
@@ -213,14 +214,17 @@ class SubstrateStore:
             )
             c.execute(
                 "INSERT INTO world.shared_rig(rig_fingerprint, workspace_id, calib_fingerprint, "
-                "T_base_cam, image_size, tip_offset, method, rms_px, rms_mm, witness, provenance, rig_doc, status) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active') "
+                "T_base_cam, image_size, tip_offset, method, rms_px, rms_mm, witness, provenance, "
+                "rig_doc, witness_sha, status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active') "
                 "ON CONFLICT (rig_fingerprint) DO UPDATE SET status='active', "
-                "T_base_cam=EXCLUDED.T_base_cam, provenance=EXCLUDED.provenance, rig_doc=EXCLUDED.rig_doc",
+                "T_base_cam=EXCLUDED.T_base_cam, provenance=EXCLUDED.provenance, "
+                "rig_doc=EXCLUDED.rig_doc, witness_sha=COALESCE(EXCLUDED.witness_sha, "
+                "world.shared_rig.witness_sha)",
                 (rig_fingerprint, workspace_id, calib_fingerprint, json.dumps(T_base_cam),
                  json.dumps(image_size), json.dumps(tip_offset), method, rms_px, rms_mm,
                  json.dumps(witness or {}), json.dumps(provenance or {}),
-                 json.dumps(rig_doc) if rig_doc is not None else None),
+                 json.dumps(rig_doc) if rig_doc is not None else None, witness_sha),
             )
 
     def read_active_rig_doc(self, workspace_id: str):
@@ -229,6 +233,23 @@ class SubstrateStore:
                 "SELECT rig_doc FROM world.shared_rig WHERE workspace_id=%s AND status='active' "
                 "ORDER BY fitted DESC NULLS LAST LIMIT 1", (workspace_id,)).fetchone()
         return row["rig_doc"] if row else None
+
+    def read_active_rig_row(self, workspace_id: str):
+        """The active rig's full doc + witness blob sha (for cache materialization)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT rig_doc, witness_sha FROM world.shared_rig "
+                "WHERE workspace_id=%s AND status='active' "
+                "ORDER BY fitted DESC NULLS LAST LIMIT 1", (workspace_id,)).fetchone()
+        return row
+
+    def read_latest_calib_doc(self):
+        """The newest intrinsics calibration doc (for scratch-cache materialization)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT calib_fingerprint, calib_doc FROM world.calibration "
+                "WHERE calib_doc IS NOT NULL ORDER BY created_at DESC LIMIT 1").fetchone()
+        return row
 
     # -- durable app state (kv / monitor / tags) ------------------------ #
     def set_kv(self, key: str, value) -> None:
@@ -272,7 +293,11 @@ class SubstrateStore:
             c.execute(
                 "INSERT INTO learning.sag_map(arm_id, rig_fingerprint, kp_key, zeros_key, "
                 "per_motor, samples, rms_mrad, validated_mm, envelope, status) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'active')",
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'active') "
+                "ON CONFLICT (arm_id, rig_fingerprint, kp_key, zeros_key) WHERE status = 'active' "
+                "DO UPDATE SET per_motor=EXCLUDED.per_motor, samples=EXCLUDED.samples, "
+                "rms_mrad=EXCLUDED.rms_mrad, validated_mm=EXCLUDED.validated_mm, "
+                "envelope=EXCLUDED.envelope, created_at=now()",
                 (arm_id, map_doc.get("rig_fingerprint", ""), map_doc.get("kp_key", "default"),
                  map_doc.get("zeros_key", "none"), json.dumps(map_doc.get("per_motor", {})),
                  map_doc.get("samples", 0), map_doc.get("rms_mrad"), map_doc.get("validated_mm"),
@@ -326,6 +351,32 @@ class SubstrateStore:
                 "SELECT b.bytes FROM evidence.plan p JOIN evidence.blob b ON b.sha256=p.blob_sha "
                 "WHERE p.plan_id=%s", (plan_id,)).fetchone()
         return bytes(row["bytes"]) if row else None
+
+    def read_plan_created_at(self, plan_id: str):
+        with self._conn() as c:
+            row = c.execute("SELECT created_at FROM evidence.plan WHERE plan_id=%s",
+                            (plan_id,)).fetchone()
+        return row["created_at"] if row else None
+
+    def count_plans(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT count(*) AS n FROM evidence.plan").fetchone()["n"]
+
+    def read_sag_map_doc(self, arm_id: str):
+        """Reconstruct the active sag map doc (the file-format the pure planner
+        paths consume) from the latest active row, or None."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT rig_fingerprint, kp_key, zeros_key, per_motor, samples, "
+                "rms_mrad, validated_mm, envelope FROM learning.sag_map "
+                "WHERE arm_id=%s AND status='active' ORDER BY created_at DESC LIMIT 1",
+                (arm_id,)).fetchone()
+        if row is None:
+            return None
+        return {"rig_fingerprint": row["rig_fingerprint"], "kp_key": row["kp_key"],
+                "zeros_key": row["zeros_key"], "per_motor": row["per_motor"],
+                "samples": row["samples"], "rms_mrad": row["rms_mrad"],
+                "validated_mm": row["validated_mm"], "envelope": row["envelope"]}
 
     def read_telemetry_doc(self, exec_id: str):
         with self._conn() as c:

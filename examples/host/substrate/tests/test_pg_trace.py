@@ -15,6 +15,9 @@ store = SubstrateStore(DSN)
 rec = PgTraceRecorder(store, workspace_id="ws_trace_test",
                       snapshot=lambda sid: {"rig": "r1", "api_key": "SECRET"})
 sid = "20261122T000000Z-trace1"
+# rerun-safe: clear this test session's events so seq starts at 1
+with store._conn() as c:
+    c.execute("DELETE FROM evidence.event WHERE episode_id=%s", (sid,))
 
 
 async def main():

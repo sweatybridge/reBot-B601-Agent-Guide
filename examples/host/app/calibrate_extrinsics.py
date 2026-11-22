@@ -13,7 +13,7 @@ One process:
 
     2. look at it, read the tool tip's pixel, then let the arm sweep
        python app/calibrate_extrinsics.py --auto --camera rtsp://... \\
-           --from state/captures/<id> --uv 812 455
+           --from work/captures/<id> --uv 812 455
 
     3. audit the result
        python app/calibrate_extrinsics.py --check
@@ -55,7 +55,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 ROOT = HERE.parent
-STATE = ROOT / "state"
+WORK = ROOT / "work"  # flattened (§8): transient tool scratch, not authoritative state
 
 import base_marker  # noqa: E402
 import calib  # noqa: E402
@@ -111,7 +111,7 @@ def joints_from_meta(meta):
 def _load_calibration(args, size=None):
     import calib as calib_mod
 
-    path = args.calib or default_calib(STATE / "calib")
+    path = args.calib or default_calib(WORK / "calib")
     if not path:
         raise CliError("no intrinsics found: run calibrate_intrinsics.py first, or pass --calib")
     return calib_mod.load(resolve(path), image_size=tuple(int(v) for v in size) if size else None)
@@ -141,7 +141,7 @@ def command_capture_pose(args):
         eye.close()
 
     capture_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
-    directory = STATE / "captures" / capture_id
+    directory = WORK / "captures" / capture_id
     directory.mkdir(parents=True, exist_ok=False)
     cv2.imwrite(str(directory / "frame.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
@@ -178,7 +178,7 @@ def command_capture_pose(args):
             except (base_marker.MarkerError, auto.AutoError) as error:
                 print("marker    : not readable (%s)" % error)
             else:
-                out = resolve(args.out or (STATE / "calib" / "extrinsics-fixed.json"))
+                out = resolve(args.out or (WORK / "calib" / "extrinsics-fixed.json"))
                 _rig, verdict, written = auto.commit_marker(
                     run, calibration, out, frame=frame, q=None)
                 print("marker    : %.0f px across, %+.0f deg grazing, %.2f px rms"
@@ -240,7 +240,7 @@ def command_auto(args):
     if q is None:
         raise CliError("that capture has no pose: take it with --capture-pose")
 
-    out = resolve(args.out or (STATE / "calib" / "extrinsics-fixed.json"))
+    out = resolve(args.out or (WORK / "calib" / "extrinsics-fixed.json"))
     marker = base_marker.parse_spec(getattr(args, 'marker_at', ''), getattr(args, 'marker_size', base_marker.SIZE_M))
     options = auto.Options(
         plane_z=float(args.plane_z if args.plane_z is not None else 0.0),
@@ -267,9 +267,9 @@ def command_auto(args):
             raise CliError("the sweep is recorded by MediaMTX, so --camera must be its RTSP "
                            "path (rtsp://mediamtx:8554/phone); %r cannot be recorded" % url)
         recorder = mediamtx.Recorder(args.mediamtx_api, path=path,
-                                     recordings=resolve(args.recordings or (STATE / "recordings")))
+                                     recordings=resolve(args.recordings or (WORK / "recordings")))
         print("sweep     : 8 poses, about 90 s of motion; the arm will move now", flush=True)
-        result = auto.run(arm, eye, calibration, options, STATE / "captures",
+        result = auto.run(arm, eye, calibration, options, WORK / "captures",
                           recorder=recorder, mount="fixed")
     finally:
         eye.close()
@@ -312,7 +312,7 @@ def describe_auto(payload):
 
 def command_check(args):
     """Audit a written rig: residuals, held-out, predicted error, age."""
-    rig_path = resolve(args.out or (STATE / "calib" / "extrinsics-fixed.json"))
+    rig_path = resolve(args.out or (WORK / "calib" / "extrinsics-fixed.json"))
     rig = ex.load_rig(rig_path)
     observations = rig.observations
     if not observations:
@@ -410,7 +410,7 @@ def main(argv=None):
     parser.add_argument("--recordings", default=os.environ.get("REBOT_RECORDINGS", ""),
                         help="where MediaMTX writes its recordings")
     parser.add_argument("--calib", default="", help="intrinsics JSON (default: newest)")
-    parser.add_argument("--out", default="", help="rig JSON (default: state/calib/extrinsics-fixed.json)")
+    parser.add_argument("--out", default="", help="rig JSON (default: work/calib/extrinsics-fixed.json)")
     parser.add_argument("--plane-z", type=float, default=None, help="worktop height in base frame")
     parser.add_argument("--work-radius", type=float, default=0.55,
                         help="radius of the grid the predicted error is reported over, m")
@@ -437,3 +437,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
