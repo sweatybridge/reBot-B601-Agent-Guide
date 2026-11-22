@@ -56,6 +56,7 @@ import calendar
 import hashlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -693,6 +694,54 @@ def predicted_error(theta, covariance, free, K, dist, plane_z, options: FitOptio
             "points": len(found)}
 
 
+def _fit_pg(observations, K, dist, options, calib_fingerprint, device, mount, dsn):
+    """PG-mode fit: rebot_calibrate_fit (Rust DLT+LM) builds the rig. Raises on a
+    substrate refusal; the caller falls back to the Python fit on any failure."""
+    import psycopg
+    with psycopg.connect(dsn) as c:
+        urow = c.execute("SELECT urdf FROM world.robot_model ORDER BY created_at LIMIT 1").fetchone()
+        if urow is None:
+            raise ExtrinsicsError("no robot model seeded (world.robot_model)")
+        urdf = next(iter(urow.values()))
+        obs = [{"q": [float(v) for v in o.q], "uv": [float(o.uv[0]), float(o.uv[1])]}
+               for o in observations]
+        opts = {"refine_tip": options.refine_tip, "refine_zeros": options.refine_zeros,
+                "plane_z": options.plane_z, "huber_px": options.huber_px,
+                "max_iterations": options.max_iterations, "max_weak_mm": options.max_weak_mm,
+                "work_radius": options.work_radius,
+                "image_size": list(options.image_size) if options.image_size else None}
+        row = c.execute(
+            "SELECT rebot_calibrate_fit(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)",
+            (urdf, json.dumps(obs),
+             json.dumps(np.asarray(K, dtype=float).reshape(-1).tolist()),
+             json.dumps(np.asarray(dist, dtype=float).reshape(-1).tolist() if dist is not None else []),
+             json.dumps(opts))).fetchone()
+    r = next(iter(row.values()))
+    T = np.asarray(r["T_base_cam"], dtype=float).reshape(4, 4)
+    tip = np.asarray(r["tip_offset"], dtype=float)
+    zeros = np.asarray(r["joint_zeros"], dtype=float) if r.get("joint_zeros") else None
+    per_pose = np.asarray(r["residuals_px"], dtype=float)
+    delta = float(options.huber_px)
+    w = np.ones(len(per_pose))
+    if delta > 0:
+        w = np.where(per_pose > delta, delta / np.maximum(per_pose, 1e-9), 1.0)
+    kf = len(r["free"])
+    cov = np.asarray(r["covariance"], dtype=float).reshape(kf, kf)
+    rig = Rig(
+        T_base_cam=T, calib_fingerprint=str(calib_fingerprint),
+        image_size=tuple(int(v) for v in (options.image_size or (0, 0))),
+        plane_z=float(options.plane_z), tip_offset=tip, joint_zeros=zeros,
+        rms_px=float(r["rms_px"]), rms_mm=float(r["rms_mm"]), max_px=float(r["max_px"]),
+        observations=list(observations), sigma=r["sigma"], weakest=r["weakest"],
+        predicted=r["predicted"], device=str(device), mount=str(mount),
+        fitted=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        iterations=int(r["iterations"]), converged=bool(r["converged"]))
+    return FitResult(rig=rig, residuals_px=per_pose, weights=w, covariance=cov,
+                     free=list(r["free"]), sigma=r["sigma"], weakest=r["weakest"],
+                     predicted=r["predicted"], iterations=int(r["iterations"]),
+                     converged=bool(r["converged"]))
+
+
 def fit(observations, K, dist, options: FitOptions | None = None, calib_fingerprint="",
         device="", mount="fixed") -> FitResult:
     """Fit `T_base<-cam` (and the tip offset) to clicked poses."""
@@ -702,6 +751,14 @@ def fit(observations, K, dist, options: FitOptions | None = None, calib_fingerpr
         raise ExtrinsicsError(
             "%d poses is not enough; the rig needs at least %d, spread over the work area and "
             "at a couple of heights" % (len(observations), MIN_POSES))
+    dsn = os.environ.get("REBOT_PG_DSN", "")
+    if dsn:
+        try:
+            return _fit_pg(observations, K, dist, options, calib_fingerprint, device, mount, dsn)
+        except ExtrinsicsError:
+            raise
+        except Exception:
+            pass  # substrate unavailable -> the Python fit below re-validates
 
     model = _Model(observations, K, dist, options)
     if model.size() <= len(model.free):

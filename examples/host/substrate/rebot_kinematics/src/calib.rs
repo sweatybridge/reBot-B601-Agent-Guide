@@ -563,6 +563,9 @@ fn rebot_calibrate_fit(urdf: &str, observations: pgrx::JsonB, k: pgrx::JsonB,
 
     let tbc: Vec<f64> = row_major4(&t_base_cam);
     let joint_zeros: Value = if refine_zeros { json!(theta[9..15].to_vec()) } else { Value::Null };
+    let kf = model.free.len();
+    let mut cov_flat = Vec::with_capacity(kf * kf);
+    for i in 0..kf { for j in 0..kf { cov_flat.push(cov[(i,j)]); } }
     pgrx::JsonB(json!({
         "T_base_cam": tbc,
         "tip_offset": [theta[6], theta[7], theta[8]],
@@ -577,6 +580,7 @@ fn rebot_calibrate_fit(urdf: &str, observations: pgrx::JsonB, k: pgrx::JsonB,
         "iterations": iterations,
         "converged": converged,
         "residuals_px": per_pose,
+        "covariance": cov_flat,
         "free": model.free,
     }))
 }

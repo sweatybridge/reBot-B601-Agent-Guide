@@ -1031,9 +1031,26 @@ transaction; self-checking assertions pass):
   approximation the reference uses for the aim command), velocity/time at rounding
   precision; identical waypoint counts/durations/worst-IK.
 - Scope: hover + sequence (both live gateway paths) done; the CLI-only Cartesian pick
-  branch is a follow-up. The live gateway is NOT switched to `plan_one`
-  (motion-affecting; needs bench validation + arm-parked go-ahead). `world.robot_model`
-  must be seeded.
+  branch is a follow-up. `world.robot_model` must be seeded.
+
+**Full compute switch (validated; the gateway is a thin HTTP→SQL adapter in PG mode):**
+- `/move` builder: `rebot_move_build` + `move_one` (`0012`); `planner_server.move_one`
+  switched. Parity exact (multi 2.8e-17), `tests/move_parity.py`.
+- Oracle verdict: `oracle_compute` (`0013`) + Rust helpers `rebot_fk_tip`/`rebot_tip_point`/
+  `rebot_sag_rad`; `capture_server._oracle_pg_compute` switched (file mode preserved).
+  Parity 2.1e-17, `tests/oracle_parity.py`.
+- Hand-eye fit: `rebot_calibrate_fit` (`calib.rs`) — DLT+SVD+RQ init, Huber LM, covariance,
+  conditioning + predicted-error gates (port of `extrinsics.fit`). `extrinsics.fit`
+  dispatches to it in PG mode (`_fit_pg`), so all calibration callers switch transparently.
+  Parity exact 1.9e-15 / noisy 1.9e-12, identical rms; `tests/calib_parity.py` incl. dispatch.
+- `/fk` display: `planner_server.fk_one` → `rebot_fk_tip` + `rebot_joint_points`. Parity
+  2.2e-16 (7 points), `tests/fk_parity.py`.
+- The Pinocchio `solve_ik` path is retired from the live motion path; residual `rebot_ik`
+  (pure-numpy) calls are perception rendering, the oracle predicted-tip overlay, fit
+  diagnostics, joint-limit constants, and file-mode fallbacks. Each switch keeps a Python
+  fallback that re-validates (a substrate refusal still propagates). Full offline selftest
+  646/0; SQL suites `test_plan_one`/`test_store`/`test_pg_trace`/`test_pg_evidence` pass.
+  `/move` + oracle live executions need a powered arm + bench go-ahead (dry plans only here).
 
 **Learning plane (Phase 1, ports validated against the Python reference):**
 - `oracle_attribute(jsonb)` (PLpgSQL, `0002`) reproduces `oracle.attribute` across all

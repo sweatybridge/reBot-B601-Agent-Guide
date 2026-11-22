@@ -2,12 +2,16 @@
 Synthetic clicks from a known rig + poses; both solvers must recover the same rig.
 Run in the capture container (has numpy + extrinsics + psycopg).
 """
-import sys, json, math
+import sys, json, math, os
 sys.path.insert(0, "/app/app")
 import numpy as np
 import psycopg
 import extrinsics as ex
 import rebot_ik
+
+# Force the Python solver for the reference fits (the capture env sets the DSN,
+# which would otherwise route ex.fit through the PG dispatch being tested).
+os.environ["REBOT_PG_DSN"] = ""
 
 URDF = open("/app/app/cad/ReBot_Arm_RS.urdf").read()
 DSN = "postgresql://postgres:rebot@substrate:5432/postgres"
@@ -75,4 +79,20 @@ drms2 = abs(res_rs2["rms_px"] - res_py2.rig.rms_px)
 print("noisy: T maxdiff %.2e tip %.2e rms py %.4f rs %.4f" % (dT2, dtip2, res_py2.rig.rms_px, res_rs2["rms_px"]))
 ok2 = dT2 < 1e-6 and dtip2 < 1e-6 and drms2 < 1e-4
 print("CALIB PARITY (noisy)", "OK" if ok2 else "CHECK")
-sys.exit(0 if (ok and ok2) else 1)
+
+# Live dispatch: with the DSN set, ex.fit must route through rebot_calibrate_fit
+# (reading the URDF from world.robot_model) and reproduce the Rust rig exactly.
+conn.execute("INSERT INTO world.robot_model (model_id, urdf) VALUES (%s, %s)",
+             ("calib-parity", URDF))
+conn.commit()
+os.environ["REBOT_PG_DSN"] = DSN
+res_disp = ex.fit([ex.Observation(q=np.array(o["q"]), uv=tuple(o["uv"])) for o in obs],
+                  K, dist, opts)
+dT3 = float(np.max(np.abs(res_disp.rig.T_base_cam - T_rs)))
+dtip3 = float(np.max(np.abs(res_disp.rig.tip_offset - tip_rs)))
+drms3 = abs(res_disp.rig.rms_px - res_rs["rms_px"])
+dcov = float(np.max(np.abs(res_disp.covariance - np.array(res_rs["covariance"]).reshape(len(res_rs["free"]), -1))))
+print("dispatch: T maxdiff %.2e tip %.2e rms %.2e cov %.2e" % (dT3, dtip3, drms3, dcov))
+ok3 = dT3 < 1e-9 and dtip3 < 1e-9 and drms3 < 1e-9 and dcov < 1e-9
+print("CALIB DISPATCH (PG fit)", "OK" if ok3 else "CHECK")
+sys.exit(0 if (ok and ok2 and ok3) else 1)
