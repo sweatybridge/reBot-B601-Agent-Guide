@@ -79,6 +79,28 @@ fn rebot_dof(urdf: &str) -> i32 {
     load_chain(urdf).dof() as i32
 }
 
+/// gripper_end position in the base frame at joint positions q6 (6 arm joints).
+#[pg_extern]
+fn rebot_fk_tip(urdf: &str, q6: Vec<f64>) -> Vec<f64> {
+    let (_robot, chain) = load_chain_arm(urdf, &q6);
+    let node = chain.find_link("gripper_end").unwrap_or_else(|| panic!("gripper_end not found"));
+    let p = node.world_transform().unwrap().translation.vector;
+    vec![p.x, p.y, p.z]
+}
+
+/// The tool tip point in the base frame: gripper_end position + R(gripper_end) @
+/// tip_offset. The oracle predicts the tip pixel from this (locate_target.project).
+#[pg_extern]
+fn rebot_tip_point(urdf: &str, q6: Vec<f64>, tip_offset: Vec<f64>) -> Vec<f64> {
+    if tip_offset.len() != 3 { panic!("tip_offset must be [x, y, z]"); }
+    let (_robot, chain) = load_chain_arm(urdf, &q6);
+    let node = chain.find_link("gripper_end").unwrap_or_else(|| panic!("gripper_end not found"));
+    let t = node.world_transform().unwrap();
+    let off = nalgebra::Vector3::new(tip_offset[0], tip_offset[1], tip_offset[2]);
+    let p = t.translation.vector + t.rotation * off;
+    vec![p.x, p.y, p.z]
+}
+
 // --------------------------------------------------------------------------- //
 // Gravity dynamics + collision checking.
 // Ports of rebot_ik.gravity_torques and sweep.path_safe (pure numpy reference),

@@ -1886,6 +1886,7 @@ async def oracle_prepare(app, plan_id):
         prep = {
             "plan_id": plan_id,
             "windows": windows,
+            "waypoints": trajectory.get("waypoints") or [],
             "targets": targets,
             "pre_capture": pre["id"],
             "pre_frame_path": str(frame_path),
@@ -2009,6 +2010,74 @@ def _oracle_tool_tip(app, rig):
     return np.array([0.0, 0.0, -float(app["tip_m"])])
 
 
+def _read_robot_urdf(store):
+    with store._conn() as c:
+        row = c.execute("SELECT urdf FROM world.robot_model ORDER BY created_at LIMIT 1").fetchone()
+    return next(iter(row.values())) if row else None
+
+
+async def _oracle_pg_compute(app, prep, samples, doc, K, dist, rig, t_tip, turn):
+    """PG mode: detect each hold's tip (OpenCV, isolated here in the capture
+    process), then let the substrate compute the residuals + verdict
+    (oracle_compute). Returns True if it populated doc; False -> Python path."""
+    mirror = app.get("pg_mirror")
+    if mirror is None or rig is None:
+        return False
+    import cv2
+    store = mirror.store
+    urdf = await asyncio.to_thread(_read_robot_urdf, store)
+    if not urdf:
+        return False
+    detections = {}
+    for window in prep["windows"]:
+        shot = prep["holds"].get(window["index"])
+        inside = [s for s in samples
+                  if window["t_start"] - 1e-6 <= float(s.get("t", -1)) <= window["t_end"] + 1e-6]
+        if not shot or not inside:
+            continue
+        q_meas = np.mean([s["meas"] for s in inside], axis=0)[:6]
+        frame = await asyncio.to_thread(cv2.imread, shot["path"])
+        if frame is None:
+            continue
+        frame, calib_g, _turn = locator.upright_frame(resolve_calibration(app), frame, turn)
+        found = await asyncio.to_thread(
+            _oracle_detect, frame, q_meas, K, dist,
+            np.asarray(rig.T_base_cam, dtype=float), t_tip, calib_g.scale)
+        if found:
+            detections[str(window["index"])] = dict(
+                found, image_size=[int(frame.shape[1]), int(frame.shape[0])],
+                grid_scale=round(float(calib_g.scale), 4), frame=shot["blob"])
+    kp_spec = sweep.KP_DEFAULT
+    tel = doc.get("telemetry") or {}
+    if isinstance(tel.get("kp"), dict):
+        kp_spec = ",".join("%d:%s" % (m, tel["kp"][str(m)])
+                           for m in range(1, 7) if str(m) in tel["kp"])
+    doc_extra = {k: doc[k] for k in (
+        "telemetry", "stream_turn", "tag_reprojection_px", "witness", "landscape",
+        "pre_image_size", "pre_grid_scale", "plan_id", "created", "session",
+        "pre_capture", "pre_frame") if k in doc}
+    K_flat = [float(v) for row in np.asarray(K, dtype=float).reshape(3, 3) for v in row]
+    T_flat = [float(v) for v in np.asarray(rig.T_base_cam, dtype=float).reshape(-1)]
+    dist_flat = [float(v) for v in np.asarray(dist, dtype=float).reshape(-1)]
+    tip_flat = [float(v) for v in np.asarray(t_tip, dtype=float).reshape(-1)]
+
+    def _call():
+        with store._conn() as c:
+            row = c.execute(
+                "SELECT oracle_compute(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,"
+                "%s,%s,%s,%s,%s,%s::jsonb)",
+                (urdf, json.dumps(prep["waypoints"]), json.dumps(samples),
+                 json.dumps(prep.get("targets") or []), json.dumps(detections),
+                 K_flat, dist_flat, T_flat, tip_flat, kp_spec, json.dumps(doc_extra))).fetchone()
+        return next(iter(row.values()))
+    res = await asyncio.to_thread(_call)
+    doc["holds"] = res["holds"]
+    doc["verdict"] = res["verdict"]
+    if res.get("max_radius_m"):
+        doc["max_radius_m"] = res["max_radius_m"]
+    return True
+
+
 async def oracle_finish(app, prep, sid):
     """Post-execution verification: telemetry + FK + pixels -> the oracle doc.
 
@@ -2071,8 +2140,10 @@ async def oracle_finish(app, prep, sid):
             except (KeyError, TypeError, ValueError):
                 pass
 
-        matched = oracle_mod.match_hold_targets(prep["windows"], prep.get("targets"))
-        for position, window in enumerate(prep["windows"]):
+        pg_handled = await _oracle_pg_compute(app, prep, samples, doc, K, dist, rig, t_tip, turn)
+        matched = (oracle_mod.match_hold_targets(prep["windows"], prep.get("targets"))
+                   if not pg_handled else [])
+        for position, window in enumerate(prep["windows"] if not pg_handled else []):
             hold = {"index": window["index"], "t_start": window["t_start"],
                     "t_end": window["t_end"]}
             target = matched[position] if position < len(matched) else None
@@ -2210,11 +2281,12 @@ async def oracle_finish(app, prep, sid):
                         if box_pre.size and box_pre.shape == box_post.shape:
                             hold["pre_post_diff"] = round(float(np.mean(
                                 cv2.absdiff(box_pre, box_post))), 2)
-        radii = [float(np.hypot(h["tip_fk_cmd"][0], h["tip_fk_cmd"][1]))
-                 for h in doc["holds"] if h.get("tip_fk_cmd")]
-        if radii:
-            doc["max_radius_m"] = round(max(radii), 4)
-        doc["verdict"] = oracle_mod.attribute(doc)
+        if not pg_handled:
+            radii = [float(np.hypot(h["tip_fk_cmd"][0], h["tip_fk_cmd"][1]))
+                     for h in doc["holds"] if h.get("tip_fk_cmd")]
+            if radii:
+                doc["max_radius_m"] = round(max(radii), 4)
+            doc["verdict"] = oracle_mod.attribute(doc)
         mirror = app.get("pg_mirror")
         if mirror is not None:
             # PG mode: the verdict doc is persisted to the substrate only. The

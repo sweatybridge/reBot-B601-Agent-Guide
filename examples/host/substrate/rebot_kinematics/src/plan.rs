@@ -1173,6 +1173,15 @@ fn q7(v: &Value) -> [f64; 7] {
 
 fn wp7(t: f64, q: [f64; 7]) -> Wp { Wp { t, q, tau: [0.0; 7] } }
 
+/// Gravity sag per joint (sweep.gravity_sag): clip(tau_g/kp, ±SAG_LIMIT_RAD).
+#[pg_extern]
+fn rebot_sag_rad(urdf: &str, q6: Vec<f64>, kp_spec: &str) -> Vec<f64> {
+    let ctx = PlanCtx::new(urdf);
+    let kp = kp_vector(kp_spec);
+    let tau = ctx.gravity(&q6);
+    gravity_sag(&tau, &kp).to_vec()
+}
+
 /// The startup elbow peel (sweep.unpark_pose): lift j3 off the j2 casing stop.
 #[pg_extern]
 fn rebot_unpark_pose(q: Vec<f64>) -> Vec<f64> {
