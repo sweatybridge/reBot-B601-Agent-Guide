@@ -498,6 +498,51 @@ fn rebot_path_collision_free(urdf: &str, a: Vec<f64>, b: Vec<f64>, samples: defa
     true
 }
 
+// --------------------------------------------------------------------------- //
+// Trajectory time law — port of traj.ease_fraction / ease_velocity (S-ramp
+// trapezoid: smoothstep ramp into constant-velocity cruise, zero accel at ends).
+// --------------------------------------------------------------------------- //
+
+const RAMP_S: f64 = 0.15;
+
+fn ramp_ratio(duration: f64, ramp: f64) -> f64 {
+    (ramp / duration).max(1e-9).min(0.5)
+}
+
+/// Fraction of a leg's travel at normalized time u (traj.ease_fraction).
+#[pg_extern]
+fn rebot_ease_fraction(u: f64, duration: f64, ramp: default!(f64, 0.15)) -> f64 {
+    let r = ramp_ratio(duration, ramp);
+    let vc = 1.0 / (1.0 - r);
+    let u = u.max(0.0).min(1.0);
+    if u <= r {
+        let x = u / r;
+        vc * r * (x.powi(3) - 0.5 * x.powi(4))
+    } else if u >= 1.0 - r {
+        let y = (1.0 - u) / r;
+        1.0 - vc * r * (y.powi(3) - 0.5 * y.powi(4))
+    } else {
+        vc * (u - 0.5 * r)
+    }
+}
+
+/// d(ease_fraction)/dt in 1/s (traj.ease_velocity); multiply by travel for rad/s.
+#[pg_extern]
+fn rebot_ease_velocity(u: f64, duration: f64, ramp: default!(f64, 0.15)) -> f64 {
+    let r = ramp_ratio(duration, ramp);
+    let vc = 1.0 / (1.0 - r);
+    let u = u.max(0.0).min(1.0);
+    if u <= r {
+        let x = u / r;
+        vc * (3.0 * x * x - 2.0 * x.powi(3)) / duration
+    } else if u >= 1.0 - r {
+        let y = (1.0 - u) / r;
+        vc * (3.0 * y * y - 2.0 * y.powi(3)) / duration
+    } else {
+        vc / duration
+    }
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
