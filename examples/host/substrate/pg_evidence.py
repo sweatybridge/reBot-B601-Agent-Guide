@@ -69,3 +69,21 @@ class PgEvidenceMirror:
     def mirror_sag(self, arm_id: str, map_doc: dict) -> None:
         self.store.ensure_arm(arm_id)
         self.store.upsert_sag_map(arm_id, map_doc)
+
+    def mirror_still(self, episode_id: str, frame_bytes: bytes, purpose: str = "hold",
+                     arm_id=None, t=None, image_size=None) -> str:
+        sha = self.store.put_blob(frame_bytes, "still")
+        w, h = (image_size or [None, None])[:2]
+        self.store.add_still(episode_id, sha, purpose=purpose, arm_id=arm_id, t=t, width=w, height=h)
+        return sha
+
+    def mirror_intrinsics(self, calib_fingerprint: str, K, dist, image_size, corners_bytes=None) -> None:
+        self.store.ensure_calibration(calib_fingerprint, K=K, dist=dist, image_size=image_size)
+        if corners_bytes is not None:
+            self.store.put_blob(corners_bytes, "other")
+
+    def mirror_monitor(self, arm_id: str, ewma_pixel_error_mm=None, ewma_tag_rms_px=None, last_doc=None) -> None:
+        self.store.set_monitor_state(arm_id, ewma_pixel_error_mm, ewma_tag_rms_px, last_doc)
+
+    def mirror_tag(self, tag_id: str, kind: str, side_mm: float, pose_world=None) -> None:
+        self.store.upsert_tag(tag_id, self.workspace_id, kind, side_mm, pose_world)

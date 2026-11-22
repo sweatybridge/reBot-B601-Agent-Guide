@@ -506,6 +506,12 @@ async def ensure_llm_context(app):
         except Exception as exc:  # noqa: BLE001 - a probe must not break health
             info["error"] = str(exc)
         app["llm_context"] = info
+        store = app.get("pg_store")
+        if store is not None:
+            try:
+                store.set_kv("llm_context", info)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("llm_context persist failed: %s", exc)
         if info["tokens"]:
             logging.info("agent context: %d tokens (%s)", info["tokens"], info["source"])
         else:
@@ -2176,6 +2182,13 @@ async def oracle_finish(app, prep, sid):
             logging.warning("accuracy map update for %s failed: %s", plan_id, exc)
         try:
             app["identify_monitor"].observe(doc, rig=app.get("rig"))
+            mirror = app.get("pg_mirror")
+            if mirror is not None:
+                mon = app["identify_monitor"]
+                mirror.mirror_monitor(app.get("arm_id", "b601"),
+                                      ewma_pixel_error_mm=mon.ewma,
+                                      ewma_tag_rms_px=mon.tag_baseline,
+                                      last_doc={"proposals": mon.proposals})
         except Exception as exc:  # noqa: BLE001
             logging.warning("identify monitor for %s failed: %s", plan_id, exc)
     except asyncio.CancelledError:
@@ -3359,6 +3372,19 @@ def build_app(args) -> web.Application:
             app["rig"] = pg_rig
         elif app.get("rig") is not None:
             _pg_mirror_rig(app, app["rig"])
+        # Mirror the base marker spec into world.tag; restore the llm context cache.
+        try:
+            marker = app.get("marker") or {}
+            if marker:
+                app["pg_mirror"].mirror_tag(
+                    str(marker.get("id", "base")), "base",
+                    float(marker.get("size_m", 0.04)),
+                    [marker.get("x"), marker.get("y"), marker.get("z"), marker.get("yaw")])
+            cached_ctx = pg_store.get_kv("llm_context")
+            if cached_ctx and not app["llm_context"]["tokens"]:
+                app["llm_context"] = cached_ctx
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("tag/context restore failed: %s", exc)
     else:
         # The snapshot callable runs lazily at a session's first event, when
         # the app state (rig, calib, gates) is fully populated.
