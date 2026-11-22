@@ -15,6 +15,11 @@ examples/host/tests/.selftest-work/
 examples/host/tests/.browser-check-work/
 examples/host/tests/.e2e-*
 
+# Flattened deploy config (§8): TLS secrets are machine-specific; export/ is
+# derived handoff staging, not a source of truth.
+examples/host/config/tls/*.pem
+examples/host/export/
+
 # CAD visual meshes (~37 MB, fetched on demand by app/cad/fetch.py)
 examples/host/app/cad/meshes/
 
