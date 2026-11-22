@@ -15,6 +15,8 @@ use nalgebra::{Isometry3, Translation3, UnitQuaternion};
 
 pg_module_magic!();
 
+mod plan;
+
 fn load_chain(urdf: &str) -> k::Chain<f64> {
     let robot = urdf_rs::read_from_string(urdf)
         .unwrap_or_else(|e| panic!("URDF parse failed: {e}"));
@@ -84,8 +86,8 @@ fn rebot_dof(urdf: &str) -> i32 {
 // SQL ERROR, never a backend crash.
 // --------------------------------------------------------------------------- //
 
-const GRAVITY: f64 = 9.80665;
-const ARM_JOINTS: [&str; 6] = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"];
+pub(crate) const GRAVITY: f64 = 9.80665;
+pub(crate) const ARM_JOINTS: [&str; 6] = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"];
 
 // (link, mass kg, COM in that link frame) — matches rebot_ik.LINK_INERTIALS.
 // Gripper fingers omitted (<0.1 Nm); gripper_end is the lumped tool mass.
@@ -100,12 +102,12 @@ const LINK_INERTIALS: [(&str, f64, [f64; 3]); 7] = [
 ];
 
 // sweep.py collision model: per-link capsule radii, worktop clearance, reach cap.
-const RADII: [f64; 7] = [0.055, 0.055, 0.050, 0.045, 0.035, 0.030, 0.020];
-const CLEARANCE: f64 = 0.012;
-const LINK_RADIUS_MAX: f64 = 0.85;
+pub(crate) const RADII: [f64; 7] = [0.055, 0.055, 0.050, 0.045, 0.035, 0.030, 0.020];
+pub(crate) const CLEARANCE: f64 = 0.012;
+pub(crate) const LINK_RADIUS_MAX: f64 = 0.85;
 
 /// Load the chain and set the 6 arm joints (gripper joints padded to 0).
-fn load_chain_arm(urdf: &str, q6: &[f64]) -> (urdf_rs::Robot, k::Chain<f64>) {
+pub(crate) fn load_chain_arm(urdf: &str, q6: &[f64]) -> (urdf_rs::Robot, k::Chain<f64>) {
     if q6.len() != 6 {
         panic!("expected 6 arm joint angles, got {}", q6.len());
     }
@@ -120,7 +122,7 @@ fn load_chain_arm(urdf: &str, q6: &[f64]) -> (urdf_rs::Robot, k::Chain<f64>) {
     (robot, chain)
 }
 
-fn joint_axis(robot: &urdf_rs::Robot, name: &str) -> nalgebra::Vector3<f64> {
+pub(crate) fn joint_axis(robot: &urdf_rs::Robot, name: &str) -> nalgebra::Vector3<f64> {
     let j = robot.joints.iter().find(|j| j.name == name)
         .unwrap_or_else(|| panic!("joint not in URDF: {name}"));
     let a = *j.axis.xyz;
@@ -128,7 +130,7 @@ fn joint_axis(robot: &urdf_rs::Robot, name: &str) -> nalgebra::Vector3<f64> {
 }
 
 /// Joint origins (joint1..6) plus the gripper_end tool point, base frame (7x3).
-fn joint_points(chain: &k::Chain<f64>) -> Vec<[f64; 3]> {
+pub(crate) fn joint_points(chain: &k::Chain<f64>) -> Vec<[f64; 3]> {
     let mut pts = Vec::with_capacity(7);
     for name in ARM_JOINTS {
         let node = chain.find(name).unwrap_or_else(|| panic!("joint not found: {name}"));
@@ -143,7 +145,7 @@ fn joint_points(chain: &k::Chain<f64>) -> Vec<[f64; 3]> {
 
 /// tau_g = dU/dq: motor torque to hold the pose against gravity (6 arm joints).
 /// tau[j] = -sum_{links>=j} z_j . cross(p_com - p_j, [0,0,-m*g]).
-fn gravity_torques_impl(robot: &urdf_rs::Robot, chain: &k::Chain<f64>) -> Vec<f64> {
+pub(crate) fn gravity_torques_impl(robot: &urdf_rs::Robot, chain: &k::Chain<f64>) -> Vec<f64> {
     let mut coms: Vec<(f64, nalgebra::Vector3<f64>)> = Vec::with_capacity(7);
     for (lname, mass, com) in LINK_INERTIALS {
         let node = chain.find_link(lname).unwrap_or_else(|| panic!("link not found: {lname}"));
@@ -170,7 +172,7 @@ fn gravity_torques_impl(robot: &urdf_rs::Robot, chain: &k::Chain<f64>) -> Vec<f6
 }
 
 /// sweep.path_safe: is the straight joint-space line a->b clear of the worktop?
-fn path_safe_impl(chain: &k::Chain<f64>, a: &[f64], b: &[f64], samples: usize) -> bool {
+pub(crate) fn path_safe_impl(chain: &k::Chain<f64>, a: &[f64], b: &[f64], samples: usize) -> bool {
     if samples < 2 {
         panic!("samples must be >= 2");
     }
