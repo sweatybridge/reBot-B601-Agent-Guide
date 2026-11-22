@@ -168,6 +168,39 @@ recordings. PG is the learning system of record throughout.
 **Rollback**: unset `REBOT_PG_DSN` (or empty it) and restart — every read falls back to the
 file path, which is still written (additive mirror). No data loss.
 
+### What lives in PG now (comprehensive move)
+
+**State / evidence (mirrored or PG-primary):**
+- Traces (events/blobs/manifests) — full switch (`PgTraceRecorder`).
+- Captures (meta/frame/target) — catalog + serving PG-primary; `locate_target` mirrors target.json.
+- Oracle verdicts + hold/pre/post frames — `oracle_verdict` + `evidence.still`/blobs (via `trace_blob`).
+- Plans + telemetry — `evidence.plan`/`telemetry` (planner mirrors at plan time; PG-primary reads).
+- Rig — `world.shared_rig.rig_doc` (lossless `Rig.from_dict`), PG-primary startup load.
+- Intrinsics — `world.calibration.calib_doc` + corners blob (`calibrate_intrinsics` mirrors).
+- Accuracy envelope — `learning.accuracy_cell` (PG-primary reads).
+- Sag maps — `learning.sag_map` (`identify_cad` mirrors).
+- Identify/CAD session evidence — episodes + blobs (`pg_cli.mirror_session`).
+- Sweep poses — `sweep_video` mirrors poses.json.
+- Recordings — periodic ingest loop mirrors completed mp4s to blobs.
+- Tags — `world.tag`; in-memory state (monitor EWMA, llm context) — `learning.monitor_state`/`substrate_kv`.
+
+**Logic ported to PG functions (all validated against the Python reference):**
+- Rust pgrx (`rebot_kinematics`): FK/IK/dof, gravity torques, worktop `path_safe`, capsule
+  self-collision + `seg_seg_distance`, traj time law (`ease_fraction`/`ease_velocity`),
+  `seconds_for`/`within_limits`, `project` (no-dist + distortion).
+- SQL: `oracle_attribute`, `trace_redact`, `accuracy_cell_update`, `accuracy_cell_key`/
+  `accuracy_validated_fraction`/`accuracy_warnings`, `judge_protocol`, sag fit (`rebot_fit_sag_map` Rust).
+
+**Residual (correctly NOT in-worker):**
+- OpenCV core (calibrate_intrinsics/auto_calibrate feature matching, `witness.check` drift/scale
+  matching, detector) and FFmpeg decode / embedding inference — native/unsafe, run as **isolated
+  activities** (crash-isolation invariant), called via `df.http()`. The embed interface (`embed.py`)
+  exists; the production model choice is open.
+- `ray_plane` iterative undistortion — port pending (the distortion *projection* is ported).
+- Judge geometry (`boxes_of`/`_geometry_problems`) — stays in the Python judge.
+- `coord.*` two-arm cooperation logic — schema ready, wired when multi-arm lands.
+- tls/secrets (`config/`), temp dirs, git code (`tests/agent_cases/`) — correctly stay files.
+
 ## Notes / gotchas
 
 - Data lives on a Docker **named volume**, never a Windows bind mount (WAL locking).
