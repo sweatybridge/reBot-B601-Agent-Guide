@@ -1,11 +1,10 @@
 """Additive PG evidence mirror (spec §8, deeper paths).
 
-The realtime capture/calibration/serving flow stays file-based — it is deeply coupled
-(click_for passes frame.jpg paths to the detector; image URLs serve files; the rig
-hot-reload reads calib files). This mirrors the evidence into the substrate learning
-plane as it is produced: PG is the learning system of record, files are the realtime
-serving cache. The trace pipeline (pg_trace.py) is fully switched; these deeper paths
-mirror additively.
+The calibration flow stays file-based (the rig hot-reload reads calib files); the
+capture catalog/serving reads are PG-primary with file fallback. This mirrors the
+evidence into the substrate learning plane as it is produced: PG is the learning
+system of record, files are the realtime serving cache. The trace pipeline
+(pg_trace.py) is fully switched; these deeper paths mirror additively.
 
 Every method is synchronous; the caller offloads to a thread and wraps it so a PG
 failure never breaks the arm/chat path (§8.4). Dependency order: a plan must be mirrored
@@ -13,8 +12,6 @@ before its oracle verdict / telemetry (oracle_verdict.plan_id and telemetry.plan
 FKs to evidence.plan).
 """
 from __future__ import annotations
-
-import json
 
 
 class PgEvidenceMirror:
@@ -76,11 +73,6 @@ class PgEvidenceMirror:
         w, h = (image_size or [None, None])[:2]
         self.store.add_still(episode_id, sha, purpose=purpose, arm_id=arm_id, t=t, width=w, height=h)
         return sha
-
-    def mirror_intrinsics(self, calib_fingerprint: str, K, dist, image_size, corners_bytes=None) -> None:
-        self.store.ensure_calibration(calib_fingerprint, K=K, dist=dist, image_size=image_size)
-        if corners_bytes is not None:
-            self.store.put_blob(corners_bytes, "other")
 
     def mirror_monitor(self, arm_id: str, ewma_pixel_error_mm=None, ewma_tag_rms_px=None, last_doc=None) -> None:
         self.store.set_monitor_state(arm_id, ewma_pixel_error_mm, ewma_tag_rms_px, last_doc)

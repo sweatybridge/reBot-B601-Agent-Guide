@@ -619,6 +619,74 @@ fn rebot_project_dist(k: Vec<f64>, t_base_cam: Vec<f64>, point: Vec<f64>, dist: 
     Some(vec![k[0] * xd + k[2], k[4] * yd + k[5]])
 }
 
+// --------------------------------------------------------------------------- //
+// Ray/plane intersection with iterative undistortion (port of
+// extrinsics.ray_plane + extrinsics.undistort). Pure math, memory-safe.
+// --------------------------------------------------------------------------- //
+
+/// Fixed-point inversion of the radial/tangential distortion (extrinsics.undistort,
+/// 10 iterations; the phone's distortion is mild enough for this to converge).
+fn undistort(xd: f64, yd: f64, dist: &[f64]) -> (f64, f64) {
+    let k1 = *dist.first().unwrap_or(&0.0);
+    let k2 = *dist.get(1).unwrap_or(&0.0);
+    let p1 = *dist.get(2).unwrap_or(&0.0);
+    let p2 = *dist.get(3).unwrap_or(&0.0);
+    let k3 = *dist.get(4).unwrap_or(&0.0);
+    if k1 == 0.0 && k2 == 0.0 && p1 == 0.0 && p2 == 0.0 && k3 == 0.0 {
+        return (xd, yd);
+    }
+    let (mut x, mut y) = (xd, yd);
+    for _ in 0..10 {
+        let r2 = x * x + y * y;
+        let radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2;
+        let dx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
+        let dy = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
+        x = (xd - dx) / radial;
+        y = (yd - dy) / radial;
+    }
+    (x, y)
+}
+
+/// Where the pixel's ray meets the horizontal plane (extrinsics.ray_plane).
+/// K row-major 3x3 (9), dist [k1,k2,p1,p2,k3] (padded with 0), T_base_cam
+/// row-major 4x4 (16). Returns {point:[x,y,z], distance, grazing_deg}.
+/// Degenerate/parallel/away rays raise a SQL ERROR (Python: ExtrinsicsError).
+#[pg_extern]
+fn rebot_ray_plane(k: Vec<f64>, dist: Vec<f64>, t_base_cam: Vec<f64>,
+                   u: f64, v: f64, plane_z: f64) -> pgrx::JsonB {
+    if k.len() != 9 || t_base_cam.len() != 16 {
+        panic!("K must be 9, T_base_cam 16");
+    }
+    let xd = (u - k[2]) / k[0];
+    let yd = (v - k[5]) / k[4];
+    let (x, y) = undistort(xd, yd, &dist);
+
+    // direction = R @ [x, y, 1]; origin = translation column.
+    let t = &t_base_cam;
+    let mut d = [
+        t[0] * x + t[1] * y + t[2],
+        t[4] * x + t[5] * y + t[6],
+        t[8] * x + t[9] * y + t[10],
+    ];
+    let norm = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if norm < 1e-12 {
+        panic!("degenerate ray for pixel ({u}, {v})");
+    }
+    for c in d.iter_mut() { *c /= norm; }
+    if d[2].abs() < 1e-6 {
+        panic!("the ray is parallel to the table plane");
+    }
+    let distance = (plane_z - t[11]) / d[2];
+    if distance <= 0.0 {
+        panic!("the ray points away from the table plane");
+    }
+    let point = [t[3] + distance * d[0], t[7] + distance * d[1], t[11] + distance * d[2]];
+    let grazing = d[2].abs().min(1.0).asin().to_degrees();
+    pgrx::JsonB(serde_json::json!({
+        "point": point, "distance": distance, "grazing_deg": grazing,
+    }))
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {

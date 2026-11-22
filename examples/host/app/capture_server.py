@@ -3436,6 +3436,17 @@ def build_app(args) -> web.Application:
     # The hillclimb (§7): the monitor only proposes; the accuracy map is the
     # measured envelope /sequence warns from and /health reports.
     app["identify_monitor"] = identify_mod.TriggerMonitor()
+    # Restore the persisted drift trend so a restart doesn't reset the EWMA.
+    if app.get("pg_mirror") is not None:
+        try:
+            st = pg_store.get_monitor_state(app.get("arm_id", "b601"))
+            if st:
+                mon = app["identify_monitor"]
+                mon.ewma = st["ewma_pixel_error_mm"]
+                mon.tag_baseline = st["ewma_tag_rms_px"]
+                mon.proposals = (st["last_doc"] or {}).get("proposals", [])
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("monitor state restore failed: %s", exc)
     app["identify_last"] = None
     app["accuracy_map_path"] = app["calib"] / "accuracy-map.json"
 
