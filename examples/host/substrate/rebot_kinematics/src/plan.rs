@@ -19,12 +19,10 @@ use crate::{load_chain_arm, joint_axis, gravity_torques_impl, path_safe_impl, AR
 type V3 = Vector3<f64>;
 type M3 = Matrix3<f64>;
 
-#[allow(dead_code)] // gripper pick/sequence branch (follow-up)
 const MOTOR7_OPEN: f64 = 4.90;
 const MOTOR7_CLOSED: f64 = -0.015;
-#[allow(dead_code)]
+const MOTOR7_HALF: f64 = (MOTOR7_OPEN + MOTOR7_CLOSED) / 2.0;
 const GRIPPER_RAD_PER_MM: f64 = 0.0412;
-#[allow(dead_code)]
 const GRIPPER_MAX_WIDTH_MM: f64 = (MOTOR7_OPEN - MOTOR7_CLOSED) / GRIPPER_RAD_PER_MM;
 const DEFAULT_MIN_Z: f64 = 0.04;
 const SAG_LIMIT_RAD: f64 = 0.15;
@@ -36,7 +34,6 @@ const MIN_CRUISE_SPEED: f64 = 0.25;
 const MIN_SECONDS: f64 = 0.3;
 const MAX_SECONDS: f64 = 25.0;
 const PEAK_SPEED: f64 = 0.5;
-#[allow(dead_code)]
 const GRIPPER_PEAK_SPEED: f64 = 3.0;
 const LIMITS: [(f64, f64); 6] = [
     (-2.80, 2.80), (0.0, 3.14), (0.0, 3.14), (-1.57, 1.57), (-1.57, 1.57), (-3.14, 3.14),
@@ -113,7 +110,6 @@ fn stage_in_front(point: &V3, approach: f64) -> V3 {
     point - V3::new(point.x, point.y, 0.0) * (approach / radius)
 }
 
-#[allow(dead_code)]
 fn close_angle(close_width_mm: Option<f64>, default: f64) -> f64 {
     match close_width_mm {
         None => default,
@@ -148,7 +144,6 @@ fn seconds_for(a: &[f64], b: &[f64]) -> f64 {
     MIN_SECONDS.max(MAX_SECONDS.min(peak_time).min(cruise_cap))
 }
 
-#[allow(dead_code)]
 fn gripper_seconds(travel: f64) -> f64 {
     if !travel.is_finite() { return 0.0; }
     (std::f64::consts::PI / 2.0) * travel.abs() / GRIPPER_PEAK_SPEED
@@ -626,7 +621,18 @@ impl<'a> Planner<'a> {
         }
     }
 
-    #[allow(dead_code)]
+    // Sequence hold: re-append at the current pose with the given gripper angle
+    // (plan_sequence.hold recomputes gravity via append; q[:6] is constant so the
+    // torque matches the carried value, but the gripper angle is explicit).
+    fn hold_g(&mut self, seconds: f64, gripper: f64) {
+        let count = (seconds * self.hz).round().max(1.0) as usize;
+        let q6 = self.last_q6();
+        for _ in 0..count {
+            self.t += self.period;
+            self.append(&q6, gripper);
+        }
+    }
+
     fn gripper_leg(&mut self, target_angle: f64, seconds: f64) {
         let current = self.waypoints.last().unwrap().q[6];
         let seconds = seconds.max(gripper_seconds(target_angle - current));
@@ -770,20 +776,7 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
     let _ = pre;
 
     // compensate_waypoints: command the sag offset at emission (§7.3b).
-    let mut compensated: Vec<Wp> = Vec::with_capacity(pl.waypoints.len());
-    for wp in &pl.waypoints {
-        let q6 = &wp.q[..6];
-        let tau = ctx.gravity(q6);
-        let extra = sag_correction(q6, &tau, &snap, &kp_spec);
-        let cmd = aim_with_ctx(&ctx, q6, &kp, &extra);
-        let mut q = [0.0; 7];
-        for j in 0..6 { q[j] = cmd[j].clamp(LIMITS[j].0, LIMITS[j].1); }
-        q[6] = wp.q[6];
-        let g = ctx.gravity_urdf(&q[..6]);
-        let mut tau7 = [0.0; 7];
-        tau7[..6].copy_from_slice(&g);
-        compensated.push(Wp { t: wp.t, q, tau: tau7 });
-    }
+    let compensated = compensate(&ctx, &pl.waypoints, &snap, &kp_spec, &kp);
 
     let steps = if is_tip {
         format!("tap target: move tip to [{:.3} {:.3} {:.3}]{}", point.x, point.y, point.z,
@@ -870,3 +863,284 @@ fn aim_with_ctx(ctx: &PlanCtx, target: &[f64], kp: &[f64; 6], extra: &[f64; 6]) 
     }
     command
 }
+
+// compensate_waypoints: command the sag offset at emission (§7.3b). The command
+// uses the numpy gravity model (as the reference does); the emitted tau uses the
+// full URDF RNEA gravity. Shared by the hover and sequence branches.
+fn compensate(ctx: &PlanCtx, waypoints: &[Wp], snap: &Value, kp_spec: &str, kp: &[f64; 6]) -> Vec<Wp> {
+    let mut out = Vec::with_capacity(waypoints.len());
+    for wp in waypoints {
+        let q6 = &wp.q[..6];
+        let tau = ctx.gravity(q6);
+        let extra = sag_correction(q6, &tau, snap, kp_spec);
+        let cmd = aim_with_ctx(ctx, q6, kp, &extra);
+        let mut q = [0.0; 7];
+        for j in 0..6 { q[j] = cmd[j].clamp(LIMITS[j].0, LIMITS[j].1); }
+        q[6] = wp.q[6];
+        let g = ctx.gravity_urdf(&q[..6]);
+        let mut tau7 = [0.0; 7];
+        tau7[..6].copy_from_slice(&g);
+        out.push(Wp { t: wp.t, q, tau: tau7 });
+    }
+    out
+}
+
+fn limits7() -> [[f64; 2]; 7] {
+    let mut l = [[0.0; 2]; 7];
+    for j in 0..6 { l[j] = [LIMITS[j].0, LIMITS[j].1]; }
+    l[6] = [-0.1, 5.0];
+    l
+}
+
+fn read_posture(dump: &Value) -> ([f64; 6], f64) {
+    let ids = dump["ids"].as_array().unwrap_or_else(|| panic!("dump needs ids"));
+    let ids6: Vec<i64> = ids.iter().take(6).map(|v| v.as_i64().unwrap()).collect();
+    if ids6 != vec![1, 2, 3, 4, 5, 6] { panic!("expected motor ids 1..6 first, got {ids6:?}"); }
+    let qdump = dump["q"].as_array().unwrap_or_else(|| panic!("dump needs q"));
+    let mut q = [0.0; 6];
+    for j in 0..6 { q[j] = qdump[j].as_f64().unwrap().clamp(LIMITS[j].0, LIMITS[j].1); }
+    let gripper = qdump.get(6).and_then(|v| v.as_f64()).unwrap_or(MOTOR7_CLOSED);
+    (q, gripper)
+}
+
+/// The multi-marker sequence core (port of plan_to_target.plan_sequence) — the
+/// gateway's gripper="alternate" path. Endpoint-first per marker (one IK solve,
+/// then joint-space interpolation), gripper open/close on odd/even markers,
+/// stage-and-slide on odd markers. Pure jsonb -> jsonb. `targets` is an array of
+/// rebot-target objects. Returns {payload, summary}.
+#[pg_extern]
+fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
+                       options: pgrx::JsonB, snap: pgrx::JsonB) -> pgrx::JsonB {
+    let dump = dump.0;
+    let targets = targets.0;
+    let options = options.0;
+    let snap = snap.0;
+    let tarr = targets.as_array().unwrap_or_else(|| panic!("targets must be an array"));
+    if tarr.is_empty() { panic!("a marker sequence needs at least one target"); }
+    if tarr.len() > 20 { panic!("a marker sequence is limited to 20 targets"); }
+    let ctx = PlanCtx::new(urdf);
+
+    let (q_start, gripper_start) = read_posture(&dump);
+    let ee_start = ctx.pose(&q_start);
+    let p_start = ee_start.translation.vector;
+    let mut r0 = ee_start.rotation.to_rotation_matrix().matrix().clone();
+
+    let tool_axis = opt_s(&options, "tool_axis", "current").to_string();
+    let yaw = opt_f(&options, "yaw", 0.0);
+    let approach = opt_f(&options, "approach", 0.06);
+    let hz = opt_f(&options, "hz", 30.0);
+    let hold_s = opt_f(&options, "hold_s", 0.6);
+    let grasp_q = opt_f(&options, "grasp_q", 2.0);
+    let close_width_mm = options.get("close_width_mm").and_then(|v| v.as_f64());
+    let unpark_j2 = opt_f(&options, "unpark_j2", 0.0);
+    let unpark_j3 = opt_f(&options, "unpark_j3", 8.0);
+    let unpark_s = opt_f(&options, "unpark_s", 2.0);
+    let ik_pos_tol = opt_f(&options, "ik_pos_tol", 0.002).max(0.010);
+    let ik_angle_tol = opt_f(&options, "ik_angle_tol", 0.5);
+    let min_z = opt_f(&options, "min_z", DEFAULT_MIN_Z);
+    let max_z = opt_f(&options, "max_z", 0.95);
+    let max_reach = opt_f(&options, "max_reach", 0.75);
+    let kp_spec = opt_s(&options, "kp_spec", "50,2:150,3:150").to_string();
+    let kp = kp_vector(&kp_spec);
+    let sequence_axis = if tool_axis == "current" { "z-".to_string() } else { tool_axis.clone() };
+
+    // Validate every marker before the first move; collect tip/flange points.
+    let mut points: Vec<V3> = Vec::new();
+    let mut hovers: Vec<f64> = Vec::new();
+    let mut tip_offsets: Vec<f64> = Vec::new();
+    let mut flange_points: Vec<V3> = Vec::new();
+    for (i, target) in tarr.iter().enumerate() {
+        if target.get("format").and_then(|v| v.as_str()) != Some("rebot-target") {
+            panic!("marker {}: not a rebot-target file", i + 1);
+        }
+        let point = json_v3(&target["point"]);
+        let hover_m = target.get("hover_m").and_then(|v| v.as_f64())
+            .unwrap_or(opt_f(&options, "hover_m", DEFAULT_MIN_Z));
+        let tip_offset_m = target.get("tip_offset_m").and_then(|v| v.as_f64())
+            .unwrap_or(opt_f(&options, "tip_m", 0.0));
+        let is_tip = target.get("point_frame").and_then(|v| v.as_str()) == Some("tip");
+        let tip_point = if is_tip { point } else { point + V3::new(0.0, 0.0, hover_m) };
+        let flange_point = tip_point + V3::new(0.0, 0.0, tip_offset_m);
+        let radius = (point.x * point.x + point.y * point.y).sqrt();
+        if tip_point.z < min_z - 1e-9 {
+            panic!("marker {}: tip z {:.4} is below the minimum {min_z:.4}", i + 1, tip_point.z);
+        }
+        if tip_point.z > max_z { panic!("marker {}: tip z {:.3} is above --max-z {max_z:.3}", i + 1, tip_point.z); }
+        if radius > max_reach {
+            panic!("marker {}: target is {radius:.3} m from the base axis, above --max-reach {max_reach:.2}", i + 1);
+        }
+        points.push(tip_point);
+        hovers.push(if is_tip { 0.0 } else { hover_m });
+        tip_offsets.push(tip_offset_m);
+        flange_points.push(flange_point);
+    }
+
+    let mut pl = Planner {
+        ctx: &ctx, hz, period: 1.0 / hz, t: 0.0, waypoints: Vec::new(),
+        worst_residual: 0.0, worst_where: String::new(), ik_pos_tol, ik_angle_tol,
+    };
+
+    // The edge starts from the current gripper angle; ramp it open first.
+    let mut gripper = MOTOR7_OPEN;
+    if (gripper_start - MOTOR7_OPEN).abs() > 1e-6 {
+        pl.t += pl.period;
+        pl.append(&q_start, gripper_start);
+        pl.gripper_leg(MOTOR7_OPEN, 0.8_f64.max(hold_s));
+    }
+
+    let mut unpark = [0.0; 6];
+    unpark[1] = unpark_j2.to_radians();
+    unpark[2] = unpark_j3.to_radians();
+    let unparked = unpark.iter().any(|v| v.abs() > 1e-9);
+    let mut seed = q_start;
+    if unparked {
+        seed = pl.joint_leg(&q_start, &unpark, unpark_s, gripper);
+        let ee = ctx.pose(&seed);
+        r0 = ee.rotation.to_rotation_matrix().matrix().clone();
+    }
+    let start_seed = seed;
+    let odd_close = close_angle(close_width_mm, grasp_q);
+
+    let mut marker_q_ik: Vec<[f64; 6]> = Vec::new();
+    let mut marker_holds: Vec<(f64, f64)> = Vec::new();
+    let mut yaw_degrees: Vec<f64> = Vec::new();
+    for (i, point) in points.iter().enumerate() {
+        let index = i + 1;
+        let place = flange_points[i];
+        let yaw_deg = point.y.atan2(point.x).to_degrees();
+        yaw_degrees.push((yaw_deg * 1000.0).round() / 1000.0);
+        let r_marker = work_orientation(&r0, &sequence_axis, yaw_deg);
+        let label = format!("marker {index}");
+        let target_q = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pl.ik_to(&place, &r_marker, &seed, &label))) {
+            Ok(q) => q,
+            Err(_) => pl.ik_to(&place, &r_marker, &start_seed, &label),
+        };
+        marker_q_ik.push(target_q);
+        let mut current_q = pl.last_q6();
+        if index % 2 == 1 {
+            let stage_point = stage_in_front(point, approach);
+            let stage_place = stage_point + V3::new(0.0, 0.0, tip_offsets[i]);
+            let slabel = format!("stage {index}");
+            let stage_q = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pl.ik_to(&stage_place, &r_marker, &seed, &slabel))) {
+                Ok(q) => q,
+                Err(_) => pl.ik_to(&stage_place, &r_marker, &start_seed, &slabel),
+            };
+            if !ctx.path_safe(&current_q, &stage_q) {
+                panic!("the leg to the staging point for marker {index} dips within a link radius of the worktop; space the markers further apart or move the arm clear");
+            }
+            let mut d = [0.0; 6];
+            for j in 0..6 { d[j] = stage_q[j] - current_q[j]; }
+            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &stage_q), gripper);
+            current_q = pl.last_q6();
+            if !ctx.path_safe(&current_q, &target_q) {
+                panic!("the slide-in to marker {index} dips within a link radius of the worktop; raise the marker or move the arm clear");
+            }
+            let mut d = [0.0; 6];
+            for j in 0..6 { d[j] = target_q[j] - current_q[j]; }
+            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &target_q), gripper);
+        } else {
+            if !ctx.path_safe(&current_q, &target_q) {
+                panic!("the leg to marker {index} dips within a link radius of the worktop; space the markers further apart or move the arm clear");
+            }
+            let mut d = [0.0; 6];
+            for j in 0..6 { d[j] = target_q[j] - current_q[j]; }
+            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &target_q), gripper);
+        }
+        let hold_t0 = pl.t;
+        pl.hold_g(0.25, gripper);
+        let next_gripper = if index % 2 == 1 { odd_close } else { MOTOR7_OPEN };
+        if (next_gripper - gripper).abs() > 1e-6 {
+            pl.gripper_leg(next_gripper, 0.8_f64.max(hold_s));
+        }
+        gripper = next_gripper;
+        pl.hold_g(0.25, gripper);
+        marker_holds.push((hold_t0, pl.t));
+        seed = target_q;
+    }
+
+    // Return in joint space to the start pose.
+    let q_last = pl.last_q6();
+    if !ctx.path_safe(&q_last, &q_start) {
+        panic!("the return from marker {} to the start pose dips within a link radius of the worktop; move the arm clear and retry", points.len());
+    }
+    let mut d = [0.0; 6];
+    for j in 0..6 { d[j] = q_start[j] - q_last[j]; }
+    pl.joint_leg(&q_last, &d, seconds_for(&q_last, &q_start), gripper);
+
+    let compensated = compensate(&ctx, &pl.waypoints, &snap, &kp_spec, &kp);
+
+    let close_text = match close_width_mm {
+        None => format!("close to {odd_close:.2} rad"),
+        Some(w) => format!("close to {w:.1} mm"),
+    };
+    let steps = format!("{} markers: stage {:.0} mm in front and slide in on odd, direct on even; \
+                         gripper open, {close_text} on odd, open on even; return",
+                        points.len(), approach * 1000.0);
+
+    let targets_prov: Vec<Value> = points.iter().enumerate().map(|(i, point)| {
+        json!({
+            "point": arr3(point),
+            "flange_point": arr3(&flange_points[i]),
+            "hover_m": hovers[i],
+            "tip_offset_m": tip_offsets[i],
+            "surface_point": tarr[i].get("surface_point").cloned().unwrap_or(Value::Null),
+            "tap_height_m": tarr[i].get("tap_height_m").cloned().unwrap_or(Value::Null),
+            "capture": tarr[i].get("capture").cloned().unwrap_or(Value::Null),
+            "source": tarr[i].get("source").cloned().unwrap_or(Value::Null),
+            "tap": tarr[i].get("tap").cloned().unwrap_or(Value::Null),
+            "q_ik": marker_q_ik[i].to_vec(),
+            "hold_t_start": marker_holds[i].0,
+            "hold_t_end": marker_holds[i].1,
+        })
+    }).collect();
+    let provenance = json!({
+        "sequence": true,
+        "hover_m": opt_f(&options, "hover_m", DEFAULT_MIN_Z),
+        "tip_m": opt_f(&options, "tip_m", 0.0),
+        "targets": targets_prov,
+        "tool_axis": sequence_axis,
+        "yaw_deg": yaw,
+        "marker_yaw_deg": yaw_degrees,
+        "gripper": {"open": MOTOR7_OPEN, "half": MOTOR7_HALF,
+                    "closed": MOTOR7_CLOSED, "odd_close": odd_close},
+    });
+    let extra = json!({
+        "capture": provenance,
+        "tool_axis": sequence_axis,
+        "yaw_deg": yaw,
+        "marker_yaw_deg": yaw_degrees,
+        "dynamics": {
+            "source": "rebot_plan_sequence (Rust CLIK + gravity port of reBotArm_control_py)",
+            "tau": "gravity torque of the planned pose, per waypoint",
+        },
+    });
+    let payload = build_payload(&compensated, hz, &limits7(), &steps, extra, None, None);
+    let stats = validate_payload(&payload);
+
+    let tip_m_summary = if !tip_offsets.is_empty()
+        && tip_offsets.iter().all(|v| (v - tip_offsets[0]).abs() < 1e-9) {
+        json!(tip_offsets[0])
+    } else { Value::Null };
+    let summary = json!({
+        "markers": points.len(),
+        "targets": points.iter().map(arr3).collect::<Vec<_>>(),
+        "flange_points": flange_points.iter().map(arr3).collect::<Vec<_>>(),
+        "q_ik": marker_q_ik.iter().map(|q| q.to_vec()).collect::<Vec<_>>(),
+        "radii": points.iter().map(|p| (p.x * p.x + p.y * p.y).sqrt()).collect::<Vec<_>>(),
+        "hover_m": opt_f(&options, "hover_m", DEFAULT_MIN_Z),
+        "hovers_m": hovers,
+        "tap_heights_m": tarr.iter().map(|t| t.get("tap_height_m").cloned().unwrap_or(Value::Null)).collect::<Vec<_>>(),
+        "tip_offsets_m": tip_offsets,
+        "tip_m": tip_m_summary,
+        "start_tcp": arr3(&p_start),
+        "waypoints": stats["waypoints"],
+        "duration_s": stats["duration_s"],
+        "worst_ik_m": pl.worst_residual,
+        "worst_ik_at": if pl.worst_where.is_empty() { Value::Null } else { json!(pl.worst_where) },
+        "peak_tau": stats["peak_tau"],
+        "max_step_rad": stats["max_step_rad"],
+        "unparked": unparked,
+    });
+    pgrx::JsonB(json!({ "payload": payload, "summary": summary }))
+}
+
