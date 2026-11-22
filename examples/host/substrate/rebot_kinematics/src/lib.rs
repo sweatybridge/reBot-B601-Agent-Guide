@@ -592,6 +592,33 @@ fn rebot_project(k: Vec<f64>, t_base_cam: Vec<f64>, point: Vec<f64>) -> Option<V
     Some(vec![qx / qz, qy / qz])
 }
 
+/// Project with lens distortion (locate_target.project's cv2.projectPoints path).
+/// dist = [k1,k2,p1,p2,k3] (radial/tangential). NULL if behind the camera.
+#[pg_extern]
+fn rebot_project_dist(k: Vec<f64>, t_base_cam: Vec<f64>, point: Vec<f64>, dist: Vec<f64>) -> Option<Vec<f64>> {
+    if k.len() != 9 || t_base_cam.len() != 16 || point.len() != 3 {
+        panic!("K must be 9, T_base_cam 16, point 3");
+    }
+    let dx = point[0] - t_base_cam[3];
+    let dy = point[1] - t_base_cam[7];
+    let dz = point[2] - t_base_cam[11];
+    let px = t_base_cam[0] * dx + t_base_cam[4] * dy + t_base_cam[8] * dz;
+    let py = t_base_cam[1] * dx + t_base_cam[5] * dy + t_base_cam[9] * dz;
+    let pz = t_base_cam[2] * dx + t_base_cam[6] * dy + t_base_cam[10] * dz;
+    if pz <= 1e-9 { return None; }
+    let x = px / pz;
+    let y = py / pz;
+    let (k1, k2, p1, p2, k3) = (
+        *dist.get(0).unwrap_or(&0.0), *dist.get(1).unwrap_or(&0.0),
+        *dist.get(2).unwrap_or(&0.0), *dist.get(3).unwrap_or(&0.0),
+        *dist.get(4).unwrap_or(&0.0));
+    let r2 = x * x + y * y;
+    let radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2;
+    let xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
+    let yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
+    Some(vec![k[0] * xd + k[2], k[4] * yd + k[5]])
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
