@@ -123,6 +123,29 @@ would break it. The flatten requires rewiring those readers to PG (a separate, l
 effort); until then `state/` stays the serving cache and PG is the learning system of record.
 Old file state can be discarded (non-production); no backfill needed.
 
+### Cutover status (what is PG-primary vs still file-based)
+
+PG-primary when `--pg-dsn` is set (file fallback otherwise):
+- **Traces** — full switch (`PgTraceRecorder`); reads from PG.
+- **Capture catalog** — `handle_captures` lists from PG; `handle_file` serves frames from
+  PG blobs; `click_for` reads meta from PG and materializes the frame blob for the detector.
+- **Capture upload** — `handle_capture` mirrors meta/frame into PG (files still written).
+- **Accuracy envelope** — `_accuracy_map` reads cells from PG (`read_accuracy_map`).
+- **Learning writes** — oracle verdict/plan/telemetry/rig/sag mirrored as produced.
+
+Still file-based (the remaining flatten work):
+- **Calib/rig reads** — `extrinsics.load_rig` reads the rig file. A PG cutover needs a
+  schema expansion: `world.shared_rig` lacks `joint_zeros`/`sigma`/`weakest`/`predicted`
+  that the live `Rig` object needs, so reconstruction is lossy until those are stored.
+- **Planner `out/` + `telemetry/` reads** — the planner reads/writes trajectory files.
+- **Directory move** — `state/tls` → `config/tls`, bootstrap → `config/`, bundles →
+  `export/`; requires updating the live stack's compose env (`REBOT_CERT`/`REBOT_KEY` etc.).
+
+The flatten (removing `state/` as source of truth) completes once those reads are cut over
+and the directory move is deployed. Deployment restarts the live capture/planner containers
+and is gated on the arm parked + explicit go-ahead (arm verified parked at q≈0 during this
+work).
+
 ## Notes / gotchas
 
 - Data lives on a Docker **named volume**, never a Windows bind mount (WAL locking).
