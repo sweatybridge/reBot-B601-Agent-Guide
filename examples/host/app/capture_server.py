@@ -2339,6 +2339,7 @@ async def handle_calibrate(request: web.Request) -> web.Response:
         else:
             app["rig"] = rig
             app["extrinsics_path"] = payload["written"]
+            _pg_mirror_rig(app, rig)
             try:
                 app["witness"] = witness.load_for(rig, Path(payload["written"]).parent)
             except witness.WitnessError as error:
@@ -2682,6 +2683,7 @@ async def handle_identify_run(request: web.Request) -> web.Response:
         else:
             app["rig"] = rig
             app["extrinsics_path"] = payload["written"]
+            _pg_mirror_rig(app, rig)
             try:
                 app["witness"] = witness.load_for(rig, Path(payload["written"]).parent)
             except witness.WitnessError as error:
@@ -2770,6 +2772,8 @@ async def handle_identify_sag(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(error)}, status=500)
     if result["ok"]:
         identify_mod.save_sag_map(app["calib"], result["map"])
+        if result.get("ok"):
+            _pg_mirror_sag(app, result["map"])
     return web.json_response(dict(result, holds=len(holds)),
                              status=200 if result["ok"] else 422)
 
@@ -2959,6 +2963,24 @@ class UprightEye:
         self.eye.close()
 
 
+def _pg_mirror_rig(app, rig):
+    mirror = app.get("pg_mirror")
+    if mirror is not None and rig is not None:
+        try:
+            mirror.mirror_rig(rig)
+        except Exception as exc:  # noqa: BLE001 - mirror never breaks the rig path (§8.4)
+            logging.warning("rig mirror failed: %s", exc)
+
+
+def _pg_mirror_sag(app, map_doc):
+    mirror = app.get("pg_mirror")
+    if mirror is not None:
+        try:
+            mirror.mirror_sag(app.get("arm_id", "b601"), map_doc)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("sag mirror failed: %s", exc)
+
+
 def grab_one(app, camera_url, commit=True):
     """One still from the fixed camera, plus the pose the click path needs.
 
@@ -3062,6 +3084,7 @@ async def handle_capture_pose(request: web.Request) -> web.Response:
         else:
             app["rig"] = rig
             app["extrinsics_path"] = written
+            _pg_mirror_rig(app, rig)
             try:
                 app["witness"] = witness.load_for(rig, Path(written).parent)
             except witness.WitnessError as error:
@@ -3258,6 +3281,9 @@ def build_app(args) -> web.Application:
         app["traces"] = PgTraceRecorder(
             pg_store, workspace_id=pg_workspace,
             snapshot=lambda sid: trace_manifest(app, sid))
+        # The startup rig loads before the mirror exists; mirror it now if present.
+        if app.get("rig") is not None:
+            _pg_mirror_rig(app, app["rig"])
     else:
         # The snapshot callable runs lazily at a session's first event, when
         # the app state (rig, calib, gates) is fully populated.

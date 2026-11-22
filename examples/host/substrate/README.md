@@ -108,15 +108,20 @@ is produced — PG is the learning system of record, files stay the realtime ser
 Wired so far (additive, wrapped so a PG failure never breaks the arm/chat, §8.4):
 - **Capture** (`save_capture`): meta/frames → `evidence.episode`/`still`/`blob` + manifest.
 - **Oracle** (verdict write): plan trajectory → `evidence.plan`, verdict →
-  `evidence.oracle_verdict`, holds → `accuracy_cell_update`. The plan is mirrored first
-  to satisfy the `oracle_verdict.plan_id` FK.
-- Validated: `tests/test_pg_evidence.py` (capture/plan/oracle/telemetry round-trip in FK
-  order, accuracy cells validate). `mirror_telemetry` is implemented but not yet wired to
-  the live telemetry write.
+  `evidence.oracle_verdict`, holds → `accuracy_cell_update`, telemetry →
+  `evidence.telemetry`. The plan is mirrored first to satisfy the `oracle_verdict.plan_id` FK.
+- **Calib**: rig load/hot-reload (calibration, identification, capture-pose, startup) →
+  `world.shared_rig` (active rig superseded); sag fit → `learning.sag_map`. Accuracy cells
+  arrive via the oracle mirror.
+- Validated: `tests/test_pg_evidence.py` (capture/plan/oracle/telemetry/rig/sag round-trip
+  in FK order; accuracy cells validate).
 
-**Remaining migration scope:** calib (rig/intrinsics/sag/accuracy) → `world.*`/`learning.*`;
-planner `out/` + `telemetry/` live wiring; and the `state/` → `config/` + `export/` flatten
-(gated on those). Old file state can be discarded (non-production); no backfill needed.
+**Remaining: the flatten.** `state/` → `config/` + `export/` is gated on a *full* serving
+cutover. The mirror is additive — the file-based realtime serving/calibration flow still
+reads/writes `state/` (image URLs, `click_for` frame paths, rig hot-reload). Flattening now
+would break it. The flatten requires rewiring those readers to PG (a separate, larger
+effort); until then `state/` stays the serving cache and PG is the learning system of record.
+Old file state can be discarded (non-production); no backfill needed.
 
 ## Notes / gotchas
 

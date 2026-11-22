@@ -164,6 +164,50 @@ class SubstrateStore:
                 (episode_id, sha, seq, t_start, t_end, codec, width, height),
             )
 
+    # -- calibration catalog (world / learning) ------------------------- #
+    def ensure_calibration(self, calib_fingerprint: str, K=None, dist=None, image_size=None) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO world.calibration(calib_fingerprint, K, dist, image_size) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (calib_fingerprint) DO NOTHING",
+                (calib_fingerprint, json.dumps(K or [[1, 0, 0], [0, 1, 0], [0, 0, 1]]),
+                 json.dumps(dist or [0, 0, 0, 0, 0]), json.dumps(image_size or [0, 0])),
+            )
+
+    def upsert_rig(self, rig_fingerprint: str, workspace_id: str, calib_fingerprint: str,
+                   T_base_cam, image_size, tip_offset, method="base-marker",
+                   rms_px=None, rms_mm=None, witness=None, provenance=None) -> None:
+        """Mirror a rig as the active shared rig; supersede prior active rigs."""
+        self.ensure_calibration(calib_fingerprint)
+        with self._conn() as c:
+            c.execute(
+                "UPDATE world.shared_rig SET status='superseded' "
+                "WHERE workspace_id=%s AND status='active' AND rig_fingerprint<>%s",
+                (workspace_id, rig_fingerprint),
+            )
+            c.execute(
+                "INSERT INTO world.shared_rig(rig_fingerprint, workspace_id, calib_fingerprint, "
+                "T_base_cam, image_size, tip_offset, method, rms_px, rms_mm, witness, provenance, status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active') "
+                "ON CONFLICT (rig_fingerprint) DO UPDATE SET status='active', "
+                "T_base_cam=EXCLUDED.T_base_cam, provenance=EXCLUDED.provenance",
+                (rig_fingerprint, workspace_id, calib_fingerprint, json.dumps(T_base_cam),
+                 json.dumps(image_size), json.dumps(tip_offset), method, rms_px, rms_mm,
+                 json.dumps(witness or {}), json.dumps(provenance or {})),
+            )
+
+    def upsert_sag_map(self, arm_id: str, map_doc: dict) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO learning.sag_map(arm_id, rig_fingerprint, kp_key, zeros_key, "
+                "per_motor, samples, rms_mrad, validated_mm, envelope, status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'active')",
+                (arm_id, map_doc.get("rig_fingerprint", ""), map_doc.get("kp_key", "default"),
+                 map_doc.get("zeros_key", "none"), json.dumps(map_doc.get("per_motor", {})),
+                 map_doc.get("samples", 0), map_doc.get("rms_mrad"), map_doc.get("validated_mm"),
+                 json.dumps(map_doc.get("envelope", {}))),
+            )
+
     # -- oracle / telemetry catalog ------------------------------------- #
     def add_oracle_verdict(self, plan_id: str, arm_id: str, verdict: dict, doc: dict, exec_id=None) -> None:
         with self._conn() as c:

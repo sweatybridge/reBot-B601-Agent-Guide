@@ -22,6 +22,7 @@ with psycopg.connect(DSN) as c:
               "T_base_cam,image_size,tip_offset,method,provenance,status) "
               "VALUES ('rig_ev','ws_ev_test','cal_ev','[[1]]','[1600,1200]','[0]','base-marker','{}','active') "
               "ON CONFLICT DO NOTHING")
+    c.execute("DELETE FROM learning.accuracy_cell WHERE arm_id='arm_ev'")
 
 # capture -> episode + still + blob + manifest
 frame = b"\xff\xd8capture-frame-bytes"
@@ -56,5 +57,33 @@ assert store.get_blob(tel_sha) == samples
 with psycopg.connect(DSN) as c:
     t = c.execute("SELECT kp_key FROM evidence.telemetry WHERE exec_id='exec_ev1'").fetchone()
     assert t == ("kp50",), "telemetry row: %s" % (t,)
+
+# calib: rig + sag mirror
+class FakeRig:
+    fingerprint = "rig_mirror1"
+    calib_fingerprint = "cal_ev"
+    T_base_cam = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+    image_size = [1600, 1200]
+    tip_offset = [0, 0, 0]
+    method = "base-marker"
+    rms_px = 0.5
+    rms_mm = 1.0
+    witness = {}
+
+    def provenance(self):
+        return {"fingerprint": self.fingerprint, "method": self.method}
+
+
+mirror.mirror_rig(FakeRig())
+with psycopg.connect(DSN) as c:
+    r = c.execute("SELECT status FROM world.shared_rig WHERE rig_fingerprint='rig_mirror1'").fetchone()
+    assert r == ("active",), "rig mirror: %s" % (r,)
+mirror.mirror_sag("arm_ev", {"rig_fingerprint": "rig_mirror1", "kp_key": "kp50", "zeros_key": "none",
+                             "per_motor": {"1": {"a": 0.001, "b": 0}}, "samples": 30,
+                             "rms_mrad": 5.0, "validated_mm": 3.0, "envelope": {}})
+with psycopg.connect(DSN) as c:
+    s = c.execute("SELECT samples, status FROM learning.sag_map "
+                  "WHERE arm_id='arm_ev' AND rig_fingerprint='rig_mirror1'").fetchone()
+    assert s == (30, "active"), "sag mirror: %s" % (s,)
 
 print("PG_EVIDENCE MIRROR ROUND-TRIP OK")

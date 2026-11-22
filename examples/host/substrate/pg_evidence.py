@@ -52,3 +52,19 @@ class PgEvidenceMirror:
         sha = self.store.put_blob(samples_bytes, "telemetry")
         self.store.add_telemetry(exec_id, plan_id, arm_id, sha, kp_key, summary or {})
         return sha
+
+    def mirror_rig(self, rig) -> None:
+        """Mirror an extrinsics.Rig as the active shared rig (numpy -> lists)."""
+        def lst(x):
+            return x.tolist() if hasattr(x, "tolist") else x
+        self.store.upsert_rig(
+            rig.fingerprint, self.workspace_id, rig.calib_fingerprint,
+            lst(rig.T_base_cam), lst(rig.image_size), lst(rig.tip_offset),
+            method=getattr(rig, "method", "base-marker"),
+            rms_px=getattr(rig, "rms_px", None), rms_mm=getattr(rig, "rms_mm", None),
+            witness=getattr(rig, "witness", None),
+            provenance=rig.provenance() if hasattr(rig, "provenance") else None)
+
+    def mirror_sag(self, arm_id: str, map_doc: dict) -> None:
+        self.store.ensure_arm(arm_id)
+        self.store.upsert_sag_map(arm_id, map_doc)
