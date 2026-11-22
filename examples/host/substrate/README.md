@@ -100,11 +100,23 @@ python app/capture_server.py --pg-dsn "postgresql://postgres@localhost:5433/post
 - Validated: `tests/test_pg_trace.py` (events/blobs/manifest round-trip, redaction,
   bit-identical blobs, write-once manifest, seq continuation across restart).
 
-**Remaining migration scope (not yet cut over):** the deeper state paths still use files —
-capture `meta.json`/frames, oracle docs, calib (rig/intrinsics/accuracy/sag), and the
-planner's `out/` trajectories + `telemetry/`. The `state/` → `config/` + `export/` flatten
-is gated on rewiring those (the app still writes them under `state/`). Old file state can
-be discarded (non-production); no backfill is needed. These are follow-up phases.
+**Deeper paths — additive evidence mirror.** The capture/calibration/serving flow is
+deeply file-coupled (`click_for` passes `frame.jpg` paths to the detector; image URLs
+serve files; the rig hot-reload reads calib files), so a PG-only replacement would break
+it. Instead, `pg_evidence.py:PgEvidenceMirror` mirrors evidence into the substrate as it
+is produced — PG is the learning system of record, files stay the realtime serving cache.
+Wired so far (additive, wrapped so a PG failure never breaks the arm/chat, §8.4):
+- **Capture** (`save_capture`): meta/frames → `evidence.episode`/`still`/`blob` + manifest.
+- **Oracle** (verdict write): plan trajectory → `evidence.plan`, verdict →
+  `evidence.oracle_verdict`, holds → `accuracy_cell_update`. The plan is mirrored first
+  to satisfy the `oracle_verdict.plan_id` FK.
+- Validated: `tests/test_pg_evidence.py` (capture/plan/oracle/telemetry round-trip in FK
+  order, accuracy cells validate). `mirror_telemetry` is implemented but not yet wired to
+  the live telemetry write.
+
+**Remaining migration scope:** calib (rig/intrinsics/sag/accuracy) → `world.*`/`learning.*`;
+planner `out/` + `telemetry/` live wiring; and the `state/` → `config/` + `export/` flatten
+(gated on those). Old file state can be discarded (non-production); no backfill needed.
 
 ## Notes / gotchas
 

@@ -2116,6 +2116,22 @@ async def oracle_finish(app, prep, sid):
         await asyncio.to_thread(
             (app["oracle_dir"] / ("%s.json" % plan_id)).write_text,
             json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        mirror = app.get("pg_mirror")
+        if mirror is not None:
+            def _mirror_oracle():
+                arm_id = app.get("arm_id", "b601")
+                mirror.store.ensure_arm(arm_id)
+                rig_fp = rig.fingerprint if rig is not None else None
+                mirror.store.create_episode(sid, mirror.workspace_id, [arm_id], kind="execution")
+                out_path = app["out_dir"] / ("%s.json" % plan_id)
+                if out_path.is_file():
+                    mirror.mirror_plan(plan_id, sid, arm_id, out_path.read_bytes(),
+                                       snapshot={"rig": rig_fp})
+                mirror.mirror_oracle(plan_id, arm_id, doc, rig_fingerprint=rig_fp)
+            try:
+                await asyncio.to_thread(_mirror_oracle)
+            except Exception as exc:  # noqa: BLE001 - the mirror never breaks /execute (§8.4)
+                logging.warning("oracle mirror for %s failed: %s", plan_id, exc)
         await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=doc["verdict"],
                           holds=len(doc["holds"]),
                           telemetry=bool(telemetry), error=None)
@@ -2962,11 +2978,17 @@ def grab_one(app, camera_url, commit=True):
                   "source": "capture-pose"}
         if pose is None:
             record["pose_note"] = "not read: the base tag solved the camera"
-        (directory / "meta.json").write_text(json.dumps({
-            "purpose": "extrinsics",
-            "image_size": size,
-            "server": record,
-        }, indent=2) + "\n", encoding="utf-8")
+        meta = {"purpose": "extrinsics", "image_size": size, "server": record}
+        (directory / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        mirror = app.get("pg_mirror")
+        if mirror is not None:
+            try:
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                if ok:
+                    mirror.mirror_capture(capture_id, meta, buf.tobytes(),
+                                          kind="calibration", image_size=size)
+            except Exception as exc:  # noqa: BLE001 - the mirror never breaks capture (§8.4)
+                logging.warning("capture mirror for %s failed: %s", capture_id, exc)
         return capture_id
 
     marker_payload = None
@@ -3208,6 +3230,7 @@ def build_app(args) -> web.Application:
     app["tool_schemas_sha256"] = None
     if getattr(args, "no_trace", False):
         app["traces"] = None
+        app["pg_mirror"] = None
     elif getattr(args, "pg_dsn", ""):
         # §8 cutover: traces go to the substrate (PG), not state/traces/. The
         # store seam lives in examples/host/substrate; psycopg must be installed.
@@ -3216,10 +3239,16 @@ def build_app(args) -> web.Application:
         if substrate_dir not in sys.path:
             sys.path.insert(0, substrate_dir)
         from pg_trace import PgTraceRecorder
+        from pg_evidence import PgEvidenceMirror
         from store import SubstrateStore
+        pg_store = SubstrateStore(args.pg_dsn)
+        pg_workspace = getattr(args, "pg_workspace", "default")
+        app["pg_store"] = pg_store
+        # The deeper evidence paths (capture/oracle/plan/telemetry) mirror into PG
+        # additively; the file-based realtime serving stays intact.
+        app["pg_mirror"] = PgEvidenceMirror(pg_store, workspace_id=pg_workspace)
         app["traces"] = PgTraceRecorder(
-            SubstrateStore(args.pg_dsn),
-            workspace_id=getattr(args, "pg_workspace", "default"),
+            pg_store, workspace_id=pg_workspace,
             snapshot=lambda sid: trace_manifest(app, sid))
     else:
         # The snapshot callable runs lazily at a session's first event, when
@@ -3227,6 +3256,7 @@ def build_app(args) -> web.Application:
         app["traces"] = trace_mod.TraceRecorder(
             app["traces_dir"], retention_days=app["trace_retention_days"],
             snapshot=lambda sid: trace_manifest(app, sid))
+        app["pg_mirror"] = None
     app["captures"].mkdir(parents=True, exist_ok=True)
     app["calib"].mkdir(parents=True, exist_ok=True)
     # The oracle's evidence (§5.3) lives beside the captures, under the same
