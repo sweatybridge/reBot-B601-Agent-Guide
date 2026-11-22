@@ -57,6 +57,15 @@ class SubstrateStore:
             return c.execute("SELECT 1 FROM evidence.blob WHERE sha256=%s", (sha,)).fetchone() is not None
 
     # -- episodes / events ---------------------------------------------- #
+    def ensure_workspace(self, workspace_id: str) -> None:
+        """Create a minimal workspace if absent (trace sessions need a workspace FK)."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO world.workspace(workspace_id, name, plane_z, min_z, hover_m) "
+                "VALUES (%s, %s, 0, 0.04, 0.05) ON CONFLICT (workspace_id) DO NOTHING",
+                (workspace_id, workspace_id),
+            )
+
     def create_episode(self, episode_id: str, workspace_id: str, arm_ids, kind: str = "execution") -> None:
         with self._conn() as c:
             c.execute(
@@ -89,6 +98,32 @@ class SubstrateStore:
                 "SELECT seq, src, type, arm_id, payload, blob_sha FROM evidence.event "
                 "WHERE episode_id=%s ORDER BY seq", (episode_id,),
             ).fetchall()
+
+    # -- manifests / episode listing ------------------------------------ #
+    def write_manifest(self, episode_id: str, snapshot: dict) -> None:
+        """Write-once environment snapshot (a later call cannot change it), redacted."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO evidence.manifest(episode_id, snapshot) VALUES (%s, trace_redact(%s::jsonb)) "
+                "ON CONFLICT (episode_id) DO NOTHING",
+                (episode_id, json.dumps(snapshot)),
+            )
+
+    def read_manifest(self, episode_id: str):
+        with self._conn() as c:
+            row = c.execute("SELECT snapshot FROM evidence.manifest WHERE episode_id=%s",
+                            (episode_id,)).fetchone()
+        return row["snapshot"] if row else None
+
+    def episode_exists(self, episode_id: str) -> bool:
+        with self._conn() as c:
+            return c.execute("SELECT 1 FROM evidence.episode WHERE episode_id=%s",
+                             (episode_id,)).fetchone() is not None
+
+    def list_episodes(self):
+        with self._conn() as c:
+            return [r["episode_id"] for r in c.execute(
+                "SELECT episode_id FROM evidence.episode ORDER BY episode_id").fetchall()]
 
     # -- plan catalog --------------------------------------------------- #
     def register_plan(self, plan_id: str, episode_id: str, arm_id: str, blob_sha: str,

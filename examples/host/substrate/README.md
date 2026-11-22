@@ -80,6 +80,32 @@ running DB so it picks up the new SQL: `DROP EXTENSION rebot_kinematics CASCADE;
 CREATE EXTENSION rebot_kinematics;` (the version is unchanged, so `CREATE EXTENSION
 IF NOT EXISTS` alone will not refresh it).
 
+## App cutover (§8) — status
+
+The trace/evidence pipeline is cut over to the substrate. Run the capture server with
+`--pg-dsn` (or `REBOT_PG_DSN`) and traces go to Postgres instead of `state/traces/`:
+
+```bash
+python app/capture_server.py --pg-dsn "postgresql://postgres@localhost:5433/postgres"
+```
+
+- `pg_trace.py:PgTraceRecorder` implements the same async interface as
+  `app/trace.py:TraceRecorder` (event/events/blob/manifest/prune + read_events/read_manifest),
+  backed by `store.py`. PG I/O runs in a thread; a PG failure costs trace evidence, never
+  a chat turn (§8.4). Retention is permanent (`prune` is a no-op).
+- `handle_trace_read` reads via the recorder, so it works for both backends; the file
+  `TraceRecorder` gained matching `read_events`/`read_manifest`.
+- `--pg-workspace` sets the workspace id for trace sessions (default `default`).
+- Requires `psycopg` in the capture server's environment and the substrate schema applied.
+- Validated: `tests/test_pg_trace.py` (events/blobs/manifest round-trip, redaction,
+  bit-identical blobs, write-once manifest, seq continuation across restart).
+
+**Remaining migration scope (not yet cut over):** the deeper state paths still use files —
+capture `meta.json`/frames, oracle docs, calib (rig/intrinsics/accuracy/sag), and the
+planner's `out/` trajectories + `telemetry/`. The `state/` → `config/` + `export/` flatten
+is gated on rewiring those (the app still writes them under `state/`). Old file state can
+be discarded (non-production); no backfill is needed. These are follow-up phases.
+
 ## Notes / gotchas
 
 - Data lives on a Docker **named volume**, never a Windows bind mount (WAL locking).

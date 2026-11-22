@@ -417,22 +417,15 @@ async def handle_trace_read(request: web.Request) -> web.Response:
     sid = request.match_info["sid"]
     if not CAPTURE_ID.match(sid):
         raise web.HTTPNotFound()
-    directory = recorder.session_dir(sid)
     kind = request.path.rsplit("/", 1)[-1]
-    path = directory / ("events.jsonl" if kind == "events" else "manifest.json")
-    if not path.is_file():
+    try:
+        if kind == "manifest":
+            manifest = await recorder.read_manifest(sid)
+            return web.json_response({"ok": True, "session": sid, "manifest": manifest})
+        events = await recorder.read_events(sid)
+        return web.json_response({"ok": True, "session": sid, "events": events})
+    except FileNotFoundError:
         raise web.HTTPNotFound(text="no trace %s for %s" % (kind, sid))
-    text = path.read_text(encoding="utf-8")
-    if kind == "manifest":
-        return web.json_response({"ok": True, "session": sid,
-                                  "manifest": json.loads(text)})
-    events = []
-    for line in text.splitlines():
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue  # a torn line must not hide the rest of the log
-    return web.json_response({"ok": True, "session": sid, "events": events})
 
 
 async def _page(request: web.Request, name: str) -> web.StreamResponse:
@@ -3215,6 +3208,19 @@ def build_app(args) -> web.Application:
     app["tool_schemas_sha256"] = None
     if getattr(args, "no_trace", False):
         app["traces"] = None
+    elif getattr(args, "pg_dsn", ""):
+        # §8 cutover: traces go to the substrate (PG), not state/traces/. The
+        # store seam lives in examples/host/substrate; psycopg must be installed.
+        import sys
+        substrate_dir = str(ROOT / "substrate")
+        if substrate_dir not in sys.path:
+            sys.path.insert(0, substrate_dir)
+        from pg_trace import PgTraceRecorder
+        from store import SubstrateStore
+        app["traces"] = PgTraceRecorder(
+            SubstrateStore(args.pg_dsn),
+            workspace_id=getattr(args, "pg_workspace", "default"),
+            snapshot=lambda sid: trace_manifest(app, sid))
     else:
         # The snapshot callable runs lazily at a session's first event, when
         # the app state (rig, calib, gates) is fully populated.
@@ -3367,6 +3373,11 @@ def main(argv=None):
                         help="prune session dirs and unreferenced blobs older than this")
     parser.add_argument("--no-trace", action="store_true",
                         help="disable session trace collection entirely (sensitive deployments)")
+    parser.add_argument("--pg-dsn", default=os.environ.get("REBOT_PG_DSN", ""),
+                        help="substrate Postgres DSN; when set, traces go to PG (the new stack) "
+                             "instead of state/traces/ (spec §8 cutover)")
+    parser.add_argument("--pg-workspace", default=os.environ.get("REBOT_PG_WORKSPACE", "default"),
+                        help="workspace id for trace sessions in the substrate")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
