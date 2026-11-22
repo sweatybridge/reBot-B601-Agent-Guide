@@ -1,5 +1,5 @@
-"""CLI mirror helper: one-shot tools (identify_cad, sweep_video, locate_target,
-calibrate_extrinsics) mirror their session evidence into the substrate via REBOT_PG_DSN.
+"""CLI mirror helper: one-shot tools (identify_cad, sweep_video, locate_target)
+mirror their session evidence into the substrate via REBOT_PG_DSN.
 No-op when REBOT_PG_DSN is unset; never raises into the tool (§8.4)."""
 from __future__ import annotations
 
@@ -42,14 +42,3 @@ def mirror_session(session_id, workspace_id="default", arm_id="b601", meta=None,
                 store.put_blob(p.read_bytes(), "other")
     except Exception as exc:  # noqa: BLE001
         print("  warning: session PG mirror failed: %s" % exc)
-
-
-def mirror_sag_map(arm_id, map_doc, workspace_id="default"):
-    store = _store()
-    if store is None:
-        return
-    try:
-        from pg_evidence import PgEvidenceMirror
-        PgEvidenceMirror(store, workspace_id=workspace_id).mirror_sag(arm_id, map_doc)
-    except Exception as exc:  # noqa: BLE001
-        print("  warning: sag PG mirror failed: %s" % exc)

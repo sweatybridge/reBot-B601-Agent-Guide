@@ -20,7 +20,13 @@ services:
       - ./migrations:/migrations:ro
       - ./tests:/tests:ro
     # pg_durable must be preloaded; the image already sets this, restated for clarity.
-    command: ["postgres", "-c", "shared_preload_libraries=pg_durable"]
+    # http_security=unrestricted is DEV-ONLY: it lets df.http() reach the isolated
+    # embed activity on the host (http://host.docker.internal:8765). The default
+    # 'restricted' policy requires HTTPS + approved domains and blocks private IPs;
+    # production keeps 'restricted' and serves the activity behind an approved
+    # HTTPS endpoint (see substrate README, "Isolated embed activity").
+    command: ["postgres", "-c", "shared_preload_libraries=pg_durable",
+              "-c", "pg_durable.http_security=unrestricted"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s

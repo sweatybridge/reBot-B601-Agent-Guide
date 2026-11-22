@@ -88,11 +88,19 @@ one invariant this design will not trade away.
   pure-Rust FK/IK/URDF on nalgebra 0.30, wrapped as the `rebot_kinematics` pgrx
   extension (`rebot_fk`, `rebot_ik`, `rebot_dof`). Memory-safe: bad input → SQL
   ERROR (pgrx catches the panic), never a backend crash. `k` itself provides FK/IK
-  only; **collision checking and gravity dynamics are added as Rust ports** in the
-  same extension — `rebot_path_safe` / `rebot_joint_points` (port of `sweep.path_safe`)
-  and `rebot_gravity_torques` (port of `rebot_ik.gravity_torques`), validated against
-  the pure-numpy reference (§9.1).
-- **Similarity:** pgvector 0.8.7 (HNSW).
+  only; the remaining numerics are **Rust ports** in the same extension —
+  `rebot_path_safe` / `rebot_joint_points` (port of `sweep.path_safe`),
+  `rebot_gravity_torques` (port of `rebot_ik.gravity_torques`), capsule self-collision
+  (`rebot_self_collision_free` / `rebot_min_self_clearance` / `rebot_seg_seg_distance`),
+  the traj time law (`rebot_ease_fraction` / `rebot_ease_velocity`),
+  `rebot_seconds_for` / `rebot_within_limits`, projection (`rebot_project` /
+  `rebot_project_dist`), and `rebot_ray_plane` (iterative undistortion + plane
+  intersection, port of `extrinsics.ray_plane`) — all validated against the
+  pure-numpy/OpenCV references (§9.1).
+- **Similarity:** pgvector 0.8.7 (HNSW). The **isolated embed activity** is wired:
+  `embed_service.py` (separate HTTP process, pluggable `Embedder`) reached from a
+  durable workflow via `df.http()` (`embed.start_embed_workflow`); inference crashes
+  fail the step, never the cluster. Validated end-to-end (§9.1).
 
 ## 3. Filesystem layout (flattened)
 
@@ -986,6 +994,10 @@ transaction; self-checking assertions pass):
 - `rebot_path_safe` reproduces `sweep.path_safe`: true for a high pose→itself, false
   for a fold-down that dips below the worktop (`CLEARANCE=0.012`, per-link `RADII`,
   `LINK_RADIUS_MAX=0.85`, 40 samples).
+- `rebot_ray_plane` reproduces `extrinsics.ray_plane` (10-iteration fixed-point
+  undistortion + ray/plane intersection): point/distance/grazing match to 1e-9 across
+  six off-center pixels with radial+tangential distortion, the zero-distortion path,
+  and the parallel-ray / away-ray rejections (SQL ERROR, matching `ExtrinsicsError`).
 
 **Learning plane (Phase 1, ports validated against the Python reference):**
 - `oracle_attribute(jsonb)` (PLpgSQL, `0002`) reproduces `oracle.attribute` across all
@@ -1024,8 +1036,15 @@ transaction; self-checking assertions pass):
   + hash + INSERT, **no decode** (FFmpeg stays an isolated activity). Content-addressed,
   idempotent per (episode, seq); blobs are bit-identical to the source segments.
 - `embed.py`: pluggable `Embedder` interface + a deterministic `HistogramEmbedder`
-  default for offline tests. A production CLIP/ONNX embedder implements the interface
-  and runs as an isolated activity. Embeddings normalized (non-zero) before insert.
+  default for offline tests. Embeddings normalized (non-zero) before insert.
+- **Isolated embed activity wired and validated end-to-end:** `embed_service.py`
+  (separate HTTP process) is reached from a durable workflow via `df.http()`
+  (`embed.start_embed_workflow`): read blob → base64 → POST → register model → upsert
+  vector. The workflow-produced vector matches the reference (float4 storage precision),
+  cosine search retrieves it, and durable replay is idempotent. A production CLIP/ONNX
+  embedder implements `Embedder` and is selected in the service; the workflow and DB
+  side do not change. Dev compose sets `pg_durable.http_security=unrestricted` to reach
+  the host service; production keeps `restricted` + an approved HTTPS endpoint.
 - `store.py` similarity methods populate `search.frame_embedding` (pgvector) and run
   `<=>` cosine search; an identical query returns distance ~0 and the correct nearest.
 - The embedding-model choice remains a deployment fork (§10); the pipeline is model-
@@ -1048,16 +1067,26 @@ worker; `df.result` returned `{"rows":[{"pose":[0.1355,…]}],"row_count":1}`.
 5. **pg_durable step results cannot be `FLOAT8[]`** (supported: scalars, text, jsonb,
    json, …). Kinematics returns `float8[]`, so wrap in `to_jsonb()` for a durable step.
 6. nalgebra `UnitQuaternion::from_quaternion` takes a `Quaternion`, not a `Vector4`.
+7. **pg_durable DSL graphs are built by SQL evaluation.** Use the functional form
+   (`df.seq`/`df.as`) inline in `df.start(...)`; passing operator syntax (`~>`, `|=>`)
+   as a bound parameter is treated as one literal SQL query ("syntax error at or near df").
+8. **`df.http()` body substitution:** put the `$result.field` token inside a JSON string
+   (`{"data_b64": "$req.b64"}`); a bare whole-body `$req.body` arrives SQL-quoted and is
+   not valid JSON. Also strip `encode(bytea,'base64')` line wraps before strict decoding.
+9. **pgvector stores float4** — vectors round-trip at single precision (~1e-8 absolute);
+   compare against float64 references with a matching tolerance.
 
 **Not yet built (gaps / later phases):**
-- Isolated decode/embed/OpenCV activities and the `df.http()` sandboxed service.
-- The full app migration (§8): dual-write, backfill, cutover, flatten.
-- General self-collision / obstacle collision beyond the worktop capsule model
-  (`rebot_path_safe` ports the existing `sweep.path_safe` table-clearance gate, not
-  full capsule-capsule self-collision needed for two-arm cooperation).
+- Isolated decode/OpenCV activities (FFmpeg frame re-extraction, calibration feature
+  matching, detector) as `df.http()` services — the embed activity is the proven pattern.
+- The production embedding model choice (§10 fork); the pipeline is model-agnostic.
+- The final physical `state/` removal (§8): reads are PG-primary with file fallback and
+  `config/`+`export/` exist, but the fallback writes and MediaMTX spool still use `state/`.
+- General obstacle collision beyond the worktop capsule model and deliberate-contact
+  exceptions for two-arm self-collision.
 
-**Reproduction:** see §11 (build the image, `docker compose up -d`, run the migration
-and the three test files under `examples/host/substrate/tests/`).
+**Reproduction:** see §11 (build the image, `docker compose up -d`, apply migrations
+`0001`–`0008`, run the SQL + Python suites under `examples/host/substrate/tests/`).
 
 ## 10. Open forks / decisions
 

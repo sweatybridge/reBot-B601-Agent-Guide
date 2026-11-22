@@ -200,12 +200,6 @@ class SubstrateStore:
                  json.dumps(calib_doc) if calib_doc is not None else None),
             )
 
-    def read_calib_doc(self, calib_fingerprint: str):
-        with self._conn() as c:
-            row = c.execute("SELECT calib_doc FROM world.calibration WHERE calib_fingerprint=%s",
-                            (calib_fingerprint,)).fetchone()
-        return row["calib_doc"] if row else None
-
     def upsert_rig(self, rig_fingerprint: str, workspace_id: str, calib_fingerprint: str,
                    T_base_cam, image_size, tip_offset, method="base-marker",
                    rms_px=None, rms_mm=None, witness=None, provenance=None, rig_doc=None) -> None:
@@ -272,10 +266,6 @@ class SubstrateStore:
                 "kind=EXCLUDED.kind, side_mm=EXCLUDED.side_mm, pose_world=EXCLUDED.pose_world",
                 (tag_id, workspace_id, kind, side_mm, json.dumps(pose_world) if pose_world is not None else None),
             )
-
-    def read_tags(self, workspace_id: str):
-        with self._conn() as c:
-            return c.execute("SELECT * FROM world.tag WHERE workspace_id=%s", (workspace_id,)).fetchall()
 
     def upsert_sag_map(self, arm_id: str, map_doc: dict) -> None:
         with self._conn() as c:

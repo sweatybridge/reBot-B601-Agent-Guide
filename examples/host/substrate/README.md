@@ -39,6 +39,9 @@ Media + similarity (Phase 3): `ingest.py` moves MediaMTX HLS fragments into the 
 (safe byte-shuffle, no decode); `embed.py` provides a pluggable `Embedder` (deterministic
 `HistogramEmbedder` default for offline tests; production CLIP/ONNX runs isolated) and
 populates pgvector. The embedding model is a deployment fork; the pipeline is model-agnostic.
+`embed_service.py` is the **isolated embed activity**: a separate HTTP process reached from
+a pg_durable workflow via `df.http()` (`embed.start_embed_workflow`), so native inference
+can never crash the cluster (see "Isolated embed activity" below).
 
 ## Quickstart
 
@@ -64,12 +67,18 @@ docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/gravit
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/oracle_attribute_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/accuracy_cell_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/sag_fit_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/coordination_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/judge_protocol_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/ray_plane_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
 python tests/test_store.py   # needs psycopg; container on localhost:5433
+python tests/test_pg_trace.py
+python tests/test_pg_evidence.py
 python tests/test_ingest_embed.py tests/_spool/ep_ingest   # HLS ingest + similarity
+python tests/test_embed_activity.py   # isolated embed activity via df.http()
 ```
 
-Apply `0002_learning_functions.sql` and `0003_coordination.sql` after `0001`.
+Apply migrations `0001`–`0008` in order (each is idempotent).
 
 All pass on PG 18.7: schema mechanisms, FK/IK round-trip on the real 6-DOF arm,
 gravity + collision matching the numpy reference, and a pg_durable workflow calling
@@ -178,28 +187,59 @@ file path, which is still written (additive mirror). No data loss.
 - Rig — `world.shared_rig.rig_doc` (lossless `Rig.from_dict`), PG-primary startup load.
 - Intrinsics — `world.calibration.calib_doc` + corners blob (`calibrate_intrinsics` mirrors).
 - Accuracy envelope — `learning.accuracy_cell` (PG-primary reads).
-- Sag maps — `learning.sag_map` (`identify_cad` mirrors).
+- Sag maps — `learning.sag_map` (mirrored at fit time).
 - Identify/CAD session evidence — episodes + blobs (`pg_cli.mirror_session`).
 - Sweep poses — `sweep_video` mirrors poses.json.
 - Recordings — periodic ingest loop mirrors completed mp4s to blobs.
 - Tags — `world.tag`; in-memory state (monitor EWMA, llm context) — `learning.monitor_state`/`substrate_kv`.
+  The monitor EWMA/tag baseline/proposals are **restored at startup**, so a restart
+  doesn't reset the drift trend.
 
 **Logic ported to PG functions (all validated against the Python reference):**
 - Rust pgrx (`rebot_kinematics`): FK/IK/dof, gravity torques, worktop `path_safe`, capsule
   self-collision + `seg_seg_distance`, traj time law (`ease_fraction`/`ease_velocity`),
-  `seconds_for`/`within_limits`, `project` (no-dist + distortion).
+  `seconds_for`/`within_limits`, `project` (no-dist + distortion), `ray_plane` (iterative
+  undistortion + plane intersection, matches `extrinsics.ray_plane` to 1e-9 incl. the
+  parallel/away-ray rejections).
 - SQL: `oracle_attribute`, `trace_redact`, `accuracy_cell_update`, `accuracy_cell_key`/
   `accuracy_validated_fraction`/`accuracy_warnings`, `judge_protocol`, sag fit (`rebot_fit_sag_map` Rust).
 
 **Residual (correctly NOT in-worker):**
 - OpenCV core (calibrate_intrinsics/auto_calibrate feature matching, `witness.check` drift/scale
-  matching, detector) and FFmpeg decode / embedding inference — native/unsafe, run as **isolated
-  activities** (crash-isolation invariant), called via `df.http()`. The embed interface (`embed.py`)
-  exists; the production model choice is open.
-- `ray_plane` iterative undistortion — port pending (the distortion *projection* is ported).
+  matching, detector) and FFmpeg decode — native/unsafe, run as **isolated activities**
+  (crash-isolation invariant), called via `df.http()`.
+- Embedding inference — the isolated activity is **wired** (`embed_service.py` +
+  `embed.start_embed_workflow`, validated end-to-end); the production model choice is open
+  (the default `HistogramEmbedder` exercises the pipeline deterministically).
 - Judge geometry (`boxes_of`/`_geometry_problems`) — stays in the Python judge.
 - `coord.*` two-arm cooperation logic — schema ready, wired when multi-arm lands.
 - tls/secrets (`config/`), temp dirs, git code (`tests/agent_cases/`) — correctly stay files.
+
+## Isolated embed activity (df.http)
+
+Native inference must never run in a postmaster child (crash → cluster reset →
+durable-retry loop). The embed activity is a separate process; pg_durable orchestrates
+and checkpoints, the inference runs outside the cluster:
+
+```bash
+python embed_service.py --port 8765        # isolated activity (host or sidecar)
+# then, from Python:
+#   start_embed_workflow(store, still_sha, "http://host.docker.internal:8765/embed")
+```
+
+The durable graph (`embed.embed_workflow_sql`): read blob bytes → base64 → `df.http()`
+POST to the service → register the reported model → upsert the vector into
+`search.frame_embedding`. Every step is idempotent, so durable replay is safe. A service
+crash or 5xx fails the HTTP step (retry/dead-letter) — the cluster is untouched.
+Validated by `tests/test_embed_activity.py` (vector matches the reference, similarity
+search, idempotent replay).
+
+Deployment notes:
+- The dev compose sets `pg_durable.http_security=unrestricted` so `df.http()` can reach
+  the host service over plain HTTP. **Dev-only**: production keeps `restricted` and
+  serves the activity behind an approved HTTPS endpoint (`pg_durable.http_allowed_domains`).
+- A production CLIP/ONNX embedder implements `embed.Embedder` and is selected in
+  `embed_service.py`; the workflow and database side do not change.
 
 ## Notes / gotchas
 
@@ -208,6 +248,14 @@ file path, which is still written (additive mirror). No data loss.
 - The `rebot_kinematics` crate must include `src/bin/pgrx_embed_rebot_kinematics.rs`
   or `cargo pgrx install` fails at SQL generation.
 - pg_durable step results cannot be `FLOAT8[]`; wrap kinematics output in `to_jsonb()`.
+- pg_durable DSL graphs are built by SQL evaluation: use the functional form
+  (`df.seq`/`df.as`) inline in `df.start(...)`. Passing operator syntax (`~>`, `|=>`)
+  as a bound parameter is treated as one literal SQL query.
+- `df.http()` body substitution: put the `$result.field` token **inside a JSON string**
+  (`{"data_b64": "$req.b64"}`); a bare whole-body `$req.body` arrives SQL-quoted and is
+  not valid JSON. Strip `encode(...,'base64')` line wraps before strict decoding.
+- pgvector stores **float4**: vectors round-trip at single precision (~1e-8 absolute);
+  compare against float64 references with a matching tolerance.
 - The published pg_durable image is for evaluation, not production (superuser durable
   instances). Harden before production use (spec §11 caveats).
 
