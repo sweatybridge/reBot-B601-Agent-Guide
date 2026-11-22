@@ -3028,7 +3028,22 @@ def _accuracy_map(app):
             return store.read_accuracy_map(app.get("arm_id", "b601"), rig.fingerprint)
         except Exception as exc:  # noqa: BLE001
             logging.warning("accuracy map PG read failed: %s", exc)
-    return _accuracy_map(app)
+    return identify_mod.load_accuracy_map(app["accuracy_map_path"])
+
+
+def _load_active_rig(app):
+    """Reconstruct the active rig from PG (lossless rig_doc); None if absent/error."""
+    store = app.get("pg_store")
+    if store is None:
+        return None
+    try:
+        doc = store.read_active_rig_doc(app.get("pg_workspace", "default"))
+        if doc is None:
+            return None
+        return extrinsics.Rig.from_dict(doc)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("PG rig load failed: %s", exc)
+        return None
 
 
 def grab_one(app, camera_url, commit=True):
@@ -3331,14 +3346,18 @@ def build_app(args) -> web.Application:
         pg_store = SubstrateStore(args.pg_dsn)
         pg_workspace = getattr(args, "pg_workspace", "default")
         app["pg_store"] = pg_store
+        app["pg_workspace"] = pg_workspace
         # The deeper evidence paths (capture/oracle/plan/telemetry) mirror into PG
         # additively; the file-based realtime serving stays intact.
         app["pg_mirror"] = PgEvidenceMirror(pg_store, workspace_id=pg_workspace)
         app["traces"] = PgTraceRecorder(
             pg_store, workspace_id=pg_workspace,
             snapshot=lambda sid: trace_manifest(app, sid))
-        # The startup rig loads before the mirror exists; mirror it now if present.
-        if app.get("rig") is not None:
+        # Startup rig: PG-primary if PG has an active rig; else seed PG from the file.
+        pg_rig = _load_active_rig(app)
+        if pg_rig is not None:
+            app["rig"] = pg_rig
+        elif app.get("rig") is not None:
             _pg_mirror_rig(app, app["rig"])
     else:
         # The snapshot callable runs lazily at a session's first event, when
