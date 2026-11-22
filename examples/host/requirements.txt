@@ -9,3 +9,6 @@ aiohttp>=3.9
 numpy>=1.24
 opencv-contrib-python-headless>=4.9
 cryptography>=42
+# Durable-substrate seam (store.py / pg_trace.py / pg_evidence.py): PG access when
+# REBOT_PG_DSN is set. Optional at runtime — the file path works without it.
+psycopg[binary]>=3.1

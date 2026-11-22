@@ -1,0 +1,20 @@
+# reBot host configuration (the flattened config/ plane, spec §8).
+#
+# The durable substrate is the learning system of record; state/ remains the
+# realtime serving/cache dir until the full flatten completes. Runtime values are
+# passed via compose environment (REBOT_*); this file documents the layout.
+
+[substrate]
+# PG-primary reads activate when REBOT_PG_DSN is set (compose default points at the
+# substrate container's published port via host.docker.internal). Empty = file-only.
+dsn_env = "REBOT_PG_DSN"
+workspace_env = "REBOT_PG_WORKSPACE"   # default "default"
+
+[tls]
+# Moved from state/tls at deployment; compose REBOT_CERT/REBOT_KEY point here.
+cert = "config/tls/cert.pem"
+key = "config/tls/key.pem"
+
+[export]
+# Handoff bundles (agent_cases graduation) materialize here from the substrate.
+dir = "export/"
