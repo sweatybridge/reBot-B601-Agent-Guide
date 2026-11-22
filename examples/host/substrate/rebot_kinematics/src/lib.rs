@@ -543,6 +543,55 @@ fn rebot_ease_velocity(u: f64, duration: f64, ramp: default!(f64, 0.15)) -> f64 
     }
 }
 
+// --------------------------------------------------------------------------- //
+// Sweep timing / limits + projection (ports of sweep.seconds_for / within_limits
+// and locate_target.project's no-distortion path).
+// --------------------------------------------------------------------------- //
+
+const MIN_CRUISE_SPEED: f64 = 0.25;
+// rebot_ik.LIMITS (joint1..6 lower/upper).
+const LIMITS: [(f64, f64); 6] = [
+    (-2.80, 2.80), (0.0, 3.14), (0.0, 3.14), (-1.57, 1.57), (-1.57, 1.57), (-3.14, 3.14),
+];
+
+/// Leg duration from the furthest-travelling joint (sweep.seconds_for).
+#[pg_extern]
+fn rebot_seconds_for(a: Vec<f64>, b: Vec<f64>, peak_speed: default!(f64, 0.5),
+                     minimum: default!(f64, 0.3), maximum: default!(f64, 25.0)) -> f64 {
+    let travel = a.iter().zip(b.iter()).map(|(x, y)| (y - x).abs()).fold(0.0_f64, f64::max);
+    let peak_time = travel / peak_speed + RAMP_S;
+    let cruise_cap = travel / MIN_CRUISE_SPEED + RAMP_S;
+    minimum.max(maximum.min(peak_time).min(cruise_cap))
+}
+
+/// Joint vector within limits (sweep.within_limits).
+#[pg_extern]
+fn rebot_within_limits(q: Vec<f64>, margin: default!(f64, 0.0)) -> bool {
+    if q.len() != 6 { panic!("expected 6 joint angles"); }
+    q.iter().zip(LIMITS.iter()).all(|(v, (lo, hi))| *v >= lo + margin && *v <= hi - margin)
+}
+
+/// Project a base-frame point to pixels (locate_target.project, no distortion).
+/// K is row-major 3x3 (9), T_base_cam row-major 4x4 (16). NULL if behind the camera.
+#[pg_extern]
+fn rebot_project(k: Vec<f64>, t_base_cam: Vec<f64>, point: Vec<f64>) -> Option<Vec<f64>> {
+    if k.len() != 9 || t_base_cam.len() != 16 || point.len() != 3 {
+        panic!("K must be 9, T_base_cam 16, point 3");
+    }
+    // p_cam = R^T (point - t)
+    let dx = point[0] - t_base_cam[3];
+    let dy = point[1] - t_base_cam[7];
+    let dz = point[2] - t_base_cam[11];
+    let px = t_base_cam[0] * dx + t_base_cam[4] * dy + t_base_cam[8] * dz;
+    let py = t_base_cam[1] * dx + t_base_cam[5] * dy + t_base_cam[9] * dz;
+    let pz = t_base_cam[2] * dx + t_base_cam[6] * dy + t_base_cam[10] * dz;
+    if pz <= 1e-9 { return None; }
+    let qx = k[0] * px + k[1] * py + k[2] * pz;
+    let qy = k[3] * px + k[4] * py + k[5] * pz;
+    let qz = k[6] * px + k[7] * py + k[8] * pz;
+    Some(vec![qx / qz, qy / qz])
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
