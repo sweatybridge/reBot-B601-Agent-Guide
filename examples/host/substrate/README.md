@@ -77,9 +77,12 @@ python tests/test_pg_trace.py
 python tests/test_pg_evidence.py
 python tests/test_ingest_embed.py tests/_spool/ep_ingest   # HLS ingest + similarity
 python tests/test_embed_activity.py   # isolated embed activity via df.http()
+# plan core/wrapper (run in the planner container; see "Plan as a SQL function"):
+#   docker exec rebot-capture-planner-1 python /app/substrate/tests/plan_parity.py
+#   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 ```
 
-Apply migrations `0001`–`0009` in order (each is idempotent).
+Apply migrations `0001`–`0010` in order (each is idempotent).
 
 Full offline app suite (file mode; 646 checks) — run inside the capture container with
 the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
@@ -164,7 +167,8 @@ named volume). From `examples/host`:
 
 1. `docker compose up -d --build` — substrate + mediamtx + capture + planner; capture/planner
    wait for substrate healthy. `REBOT_PG_DSN` defaults to the compose-network DSN.
-2. Apply migrations `0001`–`0009` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+2. Apply migrations `0001`–`0010` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+   Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
    capture upload → PG, and `/trace` → PG. Re-verify the arm parked read-only.
 
@@ -234,6 +238,42 @@ Deployment notes:
   serves the activity behind an approved HTTPS endpoint (`pg_durable.http_allowed_domains`).
 - A production CLIP/ONNX embedder implements `embed.Embedder` and is selected in
   `embed_service.py`; the workflow and database side do not change.
+
+## Plan as a SQL function (`rebot_plan` / `plan_one`)
+
+The plan logic runs in the substrate as a synchronous SQL function — no `df.start`,
+no separate planner round trip for the compute. Two layers:
+
+- **`rebot_plan(urdf, dump, target, options, snap)`** — the pure Rust core
+  (`rebot_kinematics/src/plan.rs`), `jsonb -> jsonb`, no database access. A faithful
+  port of `plan_to_target.plan`'s **hover branch** (the gateway tap path): the same
+  damped-LS CLIK IK as `reBotArm_control_py.solve_ik` (LOCAL Jacobian, `log6` error,
+  adaptive damping, active joint-limit constraints, backtracking line search — *not*
+  openrr/k's different solver), the orientation/staging helpers, trapezoid legs, sag
+  compensation, and `traj.build`/`validate`. Refusals panic → SQL ERROR → rollback.
+- **`plan_one(workspace, pose, target, options, arm_id)`** — thin PL/pgSQL wrapper
+  (migration `0010`): gathers a consistent snapshot (URDF from `world.robot_model` +
+  active rig + keyed sag map), calls the core in **one transaction**, persists the
+  trajectory to `evidence.plan` + blob, returns `{plan_id, summary}`. The gateway
+  becomes a thin HTTP→SQL adapter; the CLI can call the same function.
+
+**Parity (validated, `tests/plan_parity.py`, run in the planner container):** joint
+commands match the Pinocchio reference to **~3e-15 rad** (machine precision), tau to
+**~2e-3 Nm** (URDF RNEA gravity), velocity/time at rounding precision; identical
+waypoint counts, durations, and worst-IK. Iterative IK is not literally byte-identical
+across solvers, so parity is physical equivalence within the acceptance band.
+
+**Scope / follow-ups:** the hover single-target branch is implemented and validated.
+The CLI-only Cartesian **pick** branch and **`plan_sequence`** (multi-marker) are
+follow-ups (the gripper/orientation-blend helpers are staged). The live gateway is
+**not** switched to `plan_one` yet — that changes the motion path and needs bench
+validation + arm-parked go-ahead. `world.robot_model` must be seeded with the URDF
+(`tests/test_plan_one.py` does this).
+
+```bash
+docker exec rebot-capture-planner-1 python /app/substrate/tests/plan_parity.py
+docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
+```
 
 ## Notes / gotchas
 

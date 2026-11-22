@@ -1013,6 +1013,22 @@ transaction; self-checking assertions pass):
   six off-center pixels with radial+tangential distortion, the zero-distortion path,
   and the parallel-ray / away-ray rejections (SQL ERROR, matching `ExtrinsicsError`).
 
+**Plan as a SQL function (`rebot_plan` / `plan_one`, validated):**
+- `rebot_plan(urdf, dump, target, options, snap)` is a pure Rust core (`plan.rs`)
+  porting `plan_to_target.plan`'s hover branch — the same damped-LS CLIK IK as
+  `reBotArm_control_py.solve_ik` (LOCAL Jacobian, log6 error, adaptive damping, active
+  joint-limit constraints, backtracking line search), orientation/staging helpers,
+  trapezoid legs, sag compensation, `traj.build`/`validate`. `plan_one` (PL/pgSQL,
+  `0010`) wraps it: consistent snapshot (URDF + active rig + keyed sag) → core →
+  `evidence.plan` + blob, one transaction.
+- Golden-trajectory parity vs the Pinocchio reference (`tests/plan_parity.py`): joint
+  commands match to ~3e-15 rad, tau to ~2e-3 Nm (URDF RNEA gravity, not the numpy
+  LINK_INERTIALS approximation the reference uses for the aim command), velocity/time
+  at rounding precision; identical waypoint counts/durations/worst-IK across 3 seeds.
+- Scope: hover single-target branch done; Cartesian pick + `plan_sequence` are
+  follow-ups. The live gateway is NOT switched to `plan_one` (motion-affecting; needs
+  bench validation + arm-parked go-ahead). `world.robot_model` must be seeded.
+
 **Learning plane (Phase 1, ports validated against the Python reference):**
 - `oracle_attribute(jsonb)` (PLpgSQL, `0002`) reproduces `oracle.attribute` across all
   seven residual branches (clean/sag/rig-mismatch/joint-zeros/abort/one-plane/tip-detector):
@@ -1109,7 +1125,7 @@ upload/serving/list PG-only (bit-identical frame, no scratch file), `/trace` →
 `evidence.event`, rig + witness schema seeded into `world.shared_rig`.
 
 **Reproduction:** see §11 (build the image, `docker compose up -d`, apply migrations
-`0001`–`0009`, run the SQL + Python suites under `examples/host/substrate/tests/`).
+`0001`–`0010`, run the SQL + Python suites under `examples/host/substrate/tests/`).
 
 ## 10. Open forks / decisions
 
