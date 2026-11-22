@@ -1,5 +1,6 @@
 # The host side of the phone-capture pipeline, in one place.
 #
+#   substrate durable Postgres: pg_durable + pgvector + rebot_kinematics (§8)
 #   mediamtx  WebRTC relay: the phone publishes here, /live reads here
 #   capture   HTTPS endpoint, tap -> capture -> plan, WHIP/WHEP relay   -> :8443
 #   planner   the arm gateway: edge /pose, Pinocchio planning, optional execute
@@ -20,6 +21,37 @@
 name: rebot-capture
 
 services:
+  substrate:
+    # The durable substrate (§8): pg_durable (duroxide) + pgvector + the
+    # rebot_kinematics pgrx extension. System of record for traces, evidence,
+    # learning, and orchestration. Data on a named volume, never a bind mount.
+    build:
+      context: ./substrate
+      dockerfile: Dockerfile
+    image: rebot-substrate:pg18
+    container_name: rebot-substrate
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: rebot
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5433:5432"
+    volumes:
+      # Reuse the validated dev database (migrations 0001-0008 + extensions
+      # already applied by the substrate standalone compose).
+      - substrate_rebot-pgdata:/var/lib/postgresql
+      - ./substrate/migrations:/migrations:ro
+      - ./substrate/tests:/tests:ro
+    # http_security=unrestricted is DEV-ONLY (df.http() to the isolated embed
+    # activity on the host); production keeps 'restricted' + approved HTTPS.
+    command: ["postgres", "-c", "shared_preload_libraries=pg_durable",
+              "-c", "pg_durable.http_security=unrestricted"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   mediamtx:
     image: bluenviron/mediamtx:latest
     restart: unless-stopped
@@ -48,7 +80,10 @@ services:
     image: rebot-capture:local
     restart: unless-stopped
     depends_on:
-      - mediamtx
+      mediamtx:
+        condition: service_started
+      substrate:
+        condition: service_healthy
     ports:
       - "${REBOT_PORT:-8443}:8443"
     environment:
@@ -56,8 +91,8 @@ services:
       REBOT_CERT: /app/config/tls/cert.pem
       REBOT_KEY: /app/config/tls/key.pem
       # Durable substrate (§8 cutover): PG-primary reads when set; file fallback otherwise.
-      # The substrate PG container publishes 5433 on the host; reached via the gateway alias.
-      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres@host.docker.internal:5433/postgres}
+      # The substrate service is on the compose network; 5433 is also published on the host.
+      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:rebot@substrate:5432/postgres}
       REBOT_PG_WORKSPACE: ${REBOT_PG_WORKSPACE:-default}
       REBOT_TOKEN: ${REBOT_TOKEN:-}
       REBOT_MEDIAMTX: http://mediamtx:8889
@@ -129,6 +164,9 @@ services:
       dockerfile: examples/host/Dockerfile.pinocchio
     image: rebot-pino
     restart: unless-stopped
+    depends_on:
+      substrate:
+        condition: service_healthy
     command: ["python", "/app/app/planner_server.py"]
     working_dir: /app
     environment:
@@ -139,7 +177,7 @@ services:
       REBOT_KP: ${REBOT_KP:-50,2:150,3:150}
       REBOT_KD: ${REBOT_KD:-3,2:10,3:10,4:5,5:4,6:4,7:4}
       REBOT_OUT: /app/state/out
-      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres@host.docker.internal:5433/postgres}
+      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:rebot@substrate:5432/postgres}
       REBOT_PG_WORKSPACE: ${REBOT_PG_WORKSPACE:-default}
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -164,3 +202,9 @@ services:
       REBOT_HOST_IP: ${REBOT_HOST_IP:-}
     volumes:
       - ./state:/app/state
+
+volumes:
+  # Created by the substrate standalone compose (examples/host/substrate);
+  # holds the validated dev database. External so both composes share it.
+  substrate_rebot-pgdata:
+    external: true

@@ -18,8 +18,12 @@ RUN apt-get update \
 
 # pin = Pinocchio's PyPI distribution; motorbridge is only needed because the
 # package's __init__ imports the actuator layer, not because planning uses CAN.
-RUN pip install --no-cache-dir "pin>=3.9" numpy pyyaml "motorbridge>=0.4.9" "psycopg[binary]>=3.1" \
+RUN pip install --no-cache-dir "pin>=3.9" numpy pyyaml "motorbridge>=0.4.9" \
     && python -c "import pinocchio; print('pinocchio', pinocchio.__version__)"
+
+# PG store seam (§8 cutover). Separate layer so adding it doesn't invalidate
+# the expensive Pinocchio layer above.
+RUN pip install --no-cache-dir "psycopg[binary]>=3.1"
 
 # Pinned to the commit this repo's numbers were validated against.
 ARG REBOT_COMMIT=d4f3591bc0183de03f3ae8651298db0269aadfdd
