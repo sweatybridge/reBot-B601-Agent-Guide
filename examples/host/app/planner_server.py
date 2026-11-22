@@ -302,6 +302,24 @@ def fk_one(body):
         raise GatewayError("'q' must be numeric") from error
     if not all(math.isfinite(value) for value in values):
         raise GatewayError("'q' must be finite")
+    if pg_mirror() is not None:
+        # PG mode: the substrate computes FK (rebot_fk_tip + rebot_joint_points).
+        try:
+            mirror = pg_mirror()
+            with mirror.store._conn() as c:
+                urow = c.execute(
+                    "SELECT urdf FROM world.robot_model ORDER BY created_at LIMIT 1").fetchone()
+                if urow is not None:
+                    urdf = next(iter(urow.values()))
+                    tip = c.execute("SELECT rebot_fk_tip(%s,%s)", (urdf, values[:6])).fetchone()[0]
+                    pts = c.execute("SELECT rebot_joint_points(%s,%s)",
+                                    (urdf, values[:6])).fetchone()[0]
+            if urow is not None:
+                jp = [[float(pts[i]), float(pts[i + 1]), float(pts[i + 2])]
+                      for i in range(0, len(pts), 3)]
+                return {"ok": True, "tip_m": [float(v) for v in tip], "joint_points": jp}
+        except Exception:  # noqa: BLE001
+            pass  # substrate unavailable -> the numpy FK below
     tool, links = rebot_ik.forward(np.asarray(values[:6], dtype=float), with_links=True)
     return {
         "ok": True,

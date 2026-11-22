@@ -82,7 +82,7 @@ python tests/test_embed_activity.py   # isolated embed activity via df.http()
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 ```
 
-Apply migrations `0001`–`0011` in order (each is idempotent).
+Apply migrations `0001`–`0013` in order (each is idempotent).
 
 Full offline app suite (file mode; 646 checks) — run inside the capture container with
 the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
@@ -167,7 +167,7 @@ named volume). From `examples/host`:
 
 1. `docker compose up -d --build` — substrate + mediamtx + capture + planner; capture/planner
    wait for substrate healthy. `REBOT_PG_DSN` defaults to the compose-network DSN.
-2. Apply migrations `0001`–`0011` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+2. Apply migrations `0001`–`0013` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
    Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
    capture upload → PG, and `/trace` → PG. Re-verify the arm parked read-only.
@@ -199,6 +199,15 @@ PG data is untouched; switching back resumes from the substrate.
   `seconds_for`/`within_limits`, `project` (no-dist + distortion), `ray_plane` (iterative
   undistortion + plane intersection, matches `extrinsics.ray_plane` to 1e-9 incl. the
   parallel/away-ray rejections).
+- Rust motion cores (`plan.rs`): `rebot_plan`/`rebot_plan_sequence` (hover + multi-marker,
+  faithful CLIK port of `reBotArm_control_py.solve_ik`), `rebot_joint_move`/`rebot_joint_sequence`,
+  `rebot_traj_build`/`rebot_traj_validate`, `rebot_unpark_pose`, `rebot_move_build` (the `/move`
+  builder). Parity: joint commands to ~6e-15 rad, move builders exact (multi 2.8e-17).
+- Rust oracle helpers (`rebot_fk_tip`/`rebot_tip_point`/`rebot_sag_rad`) + `oracle_compute`
+  (migration `0013`, the hold-window verdict): parity 2.1e-17.
+- Rust hand-eye fit (`calib.rs`): `rebot_calibrate_fit` — DLT+SVD+RQ init, Huber LM,
+  covariance, conditioning + predicted-error gates (port of `extrinsics.fit`). Parity:
+  exact rig 1.9e-15, noisy 1.9e-12, identical rms; `extrinsics.fit` dispatches to it in PG mode.
 - SQL: `oracle_attribute`, `trace_redact`, `accuracy_cell_update`, `accuracy_cell_key`/
   `accuracy_validated_fraction`/`accuracy_warnings`, `judge_protocol`, sag fit (`rebot_fit_sag_map` Rust).
 
@@ -272,14 +281,43 @@ so parity is physical equivalence within the acceptance band.
 
 **Scope / follow-ups:** hover single-target and multi-marker sequence are implemented
 and validated (both live gateway paths). The CLI-only Cartesian **pick** branch is a
-follow-up (the orientation-blend helper is staged). The live gateway is **not**
-switched to `plan_one` yet — that changes the motion path and needs bench validation
-+ arm-parked go-ahead. `world.robot_model` must be seeded with the URDF
-(`tests/test_plan_one.py` does this).
+follow-up (the orientation-blend helper is staged). `world.robot_model` must be seeded
+with the URDF (`tests/test_plan_one.py` does this).
+
+### Full compute switch — complete
+
+With `REBOT_PG_DSN` set, **every gateway compute flow runs in the substrate**; the
+gateway is a thin HTTP→SQL adapter and the Pinocchio `solve_ik` path is retired from
+the live motion path. Each switch keeps a Python fallback for file mode / substrate
+unavailability (the fallback re-validates, so a refusal still propagates):
+
+| Flow | Gateway entry | Substrate function | Parity |
+|---|---|---|---|
+| Hover plan / sequence | `planner_server.plan_targets` | `plan_one` → `rebot_plan`/`rebot_plan_sequence` | dq ~6e-15 |
+| `/move` builder | `planner_server.move_one` | `move_one` → `rebot_move_build` | exact / 2.8e-17 |
+| Oracle verdict | `capture_server._oracle_pg_compute` | `oracle_compute` (0013) | 2.1e-17 |
+| Hand-eye fit | `extrinsics.fit` → `_fit_pg` | `rebot_calibrate_fit` | 1.9e-15 |
+| `/fk` display | `planner_server.fk_one` | `rebot_fk_tip` + `rebot_joint_points` | 2.2e-16 |
+
+`extrinsics.fit` dispatches transparently, so all calibration callers (`auto_calibrate`
+coarse/final fits, `calibrate_extrinsics`) use the substrate without per-call wiring.
+The residual `rebot_ik` (pure-numpy) calls are perception rendering (identify/identify_cad/
+witness/sweep), the oracle predicted-tip overlay, fit diagnostics, joint-limit constants,
+and file-mode fallbacks — not the motion/oracle/calibration solve.
+
+Validated: `tests/plan_parity.py`, `move_parity.py`, `oracle_parity.py`, `calib_parity.py`
+(incl. the live `ex.fit` dispatch), `fk_parity.py`; the full offline selftest (646 checks);
+SQL suites `test_plan_one`/`test_store`/`test_pg_trace`/`test_pg_evidence`. The `/move` and
+oracle live executions need a powered arm + bench go-ahead (motors unpowered here; compute
+parity proven separately, dry plans only).
 
 ```bash
 docker exec rebot-capture-planner-1 python /app/substrate/tests/plan_parity.py
+docker exec rebot-capture-planner-1 python /app/substrate/tests/move_parity.py
+docker exec rebot-capture-planner-1 python /app/substrate/tests/fk_parity.py
 docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
+docker exec rebot-capture-capture-1 python /app/substrate/tests/oracle_parity.py
+docker exec rebot-capture-capture-1 python /app/substrate/tests/calib_parity.py
 ```
 
 ## Notes / gotchas
