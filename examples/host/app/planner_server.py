@@ -116,6 +116,28 @@ def pg_mirror():
     return _pg_mirror
 
 
+def _pg_json(sql, args):
+    """Run a substrate SQL function returning a single jsonb value (PG mode)."""
+    mirror = pg_mirror()
+    with mirror.store._conn() as c:
+        row = c.execute(sql, args).fetchone()
+    return next(iter(row.values())) if row else None
+
+
+def _options_json(options):
+    """Map the planner Options dataclass to the json the substrate cores read."""
+    return {
+        "hz": options.hz, "approach": options.approach, "hold_s": options.hold_s,
+        "hover": options.hover, "hover_m": options.hover_m, "tip_m": options.tip_m,
+        "no_return": options.no_return, "unpark_j2": options.unpark_j2,
+        "unpark_j3": options.unpark_j3, "unpark_s": options.unpark_s,
+        "ik_pos_tol": options.ik_pos_tol, "ik_angle_tol": options.ik_angle_tol,
+        "min_z": options.min_z, "max_z": options.max_z, "max_reach": options.max_reach,
+        "tool_axis": options.tool_axis, "yaw": options.yaw, "kp_spec": options.kp_spec,
+        "grasp_q": options.grasp_q, "close_width_mm": options.close_width_mm,
+    }
+
+
 def _mirror_plan(plan_id, payload, summary=None):
     """Persist a plan into the substrate. Returns True on success; a plan that
     cannot be persisted cannot be executed, so callers in PG mode refuse it."""
@@ -423,6 +445,26 @@ def plan_targets(body):
     # the hardware could not hold anyway. Floor the band at 10 mm for both.
     options.ik_pos_tol = max(float(options.ik_pos_tol), 0.010)
     started = time.time()
+    if pg_mirror() is not None:
+        # PG mode: the substrate computes (rebot_plan / rebot_plan_sequence) and
+        # persists in one transaction; the gateway is a thin HTTP->SQL adapter.
+        if gripper == "none" and len(targets) != 1:
+            raise GatewayError('gripper "none" takes exactly one target')
+        target_arg = targets[0] if gripper == "none" else targets
+        try:
+            res = _pg_json("SELECT plan_one(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)",
+                           (PG_WORKSPACE, json.dumps(pose), json.dumps(target_arg),
+                            json.dumps(_options_json(options)), PG_ARM))
+        except Exception as error:
+            raise GatewayError(str(error), 422) from error
+        plan_id = res["plan_id"]
+        summary = res["summary"]
+        summary["compute_s"] = round(time.time() - started, 2)
+        logging.info("plan %s (substrate): %d waypoints, %.2f s, %.2f s to compute",
+                     plan_id, summary["waypoints"], summary["duration_s"],
+                     time.time() - started)
+        return {"ok": True, "id": plan_id, "path": "pg:evidence.plan/%s" % plan_id,
+                "bytes": 0, "summary": summary, "execute": EXECUTE}
     try:
         if gripper == "none":
             if len(targets) != 1:
@@ -537,6 +579,53 @@ def move_one(body):
                      1000.0 * excursion)
         q_from[:6] = np.clip(q_from[:6], lower, upper)
     gripper = float(body["gripper"]) if "gripper" in body else float(q_from[6])
+
+    if pg_mirror() is not None:
+        # PG mode: the substrate computes peel + worktop gates + sag commands +
+        # trajectory (rebot_move_build) and persists; the gateway plays it.
+        opts = {"kp_spec": str(body.get("kp") or KP), "gripper": gripper,
+                "hold": max(0.0, min(30.0, float(body.get("hold") or 0.0)))}
+        if body.get("seconds") is not None:
+            opts["seconds"] = body["seconds"]
+        pose_arg = {"ids": current["ids"], "q": [float(v) for v in q_from]}
+        tgt_arg = [[float(v) for v in t] for t in targets]
+        try:
+            res = _pg_json("SELECT move_one(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)",
+                           (PG_WORKSPACE, json.dumps(pose_arg), json.dumps(tgt_arg),
+                            json.dumps(opts), PG_ARM))
+        except Exception as error:
+            raise GatewayError(str(error), 422) from error
+        move_id = res["plan_id"]
+        summary = res["summary"]
+        trajectory = json.loads(pg_mirror().store.read_plan_blob(move_id))
+        seconds = summary.get("leg_seconds") or [summary["seconds"]]
+        hold = summary["hold"]
+        applied = summary["sag_mrad"]
+        location = "pg:evidence.plan/%s" % move_id
+        if body.get("dry_run"):
+            return {"ok": True, "id": move_id, "dry_run": True, "path": location,
+                    "bytes": 0, "poses": summary["poses"],
+                    "seconds": [round(float(v), 3) for v in seconds], "hold": hold,
+                    "waypoints": len(trajectory["waypoints"]),
+                    "duration_s": trajectory.get("duration_s")}
+        query = urllib.parse.urlencode({"kp": str(body.get("kp") or KP),
+                                        "kd": str(body.get("kd") or KD)})
+        total = sum(seconds) + hold * len(targets)
+        status, payload = edge_request("POST", "/play?" + query, body=trajectory,
+                                       timeout=max(600.0, 4.0 * total))
+        if status != 200:
+            save_telemetry(move_id, payload.get("telemetry"))
+            logging.warning("edge aborted move %s: %s", move_id, payload.get("error"))
+            raise GatewayError(payload.get("error", "the edge refused the move"), 502)
+        logging.info("moved (substrate) through %d pose(s), %.1f s, sag %s mrad",
+                     len(targets), sum(seconds), applied)
+        save_telemetry(move_id, payload.get("telemetry"))
+        answer = {"ok": True, "id": move_id, "seconds": round(sum(seconds), 2),
+                  "hold": hold, "poses": summary["poses"], "sag_mrad": applied,
+                  "pose": dump_pose()}
+        if payload.get("telemetry") is not None:
+            answer["telemetry"] = payload["telemetry"]
+        return answer
 
     # Startup peel, shared with plan_to_target's unpark: the parked arm rests j4's
     # hinge on the j2 casing, and a wrist-driving first leg stalls motor 4 against
