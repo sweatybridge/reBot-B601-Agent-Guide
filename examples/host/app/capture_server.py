@@ -704,6 +704,22 @@ async def handle_captures(request: web.Request) -> web.Response:
         limit = max(1, min(200, int(request.query.get("limit", "20"))))
     except ValueError:
         limit = 20
+    store = app.get("pg_store")
+    if store is not None:
+        rows = await asyncio.to_thread(store.list_captures, limit)
+        items = []
+        for row in rows:
+            snap = row["snapshot"] or {}
+            items.append({
+                "id": row["episode_id"],
+                "created": snap.get("capturedAt") or (snap.get("server") or {}).get("received_at"),
+                "purpose": snap.get("purpose"),
+                "tap": snap.get("tap"),
+                "image_size": snap.get("image_size"),
+                "bytes": row["size_bytes"] or 0,
+                "has_target": False,
+            })
+        return web.json_response({"ok": True, "captures": items})
     items = []
     for directory in capture_dirs(app["captures"])[:limit]:
         meta = read_meta(directory)
@@ -809,6 +825,14 @@ async def handle_capture(request: web.Request) -> web.Response:
             # only worth anything if the joints are the ones the arm had.
             record["server"]["pose"] = await capture_pose(app)
         (directory / "meta.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        mirror = app.get("pg_mirror")
+        if mirror is not None:
+            try:
+                kind = "calibration" if purpose in ("extrinsics", "calib") else "execution"
+                mirror.mirror_capture(directory.name, record, frame_path.read_bytes(),
+                                      kind=kind, image_size=meta.get("image_size"))
+            except Exception as exc:  # noqa: BLE001 - mirror never breaks the upload (§8.4)
+                logging.warning("capture mirror for %s failed: %s", directory.name, exc)
 
     except Exception:
         (directory / "meta.json").unlink(missing_ok=True)
@@ -2180,10 +2204,24 @@ def click_for(app, capture_id, u, v):
     if not CAPTURE_ID.match(capture_id):
         raise web.HTTPBadRequest(text="'capture' must be a capture id")
     directory = Path(app["captures"]) / capture_id
-    meta_path = directory / "meta.json"
-    if not meta_path.is_file():
-        raise web.HTTPNotFound(text="no capture %s" % capture_id)
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    store = app.get("pg_store")
+    if store is not None:
+        meta = store.read_capture_meta(capture_id)
+        if meta is None:
+            raise web.HTTPNotFound(text="no capture %s" % capture_id)
+        # The detector reads a file path: materialize the PG blob into the cache.
+        frame_path = directory / "frame.jpg"
+        if not frame_path.is_file():
+            data = store.read_capture_frame(capture_id)
+            if data is None:
+                raise web.HTTPNotFound(text="capture %s has no frame" % capture_id)
+            directory.mkdir(parents=True, exist_ok=True)
+            frame_path.write_bytes(data)
+    else:
+        meta_path = directory / "meta.json"
+        if not meta_path.is_file():
+            raise web.HTTPNotFound(text="no capture %s" % capture_id)
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
     pose = (meta.get("server") or {}).get("pose") or {}
     q = pose.get("q")
     if not isinstance(q, list) or len(q) < 6:
@@ -3107,6 +3145,12 @@ async def handle_file(request: web.Request) -> web.StreamResponse:
     name = request.match_info["name"]
     if not CAPTURE_ID.match(capture_id) or not SAFE_NAME.match(name):
         raise web.HTTPNotFound()
+    store = app.get("pg_store")
+    if store is not None and name == "frame.jpg":
+        data = await asyncio.to_thread(store.read_capture_frame, capture_id)
+        if data is not None:
+            return web.Response(body=data, content_type="image/jpeg",
+                                headers={"Cache-Control": "no-store"})
     path = (app["captures"] / capture_id / name).resolve()
     root = app["captures"].resolve()
     if root not in path.parents or not path.is_file():
