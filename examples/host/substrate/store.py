@@ -200,7 +200,7 @@ class SubstrateStore:
 
     def upsert_rig(self, rig_fingerprint: str, workspace_id: str, calib_fingerprint: str,
                    T_base_cam, image_size, tip_offset, method="base-marker",
-                   rms_px=None, rms_mm=None, witness=None, provenance=None) -> None:
+                   rms_px=None, rms_mm=None, witness=None, provenance=None, rig_doc=None) -> None:
         """Mirror a rig as the active shared rig; supersede prior active rigs."""
         self.ensure_calibration(calib_fingerprint)
         with self._conn() as c:
@@ -211,14 +211,22 @@ class SubstrateStore:
             )
             c.execute(
                 "INSERT INTO world.shared_rig(rig_fingerprint, workspace_id, calib_fingerprint, "
-                "T_base_cam, image_size, tip_offset, method, rms_px, rms_mm, witness, provenance, status) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active') "
+                "T_base_cam, image_size, tip_offset, method, rms_px, rms_mm, witness, provenance, rig_doc, status) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active') "
                 "ON CONFLICT (rig_fingerprint) DO UPDATE SET status='active', "
-                "T_base_cam=EXCLUDED.T_base_cam, provenance=EXCLUDED.provenance",
+                "T_base_cam=EXCLUDED.T_base_cam, provenance=EXCLUDED.provenance, rig_doc=EXCLUDED.rig_doc",
                 (rig_fingerprint, workspace_id, calib_fingerprint, json.dumps(T_base_cam),
                  json.dumps(image_size), json.dumps(tip_offset), method, rms_px, rms_mm,
-                 json.dumps(witness or {}), json.dumps(provenance or {})),
+                 json.dumps(witness or {}), json.dumps(provenance or {}),
+                 json.dumps(rig_doc) if rig_doc is not None else None),
             )
+
+    def read_active_rig_doc(self, workspace_id: str):
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT rig_doc FROM world.shared_rig WHERE workspace_id=%s AND status='active' "
+                "ORDER BY fitted DESC NULLS LAST LIMIT 1", (workspace_id,)).fetchone()
+        return row["rig_doc"] if row else None
 
     def upsert_sag_map(self, arm_id: str, map_doc: dict) -> None:
         with self._conn() as c:
@@ -272,6 +280,20 @@ class SubstrateStore:
                 "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (exec_id) DO NOTHING",
                 (exec_id, plan_id, arm_id, blob_sha, kp_key, json.dumps(summary)),
             )
+
+    def read_plan_blob(self, plan_id: str):
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT b.bytes FROM evidence.plan p JOIN evidence.blob b ON b.sha256=p.blob_sha "
+                "WHERE p.plan_id=%s", (plan_id,)).fetchone()
+        return bytes(row["bytes"]) if row else None
+
+    def read_telemetry_doc(self, exec_id: str):
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT b.bytes FROM evidence.telemetry t JOIN evidence.blob b ON b.sha256=t.blob_sha "
+                "WHERE t.exec_id=%s", (exec_id,)).fetchone()
+        return json.loads(bytes(row["bytes"])) if row else None
 
     # -- similarity (pgvector) ------------------------------------------ #
     def register_embedding_model(self, model_id: str, name: str, version: str, dim: int, kind: str = "frame") -> None:

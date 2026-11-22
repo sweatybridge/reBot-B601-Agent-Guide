@@ -84,6 +84,43 @@ KP = os.environ.get("REBOT_KP", "50,2:150,3:150")
 KD = os.environ.get("REBOT_KD", "3,2:10,3:10,4:5,5:4,6:4,7:4")
 MAX_AGE_S = float(os.environ.get("REBOT_PLAN_MAX_AGE", "600"))
 
+# §8 cutover: when REBOT_PG_DSN is set, plans/telemetry are mirrored into the
+# substrate and reads are PG-primary (file fallback). The substrate seam lives in
+# examples/host/substrate (mounted at /app/substrate); psycopg must be installed.
+PG_DSN = os.environ.get("REBOT_PG_DSN", "")
+PG_WORKSPACE = os.environ.get("REBOT_PG_WORKSPACE", "default")
+PG_ARM = os.environ.get("REBOT_PG_ARM", "b601")
+_pg_mirror = None
+
+
+def pg_mirror():
+    global _pg_mirror
+    if not PG_DSN:
+        return None
+    if _pg_mirror is None:
+        import sys
+        sub = str(ROOT / "substrate")
+        if sub not in sys.path:
+            sys.path.insert(0, sub)
+        from store import SubstrateStore
+        from pg_evidence import PgEvidenceMirror
+        _pg_mirror = PgEvidenceMirror(SubstrateStore(PG_DSN), workspace_id=PG_WORKSPACE)
+    return _pg_mirror
+
+
+def _mirror_plan(plan_id, payload, summary=None):
+    mirror = pg_mirror()
+    if mirror is None:
+        return
+    try:
+        mirror.store.ensure_arm(PG_ARM)
+        mirror.store.create_episode(plan_id, PG_WORKSPACE, [PG_ARM], kind="execution")
+        mirror.mirror_plan(plan_id, plan_id, PG_ARM,
+                           json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                           metadata=summary or {}, snapshot={})
+    except Exception as exc:  # noqa: BLE001 - mirror never fails a plan (§8.4)
+        logging.warning("plan mirror for %s failed: %s", plan_id, exc)
+
 PLAN_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s",
@@ -146,7 +183,19 @@ def save_telemetry(entry_id, telemetry):
     try:
         TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
         path = TELEMETRY_DIR / ("%s.json" % entry_id)
-        path.write_text(json.dumps(telemetry, separators=(",", ":")), encoding="utf-8")
+        raw = json.dumps(telemetry, separators=(",", ":"))
+        path.write_text(raw, encoding="utf-8")
+        mirror = pg_mirror()
+        if mirror is not None:
+            try:
+                mirror.mirror_telemetry(
+                    entry_id, entry_id, PG_ARM, raw.encode("utf-8"),
+                    kp_key=str(telemetry.get("kp", "default")),
+                    summary={"abort": telemetry.get("abort"),
+                             "gripper_stall": telemetry.get("gripper_stall"),
+                             "tick": telemetry.get("tick")})
+            except Exception as exc:  # noqa: BLE001 - mirror never fails a move (§8.4)
+                logging.warning("telemetry mirror for %s failed: %s", entry_id, exc)
         return path
     except OSError as error:
         logging.warning("cannot write telemetry for %s: %s", entry_id, error)
@@ -154,6 +203,14 @@ def save_telemetry(entry_id, telemetry):
 
 
 def read_telemetry(entry_id):
+    mirror = pg_mirror()
+    if mirror is not None:
+        try:
+            doc = mirror.store.read_telemetry_doc(entry_id)
+            if doc is not None:
+                return doc
+        except Exception as exc:  # noqa: BLE001 - fall back to the file
+            logging.warning("telemetry PG read for %s failed: %s", entry_id, exc)
     path = TELEMETRY_DIR / ("%s.json" % entry_id)
     if not path.is_file():
         raise GatewayError("no telemetry %s on disk" % entry_id, 404)
@@ -339,6 +396,7 @@ def plan_targets(body):
     plan_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
     path = OUT_DIR / ("%s.json" % plan_id)
     path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    _mirror_plan(plan_id, payload, summary)
 
     if label == "sequence":
         tap_heights = summary.get("tap_heights_m") or []
@@ -568,14 +626,24 @@ def execute_one(body):
     if not PLAN_ID.match(plan_id):
         raise GatewayError("'id' must be a plan id")
     path = OUT_DIR / ("%s.json" % plan_id)
-    if not path.is_file():
-        raise GatewayError("no plan %s on disk" % plan_id, 404)
-    age = time.time() - path.stat().st_mtime
-    if age > MAX_AGE_S:
-        raise GatewayError("plan %s is %.0f s old (limit %.0f s): plan again" % (plan_id, age, MAX_AGE_S),
-                           409)
-
-    trajectory = json.loads(path.read_text(encoding="utf-8"))
+    mirror = pg_mirror()
+    trajectory = None
+    if mirror is not None:
+        try:
+            raw = mirror.store.read_plan_blob(plan_id)
+            if raw is not None:
+                trajectory = json.loads(raw)
+        except Exception as exc:  # noqa: BLE001 - fall back to the file
+            logging.warning("plan PG read for %s failed: %s", plan_id, exc)
+    if trajectory is None:
+        if not path.is_file():
+            raise GatewayError("no plan %s on disk" % plan_id, 404)
+        trajectory = json.loads(path.read_text(encoding="utf-8"))
+    if path.is_file():
+        age = time.time() - path.stat().st_mtime
+        if age > MAX_AGE_S:
+            raise GatewayError("plan %s is %.0f s old (limit %.0f s): plan again" % (plan_id, age, MAX_AGE_S),
+                               409)
     query = urllib.parse.urlencode({
         "kp": str(body.get("kp") or KP),
         "kd": str(body.get("kd") or KD),

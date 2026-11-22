@@ -63,7 +63,8 @@ class PgEvidenceMirror:
             method=getattr(rig, "method", "base-marker"),
             rms_px=getattr(rig, "rms_px", None), rms_mm=getattr(rig, "rms_mm", None),
             witness=getattr(rig, "witness", None),
-            provenance=rig.provenance() if hasattr(rig, "provenance") else None)
+            provenance=rig.provenance() if hasattr(rig, "provenance") else None,
+            rig_doc=rig.to_dict() if hasattr(rig, "to_dict") else None)
 
     def mirror_sag(self, arm_id: str, map_doc: dict) -> None:
         self.store.ensure_arm(arm_id)
