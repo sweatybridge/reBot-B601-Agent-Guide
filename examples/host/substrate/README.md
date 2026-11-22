@@ -146,6 +146,28 @@ and the directory move is deployed. Deployment restarts the live capture/planner
 and is gated on the arm parked + explicit go-ahead (arm verified parked at q≈0 during this
 work).
 
+### Deployment procedure (post-merge, arm parked)
+
+The live stack runs from the **main checkout**; these changes ship via the PR and deploy
+after merge (worktree files are never copied into main). Steps, with the arm parked:
+
+1. **Bring up the substrate** (if not already): `cd examples/host/substrate && docker compose up -d`
+   (PG on `localhost:5433`, named volume). Apply migrations `0001`–`0004`.
+2. **Move tls**: `state/tls/` → `config/tls/` (compose `REBOT_CERT`/`REBOT_KEY` now point there).
+3. **Rebuild images** (psycopg + substrate baked in): `docker compose build capture planner`.
+4. **Restart**: `docker compose up -d` (recreates capture/planner with the substrate mount +
+   `REBOT_PG_DSN`). Verify `/health` and a read-only `/pose` (arm still parked).
+5. **Verify cutover**: take a capture, confirm it lands in PG (`evidence.episode/still/blob`);
+   `/captures.json` lists from PG; a plan mirrors to `evidence.plan`; the rig reconstructs
+   from `world.shared_rig.rig_doc`.
+
+`state/` stays as the realtime serving/cache dir (captures materialization, calib fallback,
+MediaMTX recordings) until the full flatten removes the file fallback and relocates
+recordings. PG is the learning system of record throughout.
+
+**Rollback**: unset `REBOT_PG_DSN` (or empty it) and restart — every read falls back to the
+file path, which is still written (additive mirror). No data loss.
+
 ## Notes / gotchas
 
 - Data lives on a Docker **named volume**, never a Windows bind mount (WAL locking).

@@ -27,6 +27,7 @@ RUN pip install -r requirements.txt
 COPY app ./app
 COPY web ./web
 COPY tests ./tests
+COPY substrate ./substrate
 
 # Runs as root on purpose: captures, calibrations and certs are bind mounts
 # owned by the host user, and a fixed non-root uid would not be able to write
