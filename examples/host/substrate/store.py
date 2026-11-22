@@ -228,6 +228,47 @@ class SubstrateStore:
                 "ORDER BY fitted DESC NULLS LAST LIMIT 1", (workspace_id,)).fetchone()
         return row["rig_doc"] if row else None
 
+    # -- durable app state (kv / monitor / tags) ------------------------ #
+    def set_kv(self, key: str, value) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO substrate_kv(key, value, updated_at) VALUES (%s, %s, now()) "
+                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()",
+                (key, json.dumps(value)),
+            )
+
+    def get_kv(self, key: str, default=None):
+        with self._conn() as c:
+            row = c.execute("SELECT value FROM substrate_kv WHERE key=%s", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_monitor_state(self, arm_id: str, ewma_pixel_error_mm=None, ewma_tag_rms_px=None, last_doc=None) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO learning.monitor_state(arm_id, ewma_pixel_error_mm, ewma_tag_rms_px, last_doc, updated_at) "
+                "VALUES (%s,%s,%s,%s,now()) ON CONFLICT (arm_id) DO UPDATE SET "
+                "ewma_pixel_error_mm=EXCLUDED.ewma_pixel_error_mm, ewma_tag_rms_px=EXCLUDED.ewma_tag_rms_px, "
+                "last_doc=EXCLUDED.last_doc, updated_at=now()",
+                (arm_id, ewma_pixel_error_mm, ewma_tag_rms_px, json.dumps(last_doc) if last_doc is not None else None),
+            )
+
+    def get_monitor_state(self, arm_id: str):
+        with self._conn() as c:
+            return c.execute("SELECT * FROM learning.monitor_state WHERE arm_id=%s", (arm_id,)).fetchone()
+
+    def upsert_tag(self, tag_id: str, workspace_id: str, kind: str, side_mm: float, pose_world=None) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO world.tag(tag_id, workspace_id, kind, side_mm, pose_world) "
+                "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (tag_id) DO UPDATE SET "
+                "kind=EXCLUDED.kind, side_mm=EXCLUDED.side_mm, pose_world=EXCLUDED.pose_world",
+                (tag_id, workspace_id, kind, side_mm, json.dumps(pose_world) if pose_world is not None else None),
+            )
+
+    def read_tags(self, workspace_id: str):
+        with self._conn() as c:
+            return c.execute("SELECT * FROM world.tag WHERE workspace_id=%s", (workspace_id,)).fetchall()
+
     def upsert_sag_map(self, arm_id: str, map_doc: dict) -> None:
         with self._conn() as c:
             c.execute(
