@@ -66,6 +66,15 @@ class SubstrateStore:
                 (workspace_id, workspace_id),
             )
 
+    def ensure_arm(self, arm_id: str) -> None:
+        """Create a minimal arm row if absent (evidence FKs need world.arm)."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO world.arm(arm_id, name, urdf_fingerprint, zeros_key, kp_key) "
+                "VALUES (%s, %s, 'unknown', 'none', 'default') ON CONFLICT (arm_id) DO NOTHING",
+                (arm_id, arm_id),
+            )
+
     def create_episode(self, episode_id: str, workspace_id: str, arm_ids, kind: str = "execution") -> None:
         with self._conn() as c:
             c.execute(
@@ -137,6 +146,15 @@ class SubstrateStore:
             )
 
     # -- media fragments ------------------------------------------------ #
+    def add_still(self, episode_id: str, sha: str, purpose: str = "hold", arm_id=None,
+                  t=None, width=None, height=None) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO evidence.still(episode_id, sha256, arm_id, purpose, t, width, height) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (episode_id, sha, arm_id, purpose, t, width, height),
+            )
+
     def add_fragment(self, episode_id: str, sha: str, seq: int, t_start: float, t_end: float,
                      codec=None, width=None, height=None) -> None:
         with self._conn() as c:
@@ -144,6 +162,31 @@ class SubstrateStore:
                 "INSERT INTO evidence.media_fragment(episode_id, sha256, seq, t_start, t_end, codec, width, height) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (episode_id, seq) DO NOTHING",
                 (episode_id, sha, seq, t_start, t_end, codec, width, height),
+            )
+
+    # -- oracle / telemetry catalog ------------------------------------- #
+    def add_oracle_verdict(self, plan_id: str, arm_id: str, verdict: dict, doc: dict, exec_id=None) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO evidence.oracle_verdict(plan_id, exec_id, arm_id, layer, confidence, problems, doc) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (plan_id, exec_id, arm_id, verdict.get("layer", "none"),
+                 verdict.get("confidence", "low"), json.dumps(verdict.get("problems", [])),
+                 json.dumps(doc)),
+            )
+
+    def update_accuracy_cells(self, arm_id: str, rig_fingerprint: str, doc: dict, threshold_mm: float = 10.0) -> None:
+        with self._conn() as c:
+            c.execute("SELECT accuracy_cell_update(%s, %s, %s::jsonb, %s)",
+                      (arm_id, rig_fingerprint, json.dumps(doc), threshold_mm))
+
+    def add_telemetry(self, exec_id: str, plan_id: str, arm_id: str, blob_sha: str,
+                      kp_key: str, summary: dict) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO evidence.telemetry(exec_id, plan_id, arm_id, blob_sha, kp_key, summary) "
+                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (exec_id) DO NOTHING",
+                (exec_id, plan_id, arm_id, blob_sha, kp_key, json.dumps(summary)),
             )
 
     # -- similarity (pgvector) ------------------------------------------ #
