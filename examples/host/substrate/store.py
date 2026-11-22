@@ -134,6 +134,30 @@ class SubstrateStore:
             return [r["episode_id"] for r in c.execute(
                 "SELECT episode_id FROM evidence.episode ORDER BY episode_id").fetchall()]
 
+    # -- capture catalog reads (PG-primary serving) --------------------- #
+    def list_captures(self, limit: int = 20):
+        with self._conn() as c:
+            return c.execute(
+                "SELECT e.episode_id, e.kind, e.started_at, m.snapshot, "
+                "s.sha256, s.width, s.height, b.size_bytes "
+                "FROM evidence.episode e "
+                "LEFT JOIN evidence.manifest m ON m.episode_id=e.episode_id "
+                "LEFT JOIN LATERAL (SELECT sha256, width, height FROM evidence.still "
+                "  WHERE episode_id=e.episode_id AND purpose='witness' ORDER BY id DESC LIMIT 1) s ON true "
+                "LEFT JOIN evidence.blob b ON b.sha256=s.sha256 "
+                "WHERE e.kind IN ('calibration','execution') "
+                "ORDER BY e.started_at DESC LIMIT %s", (limit,)).fetchall()
+
+    def read_capture_meta(self, capture_id: str):
+        return self.read_manifest(capture_id)
+
+    def read_capture_frame(self, capture_id: str):
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT b.bytes FROM evidence.still s JOIN evidence.blob b ON b.sha256=s.sha256 "
+                "WHERE s.episode_id=%s AND s.purpose='witness' LIMIT 1", (capture_id,)).fetchone()
+        return bytes(row["bytes"]) if row else None
+
     # -- plan catalog --------------------------------------------------- #
     def register_plan(self, plan_id: str, episode_id: str, arm_id: str, blob_sha: str,
                       metadata=None, snapshot=None, group_id=None) -> None:
