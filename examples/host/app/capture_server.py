@@ -3210,6 +3210,33 @@ async def trace_prune_loop(app):
         await asyncio.sleep(86400)
 
 
+async def recordings_ingest_loop(app):
+    """Mirror completed MediaMTX recordings into the substrate (§8); never fatal."""
+    mirror = app.get("pg_mirror")
+    rec_dir = app.get("recordings")
+    seen = set()
+    while True:
+        try:
+            if mirror is not None and rec_dir is not None and rec_dir.is_dir():
+                for mp4 in sorted(rec_dir.rglob("*.mp4")):
+                    key = str(mp4)
+                    if key in seen:
+                        continue
+                    size = mp4.stat().st_size
+                    await asyncio.sleep(0.2)
+                    if not mp4.is_file() or mp4.stat().st_size != size:
+                        continue  # still being written
+                    ep = "rec-" + mp4.stem
+                    mirror.store.create_episode(ep, app.get("pg_workspace", "default"), [], kind="execution")
+                    await asyncio.to_thread(mirror.mirror_recording, ep, mp4)
+                    seen.add(key)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("recordings ingest failed: %s", exc)
+        await asyncio.sleep(60)
+
+
 async def on_startup(app: web.Application):
     app["client"] = ClientSession()
     if app.get("llm_url") and not app["llm_context"]["tokens"]:
@@ -3218,6 +3245,8 @@ async def on_startup(app: web.Application):
         app["llm_context_task"] = asyncio.create_task(ensure_llm_context(app))
     if app.get("traces") is not None:
         app["trace_prune_task"] = asyncio.create_task(trace_prune_loop(app))
+    if app.get("pg_mirror") is not None:
+        app["recordings_ingest_task"] = asyncio.create_task(recordings_ingest_loop(app))
 
 
 async def on_cleanup(app: web.Application):
@@ -3225,6 +3254,9 @@ async def on_cleanup(app: web.Application):
     if task is not None:
         task.cancel()
     task = app.get("trace_prune_task")
+    if task is not None:
+        task.cancel()
+    task = app.get("recordings_ingest_task")
     if task is not None:
         task.cancel()
     await app["client"].close()

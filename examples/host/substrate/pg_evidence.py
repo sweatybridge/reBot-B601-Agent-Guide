@@ -87,3 +87,10 @@ class PgEvidenceMirror:
 
     def mirror_tag(self, tag_id: str, kind: str, side_mm: float, pose_world=None) -> None:
         self.store.upsert_tag(tag_id, self.workspace_id, kind, side_mm, pose_world)
+
+    def mirror_recording(self, episode_id: str, path, arm_id=None, seq: int = 0) -> str:
+        from pathlib import Path
+        data = Path(path).read_bytes()
+        sha = self.store.put_blob(data, "other")
+        self.store.add_fragment(episode_id, sha, seq=seq, t_start=0.0, t_end=0.0, codec="mp4")
+        return sha

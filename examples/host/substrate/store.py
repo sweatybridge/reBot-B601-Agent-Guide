@@ -189,14 +189,22 @@ class SubstrateStore:
             )
 
     # -- calibration catalog (world / learning) ------------------------- #
-    def ensure_calibration(self, calib_fingerprint: str, K=None, dist=None, image_size=None) -> None:
+    def ensure_calibration(self, calib_fingerprint: str, K=None, dist=None, image_size=None, calib_doc=None) -> None:
         with self._conn() as c:
             c.execute(
-                "INSERT INTO world.calibration(calib_fingerprint, K, dist, image_size) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT (calib_fingerprint) DO NOTHING",
+                "INSERT INTO world.calibration(calib_fingerprint, K, dist, image_size, calib_doc) "
+                "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (calib_fingerprint) DO UPDATE SET "
+                "calib_doc=COALESCE(EXCLUDED.calib_doc, world.calibration.calib_doc)",
                 (calib_fingerprint, json.dumps(K or [[1, 0, 0], [0, 1, 0], [0, 0, 1]]),
-                 json.dumps(dist or [0, 0, 0, 0, 0]), json.dumps(image_size or [0, 0])),
+                 json.dumps(dist or [0, 0, 0, 0, 0]), json.dumps(image_size or [0, 0]),
+                 json.dumps(calib_doc) if calib_doc is not None else None),
             )
+
+    def read_calib_doc(self, calib_fingerprint: str):
+        with self._conn() as c:
+            row = c.execute("SELECT calib_doc FROM world.calibration WHERE calib_fingerprint=%s",
+                            (calib_fingerprint,)).fetchone()
+        return row["calib_doc"] if row else None
 
     def upsert_rig(self, rig_fingerprint: str, workspace_id: str, calib_fingerprint: str,
                    T_base_cam, image_size, tip_offset, method="base-marker",

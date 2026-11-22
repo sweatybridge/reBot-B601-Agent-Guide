@@ -428,6 +428,15 @@ def locate_capture(directory, calib_path, options: Options):
 
     out_path = capture_dir / "target.json"
     out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    try:
+        import sys
+        sub = str(Path(__file__).resolve().parent.parent / "substrate")
+        if sub not in sys.path:
+            sys.path.insert(0, sub)
+        import pg_cli
+        pg_cli.mirror_session(capture_dir.name, files=[out_path])
+    except Exception as exc:  # noqa: BLE001 - mirror never fails locate
+        print("  warning: target PG mirror failed: %s" % exc)
     if options.annotate:
         annotate(image, corners, options.tag_size, T_base_cam, calibration.K, calibration.dist,
                  np.array(payload["point"]),
