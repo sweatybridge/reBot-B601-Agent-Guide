@@ -265,3 +265,22 @@ class TraceRecorder:
             for path in blobs.iterdir():
                 if path.is_file() and path.stem.split(".")[0] not in referenced:
                     path.unlink(missing_ok=True)
+
+    # -- reading (uniform interface with the PG-backed recorder) -------- #
+    async def read_events(self, sid: str) -> list:
+        path = self.session_dir(sid) / "events.jsonl"
+        if not path.is_file():
+            raise FileNotFoundError(sid)
+        events = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # a torn line must not hide the rest of the log
+        return events
+
+    async def read_manifest(self, sid: str):
+        path = self.session_dir(sid) / "manifest.json"
+        if not path.is_file():
+            raise FileNotFoundError(sid)
+        return json.loads(path.read_text(encoding="utf-8"))
