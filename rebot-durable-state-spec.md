@@ -1101,6 +1101,19 @@ Live /move + oracle executions need a powered arm + bench go-ahead (dry plans on
   on read), redacted append-only events with per-episode advisory-lock seq assignment,
   episode/plan catalog. Round-trip tested.
 
+**Offline hold-frame extraction (recording-as-source, validated offline):**
+- The oracle's hold stills need not be grabbed live: the permanent executed-trajectory
+  recording (`media_fragment.t_start/t_end`, episode-relative) + telemetry stillness let
+  them be extracted after execution. `extract.py` (pure) aligns hold windows to fragments
+  (`+t_offset`) and selects the stillest frame (min meas joint speed, midpoint tiebreak);
+  `extract_service.py` is the isolated cv2-decode activity (`df.http`, crash-isolation §2).
+  This dissolves the grab/playback interleaving so execute→oracle becomes a sequential
+  durable workflow. Validated by `tests/test_extract.py` (19 checks) on a deterministic
+  synthetic rig: window→fragment alignment, stillest-frame selection (incl. jitter), and
+  tip-pixel parity with the live midpoint grab (<0.1 px). The live oracle path is NOT yet
+  switched — the durable-workflow wiring + retirement of `_oracle_hold_grabs` is the next
+  phase (bench-gated); real-episode parity pending a powered arm.
+
 **Two-arm coordination (Phase 2, validated):**
 - `rebot_self_collision_free` / `rebot_min_self_clearance` / `rebot_path_collision_free`
   (Rust): capsule-capsule check over non-adjacent links (sweep `RADII`), via an Ericson
