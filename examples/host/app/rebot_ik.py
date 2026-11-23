@@ -87,6 +87,16 @@ LINK_RADIUS_MAX = 0.85     # any link centre, for the interpolation check
 # alias MOTOR7_OPEN/CLOSED/GRIPPER_RAD_PER_MM from this (were three copies).
 GRIPPER = {"motor7_open": 4.90, "motor7_closed": -0.015, "rad_per_mm": 0.0412}
 
+# Motion tuning (traj/sweep speed policy + gates). Single source: traj.MAX_JOINT_STEP/
+# LIMIT_TOL/RAMP_S and sweep.DEFAULT_MIN_Z/PEAK_SPEED/MIN_CRUISE_SPEED/MIN_SECONDS/
+# MAX_SECONDS/GRIPPER_PEAK_SPEED/SAG_LIMIT_RAD alias this. Matches the Rust cores'
+# motion constants (rebot_arm_config) and the world.arm_config seed bit-for-bit.
+MOTION = {
+    "default_min_z": 0.04, "sag_limit_rad": 0.15, "limit_tol": 0.002, "max_joint_step": 0.5,
+    "ramp_s": 0.15, "min_cruise_speed": 0.25, "min_seconds": 0.3, "max_seconds": 25.0,
+    "peak_speed": 0.5, "gripper_peak_speed": 3.0,
+}
+
 
 # --------------------------------------------------------------------------- #
 # Small SO(3)/SE(3) helpers
@@ -336,15 +346,17 @@ def default_config():
         "tool": {"xyz": [float(v) for v in TOOL_XYZ], "rpy": [float(v) for v in TOOL_RPY]},
         "gripper": {k: float(v) for k, v in GRIPPER.items()},
         "collision": {"clearance": float(CLEARANCE), "link_radius_max": float(LINK_RADIUS_MAX)},
+        "motion": {k: float(v) for k, v in MOTION.items()},
     }
 
 
 def apply_config(cfg):
-    """Override the physical-model constants from a world.arm_config doc, and re-sync
-    the modules that alias them (sweep/witness radii, planner gripper). The seed is
-    bit-identical to the defaults, so this is a no-op until the table is edited."""
+    """Override the physical-model + motion constants from a world.arm_config doc, and
+    re-sync the modules that alias them (sweep/witness radii, planner gripper, traj/
+    sweep motion). The seed is bit-identical to the defaults, so this is a no-op until
+    the table is edited."""
     global LIMITS, LINK_INERTIALS, TOOL_XYZ, TOOL_RPY, GRAVITY
-    global LINK_RADII, CLEARANCE, LINK_RADIUS_MAX, GRIPPER, CHAIN
+    global LINK_RADII, CLEARANCE, LINK_RADIUS_MAX, GRIPPER, CHAIN, MOTION
     import sys
     if "limits" in cfg:
         LIMITS = np.asarray(cfg["limits"], dtype=float)
@@ -365,6 +377,8 @@ def apply_config(cfg):
         LINK_RADIUS_MAX = float(cfg["collision"]["link_radius_max"])
     if "gripper" in cfg:
         GRIPPER = {k: float(v) for k, v in cfg["gripper"].items()}
+    if "motion" in cfg:
+        MOTION = {k: float(v) for k, v in cfg["motion"].items()}
     # Re-sync aliases bound at import time in already-loaded consumers.
     for name in ("sweep", "witness"):
         mod = sys.modules.get(name)
@@ -383,3 +397,17 @@ def apply_config(cfg):
             mod.MOTOR7_OPEN = GRIPPER["motor7_open"]
             mod.MOTOR7_CLOSED = GRIPPER["motor7_closed"]
             mod.GRIPPER_RAD_PER_MM = GRIPPER["rad_per_mm"]
+    # Motion tuning aliases (traj/sweep). Their default-arg functions resolve these
+    # globals at call time, so re-syncing here propagates a table edit.
+    for name, keys in (
+        ("traj", {"MAX_JOINT_STEP": "max_joint_step", "LIMIT_TOL": "limit_tol", "RAMP_S": "ramp_s"}),
+        ("sweep", {"DEFAULT_MIN_Z": "default_min_z", "PEAK_SPEED": "peak_speed",
+                   "MIN_CRUISE_SPEED": "min_cruise_speed", "MIN_SECONDS": "min_seconds",
+                   "MAX_SECONDS": "max_seconds", "GRIPPER_PEAK_SPEED": "gripper_peak_speed",
+                   "SAG_LIMIT_RAD": "sag_limit_rad"}),
+    ):
+        mod = sys.modules.get(name)
+        if mod is not None:
+            for attr, key in keys.items():
+                if hasattr(mod, attr):
+                    setattr(mod, attr, MOTION[key])

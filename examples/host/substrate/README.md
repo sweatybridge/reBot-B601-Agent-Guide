@@ -337,11 +337,16 @@ model, not the URDF inertials.
 link_radius_max), `motion` (speeds/ramp/limits tuning).
 
 - **Python single source + table-driven.** `rebot_ik` owns the constants
-  (`LINK_RADII`, `GRIPPER`, `CLEARANCE`, `LINK_RADIUS_MAX` added); `sweep.RADII` /
-  `witness.LINK_RADII` and the planners' `MOTOR7_*` now alias it (the duplicate
-  literals are gone). `rebot_ik.default_config()` / `apply_config(cfg)` build/apply
-  the doc; `arm_config.load_config()` reads the table in PG mode (called at
-  capture/planner startup) and falls back to the defaults in file mode.
+  (`LINK_RADII`, `GRIPPER`, `CLEARANCE`, `LINK_RADIUS_MAX`, `MOTION` added);
+  `sweep.RADII` / `witness.LINK_RADII`, the planners' `MOTOR7_*`, and the motion
+  tuning (`traj.MAX_JOINT_STEP`/`LIMIT_TOL`/`RAMP_S`, `sweep.DEFAULT_MIN_Z`/
+  `PEAK_SPEED`/`MIN_CRUISE_SPEED`/`MIN_SECONDS`/`MAX_SECONDS`/`GRIPPER_PEAK_SPEED`/
+  `SAG_LIMIT_RAD`) now alias it — the duplicate literals are gone. Functions that
+  took these as default args (`traj.ease_fraction`/`ease_velocity`, `sweep.seconds_for`/
+  `gripper_seconds`/`gravity_sag`) resolve them at call time, so a table edit
+  propagates. `rebot_ik.default_config()` / `apply_config(cfg)` build/apply the doc;
+  `arm_config.load_config()` reads the table in PG mode (called at capture/planner
+  startup) and falls back to the defaults in file mode.
 - **Rust single source + export.** The intra-Rust duplicates (`LIMITS`, `RAMP_S`,
   `MIN_CRUISE_SPEED` in both `lib.rs` and `plan.rs`) are consolidated into `lib.rs`
   (`pub(crate)`); `plan.rs` imports them. `rebot_arm_config()` exports the Rust
@@ -355,13 +360,12 @@ link_radius_max), `motion` (speeds/ramp/limits tuning).
 docker exec rebot-capture-capture-1 python /app/substrate/tests/arm_config_parity.py
 ```
 
-**Scope / follow-ups:** this consolidates the *physical-model* group. The `motion`
-tuning group is seeded in the table and exported by Rust, but the Python `traj`/
-`sweep` tuning literals are not yet rewired to it. Making the Rust cores *read* the
-table at runtime (config threaded through `plan_one`/`move_one` into the cores,
-~100 call sites) is the remaining motion-affecting step — it needs bench validation;
-until then the Rust constants are the single Rust source, guard-validated against
-the table.
+**Scope / follow-ups:** both the *physical-model* and *motion-tuning* groups are
+consolidated — the table is the canonical source, Python is table-driven, and the
+drift guard covers the whole doc. Making the Rust cores *read* the table at runtime
+(config threaded through `plan_one`/`move_one` into the cores, ~100 call sites) is the
+remaining motion-affecting step — it needs bench validation; until then the Rust
+constants are the single Rust source, guard-validated against the table.
 
 ## Notes / gotchas
 

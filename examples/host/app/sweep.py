@@ -70,7 +70,7 @@ CLEARANCE = rebot_ik.CLEARANCE   # m above the worktop for a link's outer surfac
 # height. The planner's min_z floor, the capture server's REBOT_HOVER_M default
 # and the sweep pose band all derive from this one number so they cannot drift.
 # CLEARANCE above is a different quantity (a link's outer surface, not the tip).
-DEFAULT_MIN_Z = 0.04
+DEFAULT_MIN_Z = rebot_ik.MOTION["default_min_z"]
 X_MIN_TIP = 0.12
 RADIUS_MAX = 0.60          # the tip's distance from the base axis
 LINK_RADIUS_MAX = rebot_ik.LINK_RADIUS_MAX   # any link centre, for the interpolation check
@@ -249,10 +249,10 @@ def check(start=None, verbose=False):
 # make a huge leg crawl. The old 3 s minimum is gone: it made short legs cruise
 # far below breakaway. The ramps provide the gentle start, so MIN_SECONDS is
 # just the triangle floor (2 x ramp).
-PEAK_SPEED = 0.5         # rad/s
-MIN_CRUISE_SPEED = 0.25  # rad/s, above the ~0.2 rad/s stiction breakaway
-MIN_SECONDS = 0.3
-MAX_SECONDS = 25.0
+PEAK_SPEED = rebot_ik.MOTION["peak_speed"]         # rad/s
+MIN_CRUISE_SPEED = rebot_ik.MOTION["min_cruise_speed"]  # rad/s, above the ~0.2 rad/s stiction breakaway
+MIN_SECONDS = rebot_ik.MOTION["min_seconds"]
+MAX_SECONDS = rebot_ik.MOTION["max_seconds"]
 
 # The jaw is not the arm: a short-travel axis with real stiction. A fixed-duration
 # gripper leg commands whatever speed its travel implies -- the sequence's full
@@ -260,7 +260,7 @@ MAX_SECONDS = 25.0
 # even with velocity feedforward. Cap its peak the same way the sweep caps the
 # arm's, with its own number: 3 rad/s is brisk but trackable at the vendor gains.
 # No MIN_SECONDS floor here -- the caller's own floor (0.8 s, grasp_s) stands.
-GRIPPER_PEAK_SPEED = 3.0   # rad/s
+GRIPPER_PEAK_SPEED = rebot_ik.MOTION["gripper_peak_speed"]   # rad/s
 
 # The board returns the arm to the pose a move started from as soon as the file
 # ends -- `shut_down` ramps to `self.start`, the pose at bring-up. So a pose only
@@ -277,7 +277,7 @@ HOLD_SECONDS = 1.5
 # The player's gain spec: `base,ID:value,ID:value`. The default is 50 everywhere
 # except motors 2 and 3 at 150 -- the two that carry the arm.
 KP_DEFAULT = "50,2:150,3:150"
-SAG_LIMIT_RAD = 0.15
+SAG_LIMIT_RAD = rebot_ik.MOTION["sag_limit_rad"]
 
 # The tool is a gripper: its tip is a few centimetres from the flange. A fit that
 # puts it hundreds of millimetres away has locked onto something else -- a shadow,
@@ -301,7 +301,7 @@ def kp_vector(spec=None):
     return np.asarray([overrides.get(motor, base) for motor in range(1, 7)], dtype=float)
 
 
-def gravity_sag(q, kp, limit=SAG_LIMIT_RAD):
+def gravity_sag(q, kp, limit=None):
     """How far each joint settles below its command, in rad.
 
     The MIT frame has no integral term: at rest the motor's `kp * (q_des - q)`
@@ -309,6 +309,7 @@ def gravity_sag(q, kp, limit=SAG_LIMIT_RAD):
     was told to be. `rebot_ik.gravity_torques` is the same URDF model the planner
     uses, so this is a prediction from geometry, not a fitted constant.
     """
+    limit = SAG_LIMIT_RAD if limit is None else limit
     q = np.asarray(q, dtype=float).reshape(6)
     kp = np.asarray(kp, dtype=float).reshape(6)
     if np.any(kp <= 0.0):
@@ -457,7 +458,7 @@ def sag_compensator(kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
     return compensate
 
 
-def seconds_for_travel(travel, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SECONDS):
+def seconds_for_travel(travel, peak_speed=None, minimum=None, maximum=None):
     """The speed policy on a path length, rad: cruise = travel / (T - ramp).
 
     The peak cap is travel / peak + ramp. The cruise floor is an upper bound on
@@ -466,13 +467,16 @@ def seconds_for_travel(travel, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maxim
     caller's minimum is the triangle floor for tiny nudges. A via chain budgets
     its whole curved path here, not just the endpoint delta.
     """
+    peak_speed = PEAK_SPEED if peak_speed is None else peak_speed
+    minimum = MIN_SECONDS if minimum is None else minimum
+    maximum = MAX_SECONDS if maximum is None else maximum
     travel = float(travel)
     peak_time = travel / float(peak_speed) + traj.RAMP_S
     cruise_cap = travel / MIN_CRUISE_SPEED + traj.RAMP_S
     return max(minimum, min(maximum, peak_time, cruise_cap))
 
 
-def seconds_for(a, b, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SECONDS):
+def seconds_for(a, b, peak_speed=None, minimum=None, maximum=None):
     """How long a leg should take, from the furthest-travelling joint.
 
     Trapezoid-native: cruise = travel / (T - ramp), so the peak cap is
@@ -481,11 +485,14 @@ def seconds_for(a, b, peak_speed=PEAK_SPEED, minimum=MIN_SECONDS, maximum=MAX_SE
     leg is shortened to keep cruise >= MIN_CRUISE_SPEED. The caller's minimum
     is the triangle floor for tiny nudges.
     """
+    peak_speed = PEAK_SPEED if peak_speed is None else peak_speed
+    minimum = MIN_SECONDS if minimum is None else minimum
+    maximum = MAX_SECONDS if maximum is None else maximum
     travel = float(np.max(np.abs(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))))
     return seconds_for_travel(travel, peak_speed, minimum, maximum)
 
 
-def gripper_seconds(travel, peak_speed=GRIPPER_PEAK_SPEED):
+def gripper_seconds(travel, peak_speed=None):
     """Duration that keeps a cosine-eased gripper leg under the jaw speed cap.
 
     A floor, never a ceiling: callers take max(their own seconds, this), so a
@@ -493,6 +500,7 @@ def gripper_seconds(travel, peak_speed=GRIPPER_PEAK_SPEED):
     as `seconds_for`, without the sweep's 3 s minimum -- a 2.90 rad close
     wants 1.5 s at the cap, not three.
     """
+    peak_speed = GRIPPER_PEAK_SPEED if peak_speed is None else peak_speed
     travel = abs(float(travel))
     if not math.isfinite(travel):
         return 0.0
