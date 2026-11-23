@@ -658,7 +658,10 @@ async def handle_reach(request: web.Request) -> web.Response:
         # is also relaying the phone's media.
         measured = await asyncio.get_running_loop().run_in_executor(
             None, measure_stream_turn, app, calibration)
-    turn = stream_turn(app, calibration)
+    turn = stream_turn(app, calibration,
+                       tuple(app["measured_turn"]["size"])
+                       if app.get("measured_turn") and app["measured_turn"].get("size")
+                       else None)
     if turn is None:
         turns, source = None, "shape"
     else:
@@ -938,7 +941,7 @@ async def handle_relay(request: web.Request) -> web.Response:
 
 
 def resolve_calibration(app, requested=None) -> Path:
-    """The calibration for this phone: an explicit file, else the newest one."""
+    """The calibration for this phone: explicit, the active rig's, else newest."""
     folder = app["calib"]
     if requested:
         candidate = Path(requested)
@@ -958,10 +961,40 @@ def resolve_calibration(app, requested=None) -> Path:
                      if not p.name.startswith(("extrinsics-", "witness-", "sag-",
                                                "accuracy-map"))) \
         if folder.is_dir() else []
+    # Durable bench default: config/calib survives a wiped work/ directory and a
+    # fresh checkout. Only for the default work/calib dir -- a test or caller
+    # with its own --calib-dir must keep its own fixtures. An explicit --calib,
+    # REBOT_CALIB, or the active rig's device file still wins above.
+    bundled = ROOT / "config" / "calib"
+    if bundled.is_dir() and folder.resolve() == (ROOT / "work" / "calib").resolve():
+        options += [p for p in bundled.glob("*.json")
+                    if not p.name.startswith(("extrinsics-", "witness-", "sag-",
+                                              "accuracy-map"))]
     if not options:
         raise web.HTTPUnprocessableEntity(
             text="no calibration in %s: run calibrate_intrinsics.py once for this phone" % folder)
-    return options[-1]
+    # A synthetic fixture must never outrank a real device calibration just
+    # because its name sorts later. Within the real ones, the newest file wins;
+    # the active rig is the strongest tie to the intended camera.
+    real = [p for p in options if p.stem.lower() != "synthetic"]
+    pool = real or options
+    rig = app.get("rig")
+    if rig is not None:
+        store = app.get("pg_store")
+        if store is not None:
+            try:
+                with store._conn() as c:
+                    row = c.execute(
+                        "SELECT calib_doc->>'device' AS device FROM world.calibration "
+                        "WHERE calib_fingerprint=%s", (rig.calib_fingerprint,)).fetchone()
+                device = row["device"] if row else None
+                if device:
+                    candidate = folder / ("%s.json" % device)
+                    if candidate.is_file():
+                        return candidate
+            except Exception:  # noqa: BLE001 - fall back to the file pool
+                pass
+    return max(pool, key=lambda p: p.stat().st_mtime)
 
 
 def effective_mode(app):
@@ -2078,7 +2111,10 @@ async def oracle_finish(app, prep, sid):
         rig = app["rig"]
         K = np.asarray(calibration.K, dtype=float)
         dist = np.asarray(calibration.dist, dtype=float).reshape(-1)
-        turn = stream_turn(app, calibration)
+        pre_image = cv2.imread(prep["pre_frame_path"])
+        turn = stream_turn(app, calibration,
+                           (pre_image.shape[1], pre_image.shape[0])
+                           if pre_image is not None else None)
         measured = app.get("measured_turn")
         doc["stream_turn"] = ({"turns": int(measured["turns"]), "source": "measured",
                                "error_px": round(float(measured["error_px"]), 2)}
@@ -2088,7 +2124,6 @@ async def oracle_finish(app, prep, sid):
         # a fresh witness check on the pre-still wherever the capture path ran.
         if measured:
             doc["tag_reprojection_px"] = round(float(measured["error_px"]), 2)
-        pre_image = cv2.imread(prep["pre_frame_path"])
         if pre_image is not None:
             doc["landscape"] = bool(pre_image.shape[1] > pre_image.shape[0])
             # Templates and the witness live in the calibration grid: turn the
@@ -2494,7 +2529,7 @@ def run_sweep(app, camera_url, calibration_path, body):
     try:
         probe = eye.read()
         base = calib_mod.load(calibration_path)
-        turn = stream_turn(app, base)
+        turn = stream_turn(app, base, (probe.shape[1], probe.shape[0]))
         probe, calibration, turn = locator.upright_frame(
             calibration_path, probe, turn)
         if turn:
@@ -2657,7 +2692,7 @@ def run_refit(app, camera_url, calibration_path, body):
     try:
         probe = eye.read()
         base = calib_mod.load(calibration_path)
-        turn = stream_turn(app, base)
+        turn = stream_turn(app, base, (probe.shape[1], probe.shape[0]))
         probe, calibration, turn = locator.upright_frame(calibration_path, probe, turn)
         if turn:
             eye = UprightEye(eye, turn)
@@ -3166,26 +3201,37 @@ def measure_stream_turn(app, calibration, frame=None):
     return best
 
 
-def stream_turn(app, calibration):
+def stream_turn(app, calibration, frame_size=None):
     """Quarter turns to apply to the stream to reach the calibration grid.
 
     Order: what the tag measurement saw, then what the phone published, then
     `None` -- which lets the caller fall back to the frame shape, that knows "a
     quarter turn" but not which way.
 
-    The phone branch is `stream_angle - calibration_angle`: `screen.orientation`
-    grows as the device turns one way and the frame turns the other, and the two
-    negations cancel, leaving the plain difference of the correction.
+    `frame_size` is optional because some callers only have the cached turn.
+    When given, a turn whose parity disagrees with the shape is discarded: a
+    phone that reports angle 0 for a landscape frame (or a stale cached turn)
+    must not turn a 1920x1080 frame into the wrong grid and then be refused as
+    an aspect change. The shape source then decides the quarter (sign included
+    only as the documented clockwise default).
     """
+    def consistent(turn):
+        if frame_size is None:
+            return True
+        swapped = calib_mod.swapped_shape(calibration.image_size, frame_size)
+        return swapped == (int(turn) % 2 == 1)
+
     measured = app.get("measured_turn")
     if measured and measured.get("turns") is not None:
-        return int(measured["turns"]) % 4
+        turn = int(measured["turns"]) % 4
+        return turn if consistent(turn) else None
     orientation = app.get("stream_orientation") or {}
     angle = orientation.get("angle")
     calib_deg = (calibration.raw or {}).get("orientation_deg")
     if angle is None or calib_deg is None:
         return None
-    return int(round((float(angle) - float(calib_deg)) / 90.0)) % 4
+    turn = int(round((float(angle) - float(calib_deg)) / 90.0)) % 4
+    return turn if consistent(turn) else None
 
 
 def marker_from_still(app, frame, q=None, commit=True):
@@ -3210,7 +3256,7 @@ def marker_from_still(app, frame, q=None, commit=True):
     try:
         calibration_path = resolve_calibration(app)
         base = calib_mod.load(calibration_path)
-        turn = stream_turn(app, base)
+        turn = stream_turn(app, base, (frame.shape[1], frame.shape[0]))
         frame, calibration, turn = locator.upright_frame(
             calibration_path, frame, turn)
     except (calib_mod.CalibError, web.HTTPException) as error:

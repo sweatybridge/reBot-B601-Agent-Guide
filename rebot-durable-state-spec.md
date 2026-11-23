@@ -1148,6 +1148,18 @@ Live /move + oracle executions need a powered arm + bench go-ahead (dry plans on
   probe completed (`duration_ms=130003`, `timeout_seconds=180`), confirming
   duroxide has no shorter implicit step timeout. The one-shot claim (attempts=0)
   remains the motion guard; no pg_durable per-step `max_attempts` is needed.
+- **Default intrinsics (`0023`):** `world.calibration.is_default` marks the bench
+  calibration (1080x1920 portrait, device 4f68…, fingerprint 9acd8707e4ad) that
+  the active rig 9caf… was fitted against. `read_latest_calib_doc` orders by
+  `is_default DESC, created_at DESC`, so stale test calibrations cannot win;
+  `config/calib/` carries the same bytes for a wiped `work/`. Capture selection is
+  explicit `--calib`/`REBOT_CALIB` → active rig device file → real (non-synthetic)
+  file by mtime. A 1920x1080 landscape frame is a quarter turn of this portrait
+  fit: `stream_turn` now rejects a turn whose parity disagrees with the frame
+  shape, so `upright_frame` rotates first and uses the native `K`; the tag solve
+  no longer fails as an aspect change. Validated by
+  `tests/default_intrinsics_tests.sql` and a no-commit tag solve at 1920x1080
+  (marker detected, verification ok).
 - **Dry validation (arm parked):** `tests/test_execute_workflow.py` runs the real
   `df.start` graph against the real activity service in `REBOT_WORKFLOW_DRY=1` with a
   synthetic recording; verified/learned, one extracted hold, one verdict, attempts==1,
@@ -1277,6 +1289,7 @@ substrate/
   migrations/0020_execute_workflow.sql # execution ledger, claim guard, idempotent oracle_learn
   migrations/0021_execute_oracle_workflow.sql # durable graph, offline stills, finalize
   migrations/0022_workflow_logic.sql # extract planning/selection, timing, receipt, coverage graph
+  migrations/0023_default_intrinsics.sql # bench default calibration (is_default)
   store.py                        # PG-backed store seam (blobs/events/catalog), psycopg3
   ingest.py                       # HLS fragment ingester (no decode)
   embed.py                        # pluggable embedder + pgvector population
@@ -1300,6 +1313,7 @@ substrate/
   tests/execute_workflow_tests.sql # 0020 ledger/claim/idempotent learning
   tests/execute_oracle_workflow_tests.sql # 0021 prepare/ready/stills/finalize replay
   tests/workflow_logic_tests.sql  # 0022 SQL extract planning/selection/timing/receipt
+  tests/default_intrinsics_tests.sql # 0023 default calibration row
   tests/test_execute_workflow.py  # dry end-to-end df.start graph (arm parked)
   tests/df_workflow.sql           # pg_durable workflow calling rebot_fk
 ```
@@ -1337,6 +1351,7 @@ docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_wor
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_workflow_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_oracle_workflow_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/workflow_logic_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/default_intrinsics_tests.sql
 docker exec rebot-capture-capture-1 python /app/substrate/tests/test_execute_workflow.py
 ```
 

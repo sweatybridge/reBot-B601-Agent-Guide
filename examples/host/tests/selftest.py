@@ -3537,7 +3537,7 @@ def test_marker_still_commit_flag(workdir: Path):
     saved = (cs.resolve_calibration, cs.stream_turn, cs.locator.upright_frame,
              cs.camera_mod.open_source, cs.calib_mod.load, ac.solve_marker, ac.commit_marker)
     cs.resolve_calibration = lambda app, requested=None: workdir / "calib.json"
-    cs.stream_turn = lambda app, base: 0
+    cs.stream_turn = lambda app, base, size=None: 0
     cs.calib_mod.load = lambda path, **k: SimpleNamespace(K=None, dist=None)
     cs.locator.upright_frame = lambda path, f, turn=None: (f, "CAL", 0)
     cs.camera_mod.open_source = lambda *a, **k: SimpleNamespace(
@@ -5059,7 +5059,7 @@ def test_identify_api(workdir: Path):
     # The stills are rendered in the calibration's own grid, so the route must not
     # turn them: the quarter-turn machinery is test_stream_turn's subject, and
     # here it would only rotate the tag out of the frame the solver expects.
-    capture_server.stream_turn = lambda app_, calibration: 0
+    capture_server.stream_turn = lambda app_, calibration, size=None: 0
     try:
         async def scenarios():
             # ---- the gates: refit moves nothing, coverage moves the arm -----
