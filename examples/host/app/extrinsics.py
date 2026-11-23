@@ -67,11 +67,12 @@ import rebot_ik
 
 FORMAT = "rebot-extrinsics"
 VERSION = 1
-MIN_POSES = 6
+MIN_POSES = rebot_ik.CALIBRATION["min_poses"]
 # Where a bench rig physically is: the camera within a few metres of the arm, the
 # tool's tip a few centimetres from the flange. A fit outside this is not a rig.
-MAX_CAMERA_M = 5.0
-MAX_TIP_M = 0.20
+# Single source: rebot_ik.CALIBRATION (world.arm_config calibration group).
+MAX_CAMERA_M = rebot_ik.CALIBRATION["max_camera_m"]
+MAX_TIP_M = rebot_ik.CALIBRATION["max_tip_m"]
 
 # Free parameters, in the order they appear in the solver's vector. 0-5 are the
 # camera pose (`T_cam<-base`), 6-8 the tip in `gripper_end`, 9-14 the joint
@@ -703,6 +704,11 @@ def _fit_pg(observations, K, dist, options, calib_fingerprint, device, mount, ds
         if urow is None:
             raise ExtrinsicsError("no robot model seeded (world.robot_model)")
         urdf = next(iter(urow.values()))
+        crow = c.execute("SELECT config_doc->'calibration' FROM world.arm_config "
+                         "ORDER BY updated_at LIMIT 1").fetchone()
+        calib_cfg = next(iter(crow.values())) if crow is not None else None
+        if calib_cfg is None:
+            raise ExtrinsicsError("no arm config calibration seeded (world.arm_config)")
         obs = [{"q": [float(v) for v in o.q], "uv": [float(o.uv[0]), float(o.uv[1])]}
                for o in observations]
         opts = {"refine_tip": options.refine_tip, "refine_zeros": options.refine_zeros,
@@ -711,11 +717,11 @@ def _fit_pg(observations, K, dist, options, calib_fingerprint, device, mount, ds
                 "work_radius": options.work_radius,
                 "image_size": list(options.image_size) if options.image_size else None}
         row = c.execute(
-            "SELECT rebot_calibrate_fit(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)",
+            "SELECT rebot_calibrate_fit(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)",
             (urdf, json.dumps(obs),
              json.dumps(np.asarray(K, dtype=float).reshape(-1).tolist()),
              json.dumps(np.asarray(dist, dtype=float).reshape(-1).tolist() if dist is not None else []),
-             json.dumps(opts))).fetchone()
+             json.dumps(opts), json.dumps(calib_cfg))).fetchone()
     r = next(iter(row.values()))
     T = np.asarray(r["T_base_cam"], dtype=float).reshape(4, 4)
     tip = np.asarray(r["tip_offset"], dtype=float)

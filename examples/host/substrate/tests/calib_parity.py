@@ -16,6 +16,8 @@ os.environ["REBOT_PG_DSN"] = ""
 URDF = open("/app/app/cad/ReBot_Arm_RS.urdf").read()
 DSN = "postgresql://postgres:rebot@substrate:5432/postgres"
 conn = psycopg.connect(DSN)
+CALIB_CFG = json.dumps(conn.execute(
+    "SELECT config_doc->'calibration' FROM world.arm_config WHERE arm_id='b601'").fetchone()[0])
 
 K = np.array([[800.0, 0.0, 640.0], [0.0, 800.0, 360.0], [0.0, 0.0, 1.0]])
 dist = np.zeros(5)
@@ -44,9 +46,9 @@ rig_py = res_py.rig
 
 opts_json = {"refine_tip": True, "refine_zeros": False, "plane_z": 0.0, "huber_px": 2.0,
              "max_iterations": 120, "max_weak_mm": 60.0, "work_radius": 0.55}
-res_rs = conn.execute("SELECT rebot_calibrate_fit(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)",
+res_rs = conn.execute("SELECT rebot_calibrate_fit(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)",
                       (URDF, json.dumps(obs), json.dumps(K.reshape(-1).tolist()),
-                       json.dumps(dist.tolist()), json.dumps(opts_json))).fetchone()[0]
+                       json.dumps(dist.tolist()), json.dumps(opts_json), CALIB_CFG)).fetchone()[0]
 
 T_rs = np.array(res_rs["T_base_cam"]).reshape(4, 4)
 tip_rs = np.array(res_rs["tip_offset"])
@@ -69,9 +71,9 @@ obs_noisy = [{"q": o["q"], "uv": [o["uv"][0] + float(rng.normal(0, 0.7)),
                                   o["uv"][1] + float(rng.normal(0, 0.7))]} for o in obs]
 res_py2 = ex.fit([ex.Observation(q=np.array(o["q"]), uv=tuple(o["uv"])) for o in obs_noisy],
                  K, dist, opts)
-res_rs2 = conn.execute("SELECT rebot_calibrate_fit(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)",
+res_rs2 = conn.execute("SELECT rebot_calibrate_fit(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)",
                        (URDF, json.dumps(obs_noisy), json.dumps(K.reshape(-1).tolist()),
-                        json.dumps(dist.tolist()), json.dumps(opts_json))).fetchone()[0]
+                        json.dumps(dist.tolist()), json.dumps(opts_json), CALIB_CFG)).fetchone()[0]
 T_rs2 = np.array(res_rs2["T_base_cam"]).reshape(4, 4)
 dT2 = float(np.max(np.abs(T_rs2 - res_py2.rig.T_base_cam)))
 dtip2 = float(np.max(np.abs(np.array(res_rs2["tip_offset"]) - res_py2.rig.tip_offset)))

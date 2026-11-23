@@ -13,9 +13,8 @@ type V3 = Vector3<f64>;
 type M4 = Matrix4<f64>;
 type DM = DMatrix<f64>;
 
-const MIN_POSES: usize = 6;
-const MAX_CAMERA_M: f64 = 5.0;
-const MAX_TIP_M: f64 = 0.20;
+// Calibration gates (min_poses/max_camera_m/max_tip_m) are required config now
+// (world.arm_config calibration group, passed into rebot_calibrate_fit).
 const NAMES: [&str; 15] = ["rx","ry","rz","tx","ty","tz","tip_x","tip_y","tip_z",
                            "j1","j2","j3","j4","j5","j6"];
 
@@ -473,7 +472,17 @@ fn predicted_error(theta: &[f64], cov: &DM, free: &[usize], k: &M3, dist: &[f64]
 /// Returns the rig fields + fit diagnostics. Refusals panic -> SQL ERROR.
 #[pg_extern]
 fn rebot_calibrate_fit(urdf: &str, observations: pgrx::JsonB, k: pgrx::JsonB,
-                       dist: pgrx::JsonB, options: pgrx::JsonB) -> pgrx::JsonB {
+                       dist: pgrx::JsonB, options: pgrx::JsonB,
+                       config: pgrx::JsonB) -> pgrx::JsonB {
+    // Required calibration gates (world.arm_config calibration group); a missing
+    // field is a hard refusal — no hardcoded fallback.
+    let cal = config.0;
+    let min_poses = cal["min_poses"].as_u64()
+        .unwrap_or_else(|| panic!("arm config calibration.min_poses required")) as usize;
+    let max_camera_m = cal["max_camera_m"].as_f64()
+        .unwrap_or_else(|| panic!("arm config calibration.max_camera_m required"));
+    let max_tip_m = cal["max_tip_m"].as_f64()
+        .unwrap_or_else(|| panic!("arm config calibration.max_tip_m required"));
     let obs_v = observations.0;
     let options = options.0;
     let oarr = obs_v.as_array().unwrap_or_else(|| panic!("observations must be an array"));
@@ -484,8 +493,8 @@ fn rebot_calibrate_fit(urdf: &str, observations: pgrx::JsonB, k: pgrx::JsonB,
         for j in 0..6 { qq[j] = q[j].as_f64().unwrap(); }
         Obs { q: qq, uv: [uv[0].as_f64().unwrap(), uv[1].as_f64().unwrap()] }
     }).collect();
-    if obs.len() < MIN_POSES {
-        panic!("{} poses is not enough; the rig needs at least {}, spread over the work area and at a couple of heights", obs.len(), MIN_POSES);
+    if obs.len() < min_poses {
+        panic!("{} poses is not enough; the rig needs at least {}, spread over the work area and at a couple of heights", obs.len(), min_poses);
     }
     let ka = k.0.as_array().unwrap();
     let km = M3::new(ka[0].as_f64().unwrap(), ka[1].as_f64().unwrap(), ka[2].as_f64().unwrap(),
@@ -554,10 +563,10 @@ fn rebot_calibrate_fit(urdf: &str, observations: pgrx::JsonB, k: pgrx::JsonB,
                weakest["direction"].as_str().unwrap(), weak_mm, max_weak_mm);
     }
     let camera = V3::new(t_base_cam[(0,3)], t_base_cam[(1,3)], t_base_cam[(2,3)]);
-    if camera.norm() > MAX_CAMERA_M {
-        panic!("the fit ran away: the camera came out {:.1} m from the base, where a bracket is within {:.0} m. The detected points do not all belong to one arm", camera.norm(), MAX_CAMERA_M);
+    if camera.norm() > max_camera_m {
+        panic!("the fit ran away: the camera came out {:.1} m from the base, where a bracket is within {:.0} m. The detected points do not all belong to one arm", camera.norm(), max_camera_m);
     }
-    if tip_v.norm() > MAX_TIP_M {
+    if tip_v.norm() > max_tip_m {
         panic!("the fit put the tip {:.0} mm from the flange, but a gripper's tip is a few centimetres: the points are not all the tool tip", 1000.0*tip_v.norm());
     }
 
