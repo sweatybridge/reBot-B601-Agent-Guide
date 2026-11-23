@@ -97,6 +97,10 @@ MOTION = {
     "peak_speed": 0.5, "gripper_peak_speed": 3.0,
 }
 
+# Hand-eye fit sanity gates (extrinsics.MIN_POSES/MAX_CAMERA_M/MAX_TIP_M alias this;
+# matches calib.rs and the world.arm_config calibration group bit-for-bit).
+CALIBRATION = {"min_poses": 6, "max_camera_m": 5.0, "max_tip_m": 0.20}
+
 
 # --------------------------------------------------------------------------- #
 # Small SO(3)/SE(3) helpers
@@ -347,6 +351,9 @@ def default_config():
         "gripper": {k: float(v) for k, v in GRIPPER.items()},
         "collision": {"clearance": float(CLEARANCE), "link_radius_max": float(LINK_RADIUS_MAX)},
         "motion": {k: float(v) for k, v in MOTION.items()},
+        "calibration": {"min_poses": int(CALIBRATION["min_poses"]),
+                        "max_camera_m": float(CALIBRATION["max_camera_m"]),
+                        "max_tip_m": float(CALIBRATION["max_tip_m"])},
     }
 
 
@@ -356,7 +363,7 @@ def apply_config(cfg):
     sweep motion). The seed is bit-identical to the defaults, so this is a no-op until
     the table is edited."""
     global LIMITS, LINK_INERTIALS, TOOL_XYZ, TOOL_RPY, GRAVITY
-    global LINK_RADII, CLEARANCE, LINK_RADIUS_MAX, GRIPPER, CHAIN, MOTION
+    global LINK_RADII, CLEARANCE, LINK_RADIUS_MAX, GRIPPER, CHAIN, MOTION, CALIBRATION
     import sys
     if "limits" in cfg:
         LIMITS = np.asarray(cfg["limits"], dtype=float)
@@ -379,6 +386,10 @@ def apply_config(cfg):
         GRIPPER = {k: float(v) for k, v in cfg["gripper"].items()}
     if "motion" in cfg:
         MOTION = {k: float(v) for k, v in cfg["motion"].items()}
+    if "calibration" in cfg:
+        CALIBRATION = {"min_poses": int(cfg["calibration"]["min_poses"]),
+                       "max_camera_m": float(cfg["calibration"]["max_camera_m"]),
+                       "max_tip_m": float(cfg["calibration"]["max_tip_m"])}
     # Re-sync aliases bound at import time in already-loaded consumers.
     for name in ("sweep", "witness"):
         mod = sys.modules.get(name)
@@ -411,3 +422,11 @@ def apply_config(cfg):
             for attr, key in keys.items():
                 if hasattr(mod, attr):
                     setattr(mod, attr, MOTION[key])
+    ext = sys.modules.get("extrinsics")
+    if ext is not None:
+        if hasattr(ext, "MIN_POSES"):
+            ext.MIN_POSES = CALIBRATION["min_poses"]
+        if hasattr(ext, "MAX_CAMERA_M"):
+            ext.MAX_CAMERA_M = CALIBRATION["max_camera_m"]
+        if hasattr(ext, "MAX_TIP_M"):
+            ext.MAX_TIP_M = CALIBRATION["max_tip_m"]
