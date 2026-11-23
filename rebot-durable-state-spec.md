@@ -1058,13 +1058,15 @@ constants formerly hardcoded and duplicated 2–3× across `rebot_ik`/`sweep`/`w
 (`arm_id` + `config_doc` jsonb: gravity/limits/link_inertials/link_radii/tool/gripper/
 collision/motion). The seed is bit-identical to the former constants (compute unchanged);
 `link_inertials` is the simplified gravity model, deliberately not URDF-derived (~2e-3 Nm
-vs raw RNEA). Python: `rebot_ik` is the single source (`sweep.RADII`/`witness.LINK_RADII`/
-planner `MOTOR7_*` alias it); `arm_config.load_config()` reads the table in PG mode at
-startup, defaults in file mode. Rust: intra-Rust duplicates (`LIMITS`/`RAMP_S`/
+vs raw RNEA). Python: `rebot_ik` is the single source (`sweep.RADII`/`witness.LINK_RADII`/planner
+`MOTOR7_*` and the `traj`/`sweep` motion tuning alias it; default-arg functions resolve
+at call time so table edits propagate); `arm_config.load_config()` reads the table in PG
+mode at startup, defaults in file mode. Rust: intra-Rust duplicates (`LIMITS`/`RAMP_S`/
 `MIN_CRUISE_SPEED`) consolidated into `lib.rs`; `rebot_arm_config()` exports the Rust
-constants. Drift guard `tests/arm_config_parity.py`: table == Python == Rust bit-exact.
-Follow-ups: rewire the Python `motion` tuning literals; thread the table config into the
-Rust cores at runtime (~100 call sites, motion-affecting, needs bench validation).
+constants. Drift guard `tests/arm_config_parity.py`: table == Python == Rust bit-exact
+(covers the whole doc incl. motion). Both physical-model and motion groups consolidated.
+Follow-up: thread the table config into the Rust cores at runtime (~100 call sites,
+motion-affecting, needs bench validation).
 
 **Learning plane (Phase 1, ports validated against the Python reference):**
 - `oracle_attribute(jsonb)` (PLpgSQL, `0002`) reproduces `oracle.attribute` across all

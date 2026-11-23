@@ -23,11 +23,13 @@ import math
 
 import numpy as np
 
+import rebot_ik  # single source for the motion tuning (world.arm_config)
+
 FORMAT = "rebot-joint-trajectory"
 VERSION = 1
 IDS = [1, 2, 3, 4, 5, 6, 7]
-MAX_JOINT_STEP = 0.5      # rad, between consecutive waypoints
-LIMIT_TOL = 0.002          # rad, encoders read a few mrad past a stop at rest
+MAX_JOINT_STEP = rebot_ik.MOTION["max_joint_step"]   # rad, between consecutive waypoints
+LIMIT_TOL = rebot_ik.MOTION["limit_tol"]             # rad, encoders read a few mrad past a stop at rest
 MIT_POSITION_LIMIT = 4.0 * math.pi
 MIN_HZ, MAX_HZ = 5.0, 200.0
 # The default stream rate every producer inherits. 50 Hz is measured on the
@@ -49,14 +51,15 @@ DEFAULT_HZ = 50.0
 # stick-slip segments. The S-ramp leaves rest quadratically (a hair slower
 # than linear at the very start) but crosses the breakaway band in well under
 # the 0.2 s stall budget; 0.15 s keeps the whole ramp short.
-RAMP_S = 0.15
+# Single source: rebot_ik.MOTION (world.arm_config motion group).
+RAMP_S = rebot_ik.MOTION["ramp_s"]
 
 
 def _ramp_ratio(duration, ramp):
     return min(0.5, max(1e-9, float(ramp) / max(float(duration), 1e-9)))
 
 
-def ease_fraction(u, duration, ramp=RAMP_S):
+def ease_fraction(u, duration, ramp=None):
     """Fraction of a leg's travel at normalized time u, S-ramp trapezoid.
 
     Velocity rises as a smoothstep (3x^2 - 2x^3) over the ramp: acceleration
@@ -66,7 +69,7 @@ def ease_fraction(u, duration, ramp=RAMP_S):
     cruise); every shape starts and ends at rest. `duration` is the leg's
     scheduled time in seconds.
     """
-    r = _ramp_ratio(duration, ramp)
+    r = _ramp_ratio(duration, RAMP_S if ramp is None else ramp)
     vc = 1.0 / (1.0 - r)
     u = max(0.0, min(1.0, float(u)))
     if u <= r:
@@ -78,9 +81,9 @@ def ease_fraction(u, duration, ramp=RAMP_S):
     return vc * (u - 0.5 * r)
 
 
-def ease_velocity(u, duration, ramp=RAMP_S):
+def ease_velocity(u, duration, ramp=None):
     """d(ease_fraction)/dt in 1/s; multiply by the joint travel for rad/s."""
-    r = _ramp_ratio(duration, ramp)
+    r = _ramp_ratio(duration, RAMP_S if ramp is None else ramp)
     vc = 1.0 / (1.0 - r)
     u = max(0.0, min(1.0, float(u)))
     duration = max(float(duration), 1e-9)
