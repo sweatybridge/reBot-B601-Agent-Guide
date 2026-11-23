@@ -18,11 +18,11 @@ CFG = json.dumps(conn.execute(
 def rust(sql, args):
     return conn.execute(sql, args).fetchone()[0]
 
-# â”€â”€ builders: exact parity (deterministic interpolation) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ #
+# ── builders: exact parity (deterministic interpolation) ─────────────────── #
 worst = 0.0
 q_from = [0.0, 0.2, 0.3, 0.0, 0.1, 0.0, 4.9]
 q_to = [0.2, 0.4, 0.5, 0.1, 0.2, 0.1, 2.0]
-ref = traj.joint_move(np.array(q_from), np.array(q_to), 2.0, hold_s=0.5,
+ref = traj.joint_move(np.array(q_from), np.array(q_to), 2.0, control_hz=30.0, hold_s=0.5,
                       limits=[list(l) for l in sweep.rebot_ik.LIMITS] + [[-0.1, 5.0]])
 got = rust("SELECT rebot_joint_move(%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,%s::text)",
            (q_from, q_to, 2.0, CFG, 30.0, 0.5,
@@ -35,7 +35,7 @@ for a, b in zip(ref["waypoints"], got["waypoints"]):
 print("joint_move wp", len(got["waypoints"]), "maxdiff %.2e" % worst)
 
 poses = [q_from, q_to, [0.1, 0.3, 0.4, 0.05, 0.15, 0.05, 4.9]]
-ref = traj.joint_sequence([np.array(p) for p in poses], [2.0, 1.5], hold_s=0.4,
+ref = traj.joint_sequence([np.array(p) for p in poses], [2.0, 1.5], control_hz=30.0, hold_s=0.4,
                           limits=[list(l) for l in sweep.rebot_ik.LIMITS] + [[-0.1, 5.0]])
 got = rust("SELECT rebot_joint_sequence(%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s::jsonb,%s::text)",
            (json.dumps(poses), json.dumps([2.0, 1.5]), CFG, 30.0, 0.4,
@@ -46,6 +46,33 @@ for a, b in zip(ref["waypoints"], got["waypoints"]):
                 max(abs(x - y) for x, y in zip(a["q"], b["q"])),
                 max(abs(x - y) for x, y in zip(a["v"], b["v"])))
 print("joint_sequence wp", len(got["waypoints"]), "maxdiff %.2e" % worst)
+
+# DEFAULT_HZ parity: Python's default is now 50 Hz; the Rust cores' hz defaults
+# must match when the argument is omitted (move_one relies on this).
+ref = traj.joint_move(np.array(q_from), np.array(q_to), 2.0, hold_s=0.5,
+                      limits=[list(l) for l in sweep.rebot_ik.LIMITS] + [[-0.1, 5.0]])
+got = rust("SELECT rebot_joint_move(%s,%s,%s,%s::jsonb, hold_s := %s, limits := %s::jsonb)",
+           (q_from, q_to, 2.0, CFG, 0.5,
+            json.dumps([list(l) for l in sweep.rebot_ik.LIMITS] + [[-0.1, 5.0]])))
+assert got["control_hz"] == traj.DEFAULT_HZ == 50.0, "joint_move default hz"
+assert len(ref["waypoints"]) == len(got["waypoints"]), "joint_move default-hz count"
+for a, b in zip(ref["waypoints"], got["waypoints"]):
+    worst = max(worst, abs(a["t"] - b["t"]),
+                max(abs(x - y) for x, y in zip(a["q"], b["q"])),
+                max(abs(x - y) for x, y in zip(a["v"], b["v"])))
+print("joint_move default-hz wp", len(got["waypoints"]), "maxdiff %.2e" % worst)
+ref = traj.joint_sequence([np.array(p) for p in poses], [2.0, 1.5], hold_s=0.4,
+                          limits=[list(l) for l in sweep.rebot_ik.LIMITS] + [[-0.1, 5.0]])
+got = rust("SELECT rebot_joint_sequence(%s::jsonb,%s::jsonb,%s::jsonb, hold_s := %s, limits := %s::jsonb)",
+           (json.dumps(poses), json.dumps([2.0, 1.5]), CFG, 0.4,
+            json.dumps([list(l) for l in sweep.rebot_ik.LIMITS] + [[-0.1, 5.0]])))
+assert got["control_hz"] == traj.DEFAULT_HZ == 50.0, "joint_sequence default hz"
+assert len(ref["waypoints"]) == len(got["waypoints"]), "joint_sequence default-hz count"
+for a, b in zip(ref["waypoints"], got["waypoints"]):
+    worst = max(worst, abs(a["t"] - b["t"]),
+                max(abs(x - y) for x, y in zip(a["q"], b["q"])),
+                max(abs(x - y) for x, y in zip(a["v"], b["v"])))
+print("joint_sequence default-hz wp", len(got["waypoints"]), "maxdiff %.2e" % worst)
 print("BUILDERS", "OK" if worst < 1e-9 else "CHECK")
 
 # â”€â”€ move_build vs planner_server.move_one compute (dry_run, mocked edge) â”€â”€â”€ #

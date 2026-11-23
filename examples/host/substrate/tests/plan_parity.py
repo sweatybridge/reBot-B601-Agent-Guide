@@ -34,6 +34,7 @@ def opts():
     o = ptt.Options()
     o.hover = True; o.hover_m = 0.0; o.tip_m = 0.0; o.quiet = True
     o.ik_pos_tol = 0.010; o.calib_dir = ""
+    o.hz = 30.0  # opts_json passes hz=30 explicitly; pin the reference to match
     return o
 
 
@@ -90,6 +91,7 @@ print("HOVER CASES", cases, "WORST dq %.3e dtau %.3e dv %.3e" % (worst_q, worst_
 def seq_opts():
     o = ptt.Options()
     o.quiet = True; o.ik_pos_tol = 0.010; o.calib_dir = ""
+    o.hz = 30.0  # seq_opts_json passes hz=30 explicitly; pin the reference to match
     return o
 
 def seq_opts_json():
@@ -137,7 +139,49 @@ for q6, tips in marker_sets:
           "dur ref %.3f rust %.3f" % (ref_sum["duration_s"], rust["summary"]["duration_s"]),
           "maxdq %.2e dtau %.2e dv %.2e" % (dq, dtau, dv))
 print("SEQ CASES", seq_cases)
+
+# ── via pass-through chain parity (marker 'via' lists -> traj.chain_series) ── #
+# One continuous filleted chain leg per via-carrying marker, under one S-ramp;
+# odd markers chain into the staging point then slide, even markers chain into
+# the pose. searchsorted/interpolation port: q must agree to ~1e-9 rad.
+via_cases = 0
+q6 = [0.2, 0.3, 0.4, 0.2, 0.1, 0.0]
+tip = fk_tip(q6)
+
+def mk_via(dx, dy, vias=None):
+    t = {"format": "rebot-target",
+         "point": [float(tip[0] + dx), float(tip[1] + dy), float(tip[2] - 0.035)],
+         "point_frame": "tip", "tip_offset_m": 0.035}
+    if vias:
+        t["via"] = [[float(tip[0] + vx), float(tip[1] + vy), float(tip[2])]
+                    for vx, vy in vias]
+    return t
+
+via_targets = [
+    mk_via(0.03, 0.00, vias=[(0.015, 0.02)]),
+    mk_via(-0.02, 0.03),
+    mk_via(0.00, -0.03, vias=[(0.02, -0.01), (-0.01, -0.02)]),
+]
+dump = {"ids": [1, 2, 3, 4, 5, 6, 7], "q": q6 + [4.9]}
+ref_payload, ref_sum = ptt.plan_sequence(dump, via_targets, seq_opts(), log=lambda *a: None)
+row = conn.execute("SELECT rebot_plan_sequence(%s, %s, %s, %s, %s, %s::jsonb)",
+                   (URDF, json.dumps(dump), json.dumps(via_targets),
+                    json.dumps(seq_opts_json()), json.dumps({}), CFG)).fetchone()
+rust = row[0]
+rw, fw = rust["payload"]["waypoints"], ref_payload["waypoints"]
+assert len(rw) == len(fw), "via WAYPOINT COUNT differs: rust %d ref %d" % (len(rw), len(fw))
+dq, dtau, dv, dt = compare(rw, fw)
+assert rust["summary"]["via_counts"] == ref_sum["via_counts"], "via_counts differ"
+assert rust["summary"]["via_points"] == ref_sum["via_points"], "via_points differ"
+assert dq < 1e-9, "via chain q parity gap %.3e rad" % dq
+assert dt < 1e-9, "via chain time parity gap %.3e s" % dt
+worst_q = max(worst_q, dq); worst_tau = max(worst_tau, dtau); worst_v = max(worst_v, dv)
+via_cases += 1
+print("via markers", len(via_targets), "wp", len(rw),
+      "dur ref %.3f rust %.3f" % (ref_sum["duration_s"], rust["summary"]["duration_s"]),
+      "maxdq %.2e dtau %.2e dv %.2e" % (dq, dtau, dv))
+print("VIA CASES", via_cases)
 print("TOTAL WORST dq %.3e dtau %.3e dv %.3e" % (worst_q, worst_tau, worst_v))
-ok = cases > 0 and seq_cases > 0 and worst_q < 1e-2 and worst_tau < 1e-2
+ok = cases > 0 and seq_cases > 0 and via_cases > 0 and worst_q < 1e-2 and worst_tau < 1e-2
 print("PARITY", "OK" if ok else "CHECK")
 sys.exit(0 if ok else 1)

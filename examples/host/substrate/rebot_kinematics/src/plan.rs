@@ -14,12 +14,20 @@
 use pgrx::prelude::*;
 use serde_json::{json, Value};
 use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3, Matrix3, Vector6, Matrix6, DMatrix};
-use crate::{load_chain_arm, joint_axis, gravity_torques_impl, path_safe_impl, ARM_JOINTS, Config};
+use crate::{load_chain_arm, joint_axis, joint_points, gravity_torques_impl, path_safe_impl, ARM_JOINTS, Config};
 
 type V3 = Vector3<f64>;
 type M3 = Matrix3<f64>;
 
 const MIT_POSITION_LIMIT: f64 = 4.0 * std::f64::consts::PI;
+
+// traj.DEFAULT_HZ / plan_to_target.MAX_VIAS / traj chain constants: parity-first
+// mirrors of the Python values (not config fields in this pass).
+const DEFAULT_HZ: f64 = 50.0;
+const MAX_VIAS: usize = 5;
+const CORNER_RADIUS_RAD: f64 = 0.05;
+const CHAIN_LINE_SAMPLES: usize = 40;
+const CHAIN_FILLET_SAMPLES: usize = 16;
 
 fn json_v3(v: &Value) -> V3 {
     let a = v.as_array().unwrap_or_else(|| panic!("expected [x, y, z]"));
@@ -115,21 +123,139 @@ fn ease_fraction(u: f64, duration: f64, cfg: &Config) -> f64 {
     let r = ramp_ratio(duration, cfg.ramp_s);
     let vc = 1.0 / (1.0 - r);
     let u = u.clamp(0.0, 1.0);
-    if u <= r { vc * u * u / (2.0 * r) }
-    else if u >= 1.0 - r { 1.0 - vc * (1.0 - u).powi(2) / (2.0 * r) }
-    else { vc * (u - 0.5 * r) }
+    if u <= r {
+        let x = u / r;
+        vc * r * (x.powi(3) - 0.5 * x.powi(4))
+    } else if u >= 1.0 - r {
+        let y = (1.0 - u) / r;
+        1.0 - vc * r * (y.powi(3) - 0.5 * y.powi(4))
+    } else {
+        vc * (u - 0.5 * r)
+    }
 }
 
-fn seconds_for(a: &[f64], b: &[f64], cfg: &Config) -> f64 {
-    let travel = a.iter().zip(b.iter()).map(|(x, y)| (y - x).abs()).fold(0.0_f64, f64::max);
+fn seconds_for_travel(travel: f64, cfg: &Config) -> f64 {
     let peak_time = travel / cfg.peak_speed + cfg.ramp_s;
     let cruise_cap = travel / cfg.min_cruise_speed + cfg.ramp_s;
     cfg.min_seconds.max(cfg.max_seconds.min(peak_time).min(cruise_cap))
 }
 
+fn seconds_for(a: &[f64], b: &[f64], cfg: &Config) -> f64 {
+    let travel = a.iter().zip(b.iter()).map(|(x, y)| (y - x).abs()).fold(0.0_f64, f64::max);
+    seconds_for_travel(travel, cfg)
+}
+
 fn gripper_seconds(travel: f64, cfg: &Config) -> f64 {
     if !travel.is_finite() { return 0.0; }
     (std::f64::consts::PI / 2.0) * travel.abs() / cfg.gripper_peak_speed
+}
+
+// ── via pass-through chains (ports of traj._chain_path / chain_travel /
+//    chain_series): straight joint-space segments with tangent quadratic
+//    fillets at the interior knots, one S-ramp time law over the whole arc. ── //
+
+fn chain_path(poses: &[[f64; 6]], radius: f64) -> (Vec<[f64; 6]>, Vec<f64>) {
+    if poses.len() < 2 { panic!("a chain needs at least two poses, got {}", poses.len()); }
+    if !poses.iter().all(|p| p.iter().all(|v| v.is_finite())) {
+        panic!("chain poses must be finite");
+    }
+    let norm = |v: &[f64; 6]| -> f64 {
+        (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3] + v[4] * v[4] + v[5] * v[5]).sqrt()
+    };
+    let sub = |a: &[f64; 6], b: &[f64; 6]| -> [f64; 6] {
+        let mut d = [0.0; 6];
+        for j in 0..6 { d[j] = a[j] - b[j]; }
+        d
+    };
+    let lengths: Vec<f64> = (0..poses.len() - 1)
+        .map(|i| norm(&sub(&poses[i + 1], &poses[i]))).collect();
+    let mut samples: Vec<[f64; 6]> = vec![poses[0]];
+    let mut cursor = poses[0];
+    for index in 1..poses.len() - 1 {
+        let knot = poses[index];
+        let span_in = lengths[index - 1];
+        let span_out = lengths[index];
+        let r = radius.min(span_in / 2.0).min(span_out / 2.0);
+        if r > 1e-9 && span_in > 1e-12 && span_out > 1e-12 {
+            let mut u_in = [0.0; 6];
+            let mut u_out = [0.0; 6];
+            let mut a = [0.0; 6];
+            let mut b = [0.0; 6];
+            for j in 0..6 {
+                u_in[j] = (knot[j] - poses[index - 1][j]) / span_in;
+                u_out[j] = (poses[index + 1][j] - knot[j]) / span_out;
+                a[j] = knot[j] - u_in[j] * r;
+                b[j] = knot[j] + u_out[j] * r;
+            }
+            for step in 1..=CHAIN_LINE_SAMPLES {
+                let f = step as f64 / CHAIN_LINE_SAMPLES as f64;
+                let mut s = [0.0; 6];
+                for j in 0..6 { s[j] = cursor[j] + (a[j] - cursor[j]) * f; }
+                samples.push(s);
+            }
+            for step in 1..=CHAIN_FILLET_SAMPLES {
+                let t = step as f64 / CHAIN_FILLET_SAMPLES as f64;
+                let omt = 1.0 - t;
+                let mut s = [0.0; 6];
+                for j in 0..6 {
+                    s[j] = omt * omt * a[j] + 2.0 * t * omt * knot[j] + t * t * b[j];
+                }
+                samples.push(s);
+            }
+            cursor = b;
+        } else {
+            for step in 1..=CHAIN_LINE_SAMPLES {
+                let f = step as f64 / CHAIN_LINE_SAMPLES as f64;
+                let mut s = [0.0; 6];
+                for j in 0..6 { s[j] = cursor[j] + (knot[j] - cursor[j]) * f; }
+                samples.push(s);
+            }
+            cursor = knot;
+        }
+    }
+    for step in 1..=CHAIN_LINE_SAMPLES {
+        let f = step as f64 / CHAIN_LINE_SAMPLES as f64;
+        let mut s = [0.0; 6];
+        for j in 0..6 { s[j] = cursor[j] + (poses[poses.len() - 1][j] - cursor[j]) * f; }
+        samples.push(s);
+    }
+    let mut arc: Vec<f64> = Vec::with_capacity(samples.len());
+    arc.push(0.0);
+    let mut acc = 0.0;
+    for i in 1..samples.len() {
+        acc += norm(&sub(&samples[i], &samples[i - 1]));
+        arc.push(acc);
+    }
+    (samples, arc)
+}
+
+fn chain_travel(samples: &[[f64; 6]]) -> f64 {
+    let mut sums = [0.0_f64; 6];
+    for w in samples.windows(2) {
+        for j in 0..6 { sums[j] += (w[1][j] - w[0][j]).abs(); }
+    }
+    sums.iter().cloned().fold(0.0_f64, f64::max)
+}
+
+fn chain_series(samples: &[[f64; 6]], arc: &[f64], seconds: f64, hz: f64, cfg: &Config) -> Vec<[f64; 6]> {
+    let total = *arc.last().unwrap();
+    let count = (seconds.max(0.2) * hz).round_ties_even().max(2.0) as usize;
+    let duration = count as f64 / hz;
+    let mut out: Vec<[f64; 6]> = Vec::with_capacity(count);
+    for index in 1..=count {
+        let target = ease_fraction(index as f64 / count as f64, duration, cfg) * total;
+        // np.searchsorted(arc, target, side="right") - 1, clamped.
+        let slot = (arc.partition_point(|&a| a <= target) as isize - 1)
+            .clamp(0, arc.len() as isize - 2) as usize;
+        let span = arc[slot + 1] - arc[slot];
+        let weight = if span <= 1e-12 { 0.0 } else { (target - arc[slot]) / span };
+        let mut s = [0.0; 6];
+        for j in 0..6 { s[j] = samples[slot][j] + (samples[slot + 1][j] - samples[slot][j]) * weight; }
+        out.push(s);
+    }
+    let last = *samples.last().unwrap();
+    *out.last_mut().unwrap() = last;
+    out
 }
 
 fn kp_vector(spec: &str) -> [f64; 6] {
@@ -302,6 +428,28 @@ impl PlanCtx {
     fn path_safe(&self, a: &[f64], b: &[f64]) -> bool {
         let (_, ch) = load_chain_arm(&self.urdf, a);
         path_safe_impl(&ch, a, b, 40, &self.cfg)
+    }
+
+    // sweep.samples_safe: the capsule gate on a dense sample series (the via
+    // chain's filleted path, not its chords).
+    fn samples_safe(&self, samples: &[[f64; 6]]) -> bool {
+        for q6 in samples {
+            let (_, ch) = load_chain_arm(&self.urdf, q6);
+            let points = joint_points(&ch);
+            for index in 1..points.len() {
+                let start = points[index - 1];
+                let end = points[index];
+                let radius = self.cfg.link_radii[index.min(self.cfg.link_radii.len() - 1)];
+                for fraction in [0.0, 0.5] {
+                    let cz = start[2] + (end[2] - start[2]) * fraction;
+                    if cz - radius < self.cfg.clearance { return false; }
+                }
+                if (end[0] * end[0] + end[1] * end[1]).sqrt() > self.cfg.link_radius_max {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -637,6 +785,28 @@ impl<'a> Planner<'a> {
             self.waypoints.push(Wp { t: self.t, q, tau: last.tau });
         }
     }
+
+    // plan_sequence.chain_leg: one continuous pass through the knots under a
+    // single S-ramp, fillets at the vias, capsule gate on the filleted path,
+    // speed policy on the whole curved travel.
+    fn chain_leg(&mut self, knots: &[[f64; 6]], into_marker: usize, gripper: f64) -> [f64; 6] {
+        let mut unique: Vec<[f64; 6]> = vec![knots[0]];
+        for knot in &knots[1..] {
+            if max_diff(knot, unique.last().unwrap()) > 1e-6 { unique.push(*knot); }
+        }
+        if unique.len() < 2 { return self.last_q6(); }
+        let (samples, arc) = chain_path(&unique, CORNER_RADIUS_RAD);
+        if !self.ctx.samples_safe(&samples) {
+            panic!("the via chain into marker {into_marker} dips within a link radius of the \
+                    worktop; raise the via points or move the arm clear");
+        }
+        let seconds = seconds_for_travel(chain_travel(&samples), &self.ctx.cfg);
+        for q in chain_series(&samples, &arc, seconds, self.hz, &self.ctx.cfg) {
+            self.t += self.period;
+            self.append(&q, gripper);
+        }
+        self.last_q6()
+    }
 }
 
 /// The plan core. dump = {ids, q}; target = rebot-target {point, point_frame,
@@ -695,7 +865,7 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
     let tool_axis = opt_s(&options, "tool_axis", "current").to_string();
     let yaw = opt_f(&options, "yaw", 0.0);
     let approach = opt_f(&options, "approach", 0.06);
-    let hz = opt_f(&options, "hz", 30.0);
+    let hz = opt_f(&options, "hz", DEFAULT_HZ);
     let hold_s = opt_f(&options, "hold_s", 0.6);
     let no_return = opt_b(&options, "no_return", false);
     let unpark_j2 = opt_f(&options, "unpark_j2", 0.0);
@@ -918,7 +1088,7 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
     let tool_axis = opt_s(&options, "tool_axis", "current").to_string();
     let yaw = opt_f(&options, "yaw", 0.0);
     let approach = opt_f(&options, "approach", 0.06);
-    let hz = opt_f(&options, "hz", 30.0);
+    let hz = opt_f(&options, "hz", DEFAULT_HZ);
     let hold_s = opt_f(&options, "hold_s", 0.6);
     let grasp_q = opt_f(&options, "grasp_q", 2.0);
     let close_width_mm = options.get("close_width_mm").and_then(|v| v.as_f64());
@@ -939,6 +1109,8 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
     let mut hovers: Vec<f64> = Vec::new();
     let mut tip_offsets: Vec<f64> = Vec::new();
     let mut flange_points: Vec<V3> = Vec::new();
+    let mut vias: Vec<Vec<V3>> = Vec::new();
+    let mut via_flange_points: Vec<Vec<V3>> = Vec::new();
     for (i, target) in tarr.iter().enumerate() {
         if target.get("format").and_then(|v| v.as_str()) != Some("rebot-target") {
             panic!("marker {}: not a rebot-target file", i + 1);
@@ -959,10 +1131,50 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
         if radius > max_reach {
             panic!("marker {}: target is {radius:.3} m from the base axis, above --max-reach {max_reach:.2}", i + 1);
         }
+        // Via points follow the marker's own frame convention and face the same gates.
+        let via_raw = match target.get("via") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(v) => v.as_array().unwrap_or_else(|| panic!(
+                "marker {}: 'via' must be a list of at most {MAX_VIAS} [x, y, z] points", i + 1)).clone(),
+        };
+        if via_raw.len() > MAX_VIAS {
+            panic!("marker {}: 'via' must be a list of at most {MAX_VIAS} [x, y, z] points", i + 1);
+        }
+        let mut marker_vias: Vec<V3> = Vec::new();
+        let mut marker_via_flanges: Vec<V3> = Vec::new();
+        for (vi, via) in via_raw.iter().enumerate() {
+            let via_index = vi + 1;
+            let a = via.as_array().unwrap_or_else(|| panic!(
+                "marker {} via {via_index}: must be [x, y, z]", i + 1));
+            if a.len() != 3 { panic!("marker {} via {via_index}: must be [x, y, z]", i + 1); }
+            let mut vp = V3::zeros();
+            for j in 0..3 {
+                vp[j] = a[j].as_f64().unwrap_or_else(|| panic!(
+                    "marker {} via {via_index}: non-numeric point", i + 1));
+            }
+            if !vp.iter().all(|v| v.is_finite()) {
+                panic!("marker {} via {via_index}: non-finite point", i + 1);
+            }
+            if !is_tip { vp += V3::new(0.0, 0.0, hover_m); }
+            if vp.z < min_z - 1e-9 {
+                panic!("marker {} via {via_index}: tip z {:.4} is below the minimum {min_z:.4}", i + 1, vp.z);
+            }
+            if vp.z > max_z {
+                panic!("marker {} via {via_index}: tip z {:.3} is above --max-z {max_z:.3}", i + 1, vp.z);
+            }
+            let vr = (vp.x * vp.x + vp.y * vp.y).sqrt();
+            if vr > max_reach {
+                panic!("marker {} via {via_index}: point is {vr:.3} m from the base axis, above --max-reach {max_reach:.2}", i + 1);
+            }
+            marker_vias.push(vp);
+            marker_via_flanges.push(vp + V3::new(0.0, 0.0, tip_offset_m));
+        }
         points.push(tip_point);
         hovers.push(if is_tip { 0.0 } else { hover_m });
         tip_offsets.push(tip_offset_m);
         flange_points.push(flange_point);
+        vias.push(marker_vias);
+        via_flange_points.push(marker_via_flanges);
     }
 
     let mut pl = Planner {
@@ -992,6 +1204,7 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
     let odd_close = close_angle(&cfg, close_width_mm, grasp_q);
 
     let mut marker_q_ik: Vec<[f64; 6]> = Vec::new();
+    let mut via_q_ik: Vec<Vec<[f64; 6]>> = vec![Vec::new(); points.len()];
     let mut marker_holds: Vec<(f64, f64)> = Vec::new();
     let mut yaw_degrees: Vec<f64> = Vec::new();
     for (i, point) in points.iter().enumerate() {
@@ -1006,35 +1219,67 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
             Err(_) => pl.ik_to(&place, &r_marker, &start_seed, &label),
         };
         marker_q_ik.push(target_q);
-        let mut current_q = pl.last_q6();
-        if index % 2 == 1 {
+        let current_q = pl.last_q6();
+        // Odd markers are grasped: stage in front, then slide. The via chain
+        // (when present) delivers the arm to the staging point; the slide-in
+        // itself is unchanged.
+        let arrival_q = if index % 2 == 1 {
+            let radius = (point.x * point.x + point.y * point.y).sqrt();
+            if radius <= approach {
+                panic!("marker {index}: target is {radius:.3} m from the base axis, inside the {:.0} mm approach standoff: no room to stage in front of it", approach * 1000.0);
+            }
             let stage_point = stage_in_front(point, approach);
             let stage_place = stage_point + V3::new(0.0, 0.0, tip_offsets[i]);
             let slabel = format!("stage {index}");
-            let stage_q = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pl.ik_to(&stage_place, &r_marker, &seed, &slabel))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pl.ik_to(&stage_place, &r_marker, &seed, &slabel))) {
                 Ok(q) => q,
                 Err(_) => pl.ik_to(&stage_place, &r_marker, &start_seed, &slabel),
+            }
+        } else {
+            target_q
+        };
+        // This marker's vias: solved endpoint-first in its own work orientation,
+        // before any motion, exactly like a marker IK failure.
+        let mut via_qs: Vec<[f64; 6]> = Vec::new();
+        for (vi, via_place) in via_flange_points[i].iter().enumerate() {
+            let vlabel = format!("via {index}.{}", vi + 1);
+            let via_q = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pl.ik_to(via_place, &r_marker, &seed, &vlabel))) {
+                Ok(q) => q,
+                Err(_) => pl.ik_to(via_place, &r_marker, &start_seed, &vlabel),
             };
-            if !ctx.path_safe(&current_q, &stage_q) {
+            via_qs.push(via_q);
+            via_q_ik[i].push(via_q);
+        }
+        // The leg in, policy-paced. With vias, one continuous chain replaces the
+        // plain joint leg; both get the worktop capsule gate.
+        if !via_qs.is_empty() {
+            let mut knots: Vec<[f64; 6]> = vec![current_q];
+            knots.extend(via_qs.iter().copied());
+            knots.push(arrival_q);
+            seed = pl.chain_leg(&knots, index, gripper);
+        } else if index % 2 == 1 {
+            if !ctx.path_safe(&current_q, &arrival_q) {
                 panic!("the leg to the staging point for marker {index} dips within a link radius of the worktop; space the markers further apart or move the arm clear");
             }
             let mut d = [0.0; 6];
-            for j in 0..6 { d[j] = stage_q[j] - current_q[j]; }
-            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &stage_q, &cfg), gripper);
-            current_q = pl.last_q6();
-            if !ctx.path_safe(&current_q, &target_q) {
-                panic!("the slide-in to marker {index} dips within a link radius of the worktop; raise the marker or move the arm clear");
-            }
-            let mut d = [0.0; 6];
-            for j in 0..6 { d[j] = target_q[j] - current_q[j]; }
-            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &target_q, &cfg), gripper);
+            for j in 0..6 { d[j] = arrival_q[j] - current_q[j]; }
+            seed = pl.joint_leg(&current_q, &d, seconds_for(&current_q, &arrival_q, &cfg), gripper);
         } else {
             if !ctx.path_safe(&current_q, &target_q) {
                 panic!("the leg to marker {index} dips within a link radius of the worktop; space the markers further apart or move the arm clear");
             }
             let mut d = [0.0; 6];
             for j in 0..6 { d[j] = target_q[j] - current_q[j]; }
-            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &target_q, &cfg), gripper);
+            seed = pl.joint_leg(&current_q, &d, seconds_for(&current_q, &target_q, &cfg), gripper);
+        }
+        if index % 2 == 1 {
+            let current_q = pl.last_q6();
+            if !ctx.path_safe(&current_q, &target_q) {
+                panic!("the slide-in to marker {index} dips within a link radius of the worktop; raise the marker or move the arm clear");
+            }
+            let mut d = [0.0; 6];
+            for j in 0..6 { d[j] = target_q[j] - current_q[j]; }
+            seed = pl.joint_leg(&current_q, &d, seconds_for(&current_q, &target_q, &cfg), gripper);
         }
         let hold_t0 = pl.t;
         pl.hold_g(0.25, gripper);
@@ -1045,7 +1290,6 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
         gripper = next_gripper;
         pl.hold_g(0.25, gripper);
         marker_holds.push((hold_t0, pl.t));
-        seed = target_q;
     }
 
     // Return in joint space to the start pose.
@@ -1063,9 +1307,13 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
         None => format!("close to {odd_close:.2} rad"),
         Some(w) => format!("close to {w:.1} mm"),
     };
-    let steps = format!("{} markers: stage {:.0} mm in front and slide in on odd, direct on even; \
+    let total_vias: usize = vias.iter().map(|v| v.len()).sum();
+    let mut steps = format!("{} markers: stage {:.0} mm in front and slide in on odd, direct on even; \
                          gripper open, {close_text} on odd, open on even; return",
                         points.len(), approach * 1000.0);
+    if total_vias > 0 {
+        steps += &format!("; {total_vias} via points passed through without stopping");
+    }
 
     let targets_prov: Vec<Value> = points.iter().enumerate().map(|(i, point)| {
         json!({
@@ -1078,12 +1326,15 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
             "capture": tarr[i].get("capture").cloned().unwrap_or(Value::Null),
             "source": tarr[i].get("source").cloned().unwrap_or(Value::Null),
             "tap": tarr[i].get("tap").cloned().unwrap_or(Value::Null),
+            "via": vias[i].iter().map(arr3).collect::<Vec<_>>(),
+            "via_flange_points": via_flange_points[i].iter().map(arr3).collect::<Vec<_>>(),
+            "via_q_ik": via_q_ik[i].iter().map(|q| q.to_vec()).collect::<Vec<_>>(),
             "q_ik": marker_q_ik[i].to_vec(),
             "hold_t_start": marker_holds[i].0,
             "hold_t_end": marker_holds[i].1,
         })
     }).collect();
-    let provenance = json!({
+    let mut provenance = json!({
         "sequence": true,
         "hover_m": opt_f(&options, "hover_m", cfg.default_min_z),
         "tip_m": opt_f(&options, "tip_m", 0.0),
@@ -1094,6 +1345,9 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
         "gripper": {"open": cfg.motor7_open, "half": cfg.motor7_half(),
                     "closed": cfg.motor7_closed, "odd_close": odd_close},
     });
+    if total_vias > 0 {
+        provenance["via_corner_radius_rad"] = json!(CORNER_RADIUS_RAD);
+    }
     let extra = json!({
         "capture": provenance,
         "tool_axis": sequence_axis,
@@ -1116,6 +1370,9 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
         "targets": points.iter().map(arr3).collect::<Vec<_>>(),
         "flange_points": flange_points.iter().map(arr3).collect::<Vec<_>>(),
         "q_ik": marker_q_ik.iter().map(|q| q.to_vec()).collect::<Vec<_>>(),
+        "via_counts": vias.iter().map(|v| v.len()).collect::<Vec<_>>(),
+        "via_points": total_vias,
+        "via_q_ik": via_q_ik.iter().map(|qs| qs.iter().map(|q| q.to_vec()).collect::<Vec<_>>()).collect::<Vec<_>>(),
         "radii": points.iter().map(|p| (p.x * p.x + p.y * p.y).sqrt()).collect::<Vec<_>>(),
         "hover_m": opt_f(&options, "hover_m", cfg.default_min_z),
         "hovers_m": hovers,
@@ -1210,7 +1467,7 @@ fn rebot_traj_build(waypoints: pgrx::JsonB, hz: f64, limits: pgrx::JsonB,
 #[pg_extern]
 fn rebot_joint_move(q_from: Vec<f64>, q_to: Vec<f64>, seconds: f64,
                     config: pgrx::JsonB,
-                    hz: default!(f64, 30.0), hold_s: default!(f64, 0.4),
+                    hz: default!(f64, 50.0), hold_s: default!(f64, 0.4),
                     limits: default!(pgrx::JsonB, "null"), label: default!(&str, "''")) -> pgrx::JsonB {
     let cfg = Config::from_json(&config.0);
     if q_from.len() != 7 || q_to.len() != 7 { panic!("a joint move needs 7 angles at both ends"); }
@@ -1250,7 +1507,7 @@ fn q_from_arr(v: &[f64]) -> [f64; 7] {
 #[pg_extern]
 fn rebot_joint_sequence(poses: pgrx::JsonB, seconds: pgrx::JsonB,
                         config: pgrx::JsonB,
-                        hz: default!(f64, 30.0), hold_s: default!(f64, 0.4),
+                        hz: default!(f64, 50.0), hold_s: default!(f64, 0.4),
                         limits: default!(pgrx::JsonB, "null"), label: default!(&str, "''")) -> pgrx::JsonB {
     let cfg = Config::from_json(&config.0);
     let parr = poses.0.as_array().unwrap_or_else(|| panic!("poses must be an array"));
@@ -1397,14 +1654,14 @@ fn rebot_move_build(urdf: &str, pose: pgrx::JsonB, targets: pgrx::JsonB,
         let label = format!("calibration move to [{}]",
             targets6[0].iter().map(|v| format!("{v:+.2}")).collect::<Vec<_>>().join(", "));
         rebot_joint_move(q_from7.to_vec(), points[points.len() - 1].to_vec(),
-                         seconds[0], pgrx::JsonB(config.0.clone()), 30.0, hold,
+                         seconds[0], pgrx::JsonB(config.0.clone()), DEFAULT_HZ, hold,
                          pgrx::JsonB(limits), &label).0
     } else {
         let poses = json!(points.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
         let secs = json!(seconds);
         let label = format!("{} poses, one pass", targets6.len());
         rebot_joint_sequence(pgrx::JsonB(poses), pgrx::JsonB(secs),
-                             pgrx::JsonB(config.0.clone()), 30.0, hold,
+                             pgrx::JsonB(config.0.clone()), DEFAULT_HZ, hold,
                              pgrx::JsonB(limits), &label).0
     };
     let stats = validate_payload(&payload, &cfg);

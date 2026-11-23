@@ -533,7 +533,7 @@ fn rebot_path_collision_free(urdf: &str, a: Vec<f64>, b: Vec<f64>, config: pgrx:
 // --------------------------------------------------------------------------- //
 
 fn ramp_ratio(duration: f64, ramp: f64) -> f64 {
-    (ramp / duration).max(1e-9).min(0.5)
+    (ramp / duration.max(1e-9)).max(1e-9).min(0.5)
 }
 
 /// Fraction of a leg's travel at normalized time u (traj.ease_fraction).
@@ -559,6 +559,7 @@ fn rebot_ease_velocity(u: f64, duration: f64, ramp: default!(f64, 0.15)) -> f64 
     let r = ramp_ratio(duration, ramp);
     let vc = 1.0 / (1.0 - r);
     let u = u.max(0.0).min(1.0);
+    let duration = duration.max(1e-9);
     if u <= r {
         let x = u / r;
         vc * (3.0 * x * x - 2.0 * x.powi(3)) / duration
