@@ -61,10 +61,11 @@ POSES = (
     (+1.2214, +2.4181, +2.7969, -1.4298, +1.1353, +2.4046),  # tip [+0.333 -0.377 +0.303]
 )
 
-# Link capsule radii, the same table the collision probe uses.
-RADII = (0.055, 0.055, 0.050, 0.045, 0.035, 0.030, 0.020)
+# Link capsule radii, the same table the collision probe uses (single source:
+# rebot_ik.LINK_RADII; witness.LINK_RADII aliases the same).
+RADII = rebot_ik.LINK_RADII
 
-CLEARANCE = 0.012          # m above the worktop for a link's outer surface
+CLEARANCE = rebot_ik.CLEARANCE   # m above the worktop for a link's outer surface
 # The single minimum tool-tip height above the worktop, and the default hover
 # height. The planner's min_z floor, the capture server's REBOT_HOVER_M default
 # and the sweep pose band all derive from this one number so they cannot drift.
@@ -72,7 +73,7 @@ CLEARANCE = 0.012          # m above the worktop for a link's outer surface
 DEFAULT_MIN_Z = 0.04
 X_MIN_TIP = 0.12
 RADIUS_MAX = 0.60          # the tip's distance from the base axis
-LINK_RADIUS_MAX = 0.85     # any link centre, for the interpolation check
+LINK_RADIUS_MAX = rebot_ik.LINK_RADIUS_MAX   # any link centre, for the interpolation check
 
 
 class SweepError(Exception):

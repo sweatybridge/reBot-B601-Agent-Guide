@@ -3582,6 +3582,10 @@ def build_app(args) -> web.Application:
         from pg_evidence import PgEvidenceMirror
         from store import SubstrateStore
         pg_store = SubstrateStore(args.pg_dsn)
+        # world.arm_config is the system of record for the physical-model constants;
+        # apply it to rebot_ik (single Python source). Seed == defaults -> no-op.
+        import arm_config
+        arm_config.load_config(dsn=args.pg_dsn)
         pg_workspace = getattr(args, "pg_workspace", "default")
         app["pg_store"] = pg_store
         app["pg_workspace"] = pg_workspace

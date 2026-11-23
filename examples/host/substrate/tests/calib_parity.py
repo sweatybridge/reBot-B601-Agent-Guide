@@ -82,8 +82,8 @@ print("CALIB PARITY (noisy)", "OK" if ok2 else "CHECK")
 
 # Live dispatch: with the DSN set, ex.fit must route through rebot_calibrate_fit
 # (reading the URDF from world.robot_model) and reproduce the Rust rig exactly.
-conn.execute("INSERT INTO world.robot_model (model_id, urdf) VALUES (%s, %s)",
-             ("calib-parity", URDF))
+conn.execute("INSERT INTO world.robot_model (model_id, urdf) VALUES (%s, %s) "
+             "ON CONFLICT (model_id) DO NOTHING", ("calib-parity", URDF))
 conn.commit()
 os.environ["REBOT_PG_DSN"] = DSN
 res_disp = ex.fit([ex.Observation(q=np.array(o["q"]), uv=tuple(o["uv"])) for o in obs],

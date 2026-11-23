@@ -14,7 +14,9 @@
 use pgrx::prelude::*;
 use serde_json::{json, Value};
 use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3, Matrix3, Vector6, Matrix6, DMatrix};
-use crate::{load_chain_arm, joint_axis, gravity_torques_impl, path_safe_impl, ARM_JOINTS};
+use crate::{load_chain_arm, joint_axis, gravity_torques_impl, path_safe_impl, ARM_JOINTS,
+            LIMITS, RAMP_S, MIN_CRUISE_SPEED, GRAVITY, LINK_INERTIALS, RADII, CLEARANCE,
+            LINK_RADIUS_MAX};
 
 type V3 = Vector3<f64>;
 type M3 = Matrix3<f64>;
@@ -29,15 +31,36 @@ const SAG_LIMIT_RAD: f64 = 0.15;
 const LIMIT_TOL: f64 = 0.002;
 const MAX_JOINT_STEP: f64 = 0.5;
 const MIT_POSITION_LIMIT: f64 = 4.0 * std::f64::consts::PI;
-const RAMP_S: f64 = 0.15;
-const MIN_CRUISE_SPEED: f64 = 0.25;
 const MIN_SECONDS: f64 = 0.3;
 const MAX_SECONDS: f64 = 25.0;
 const PEAK_SPEED: f64 = 0.5;
 const GRIPPER_PEAK_SPEED: f64 = 3.0;
-const LIMITS: [(f64, f64); 6] = [
-    (-2.80, 2.80), (0.0, 3.14), (0.0, 3.14), (-1.57, 1.57), (-1.57, 1.57), (-3.14, 3.14),
-];
+// LIMITS / RAMP_S / MIN_CRUISE_SPEED are the single source in lib.rs (imported above).
+
+/// The Rust physical-model + tuning constants as jsonb — the canonical Rust source
+/// for `world.arm_config`. The drift guard (`tests/arm_config_parity.py`) asserts this
+/// equals the table seed and the Python constants. `tool` is URDF-derived (not a Rust
+/// const), so it is omitted here and compared against Python only.
+#[pg_extern]
+fn rebot_arm_config() -> pgrx::JsonB {
+    let limits: Vec<Value> = LIMITS.iter().map(|(lo, hi)| json!([lo, hi])).collect();
+    let inertials: Vec<Value> = LINK_INERTIALS.iter().map(|(n, m, c)| json!([n, m, c])).collect();
+    pgrx::JsonB(json!({
+        "gravity": GRAVITY,
+        "limits": limits,
+        "link_inertials": inertials,
+        "link_radii": RADII,
+        "collision": {"clearance": CLEARANCE, "link_radius_max": LINK_RADIUS_MAX},
+        "gripper": {"motor7_open": MOTOR7_OPEN, "motor7_closed": MOTOR7_CLOSED,
+                    "rad_per_mm": GRIPPER_RAD_PER_MM},
+        "motion": {
+            "default_min_z": DEFAULT_MIN_Z, "sag_limit_rad": SAG_LIMIT_RAD, "limit_tol": LIMIT_TOL,
+            "max_joint_step": MAX_JOINT_STEP, "ramp_s": RAMP_S, "min_cruise_speed": MIN_CRUISE_SPEED,
+            "min_seconds": MIN_SECONDS, "max_seconds": MAX_SECONDS, "peak_speed": PEAK_SPEED,
+            "gripper_peak_speed": GRIPPER_PEAK_SPEED
+        }
+    }))
+}
 
 fn json_v3(v: &Value) -> V3 {
     let a = v.as_array().unwrap_or_else(|| panic!("expected [x, y, z]"));

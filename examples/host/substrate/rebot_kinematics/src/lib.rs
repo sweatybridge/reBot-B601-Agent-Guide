@@ -114,7 +114,7 @@ pub(crate) const ARM_JOINTS: [&str; 6] = ["joint1", "joint2", "joint3", "joint4"
 
 // (link, mass kg, COM in that link frame) — matches rebot_ik.LINK_INERTIALS.
 // Gripper fingers omitted (<0.1 Nm); gripper_end is the lumped tool mass.
-const LINK_INERTIALS: [(&str, f64, [f64; 3]); 7] = [
+pub(crate) const LINK_INERTIALS: [(&str, f64, [f64; 3]); 7] = [
     ("link1", 0.4655, [0.00817652, 0.00122584, 0.03314197]),
     ("link2", 1.5520, [-0.11786481, -0.00342226, -0.02715519]),
     ("link3", 1.2520, [0.10342715, -0.06641379, -0.02710687]),
@@ -528,7 +528,7 @@ fn rebot_path_collision_free(urdf: &str, a: Vec<f64>, b: Vec<f64>, samples: defa
 // trapezoid: smoothstep ramp into constant-velocity cruise, zero accel at ends).
 // --------------------------------------------------------------------------- //
 
-const RAMP_S: f64 = 0.15;
+pub(crate) const RAMP_S: f64 = 0.15;
 
 fn ramp_ratio(duration: f64, ramp: f64) -> f64 {
     (ramp / duration).max(1e-9).min(0.5)
@@ -573,9 +573,9 @@ fn rebot_ease_velocity(u: f64, duration: f64, ramp: default!(f64, 0.15)) -> f64 
 // and locate_target.project's no-distortion path).
 // --------------------------------------------------------------------------- //
 
-const MIN_CRUISE_SPEED: f64 = 0.25;
+pub(crate) const MIN_CRUISE_SPEED: f64 = 0.25;
 // rebot_ik.LIMITS (joint1..6 lower/upper).
-const LIMITS: [(f64, f64); 6] = [
+pub(crate) const LIMITS: [(f64, f64); 6] = [
     (-2.80, 2.80), (0.0, 3.14), (0.0, 3.14), (-1.57, 1.57), (-1.57, 1.57), (-3.14, 3.14),
 ];
 
