@@ -111,6 +111,38 @@ ORACLE = {
     "placement_xy_mm": 10.0, "placement_z_tol_mm": 5.0, "ik_residual_mm": 10.0,
 }
 
+# Learning thresholds (identify.RIG_MAX_AGE_DAYS etc. alias this; matches
+# rebot_fit_sag_map / accuracy_cell_update's required config arg and the
+# world.arm_config learning group bit-for-bit). Arrays stay lists; the count
+# gates stay ints.
+LEARNING = {
+    "rig_max_age_days": 30.0, "tag_growth_px": 2.0, "ewma_alpha": 0.3,
+    "marker_min_usable": 3, "marker_spread_max_mm": 6.0, "holdout_max_px": 3.0,
+    "tag_prior_depth": 0.01, "sag_min_holds": 30, "sag_huber_rad": 0.010,
+    "sag_validate_max_mrad": 15.0, "sag_validate_ratio": 2.0,
+    "sag_span_radius_m": 0.10, "sag_span_height_m": 0.05, "accuracy_min_n": 3,
+    "accuracy_radius_edges": [0.10, 0.20, 0.30, 0.40, 0.50, 0.60],
+    "accuracy_height_edges": [0.00, 0.10, 0.20, 0.30, 0.40], "accuracy_sectors": 8,
+    "coverage_max_poses": 12, "coverage_hold_s": 2.0, "coverage_perturbations": 24,
+    "coverage_max_reach_m": 0.75,
+}
+_LEARNING_INT_KEYS = ("marker_min_usable", "sag_min_holds", "accuracy_min_n",
+                      "accuracy_sectors", "coverage_max_poses", "coverage_perturbations")
+_LEARNING_ARRAY_KEYS = ("accuracy_radius_edges", "accuracy_height_edges")
+
+
+def _learning_doc(src):
+    """Coerce a learning group to the canonical doc shape (ints/floats/lists)."""
+    out = {}
+    for k, v in src.items():
+        if k in _LEARNING_INT_KEYS:
+            out[k] = int(v)
+        elif k in _LEARNING_ARRAY_KEYS:
+            out[k] = [float(x) for x in v]
+        else:
+            out[k] = float(v)
+    return out
+
 
 # --------------------------------------------------------------------------- #
 # Small SO(3)/SE(3) helpers
@@ -365,6 +397,7 @@ def default_config():
                         "max_camera_m": float(CALIBRATION["max_camera_m"]),
                         "max_tip_m": float(CALIBRATION["max_tip_m"])},
         "oracle": {k: float(v) for k, v in ORACLE.items()},
+        "learning": _learning_doc(LEARNING),
     }
 
 
@@ -374,7 +407,7 @@ def apply_config(cfg):
     sweep motion). The seed is bit-identical to the defaults, so this is a no-op until
     the table is edited."""
     global LIMITS, LINK_INERTIALS, TOOL_XYZ, TOOL_RPY, GRAVITY
-    global LINK_RADII, CLEARANCE, LINK_RADIUS_MAX, GRIPPER, CHAIN, MOTION, CALIBRATION, ORACLE
+    global LINK_RADII, CLEARANCE, LINK_RADIUS_MAX, GRIPPER, CHAIN, MOTION, CALIBRATION, ORACLE, LEARNING
     import sys
     if "limits" in cfg:
         LIMITS = np.asarray(cfg["limits"], dtype=float)
@@ -403,6 +436,8 @@ def apply_config(cfg):
                        "max_tip_m": float(cfg["calibration"]["max_tip_m"])}
     if "oracle" in cfg:
         ORACLE = {k: float(v) for k, v in cfg["oracle"].items()}
+    if "learning" in cfg:
+        LEARNING = _learning_doc(cfg["learning"])
     # Re-sync aliases bound at import time in already-loaded consumers.
     for name in ("sweep", "witness"):
         mod = sys.modules.get(name)
@@ -456,3 +491,24 @@ def apply_config(cfg):
         ):
             if hasattr(orc, attr):
                 setattr(orc, attr, ORACLE[key])
+    ident = sys.modules.get("identify")
+    if ident is not None:
+        for attr, key in (
+            ("RIG_MAX_AGE_DAYS", "rig_max_age_days"), ("TAG_GROWTH_PX", "tag_growth_px"),
+            ("EWMA_ALPHA", "ewma_alpha"), ("MARKER_MIN_USABLE", "marker_min_usable"),
+            ("MARKER_SPREAD_MAX_MM", "marker_spread_max_mm"), ("HOLDOUT_MAX_PX", "holdout_max_px"),
+            ("TAG_PRIOR_DEPTH", "tag_prior_depth"), ("SAG_MIN_HOLDS", "sag_min_holds"),
+            ("SAG_HUBER_RAD", "sag_huber_rad"), ("SAG_VALIDATE_MAX_MRAD", "sag_validate_max_mrad"),
+            ("SAG_VALIDATE_RATIO", "sag_validate_ratio"), ("SAG_SPAN_RADIUS_M", "sag_span_radius_m"),
+            ("SAG_SPAN_HEIGHT_M", "sag_span_height_m"), ("ACCURACY_MIN_N", "accuracy_min_n"),
+            ("ACCURACY_SECTORS", "accuracy_sectors"), ("COVERAGE_MAX_POSES", "coverage_max_poses"),
+            ("COVERAGE_HOLD_S", "coverage_hold_s"),
+            ("COVERAGE_PERTURBATIONS", "coverage_perturbations"),
+            ("COVERAGE_MAX_REACH_M", "coverage_max_reach_m"),
+        ):
+            if hasattr(ident, attr):
+                setattr(ident, attr, LEARNING[key])
+        if hasattr(ident, "ACCURACY_RADIUS_EDGES"):
+            ident.ACCURACY_RADIUS_EDGES = tuple(LEARNING["accuracy_radius_edges"])
+        if hasattr(ident, "ACCURACY_HEIGHT_EDGES"):
+            ident.ACCURACY_HEIGHT_EDGES = tuple(LEARNING["accuracy_height_edges"])

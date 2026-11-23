@@ -16,6 +16,10 @@ mirror = PgEvidenceMirror(store, workspace_id="ws_ev_test")
 with psycopg.connect(DSN) as c:
     c.execute("INSERT INTO world.arm(arm_id,name,urdf_fingerprint,zeros_key,kp_key) "
               "VALUES ('arm_ev','E','u','z','kp50') ON CONFLICT DO NOTHING")
+    # accuracy_cell_update now requires the learning config; seed arm_ev from b601.
+    c.execute("INSERT INTO world.arm_config(arm_id, config_doc) "
+              "SELECT 'arm_ev', config_doc FROM world.arm_config WHERE arm_id='b601' "
+              "ON CONFLICT (arm_id) DO NOTHING")
     c.execute("INSERT INTO world.calibration(calib_fingerprint,K,dist,image_size) "
               "VALUES ('cal_ev','[[1]]','[0]','[1600,1200]') ON CONFLICT DO NOTHING")
     c.execute("INSERT INTO world.shared_rig(rig_fingerprint,workspace_id,calib_fingerprint,"
