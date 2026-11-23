@@ -14,53 +14,12 @@
 use pgrx::prelude::*;
 use serde_json::{json, Value};
 use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3, Matrix3, Vector6, Matrix6, DMatrix};
-use crate::{load_chain_arm, joint_axis, gravity_torques_impl, path_safe_impl, ARM_JOINTS,
-            LIMITS, RAMP_S, MIN_CRUISE_SPEED, GRAVITY, LINK_INERTIALS, RADII, CLEARANCE,
-            LINK_RADIUS_MAX};
+use crate::{load_chain_arm, joint_axis, gravity_torques_impl, path_safe_impl, ARM_JOINTS, Config};
 
 type V3 = Vector3<f64>;
 type M3 = Matrix3<f64>;
 
-const MOTOR7_OPEN: f64 = 4.90;
-const MOTOR7_CLOSED: f64 = -0.015;
-const MOTOR7_HALF: f64 = (MOTOR7_OPEN + MOTOR7_CLOSED) / 2.0;
-const GRIPPER_RAD_PER_MM: f64 = 0.0412;
-const GRIPPER_MAX_WIDTH_MM: f64 = (MOTOR7_OPEN - MOTOR7_CLOSED) / GRIPPER_RAD_PER_MM;
-const DEFAULT_MIN_Z: f64 = 0.04;
-const SAG_LIMIT_RAD: f64 = 0.15;
-const LIMIT_TOL: f64 = 0.002;
-const MAX_JOINT_STEP: f64 = 0.5;
 const MIT_POSITION_LIMIT: f64 = 4.0 * std::f64::consts::PI;
-const MIN_SECONDS: f64 = 0.3;
-const MAX_SECONDS: f64 = 25.0;
-const PEAK_SPEED: f64 = 0.5;
-const GRIPPER_PEAK_SPEED: f64 = 3.0;
-// LIMITS / RAMP_S / MIN_CRUISE_SPEED are the single source in lib.rs (imported above).
-
-/// The Rust physical-model + tuning constants as jsonb — the canonical Rust source
-/// for `world.arm_config`. The drift guard (`tests/arm_config_parity.py`) asserts this
-/// equals the table seed and the Python constants. `tool` is URDF-derived (not a Rust
-/// const), so it is omitted here and compared against Python only.
-#[pg_extern]
-fn rebot_arm_config() -> pgrx::JsonB {
-    let limits: Vec<Value> = LIMITS.iter().map(|(lo, hi)| json!([lo, hi])).collect();
-    let inertials: Vec<Value> = LINK_INERTIALS.iter().map(|(n, m, c)| json!([n, m, c])).collect();
-    pgrx::JsonB(json!({
-        "gravity": GRAVITY,
-        "limits": limits,
-        "link_inertials": inertials,
-        "link_radii": RADII,
-        "collision": {"clearance": CLEARANCE, "link_radius_max": LINK_RADIUS_MAX},
-        "gripper": {"motor7_open": MOTOR7_OPEN, "motor7_closed": MOTOR7_CLOSED,
-                    "rad_per_mm": GRIPPER_RAD_PER_MM},
-        "motion": {
-            "default_min_z": DEFAULT_MIN_Z, "sag_limit_rad": SAG_LIMIT_RAD, "limit_tol": LIMIT_TOL,
-            "max_joint_step": MAX_JOINT_STEP, "ramp_s": RAMP_S, "min_cruise_speed": MIN_CRUISE_SPEED,
-            "min_seconds": MIN_SECONDS, "max_seconds": MAX_SECONDS, "peak_speed": PEAK_SPEED,
-            "gripper_peak_speed": GRIPPER_PEAK_SPEED
-        }
-    }))
-}
 
 fn json_v3(v: &Value) -> V3 {
     let a = v.as_array().unwrap_or_else(|| panic!("expected [x, y, z]"));
@@ -133,14 +92,15 @@ fn stage_in_front(point: &V3, approach: f64) -> V3 {
     point - V3::new(point.x, point.y, 0.0) * (approach / radius)
 }
 
-fn close_angle(close_width_mm: Option<f64>, default: f64) -> f64 {
+fn close_angle(cfg: &Config, close_width_mm: Option<f64>, default: f64) -> f64 {
     match close_width_mm {
         None => default,
         Some(width) => {
-            if !(0.0..=GRIPPER_MAX_WIDTH_MM).contains(&width) {
-                panic!("close_width_mm {width:.1} is outside the jaw stroke [0, {GRIPPER_MAX_WIDTH_MM:.1}] mm");
+            let max_width = cfg.gripper_max_width_mm();
+            if !(0.0..=max_width).contains(&width) {
+                panic!("close_width_mm {width:.1} is outside the jaw stroke [0, {max_width:.1}] mm");
             }
-            MOTOR7_CLOSED + width * GRIPPER_RAD_PER_MM
+            cfg.motor7_closed + width * cfg.gripper_rad_per_mm
         }
     }
 }
@@ -151,8 +111,8 @@ fn ramp_ratio(duration: f64, ramp: f64) -> f64 {
     (ramp / duration.max(1e-9)).clamp(1e-9, 0.5)
 }
 
-fn ease_fraction(u: f64, duration: f64) -> f64 {
-    let r = ramp_ratio(duration, RAMP_S);
+fn ease_fraction(u: f64, duration: f64, cfg: &Config) -> f64 {
+    let r = ramp_ratio(duration, cfg.ramp_s);
     let vc = 1.0 / (1.0 - r);
     let u = u.clamp(0.0, 1.0);
     if u <= r { vc * u * u / (2.0 * r) }
@@ -160,16 +120,16 @@ fn ease_fraction(u: f64, duration: f64) -> f64 {
     else { vc * (u - 0.5 * r) }
 }
 
-fn seconds_for(a: &[f64], b: &[f64]) -> f64 {
+fn seconds_for(a: &[f64], b: &[f64], cfg: &Config) -> f64 {
     let travel = a.iter().zip(b.iter()).map(|(x, y)| (y - x).abs()).fold(0.0_f64, f64::max);
-    let peak_time = travel / PEAK_SPEED + RAMP_S;
-    let cruise_cap = travel / MIN_CRUISE_SPEED + RAMP_S;
-    MIN_SECONDS.max(MAX_SECONDS.min(peak_time).min(cruise_cap))
+    let peak_time = travel / cfg.peak_speed + cfg.ramp_s;
+    let cruise_cap = travel / cfg.min_cruise_speed + cfg.ramp_s;
+    cfg.min_seconds.max(cfg.max_seconds.min(peak_time).min(cruise_cap))
 }
 
-fn gripper_seconds(travel: f64) -> f64 {
+fn gripper_seconds(travel: f64, cfg: &Config) -> f64 {
     if !travel.is_finite() { return 0.0; }
-    (std::f64::consts::PI / 2.0) * travel.abs() / GRIPPER_PEAK_SPEED
+    (std::f64::consts::PI / 2.0) * travel.abs() / cfg.gripper_peak_speed
 }
 
 fn kp_vector(spec: &str) -> [f64; 6] {
@@ -189,13 +149,13 @@ fn kp_vector(spec: &str) -> [f64; 6] {
     out
 }
 
-fn gravity_sag(tau: &[f64], kp: &[f64; 6]) -> [f64; 6] {
+fn gravity_sag(tau: &[f64], kp: &[f64; 6], cfg: &Config) -> [f64; 6] {
     let mut s = [0.0; 6];
-    for j in 0..6 { s[j] = (tau[j] / kp[j]).clamp(-SAG_LIMIT_RAD, SAG_LIMIT_RAD); }
+    for j in 0..6 { s[j] = (tau[j] / kp[j]).clamp(-cfg.sag_limit_rad, cfg.sag_limit_rad); }
     s
 }
 
-fn sag_correction(q: &[f64], tau: &[f64], snap: &Value, kp_key: &str) -> [f64; 6] {
+fn sag_correction(q: &[f64], tau: &[f64], snap: &Value, kp_key: &str, cfg: &Config) -> [f64; 6] {
     let mut extra = [0.0; 6];
     let map = match snap.get("sag_map") { Some(m) if m.is_object() => m, _ => return extra };
     let fp = snap.get("rig_fingerprint").and_then(|v| v.as_str()).unwrap_or("");
@@ -219,7 +179,7 @@ fn sag_correction(q: &[f64], tau: &[f64], snap: &Value, kp_key: &str) -> [f64; 6
         let m = match per.get(&(j + 1).to_string()) { Some(m) => m, None => return extra };
         let a = m.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let b = m.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        extra[j] = (a * tau[j] + b).clamp(-SAG_LIMIT_RAD, SAG_LIMIT_RAD);
+        extra[j] = (a * tau[j] + b).clamp(-cfg.sag_limit_rad, cfg.sag_limit_rad);
     }
     extra
 }
@@ -230,13 +190,14 @@ struct PlanCtx {
     robot: urdf_rs::Robot,
     chain: k::Chain<f64>,
     urdf: String,
+    cfg: Config,
 }
 
 impl PlanCtx {
-    fn new(urdf: &str) -> Self {
+    fn new(urdf: &str, cfg: Config) -> Self {
         let robot = urdf_rs::read_from_string(urdf).unwrap_or_else(|e| panic!("URDF parse failed: {e}"));
         let chain = k::Chain::<f64>::from(&robot);
-        PlanCtx { robot, chain, urdf: urdf.to_string() }
+        PlanCtx { robot, chain, urdf: urdf.to_string(), cfg }
     }
 
     fn pose(&self, q6: &[f64]) -> Isometry3<f64> {
@@ -251,7 +212,7 @@ impl PlanCtx {
 
     fn gravity(&self, q6: &[f64]) -> [f64; 6] {
         let (_, ch) = load_chain_arm(&self.urdf, q6);
-        let tau = gravity_torques_impl(&self.robot, &ch);
+        let tau = gravity_torques_impl(&self.robot, &ch, &self.cfg);
         let mut out = [0.0; 6];
         out.copy_from_slice(&tau);
         out
@@ -307,7 +268,7 @@ impl PlanCtx {
                 // downstream of joint j iff its child link is an ancestor of the
                 // body (or the body is the child link itself).
                 if lname != &child && !ancestors(lname).contains(&child) { continue; }
-                let force = V3::new(0.0, 0.0, -mass * crate::GRAVITY);
+                let force = V3::new(0.0, 0.0, -mass * self.cfg.gravity);
                 total += z.dot(&(com - p_j).cross(&force));
             }
             tau[j] = -total;
@@ -340,7 +301,7 @@ impl PlanCtx {
 
     fn path_safe(&self, a: &[f64], b: &[f64]) -> bool {
         let (_, ch) = load_chain_arm(&self.urdf, a);
-        path_safe_impl(&ch, a, b, 40)
+        path_safe_impl(&ch, a, b, 40, &self.cfg)
     }
 }
 
@@ -381,7 +342,7 @@ fn solve_ik(ctx: &PlanCtx, target: &Isometry3<f64>, q_init: &[f64],
         let ee = ctx.pose(&q);
         let j = ctx.jacobian(&q, &ee);
         let lam = damping * (prev_err * 10.0).max(1.0);
-        let dq = damped_step_active_limits(&q, &j, &err, lam, step_size);
+        let dq = damped_step_active_limits(&q, &j, &err, lam, step_size, &ctx.cfg);
         if dq.norm() < 1e-12 {
             return IkResult { q, success: false };
         }
@@ -390,7 +351,7 @@ fn solve_ik(ctx: &PlanCtx, target: &Isometry3<f64>, q_init: &[f64],
         for _ in 0..8 {
             let mut q_new = [0.0; 6];
             for i in 0..6 {
-                q_new[i] = (q[i] + alpha * dq[i]).clamp(LIMITS[i].0, LIMITS[i].1);
+                q_new[i] = (q[i] + alpha * dq[i]).clamp(ctx.cfg.limits[i][0], ctx.cfg.limits[i][1]);
             }
             let (new_err, err_new) = se3_error(&ctx.pose(&q_new), target);
             if new_err < prev_err {
@@ -413,7 +374,7 @@ fn solve_ik(ctx: &PlanCtx, target: &Isometry3<f64>, q_init: &[f64],
 }
 
 fn damped_step_active_limits(q: &[f64], j: &Matrix6<f64>, err: &Vector6<f64>,
-                             damping: f64, step_size: f64) -> Vector6<f64> {
+                             damping: f64, step_size: f64, cfg: &Config) -> Vector6<f64> {
     let mut free = [true; 6];
     let limit_eps = 1e-10;
     let mut dq = Vector6::zeros();
@@ -432,7 +393,7 @@ fn damped_step_active_limits(q: &[f64], j: &Matrix6<f64>, err: &Vector6<f64>,
         for (c, &orig) in cols.iter().enumerate() { dq[orig] = dq_free[c]; }
         let mut newly_blocked = [false; 6];
         for i in 0..6 {
-            let (lo, hi) = LIMITS[i];
+            let (lo, hi) = (cfg.limits[i][0], cfg.limits[i][1]);
             let at_lower = q[i] <= lo + limit_eps;
             let at_upper = q[i] >= hi - limit_eps;
             if (at_lower && dq[i] < 0.0) || (at_upper && dq[i] > 0.0) {
@@ -457,7 +418,7 @@ fn round6(v: f64) -> f64 { (v * 1e6).round_ties_even() / 1e6 }
 
 fn build_payload(waypoints: &[Wp], hz: f64, limits: &[[f64; 2]; 7], steps: &str,
                  extra: Value, hold_start: Option<f64>, hold_end: Option<f64>,
-                 with_tau: bool) -> Value {
+                 with_tau: bool, cfg: &Config) -> Value {
     let n = waypoints.len();
     // traj.waypoint rounds t to 6 decimals at creation; build derives v from the
     // rounded series. Match exactly so parity is bit-level on time/velocity.
@@ -500,7 +461,7 @@ fn build_payload(waypoints: &[Wp], hz: f64, limits: &[[f64; 2]; 7], steps: &str,
     if let Value::Object(map) = extra {
         for (k, v) in map { if !v.is_null() { payload[k] = v; } }
     }
-    validate_payload(&payload);
+    validate_payload(&payload, cfg);
     payload
 }
 
@@ -508,7 +469,7 @@ fn max_diff(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0_f64, f64::max)
 }
 
-fn validate_payload(p: &Value) -> Value {
+fn validate_payload(p: &Value, cfg: &Config) -> Value {
     let wps = p["waypoints"].as_array().unwrap_or_else(|| panic!("no waypoints"));
     if wps.len() < 2 { panic!("need at least two waypoints, got {}", wps.len()); }
     let limits = p["limits"].as_array();
@@ -530,13 +491,13 @@ fn validate_payload(p: &Value) -> Value {
                 let lo = lim[j][0].as_f64().unwrap();
                 let hi = lim[j][1].as_f64().unwrap();
                 let qj = q[j].as_f64().unwrap();
-                if qj < lo - LIMIT_TOL || qj > hi + LIMIT_TOL {
+                if qj < lo - cfg.limit_tol || qj > hi + cfg.limit_tol {
                     panic!("joint {} leaves its limit [{lo:.3}, {hi:.3}]: {qj:.3}", j + 1);
                 }
             }
         }
         for j in 0..7 {
-            if q[j].as_f64().unwrap().abs() > MIT_POSITION_LIMIT + LIMIT_TOL {
+            if q[j].as_f64().unwrap().abs() > MIT_POSITION_LIMIT + cfg.limit_tol {
                 panic!("joint {} at waypoint {i} outside the MIT range", j + 1);
             }
         }
@@ -544,8 +505,8 @@ fn validate_payload(p: &Value) -> Value {
             let prev = wps[i - 1]["q"].as_array().unwrap();
             let step = (0..7).map(|j| (q[j].as_f64().unwrap() - prev[j].as_f64().unwrap()).abs())
                 .fold(0.0_f64, f64::max);
-            if step > MAX_JOINT_STEP {
-                panic!("waypoints {}->{i} jump {step:.3} rad, above the {MAX_JOINT_STEP:.2} sanity limit", i - 1);
+            if step > cfg.max_joint_step {
+                panic!("waypoints {}->{i} jump {step:.3} rad, above the {:.2} sanity limit", i - 1, cfg.max_joint_step);
             }
             max_step = max_step.max(step);
             if times[i] < times[i - 1] { panic!("waypoint times are not monotonic"); }
@@ -620,9 +581,10 @@ impl<'a> Planner<'a> {
             self.worst_where = label.to_string();
         }
         for j in 0..6 {
-            if res.q[j] < LIMITS[j].0 - LIMIT_TOL || res.q[j] > LIMITS[j].1 + LIMIT_TOL {
+            if res.q[j] < self.ctx.cfg.limits[j][0] - self.ctx.cfg.limit_tol
+                || res.q[j] > self.ctx.cfg.limits[j][1] + self.ctx.cfg.limit_tol {
                 panic!("IK returned joint {} = {:.3} rad at {label}, outside its limits [{:.3}, {:.3}]",
-                    j + 1, res.q[j], LIMITS[j].0, LIMITS[j].1);
+                    j + 1, res.q[j], self.ctx.cfg.limits[j][0], self.ctx.cfg.limits[j][1]);
             }
         }
         res.q
@@ -632,7 +594,7 @@ impl<'a> Planner<'a> {
         let count = (seconds * self.hz).round_ties_even().max(1.0) as usize;
         for index in 1..=count {
             self.t += self.period;
-            let fraction = ease_fraction(index as f64 / count as f64, count as f64 / self.hz);
+            let fraction = ease_fraction(index as f64 / count as f64, count as f64 / self.hz, &self.ctx.cfg);
             let mut q = [0.0; 6];
             for j in 0..6 { q[j] = base[j] + delta[j] * fraction; }
             self.append(&q, gripper);
@@ -663,13 +625,13 @@ impl<'a> Planner<'a> {
 
     fn gripper_leg(&mut self, target_angle: f64, seconds: f64) {
         let current = self.waypoints.last().unwrap().q[6];
-        let seconds = seconds.max(gripper_seconds(target_angle - current));
+        let seconds = seconds.max(gripper_seconds(target_angle - current, &self.ctx.cfg));
         let count = (seconds * self.hz).round_ties_even().max(1.0) as usize;
         let last = self.waypoints.last().unwrap().clone();
         for index in 1..=count {
             self.t += self.period;
             let angle = current + (target_angle - current)
-                * ease_fraction(index as f64 / count as f64, count as f64 / self.hz);
+                * ease_fraction(index as f64 / count as f64, count as f64 / self.hz, &self.ctx.cfg);
             let mut q = last.q;
             q[6] = angle;
             self.waypoints.push(Wp { t: self.t, q, tau: last.tau });
@@ -683,12 +645,13 @@ impl<'a> Planner<'a> {
 /// Returns {payload, summary}. Pure: no database access.
 #[pg_extern]
 fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
-              options: pgrx::JsonB, snap: pgrx::JsonB) -> pgrx::JsonB {
+              options: pgrx::JsonB, snap: pgrx::JsonB, config: pgrx::JsonB) -> pgrx::JsonB {
+    let cfg = Config::from_json(&config.0);
     let dump = dump.0;
     let target = target.0;
     let options = options.0;
     let snap = snap.0;
-    let ctx = PlanCtx::new(urdf);
+    let ctx = PlanCtx::new(urdf, cfg.clone());
 
     // posture(dump)
     let ids = dump["ids"].as_array().unwrap_or_else(|| panic!("dump needs ids"));
@@ -697,8 +660,8 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
     let qdump = dump["q"].as_array().unwrap_or_else(|| panic!("dump needs q"));
     let mut q_start = [0.0; 6];
     for j in 0..6 { q_start[j] = qdump[j].as_f64().unwrap(); }
-    let gripper_start = qdump.get(6).and_then(|v| v.as_f64()).unwrap_or(MOTOR7_CLOSED);
-    for j in 0..6 { q_start[j] = q_start[j].clamp(LIMITS[j].0, LIMITS[j].1); }
+    let gripper_start = qdump.get(6).and_then(|v| v.as_f64()).unwrap_or(cfg.motor7_closed);
+    for j in 0..6 { q_start[j] = q_start[j].clamp(cfg.limits[j][0], cfg.limits[j][1]); }
 
     let ee_start = ctx.pose(&q_start);
     let p0 = ee_start.translation.vector;
@@ -710,7 +673,7 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
         panic!("not a rebot-target file");
     }
     let point = json_v3(&target["point"]);
-    let hover_m = target.get("hover_m").and_then(|v| v.as_f64()).unwrap_or(opt_f(&options, "hover_m", DEFAULT_MIN_Z));
+    let hover_m = target.get("hover_m").and_then(|v| v.as_f64()).unwrap_or(opt_f(&options, "hover_m", cfg.default_min_z));
     let tip_offset_m = target.get("tip_offset_m").and_then(|v| v.as_f64()).unwrap_or(opt_f(&options, "tip_m", 0.0));
     let is_tip = target.get("point_frame").and_then(|v| v.as_str()) == Some("tip");
     let hover = opt_b(&options, "hover", true);
@@ -718,7 +681,7 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
     let tip_point = point + V3::new(0.0, 0.0, lift_m);
     let flange_point = tip_point + V3::new(0.0, 0.0, tip_offset_m);
     let radius = (point.x * point.x + point.y * point.y).sqrt();
-    let min_z = opt_f(&options, "min_z", DEFAULT_MIN_Z);
+    let min_z = opt_f(&options, "min_z", cfg.default_min_z);
     let max_z = opt_f(&options, "max_z", 0.95);
     let max_reach = opt_f(&options, "max_reach", 0.75);
     let judged = if hover { tip_point } else { point };
@@ -782,7 +745,7 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
         }
         let mut delta = [0.0; 6];
         for j in 0..6 { delta[j] = target_q[j] - current_q[j]; }
-        pl.joint_leg(&current_q, &delta, seconds_for(&current_q, &target_q), gripper_start);
+        pl.joint_leg(&current_q, &delta, seconds_for(&current_q, &target_q, &cfg), gripper_start);
         let hs = pl.t;
         pl.hold(hold_s);
         let he = pl.t;
@@ -793,7 +756,7 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
             }
             let mut d = [0.0; 6];
             for j in 0..6 { d[j] = start_seed[j] - q_last[j]; }
-            pl.joint_leg(&q_last, &d, seconds_for(&q_last, &start_seed), gripper_start);
+            pl.joint_leg(&q_last, &d, seconds_for(&q_last, &start_seed, &cfg), gripper_start);
         }
         (hover_axis, hover_yaw, hs, he)
     } else {
@@ -832,9 +795,7 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
         m.retain(|_, v| !v.is_null());
     }
 
-    let mut limits7 = [[0.0; 2]; 7];
-    for j in 0..6 { limits7[j] = [LIMITS[j].0, LIMITS[j].1]; }
-    limits7[6] = [-0.1, 5.0];
+    let limits7 = limits7(&cfg);
 
     let extra = json!({
         "capture": provenance,
@@ -847,8 +808,8 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
     });
     let payload = build_payload(&compensated, hz, &limits7, &steps, extra,
         if hold_end > hold_start { Some(hold_start) } else { None },
-        if hold_end > hold_start { Some(hold_end) } else { None }, true);
-    let stats = validate_payload(&payload);
+        if hold_end > hold_start { Some(hold_end) } else { None }, true, &cfg);
+    let stats = validate_payload(&payload, &cfg);
 
     let summary = json!({
         "start_tcp": arr3(&p_start),
@@ -877,9 +838,9 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
 fn aim_with_ctx(ctx: &PlanCtx, target: &[f64], kp: &[f64; 6], extra: &[f64; 6]) -> [f64; 6] {
     let sag_at = |q: &[f64]| -> [f64; 6] {
         let tau = ctx.gravity(q);
-        let g = gravity_sag(&tau, kp);
+        let g = gravity_sag(&tau, kp, &ctx.cfg);
         let mut t = [0.0; 6];
-        for j in 0..6 { t[j] = (g[j] + extra[j]).clamp(-SAG_LIMIT_RAD, SAG_LIMIT_RAD); }
+        for j in 0..6 { t[j] = (g[j] + extra[j]).clamp(-ctx.cfg.sag_limit_rad, ctx.cfg.sag_limit_rad); }
         t
     };
     let mut command = [0.0; 6];
@@ -900,10 +861,10 @@ fn compensate(ctx: &PlanCtx, waypoints: &[Wp], snap: &Value, kp_spec: &str, kp: 
     for wp in waypoints {
         let q6 = &wp.q[..6];
         let tau = ctx.gravity(q6);
-        let extra = sag_correction(q6, &tau, snap, kp_spec);
+        let extra = sag_correction(q6, &tau, snap, kp_spec, &ctx.cfg);
         let cmd = aim_with_ctx(ctx, q6, kp, &extra);
         let mut q = [0.0; 7];
-        for j in 0..6 { q[j] = cmd[j].clamp(LIMITS[j].0, LIMITS[j].1); }
+        for j in 0..6 { q[j] = cmd[j].clamp(ctx.cfg.limits[j][0], ctx.cfg.limits[j][1]); }
         q[6] = wp.q[6];
         let g = ctx.gravity_urdf(&q[..6]);
         let mut tau7 = [0.0; 7];
@@ -913,21 +874,21 @@ fn compensate(ctx: &PlanCtx, waypoints: &[Wp], snap: &Value, kp_spec: &str, kp: 
     out
 }
 
-fn limits7() -> [[f64; 2]; 7] {
+fn limits7(cfg: &Config) -> [[f64; 2]; 7] {
     let mut l = [[0.0; 2]; 7];
-    for j in 0..6 { l[j] = [LIMITS[j].0, LIMITS[j].1]; }
+    for j in 0..6 { l[j] = [cfg.limits[j][0], cfg.limits[j][1]]; }
     l[6] = [-0.1, 5.0];
     l
 }
 
-fn read_posture(dump: &Value) -> ([f64; 6], f64) {
+fn read_posture(dump: &Value, cfg: &Config) -> ([f64; 6], f64) {
     let ids = dump["ids"].as_array().unwrap_or_else(|| panic!("dump needs ids"));
     let ids6: Vec<i64> = ids.iter().take(6).map(|v| v.as_i64().unwrap()).collect();
     if ids6 != vec![1, 2, 3, 4, 5, 6] { panic!("expected motor ids 1..6 first, got {ids6:?}"); }
     let qdump = dump["q"].as_array().unwrap_or_else(|| panic!("dump needs q"));
     let mut q = [0.0; 6];
-    for j in 0..6 { q[j] = qdump[j].as_f64().unwrap().clamp(LIMITS[j].0, LIMITS[j].1); }
-    let gripper = qdump.get(6).and_then(|v| v.as_f64()).unwrap_or(MOTOR7_CLOSED);
+    for j in 0..6 { q[j] = qdump[j].as_f64().unwrap().clamp(cfg.limits[j][0], cfg.limits[j][1]); }
+    let gripper = qdump.get(6).and_then(|v| v.as_f64()).unwrap_or(cfg.motor7_closed);
     (q, gripper)
 }
 
@@ -938,7 +899,8 @@ fn read_posture(dump: &Value) -> ([f64; 6], f64) {
 /// rebot-target objects. Returns {payload, summary}.
 #[pg_extern]
 fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
-                       options: pgrx::JsonB, snap: pgrx::JsonB) -> pgrx::JsonB {
+                       options: pgrx::JsonB, snap: pgrx::JsonB, config: pgrx::JsonB) -> pgrx::JsonB {
+    let cfg = Config::from_json(&config.0);
     let dump = dump.0;
     let targets = targets.0;
     let options = options.0;
@@ -946,9 +908,9 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
     let tarr = targets.as_array().unwrap_or_else(|| panic!("targets must be an array"));
     if tarr.is_empty() { panic!("a marker sequence needs at least one target"); }
     if tarr.len() > 20 { panic!("a marker sequence is limited to 20 targets"); }
-    let ctx = PlanCtx::new(urdf);
+    let ctx = PlanCtx::new(urdf, cfg.clone());
 
-    let (q_start, gripper_start) = read_posture(&dump);
+    let (q_start, gripper_start) = read_posture(&dump, &cfg);
     let ee_start = ctx.pose(&q_start);
     let p_start = ee_start.translation.vector;
     let mut r0 = ee_start.rotation.to_rotation_matrix().matrix().clone();
@@ -965,7 +927,7 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
     let unpark_s = opt_f(&options, "unpark_s", 2.0);
     let ik_pos_tol = opt_f(&options, "ik_pos_tol", 0.002).max(0.010);
     let ik_angle_tol = opt_f(&options, "ik_angle_tol", 0.5);
-    let min_z = opt_f(&options, "min_z", DEFAULT_MIN_Z);
+    let min_z = opt_f(&options, "min_z", cfg.default_min_z);
     let max_z = opt_f(&options, "max_z", 0.95);
     let max_reach = opt_f(&options, "max_reach", 0.75);
     let kp_spec = opt_s(&options, "kp_spec", "50,2:150,3:150").to_string();
@@ -983,7 +945,7 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
         }
         let point = json_v3(&target["point"]);
         let hover_m = target.get("hover_m").and_then(|v| v.as_f64())
-            .unwrap_or(opt_f(&options, "hover_m", DEFAULT_MIN_Z));
+            .unwrap_or(opt_f(&options, "hover_m", cfg.default_min_z));
         let tip_offset_m = target.get("tip_offset_m").and_then(|v| v.as_f64())
             .unwrap_or(opt_f(&options, "tip_m", 0.0));
         let is_tip = target.get("point_frame").and_then(|v| v.as_str()) == Some("tip");
@@ -1009,11 +971,11 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
     };
 
     // The edge starts from the current gripper angle; ramp it open first.
-    let mut gripper = MOTOR7_OPEN;
-    if (gripper_start - MOTOR7_OPEN).abs() > 1e-6 {
+    let mut gripper = cfg.motor7_open;
+    if (gripper_start - cfg.motor7_open).abs() > 1e-6 {
         pl.t += pl.period;
         pl.append(&q_start, gripper_start);
-        pl.gripper_leg(MOTOR7_OPEN, 0.8_f64.max(hold_s));
+        pl.gripper_leg(cfg.motor7_open, 0.8_f64.max(hold_s));
     }
 
     let mut unpark = [0.0; 6];
@@ -1027,7 +989,7 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
         r0 = ee.rotation.to_rotation_matrix().matrix().clone();
     }
     let start_seed = seed;
-    let odd_close = close_angle(close_width_mm, grasp_q);
+    let odd_close = close_angle(&cfg, close_width_mm, grasp_q);
 
     let mut marker_q_ik: Vec<[f64; 6]> = Vec::new();
     let mut marker_holds: Vec<(f64, f64)> = Vec::new();
@@ -1058,25 +1020,25 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
             }
             let mut d = [0.0; 6];
             for j in 0..6 { d[j] = stage_q[j] - current_q[j]; }
-            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &stage_q), gripper);
+            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &stage_q, &cfg), gripper);
             current_q = pl.last_q6();
             if !ctx.path_safe(&current_q, &target_q) {
                 panic!("the slide-in to marker {index} dips within a link radius of the worktop; raise the marker or move the arm clear");
             }
             let mut d = [0.0; 6];
             for j in 0..6 { d[j] = target_q[j] - current_q[j]; }
-            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &target_q), gripper);
+            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &target_q, &cfg), gripper);
         } else {
             if !ctx.path_safe(&current_q, &target_q) {
                 panic!("the leg to marker {index} dips within a link radius of the worktop; space the markers further apart or move the arm clear");
             }
             let mut d = [0.0; 6];
             for j in 0..6 { d[j] = target_q[j] - current_q[j]; }
-            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &target_q), gripper);
+            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &target_q, &cfg), gripper);
         }
         let hold_t0 = pl.t;
         pl.hold_g(0.25, gripper);
-        let next_gripper = if index % 2 == 1 { odd_close } else { MOTOR7_OPEN };
+        let next_gripper = if index % 2 == 1 { odd_close } else { cfg.motor7_open };
         if (next_gripper - gripper).abs() > 1e-6 {
             pl.gripper_leg(next_gripper, 0.8_f64.max(hold_s));
         }
@@ -1093,7 +1055,7 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
     }
     let mut d = [0.0; 6];
     for j in 0..6 { d[j] = q_start[j] - q_last[j]; }
-    pl.joint_leg(&q_last, &d, seconds_for(&q_last, &q_start), gripper);
+    pl.joint_leg(&q_last, &d, seconds_for(&q_last, &q_start, &cfg), gripper);
 
     let compensated = compensate(&ctx, &pl.waypoints, &snap, &kp_spec, &kp);
 
@@ -1123,14 +1085,14 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
     }).collect();
     let provenance = json!({
         "sequence": true,
-        "hover_m": opt_f(&options, "hover_m", DEFAULT_MIN_Z),
+        "hover_m": opt_f(&options, "hover_m", cfg.default_min_z),
         "tip_m": opt_f(&options, "tip_m", 0.0),
         "targets": targets_prov,
         "tool_axis": sequence_axis,
         "yaw_deg": yaw,
         "marker_yaw_deg": yaw_degrees,
-        "gripper": {"open": MOTOR7_OPEN, "half": MOTOR7_HALF,
-                    "closed": MOTOR7_CLOSED, "odd_close": odd_close},
+        "gripper": {"open": cfg.motor7_open, "half": cfg.motor7_half(),
+                    "closed": cfg.motor7_closed, "odd_close": odd_close},
     });
     let extra = json!({
         "capture": provenance,
@@ -1142,8 +1104,8 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
             "tau": "gravity torque of the planned pose, per waypoint",
         },
     });
-    let payload = build_payload(&compensated, hz, &limits7(), &steps, extra, None, None, true);
-    let stats = validate_payload(&payload);
+    let payload = build_payload(&compensated, hz, &limits7(&cfg), &steps, extra, None, None, true, &cfg);
+    let stats = validate_payload(&payload, &cfg);
 
     let tip_m_summary = if !tip_offsets.is_empty()
         && tip_offsets.iter().all(|v| (v - tip_offsets[0]).abs() < 1e-9) {
@@ -1155,7 +1117,7 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
         "flange_points": flange_points.iter().map(arr3).collect::<Vec<_>>(),
         "q_ik": marker_q_ik.iter().map(|q| q.to_vec()).collect::<Vec<_>>(),
         "radii": points.iter().map(|p| (p.x * p.x + p.y * p.y).sqrt()).collect::<Vec<_>>(),
-        "hover_m": opt_f(&options, "hover_m", DEFAULT_MIN_Z),
+        "hover_m": opt_f(&options, "hover_m", cfg.default_min_z),
         "hovers_m": hovers,
         "tap_heights_m": tarr.iter().map(|t| t.get("tap_height_m").cloned().unwrap_or(Value::Null)).collect::<Vec<_>>(),
         "tip_offsets_m": tip_offsets,
@@ -1174,8 +1136,8 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
 
 // ── /move trajectory builders (ports of traj.joint_move / joint_sequence) ── //
 
-fn parse_limits(v: &Value) -> [[f64; 2]; 7] {
-    let mut l = limits7();
+fn parse_limits(v: &Value, cfg: &Config) -> [[f64; 2]; 7] {
+    let mut l = limits7(cfg);
     if let Some(arr) = v.as_array() {
         if arr.len() == 7 {
             for j in 0..7 {
@@ -1198,34 +1160,39 @@ fn wp7(t: f64, q: [f64; 7]) -> Wp { Wp { t, q, tau: [0.0; 7] } }
 
 /// Gravity sag per joint (sweep.gravity_sag): clip(tau_g/kp, ±SAG_LIMIT_RAD).
 #[pg_extern]
-fn rebot_sag_rad(urdf: &str, q6: Vec<f64>, kp_spec: &str) -> Vec<f64> {
-    let ctx = PlanCtx::new(urdf);
+fn rebot_sag_rad(urdf: &str, q6: Vec<f64>, kp_spec: &str, config: pgrx::JsonB) -> Vec<f64> {
+    let cfg = Config::from_json(&config.0);
+    let ctx = PlanCtx::new(urdf, cfg.clone());
     let kp = kp_vector(kp_spec);
     let tau = ctx.gravity(&q6);
-    gravity_sag(&tau, &kp).to_vec()
+    gravity_sag(&tau, &kp, &cfg).to_vec()
 }
 
 /// The startup elbow peel (sweep.unpark_pose): lift j3 off the j2 casing stop.
 #[pg_extern]
-fn rebot_unpark_pose(q: Vec<f64>) -> Vec<f64> {
+fn rebot_unpark_pose(q: Vec<f64>, config: pgrx::JsonB) -> Vec<f64> {
+    let cfg = Config::from_json(&config.0);
     if q.len() != 6 { panic!("expected 6 joint angles"); }
     let mut q = q;
     if q[2] >= 0.05 { return q; }
-    q[2] = (q[2] + 8.0_f64.to_radians()).min(LIMITS[2].1);
+    q[2] = (q[2] + 8.0_f64.to_radians()).min(cfg.limits[2][1]);
     q
 }
 
 /// Validate a trajectory payload (traj.validate); returns the stats or raises.
 #[pg_extern]
-fn rebot_traj_validate(payload: pgrx::JsonB) -> pgrx::JsonB {
-    pgrx::JsonB(validate_payload(&payload.0))
+fn rebot_traj_validate(payload: pgrx::JsonB, config: pgrx::JsonB) -> pgrx::JsonB {
+    let cfg = Config::from_json(&config.0);
+    pgrx::JsonB(validate_payload(&payload.0, &cfg))
 }
 
 /// Assemble a trajectory payload from waypoints (traj.build). waypoints is an
 /// array of {t, q[7], tau?[7]}; with_tau controls whether tau is emitted.
 #[pg_extern]
 fn rebot_traj_build(waypoints: pgrx::JsonB, hz: f64, limits: pgrx::JsonB,
-                    steps: &str, extra: pgrx::JsonB, with_tau: default!(bool, true)) -> pgrx::JsonB {
+                    steps: &str, extra: pgrx::JsonB, config: pgrx::JsonB,
+                    with_tau: default!(bool, true)) -> pgrx::JsonB {
+    let cfg = Config::from_json(&config.0);
     let arr = waypoints.0.as_array().unwrap_or_else(|| panic!("waypoints must be an array"));
     let wps: Vec<Wp> = arr.iter().map(|w| {
         let q = q7(&w["q"]);
@@ -1235,15 +1202,17 @@ fn rebot_traj_build(waypoints: pgrx::JsonB, hz: f64, limits: pgrx::JsonB,
         }
         Wp { t: w["t"].as_f64().unwrap(), q, tau }
     }).collect();
-    let payload = build_payload(&wps, hz, &parse_limits(&limits.0), steps, extra.0, None, None, with_tau);
+    let payload = build_payload(&wps, hz, &parse_limits(&limits.0, &cfg), steps, extra.0, None, None, with_tau, &cfg);
     pgrx::JsonB(payload)
 }
 
 /// A joint-space move with a hold (traj.joint_move). q_from/q_to are 7-vectors.
 #[pg_extern]
 fn rebot_joint_move(q_from: Vec<f64>, q_to: Vec<f64>, seconds: f64,
+                    config: pgrx::JsonB,
                     hz: default!(f64, 30.0), hold_s: default!(f64, 0.4),
                     limits: default!(pgrx::JsonB, "null"), label: default!(&str, "''")) -> pgrx::JsonB {
+    let cfg = Config::from_json(&config.0);
     if q_from.len() != 7 || q_to.len() != 7 { panic!("a joint move needs 7 angles at both ends"); }
     if !q_from.iter().chain(q_to.iter()).all(|v| v.is_finite()) { panic!("joint angles must be finite"); }
     let travel = q_from.iter().zip(q_to.iter()).map(|(a, b)| (b - a).abs()).fold(0.0_f64, f64::max);
@@ -1256,7 +1225,7 @@ fn rebot_joint_move(q_from: Vec<f64>, q_to: Vec<f64>, seconds: f64,
     let qt = q_from_arr(&q_to);
     for index in 1..=count {
         t += period;
-        let frac = ease_fraction(index as f64 / count as f64, count as f64 / hz);
+        let frac = ease_fraction(index as f64 / count as f64, count as f64 / hz, &cfg);
         let mut q = [0.0; 7];
         for j in 0..7 { q[j] = qf[j] + (qt[j] - qf[j]) * frac; }
         wps.push(wp7(t, q));
@@ -1266,7 +1235,7 @@ fn rebot_joint_move(q_from: Vec<f64>, q_to: Vec<f64>, seconds: f64,
     let steps = if label.is_empty() {
         format!("joint move {:.2} rad over {:.1} s", travel, seconds)
     } else { label.to_string() };
-    let payload = build_payload(&wps, hz, &parse_limits(&limits.0), &steps, json!({}), None, None, false);
+    let payload = build_payload(&wps, hz, &parse_limits(&limits.0, &cfg), &steps, json!({}), None, None, false, &cfg);
     pgrx::JsonB(payload)
 }
 
@@ -1280,8 +1249,10 @@ fn q_from_arr(v: &[f64]) -> [f64; 7] {
 /// poses is N x 7; seconds is N-1 durations (or a scalar applied to every leg).
 #[pg_extern]
 fn rebot_joint_sequence(poses: pgrx::JsonB, seconds: pgrx::JsonB,
+                        config: pgrx::JsonB,
                         hz: default!(f64, 30.0), hold_s: default!(f64, 0.4),
                         limits: default!(pgrx::JsonB, "null"), label: default!(&str, "''")) -> pgrx::JsonB {
+    let cfg = Config::from_json(&config.0);
     let parr = poses.0.as_array().unwrap_or_else(|| panic!("poses must be an array"));
     let points: Vec<[f64; 7]> = parr.iter().map(q7).collect();
     if points.len() < 2 { panic!("a sequence needs at least two poses"); }
@@ -1304,7 +1275,7 @@ fn rebot_joint_sequence(poses: pgrx::JsonB, seconds: pgrx::JsonB,
         let count = (durations[index - 1].max(0.2) * hz).round_ties_even().max(2.0) as usize;
         for step in 1..=count {
             t += period;
-            let frac = ease_fraction(step as f64 / count as f64, count as f64 / hz);
+            let frac = ease_fraction(step as f64 / count as f64, count as f64 / hz, &cfg);
             let mut q = [0.0; 7];
             for j in 0..7 { q[j] = start[j] + (end[j] - start[j]) * frac; }
             wps.push(wp7(t, q));
@@ -1312,7 +1283,7 @@ fn rebot_joint_sequence(poses: pgrx::JsonB, seconds: pgrx::JsonB,
         for _ in 0..hold { t += period; wps.push(wp7(t, end)); }
     }
     let steps = if label.is_empty() { format!("{} poses, one pass", points.len()) } else { label.to_string() };
-    let payload = build_payload(&wps, hz, &parse_limits(&limits.0), &steps, json!({}), None, None, false);
+    let payload = build_payload(&wps, hz, &parse_limits(&limits.0, &cfg), &steps, json!({}), None, None, false, &cfg);
     pgrx::JsonB(payload)
 }
 
@@ -1322,12 +1293,13 @@ fn rebot_joint_sequence(poses: pgrx::JsonB, seconds: pgrx::JsonB,
 /// /play, telemetry); this returns the trajectory + summary. Pure jsonb -> jsonb.
 #[pg_extern]
 fn rebot_move_build(urdf: &str, pose: pgrx::JsonB, targets: pgrx::JsonB,
-                    options: pgrx::JsonB, snap: pgrx::JsonB) -> pgrx::JsonB {
+                    options: pgrx::JsonB, snap: pgrx::JsonB, config: pgrx::JsonB) -> pgrx::JsonB {
+    let cfg = Config::from_json(&config.0);
     let pose = pose.0;
     let options = options.0;
     let snap = snap.0;
-    let ctx = PlanCtx::new(urdf);
-    let (q_from6, gripper_default) = read_posture(&pose);
+    let ctx = PlanCtx::new(urdf, cfg.clone());
+    let (q_from6, gripper_default) = read_posture(&pose, &cfg);
     let tarr = targets.0.as_array().unwrap_or_else(|| panic!("targets must be an array of [6]"));
     if tarr.is_empty() { panic!("'targets' must be a non-empty list"); }
     let mut targets6: Vec<[f64; 6]> = Vec::new();
@@ -1338,7 +1310,7 @@ fn rebot_move_build(urdf: &str, pose: pgrx::JsonB, targets: pgrx::JsonB,
         for j in 0..6 { q[j] = a[j].as_f64().unwrap(); }
         if !q.iter().all(|v| v.is_finite()) { panic!("every target must be finite"); }
         for j in 0..6 {
-            if q[j] < LIMITS[j].0 || q[j] > LIMITS[j].1 {
+            if q[j] < cfg.limits[j][0] || q[j] > cfg.limits[j][1] {
                 panic!("a target is outside the joint limits: [{:.3}]", q[j]);
             }
         }
@@ -1351,14 +1323,14 @@ fn rebot_move_build(urdf: &str, pose: pgrx::JsonB, targets: pgrx::JsonB,
 
     // Clamp a small start-pose sag past a limit (a large excursion is a fault).
     let mut q_from = q_from6;
-    let excursion = (0..6).map(|j| (LIMITS[j].0 - q_from[j]).max(q_from[j] - LIMITS[j].1))
+    let excursion = (0..6).map(|j| (cfg.limits[j][0] - q_from[j]).max(q_from[j] - cfg.limits[j][1]))
         .fold(0.0_f64, f64::max);
     if excursion > 0.0 && excursion <= 0.02 {
-        for j in 0..6 { q_from[j] = q_from[j].clamp(LIMITS[j].0, LIMITS[j].1); }
+        for j in 0..6 { q_from[j] = q_from[j].clamp(cfg.limits[j][0], cfg.limits[j][1]); }
     }
 
     // Startup peel: prepend the elbow lift when starting from rest.
-    let lift = rebot_unpark_pose(q_from.to_vec());
+    let lift = rebot_unpark_pose(q_from.to_vec(), pgrx::JsonB(config.0.clone()));
     let mut lift6 = [0.0; 6];
     lift6.copy_from_slice(&lift);
     let unparked = (0..6).any(|j| (lift6[j] - q_from[j]).abs() > 1e-9);
@@ -1378,10 +1350,10 @@ fn rebot_move_build(urdf: &str, pose: pgrx::JsonB, targets: pgrx::JsonB,
     let mut applied: Vec<f64> = Vec::new();
     for target in &targets6 {
         let tau = ctx.gravity(target);
-        let extra = sag_correction(target, &tau, &snap, &kp_spec);
+        let extra = sag_correction(target, &tau, &snap, &kp_spec, &cfg);
         let cmd = aim_with_ctx(&ctx, target, &kp, &extra);
         let mut clipped = [0.0; 6];
-        for j in 0..6 { clipped[j] = cmd[j].clamp(LIMITS[j].0, LIMITS[j].1); }
+        for j in 0..6 { clipped[j] = cmd[j].clamp(cfg.limits[j][0], cfg.limits[j][1]); }
         let max_off = (0..6).map(|j| (clipped[j] - target[j]).abs()).fold(0.0_f64, f64::max);
         applied.push((1000.0 * max_off * 10.0).round_ties_even() / 10.0);
         commands.push(clipped);
@@ -1391,7 +1363,7 @@ fn rebot_move_build(urdf: &str, pose: pgrx::JsonB, targets: pgrx::JsonB,
     let mut cmd_chain: Vec<[f64; 6]> = vec![q_from];
     cmd_chain.extend(commands.iter().copied());
     let wanted: Vec<f64> = (0..cmd_chain.len() - 1)
-        .map(|i| seconds_for(&cmd_chain[i], &cmd_chain[i + 1])).collect();
+        .map(|i| seconds_for(&cmd_chain[i], &cmd_chain[i + 1], &cfg)).collect();
     let given = options.get("seconds");
     let seconds: Vec<f64> = match given.and_then(|v| v.as_array()) {
         Some(arr) => {
@@ -1407,7 +1379,7 @@ fn rebot_move_build(urdf: &str, pose: pgrx::JsonB, targets: pgrx::JsonB,
             None => wanted.clone(),
         }
     };
-    let seconds: Vec<f64> = seconds.iter().map(|s| s.clamp(MIN_SECONDS, MAX_SECONDS)).collect();
+    let seconds: Vec<f64> = seconds.iter().map(|s| s.clamp(cfg.min_seconds, cfg.max_seconds)).collect();
 
     // Assemble: single target -> joint_move; several -> joint_sequence.
     let mut points: Vec<[f64; 7]> = Vec::new();
@@ -1420,20 +1392,22 @@ fn rebot_move_build(urdf: &str, pose: pgrx::JsonB, targets: pgrx::JsonB,
     let mut q_from7 = [0.0; 7];
     q_from7[..6].copy_from_slice(&q_from);
     q_from7[6] = gripper;
-    let limits = json!(limits7().iter().map(|l| json!([l[0], l[1]])).collect::<Vec<_>>());
+    let limits = json!(limits7(&cfg).iter().map(|l| json!([l[0], l[1]])).collect::<Vec<_>>());
     let payload = if targets6.len() == 1 {
         let label = format!("calibration move to [{}]",
             targets6[0].iter().map(|v| format!("{v:+.2}")).collect::<Vec<_>>().join(", "));
         rebot_joint_move(q_from7.to_vec(), points[points.len() - 1].to_vec(),
-                         seconds[0], 30.0, hold, pgrx::JsonB(limits), &label).0
+                         seconds[0], pgrx::JsonB(config.0.clone()), 30.0, hold,
+                         pgrx::JsonB(limits), &label).0
     } else {
         let poses = json!(points.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
         let secs = json!(seconds);
         let label = format!("{} poses, one pass", targets6.len());
-        rebot_joint_sequence(pgrx::JsonB(poses), pgrx::JsonB(secs), 30.0, hold,
+        rebot_joint_sequence(pgrx::JsonB(poses), pgrx::JsonB(secs),
+                             pgrx::JsonB(config.0.clone()), 30.0, hold,
                              pgrx::JsonB(limits), &label).0
     };
-    let stats = validate_payload(&payload);
+    let stats = validate_payload(&payload, &cfg);
     let summary = json!({
         "seconds": (seconds.iter().sum::<f64>() * 100.0).round_ties_even() / 100.0,
         "leg_seconds": seconds,

@@ -17,6 +17,9 @@ pg_module_magic!();
 
 mod plan;
 mod calib;
+mod config;
+
+pub(crate) use config::Config;
 
 fn load_chain(urdf: &str) -> k::Chain<f64> {
     let robot = urdf_rs::read_from_string(urdf)
@@ -109,25 +112,7 @@ fn rebot_tip_point(urdf: &str, q6: Vec<f64>, tip_offset: Vec<f64>) -> Vec<f64> {
 // SQL ERROR, never a backend crash.
 // --------------------------------------------------------------------------- //
 
-pub(crate) const GRAVITY: f64 = 9.80665;
 pub(crate) const ARM_JOINTS: [&str; 6] = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"];
-
-// (link, mass kg, COM in that link frame) — matches rebot_ik.LINK_INERTIALS.
-// Gripper fingers omitted (<0.1 Nm); gripper_end is the lumped tool mass.
-pub(crate) const LINK_INERTIALS: [(&str, f64, [f64; 3]); 7] = [
-    ("link1", 0.4655, [0.00817652, 0.00122584, 0.03314197]),
-    ("link2", 1.5520, [-0.11786481, -0.00342226, -0.02715519]),
-    ("link3", 1.2520, [0.10342715, -0.06641379, -0.02710687]),
-    ("link4", 0.4600, [0.04755445, -0.04411135, -0.03141119]),
-    ("link5", 0.2012, [0.01144006, 0.00000479, 0.03804875]),
-    ("link6", 0.1000, [0.00001802, 0.00000002, 0.00434806]),
-    ("gripper_end", 0.6500, [-0.11275169, 0.00012844, -0.00000573]),
-];
-
-// sweep.py collision model: per-link capsule radii, worktop clearance, reach cap.
-pub(crate) const RADII: [f64; 7] = [0.055, 0.055, 0.050, 0.045, 0.035, 0.030, 0.020];
-pub(crate) const CLEARANCE: f64 = 0.012;
-pub(crate) const LINK_RADIUS_MAX: f64 = 0.85;
 
 /// Load the chain and set the 6 arm joints (gripper joints padded to 0).
 pub(crate) fn load_chain_arm(urdf: &str, q6: &[f64]) -> (urdf_rs::Robot, k::Chain<f64>) {
@@ -168,13 +153,13 @@ pub(crate) fn joint_points(chain: &k::Chain<f64>) -> Vec<[f64; 3]> {
 
 /// tau_g = dU/dq: motor torque to hold the pose against gravity (6 arm joints).
 /// tau[j] = -sum_{links>=j} z_j . cross(p_com - p_j, [0,0,-m*g]).
-pub(crate) fn gravity_torques_impl(robot: &urdf_rs::Robot, chain: &k::Chain<f64>) -> Vec<f64> {
+pub(crate) fn gravity_torques_impl(robot: &urdf_rs::Robot, chain: &k::Chain<f64>, cfg: &Config) -> Vec<f64> {
     let mut coms: Vec<(f64, nalgebra::Vector3<f64>)> = Vec::with_capacity(7);
-    for (lname, mass, com) in LINK_INERTIALS {
+    for (lname, mass, com) in &cfg.link_inertials {
         let node = chain.find_link(lname).unwrap_or_else(|| panic!("link not found: {lname}"));
         let t = node.world_transform().unwrap();
         let p_com = t.rotation * nalgebra::Vector3::new(com[0], com[1], com[2]) + t.translation.vector;
-        coms.push((mass, p_com));
+        coms.push((*mass, p_com));
     }
     let mut tau = vec![0.0; 6];
     for j in 0..6 {
@@ -186,7 +171,7 @@ pub(crate) fn gravity_torques_impl(robot: &urdf_rs::Robot, chain: &k::Chain<f64>
         let z_j = t.rotation * joint_axis(robot, ARM_JOINTS[j]);
         let mut total = 0.0;
         for (mass, p_com) in coms.iter().skip(j) {
-            let force = nalgebra::Vector3::new(0.0, 0.0, -mass * GRAVITY);
+            let force = nalgebra::Vector3::new(0.0, 0.0, -mass * cfg.gravity);
             total += z_j.dot(&(p_com - p_j).cross(&force));
         }
         tau[j] = -total;
@@ -195,7 +180,7 @@ pub(crate) fn gravity_torques_impl(robot: &urdf_rs::Robot, chain: &k::Chain<f64>
 }
 
 /// sweep.path_safe: is the straight joint-space line a->b clear of the worktop?
-pub(crate) fn path_safe_impl(chain: &k::Chain<f64>, a: &[f64], b: &[f64], samples: usize) -> bool {
+pub(crate) fn path_safe_impl(chain: &k::Chain<f64>, a: &[f64], b: &[f64], samples: usize, cfg: &Config) -> bool {
     if samples < 2 {
         panic!("samples must be >= 2");
     }
@@ -211,14 +196,14 @@ pub(crate) fn path_safe_impl(chain: &k::Chain<f64>, a: &[f64], b: &[f64], sample
         for index in 1..points.len() {
             let start = points[index - 1];
             let end = points[index];
-            let radius = RADII[index.min(RADII.len() - 1)];
+            let radius = cfg.link_radii[index.min(cfg.link_radii.len() - 1)];
             for fraction in [0.0, 0.5] {
                 let cz = start[2] + (end[2] - start[2]) * fraction;
-                if cz - radius < CLEARANCE {
+                if cz - radius < cfg.clearance {
                     return false;
                 }
             }
-            if (end[0] * end[0] + end[1] * end[1]).sqrt() > LINK_RADIUS_MAX {
+            if (end[0] * end[0] + end[1] * end[1]).sqrt() > cfg.link_radius_max {
                 return false;
             }
         }
@@ -227,10 +212,12 @@ pub(crate) fn path_safe_impl(chain: &k::Chain<f64>, a: &[f64], b: &[f64], sample
 }
 
 /// Joint torques (Nm, 6 arm joints) to hold pose `q` against gravity.
+/// `config` is the REQUIRED world.arm_config doc (no hardcoded fallback).
 #[pg_extern]
-fn rebot_gravity_torques(urdf: &str, q: Vec<f64>) -> Vec<f64> {
+fn rebot_gravity_torques(urdf: &str, q: Vec<f64>, config: pgrx::JsonB) -> Vec<f64> {
+    let cfg = Config::from_json(&config.0);
     let (robot, chain) = load_chain_arm(urdf, &q);
-    gravity_torques_impl(&robot, &chain)
+    gravity_torques_impl(&robot, &chain, &cfg)
 }
 
 /// Joint origins + tool point (7 points, flattened to 21 floats) at pose `q`.
@@ -242,9 +229,11 @@ fn rebot_joint_points(urdf: &str, q: Vec<f64>) -> Vec<f64> {
 
 /// Is the straight joint-space interpolation a->b clear of the worktop (sweep.path_safe)?
 #[pg_extern]
-fn rebot_path_safe(urdf: &str, a: Vec<f64>, b: Vec<f64>, samples: default!(i32, 40)) -> bool {
+fn rebot_path_safe(urdf: &str, a: Vec<f64>, b: Vec<f64>, config: pgrx::JsonB,
+                   samples: default!(i32, 40)) -> bool {
+    let cfg = Config::from_json(&config.0);
     let (_robot, chain) = load_chain_arm(urdf, &a);
-    path_safe_impl(&chain, &a, &b, samples as usize)
+    path_safe_impl(&chain, &a, &b, samples as usize, &cfg)
 }
 
 // --------------------------------------------------------------------------- //
@@ -454,12 +443,12 @@ fn seg_seg_distance(p1: V3, q1: V3, p2: V3, q2: V3) -> f64 {
 fn v3(p: [f64; 3]) -> V3 { V3::new(p[0], p[1], p[2]) }
 
 /// True if no non-adjacent link capsules intersect at this pose.
-fn self_collision_free(chain: &k::Chain<f64>) -> bool {
+fn self_collision_free(chain: &k::Chain<f64>, cfg: &Config) -> bool {
     let pts = joint_points(chain);
     for i in 1..pts.len() {
         for j in (i + 2)..pts.len() {
             let dist = seg_seg_distance(v3(pts[i - 1]), v3(pts[i]), v3(pts[j - 1]), v3(pts[j]));
-            if dist < RADII[i] + RADII[j] {
+            if dist < cfg.link_radii[i] + cfg.link_radii[j] {
                 return false;
             }
         }
@@ -468,13 +457,13 @@ fn self_collision_free(chain: &k::Chain<f64>) -> bool {
 }
 
 /// Minimum clearance (m) between any non-adjacent link capsules (surface gap).
-fn min_self_clearance(chain: &k::Chain<f64>) -> f64 {
+fn min_self_clearance(chain: &k::Chain<f64>, cfg: &Config) -> f64 {
     let pts = joint_points(chain);
     let mut best = f64::INFINITY;
     for i in 1..pts.len() {
         for j in (i + 2)..pts.len() {
             let dist = seg_seg_distance(v3(pts[i - 1]), v3(pts[i]), v3(pts[j - 1]), v3(pts[j]));
-            best = best.min(dist - RADII[i] - RADII[j]);
+            best = best.min(dist - cfg.link_radii[i] - cfg.link_radii[j]);
         }
     }
     best
@@ -483,9 +472,10 @@ fn min_self_clearance(chain: &k::Chain<f64>) -> f64 {
 /// Is the pose free of (non-adjacent) link self-collision? Deliberate contacts must
 /// be excepted by the caller.
 #[pg_extern]
-fn rebot_self_collision_free(urdf: &str, q: Vec<f64>) -> bool {
+fn rebot_self_collision_free(urdf: &str, q: Vec<f64>, config: pgrx::JsonB) -> bool {
+    let cfg = Config::from_json(&config.0);
     let (_robot, chain) = load_chain_arm(urdf, &q);
-    self_collision_free(&chain)
+    self_collision_free(&chain, &cfg)
 }
 
 /// Closest distance between two segments (each given as [x,y,z] endpoints). The
@@ -501,14 +491,17 @@ fn rebot_seg_seg_distance(p1: Vec<f64>, q1: Vec<f64>, p2: Vec<f64>, q2: Vec<f64>
 
 /// Minimum surface gap (m) between non-adjacent link capsules; negative = intersecting.
 #[pg_extern]
-fn rebot_min_self_clearance(urdf: &str, q: Vec<f64>) -> f64 {
+fn rebot_min_self_clearance(urdf: &str, q: Vec<f64>, config: pgrx::JsonB) -> f64 {
+    let cfg = Config::from_json(&config.0);
     let (_robot, chain) = load_chain_arm(urdf, &q);
-    min_self_clearance(&chain)
+    min_self_clearance(&chain, &cfg)
 }
 
 /// Is the straight joint-space line a->b free of self-collision at every sample?
 #[pg_extern]
-fn rebot_path_collision_free(urdf: &str, a: Vec<f64>, b: Vec<f64>, samples: default!(i32, 40)) -> bool {
+fn rebot_path_collision_free(urdf: &str, a: Vec<f64>, b: Vec<f64>, config: pgrx::JsonB,
+    samples: default!(i32, 40)) -> bool {
+    let cfg = Config::from_json(&config.0);
     let (_robot, chain) = load_chain_arm(urdf, &a);
     let samples = samples as usize;
     if samples < 2 { panic!("samples must be >= 2"); }
@@ -518,7 +511,7 @@ fn rebot_path_collision_free(urdf: &str, a: Vec<f64>, b: Vec<f64>, samples: defa
         while q.len() < chain.dof() { q.push(0.0); }
         chain.set_joint_positions(&q).unwrap_or_else(|e| panic!("set_joint_positions: {e}"));
         chain.update_transforms();
-        if !self_collision_free(&chain) { return false; }
+        if !self_collision_free(&chain, &cfg) { return false; }
     }
     true
 }
@@ -527,8 +520,6 @@ fn rebot_path_collision_free(urdf: &str, a: Vec<f64>, b: Vec<f64>, samples: defa
 // Trajectory time law — port of traj.ease_fraction / ease_velocity (S-ramp
 // trapezoid: smoothstep ramp into constant-velocity cruise, zero accel at ends).
 // --------------------------------------------------------------------------- //
-
-pub(crate) const RAMP_S: f64 = 0.15;
 
 fn ramp_ratio(duration: f64, ramp: f64) -> f64 {
     (ramp / duration).max(1e-9).min(0.5)
@@ -573,27 +564,30 @@ fn rebot_ease_velocity(u: f64, duration: f64, ramp: default!(f64, 0.15)) -> f64 
 // and locate_target.project's no-distortion path).
 // --------------------------------------------------------------------------- //
 
-pub(crate) const MIN_CRUISE_SPEED: f64 = 0.25;
-// rebot_ik.LIMITS (joint1..6 lower/upper).
-pub(crate) const LIMITS: [(f64, f64); 6] = [
-    (-2.80, 2.80), (0.0, 3.14), (0.0, 3.14), (-1.57, 1.57), (-1.57, 1.57), (-3.14, 3.14),
-];
-
 /// Leg duration from the furthest-travelling joint (sweep.seconds_for).
+/// peak_speed/minimum/maximum default to the config's motion values when NULL.
 #[pg_extern]
-fn rebot_seconds_for(a: Vec<f64>, b: Vec<f64>, peak_speed: default!(f64, 0.5),
-                     minimum: default!(f64, 0.3), maximum: default!(f64, 25.0)) -> f64 {
+fn rebot_seconds_for(a: Vec<f64>, b: Vec<f64>,
+                     config: pgrx::JsonB,
+                     peak_speed: default!(Option<f64>, "NULL"),
+                     minimum: default!(Option<f64>, "NULL"),
+                     maximum: default!(Option<f64>, "NULL")) -> f64 {
+    let cfg = Config::from_json(&config.0);
+    let peak_speed = peak_speed.unwrap_or(cfg.peak_speed);
+    let minimum = minimum.unwrap_or(cfg.min_seconds);
+    let maximum = maximum.unwrap_or(cfg.max_seconds);
     let travel = a.iter().zip(b.iter()).map(|(x, y)| (y - x).abs()).fold(0.0_f64, f64::max);
-    let peak_time = travel / peak_speed + RAMP_S;
-    let cruise_cap = travel / MIN_CRUISE_SPEED + RAMP_S;
+    let peak_time = travel / peak_speed + cfg.ramp_s;
+    let cruise_cap = travel / cfg.min_cruise_speed + cfg.ramp_s;
     minimum.max(maximum.min(peak_time).min(cruise_cap))
 }
 
 /// Joint vector within limits (sweep.within_limits).
 #[pg_extern]
-fn rebot_within_limits(q: Vec<f64>, margin: default!(f64, 0.0)) -> bool {
+fn rebot_within_limits(q: Vec<f64>, config: pgrx::JsonB, margin: default!(f64, 0.0)) -> bool {
+    let cfg = Config::from_json(&config.0);
     if q.len() != 6 { panic!("expected 6 joint angles"); }
-    q.iter().zip(LIMITS.iter()).all(|(v, (lo, hi))| *v >= lo + margin && *v <= hi - margin)
+    q.iter().zip(cfg.limits.iter()).all(|(v, l)| *v >= l[0] + margin && *v <= l[1] - margin)
 }
 
 /// Project a base-frame point to pixels (locate_target.project, no distortion).
