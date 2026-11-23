@@ -1071,9 +1071,14 @@ A required param cannot follow a defaulted one in PG, so config precedes the fir
 Drift guard `tests/arm_config_parity.py`: table == Python bit-exact (whole doc incl. motion),
 apply_config no-op on seed, and a core hard-refuses an empty config. Both physical-model and
 motion groups consolidated; Rust fully table-driven. Parity machine-exact; selftest 646/0;
-gravity/collision SQL test + SQL suites pass. Out of scope (still hardcoded): identify learning
-thresholds, calibration gates, oracle attribution thresholds. Live /move + oracle executions
-need a powered arm + bench go-ahead (dry plans only here).
+gravity/collision SQL test + SQL suites pass. The remaining gate groups are now consolidated
+too (same required-config pattern): calibration fit gates (`0016`, `rebot_calibrate_fit`),
+oracle attribution thresholds (`0017`, `oracle_attribute(doc, config)` fed `cfg->'oracle'` by
+`oracle_compute`), and learning thresholds (`0018`, `rebot_fit_sag_map` + `accuracy_cell_update`
++ `identify`; `store.update_accuracy_cells` reads the learning group). `rebot_ik` is the Python
+single source for all groups (CALIBRATION/ORACLE/LEARNING dicts; `apply_config` re-syncs the
+aliasing modules). Only structural identifiers and pure numeric epsilons remain hardcoded.
+Live /move + oracle executions need a powered arm + bench go-ahead (dry plans only here).
 
 **Learning plane (Phase 1, ports validated against the Python reference):**
 - `oracle_attribute(jsonb)` (PLpgSQL, `0002`) reproduces `oracle.attribute` across all
