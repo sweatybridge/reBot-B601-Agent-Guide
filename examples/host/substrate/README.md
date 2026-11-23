@@ -74,6 +74,7 @@ docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/ray_pl
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_workflow_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_oracle_workflow_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/workflow_logic_tests.sql
 python tests/test_store.py   # needs psycopg; container on localhost:5433
 python tests/test_pg_trace.py
 python tests/test_pg_evidence.py
@@ -86,7 +87,7 @@ docker exec rebot-capture-capture-1 python /app/substrate/tests/test_execute_wor
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 ```
 
-Apply migrations `0001`–`0021` in order (each is idempotent).
+Apply migrations `0001`–`0022` in order (each is idempotent).
 
 Full offline app suite (file mode; 682 checks) — run inside the capture container with
 the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
@@ -174,7 +175,7 @@ volume). From `examples/host`:
    activities; capture/planner/activities wait for substrate healthy.
    `REBOT_PG_DSN` defaults to the compose-network DSN; capture's
    `REBOT_WORKFLOW_URL` defaults to `http://activities:8766`.
-2. Apply migrations `0001`–`0021` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+2. Apply migrations `0001`–`0022` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
    Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`);
    `world.arm_config` is seeded for `b601` by `0014` (the cores require it).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
@@ -308,7 +309,7 @@ window→fragment alignment, stillest-frame selection (incl. a jitter case that 
 the still plateau over the midpoint), and **tip-pixel parity with the live midpoint
 grab** (<0.1 px) — the oracle gate is verdict agreement, not pixel identity.
 
-## Durable execute→oracle workflow (`0020` + `0021`)
+## Durable execute→oracle workflow (`0020`–`0022`)
 
 The execute→oracle chain is one pg_durable graph. The live hold-grab timer is
 retired: hold stills are extracted from the executed-trajectory recording after
@@ -319,7 +320,7 @@ execution_prepare
   -> activity /execute (claim pending->playing BEFORE moving; play; record; ingest)
   -> execution_after_play (ledger + telemetry)
   -> loop until recording fragments cover every hold (or the deadline)
-  -> activity /extract (decode only the hold windows; stillest frame)
+  -> activity /extract (decode only the hold windows; frame choice is SQL)
   -> execution_store_stills (content-addressed stills + execution_hold)
   -> activity /detect (green tip on each extracted still)
   -> execution_finalize (oracle_compute + oracle_learn)
@@ -342,33 +343,54 @@ Safety is structural, not conventional:
   runs and the oracle reports `no recording` after the deadline; a missing camera
   never blocks motion.
 
+### Python / SQL split (`0022`)
+
+Python is left with the parts that must be native or I/O-bound: HTTP to the edge,
+MediaMTX control, file reads, cv2/FFmpeg decode, JPEG encode, the OpenCV tip
+detector. Everything that is a decision over relational data is SQL:
+
+| Decision | SQL |
+|---|---|
+| Hold-window → fragment plan | `extraction_windows` |
+| Joint speed / nearest sample / stillest frame + midpoint tiebreak | `extract_joint_speeds`, `extract_speed_at`, `select_hold_frame` |
+| Cumulative fragment timing for a multi-segment recording | `episode_add_segment`, `execution_add_segment` |
+| Dry-play cmd/meas telemetry + kp map | `execution_dry_telemetry` |
+| `ok` / `executed` / `pending` / verdict / holds receipt | `execution_receipt` (reads `df.status`) |
+| Coverage oracle chain (adopt → extract → detect → finalize) | `coverage_workflow_start` |
+
+The activity still calls the SQL functions over its own connection; the durable
+graph keeps the ordering. The large media payloads never enter `df.nodes` — the
+services read fragments/blobs from the catalog by execution id.
+
 ### Isolated activity service (the capture/planner merge)
 
 `workflow_service.py` is the **one isolated activity process** that merges the
 planner half (play on the edge, persist telemetry, record + ingest) and the capture
 half (decode the recording, select hold stills, detect the tip). pg_durable reaches
 it via `df.http()`; a decode/cv2/FFmpeg crash fails the workflow step and can never
-reset the Postgres cluster (spec §2). The pure extraction/selection stays in
-`extract.py`; the detector is shared with the capture server through
-`app/oracle_vision.py`.
+reset the Postgres cluster (spec §2). The detector is shared with the capture
+server through `app/oracle_vision.py`; the durability decisions are SQL.
 
 The `activities` compose service runs it on the compose network (`:8766`);
 capture's `REBOT_WORKFLOW_URL` points at it. Coverage/identify moves use the same
-activity service through `execution_adopt` + the same extract/detect/finalize
-functions, so they are recorded and extracted too (no live grabs).
+activity service through `coverage_workflow_start`, so they are recorded and
+extracted too (no live grabs).
 
 ### Validation
 
 - `tests/execute_oracle_workflow_tests.sql`: prepare, at-most-once claim,
   recording readiness, still storage idempotence, detect request geometry,
   finalize verified/learned, replay does not add a verdict or fold a cell.
+- `tests/workflow_logic_tests.sql`: cumulative fragment timing, extraction
+  windows, joint speeds, stillest-frame/midpoint selection, dry telemetry,
+  receipt, and t_offset shifts.
 - `tests/test_execute_workflow.py`: **dry end-to-end, arm parked**. It seeds a
   deterministic synthetic recording + plan, runs the real `df.start` graph against
   the real activity service in `REBOT_WORKFLOW_DRY=1` (no gateway/edge call), and
   proves: verified/learned, one extracted hold, a persisted verdict, attempts==1,
-  and a replay that writes no second verdict, folds no second cell, duplicates no
-  still and does not re-claim the play. The planner log shows only health checks
-  during the run — no `/execute` reached it.
+  an SQL receipt (`ok`/`executed`/not pending) and a replay that writes no second
+  verdict, folds no second cell, duplicates no still and does not re-claim the play.
+  The planner log shows only health checks during the run — no `/execute` reached it.
 - The existing `tests/execute_workflow_tests.sql` (0020) still covers the ledger
   primitives.
 

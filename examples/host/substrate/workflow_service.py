@@ -14,8 +14,9 @@ cluster.
       arm. Starts the MediaMTX recording around the play, ingests the completed
       file as `evidence.media_fragment`, and records the clock offset.
     POST /extract  {exec_id}
-      Reads the ingested fragments + telemetry, decodes only the hold windows,
-      and returns the stillest JPEG per hold (extract.py).
+      SQL decides the per-hold windows/fragments and the stillest frame
+      (`extraction_windows`, `select_hold_frame`); this service only decodes
+      the requested windows and JPEG-encodes the chosen frame.
     POST /detect   {exec_id}
       Reads the extracted stills + geometry from the substrate and runs the
       green-tip detector (oracle_vision.detect_tip).
@@ -75,44 +76,6 @@ def _json(sql, args=()):
     return next(iter(row.values())) if row else None
 
 
-def _plan_doc(plan_id):
-    raw = STORE.read_plan_blob(plan_id)
-    return json.loads(raw) if raw else None
-
-
-def _synthetic_telemetry(plan_id):
-    """Dry mode: no edge call, but a complete cmd/meas telemetry block.
-
-    The arm is parked, so `meas == cmd` and every hold window is still. This is
-    exactly the shape the extractor and oracle consume; it proves the durable
-    chain without claiming a physical execution.
-    """
-    trajectory = _plan_doc(plan_id) or {}
-    samples = []
-    for point in trajectory.get("waypoints") or []:
-        q = point.get("q")
-        if q is None:
-            continue
-        samples.append({"t": point.get("t"), "cmd": list(q), "meas": list(q)})
-    return {
-        "format": "rebot-trajectory-log", "version": 2,
-        "samples": samples, "dry": True,
-    }
-
-
-def _kp_map(spec):
-    """`50,2:150,3:150` -> {"2": 50.0, "3": 150.0, "1": 50.0} for telemetry."""
-    out = {}
-    for part in str(spec).split(":"):
-        if "," not in part:
-            continue
-        kp, motor = part.split(",", 1)
-        out[str(int(motor))] = float(kp)
-    if "1" not in out:
-        out["1"] = float(out.get("2", 50.0))
-    return out
-
-
 def _http_json(url, body, timeout=360, method="POST", token=""):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"Content-Type": "application/json"}
@@ -159,21 +122,23 @@ def _ingest_recording(exec_id, segments, play_wall):
     episode = (ex or {}).get("episode_id")
     if not episode:
         raise RuntimeError("execution %s has no episode" % exec_id)
-    t = 0.0
     first_start = None
+    last_end = 0.0
     for seq, segment in enumerate(segments):
         data = Path(segment.path).read_bytes()
         sha = STORE.put_blob(data, "fragment")
         duration = _video_duration(segment.path)
         if duration <= 0:
             duration = 10.0  # MediaMTX recordSegmentDuration fallback
-        STORE.add_fragment(episode, sha, seq, t, t + duration, codec="mp4")
+        # The cumulative episode span is computed by the catalog, not here.
+        added = _json("SELECT execution_add_segment(%s,%s,%s,%s,'mp4')",
+                      (exec_id, seq, sha, duration))
+        last_end = float((added or {}).get("t_end", last_end))
         if first_start is None:
             first_start = float(segment.start)
-        t += duration
     t_offset = float(play_wall - (first_start if first_start is not None else play_wall))
     _json("SELECT execution_set_recording(%s,%s)", (exec_id, t_offset))
-    return {"segments": len(segments), "duration_s": round(t, 3),
+    return {"segments": len(segments), "duration_s": round(last_end, 3),
             "t_offset": round(t_offset, 3)}
 
 
@@ -193,8 +158,7 @@ def execute(exec_id):
             _json("SELECT execution_mark_dead(%s)", (exec_id,))
             return {"ok": False, "claimed": True, "executed": False,
                     "error": "dry mode is refused when REBOT_EXECUTE=1"}
-        tel = _synthetic_telemetry(plan_id)
-        tel["kp"] = _kp_map(KP)
+        tel = _json("SELECT execution_dry_telemetry(%s,%s)", (plan_id, KP))
         return {"ok": True, "claimed": True, "executed": True, "dry": True,
                 "exec_id": exec_id, "telemetry": tel}
 
@@ -272,16 +236,37 @@ def extract(exec_id):
     if not fragments:
         return {"holds": [], "missed": ex.get("hold_windows") or [],
                 "error": "no recording fragments"}
-    telemetry = STORE.read_telemetry_doc(exec_id) or {}
-    req = {
-        "fragments": [{"seq": f["seq"], "t_start": f["t_start"], "t_end": f["t_end"],
-                       "data_b64": base64.b64encode(f["data"]).decode("ascii")}
-                      for f in fragments],
-        "samples": telemetry.get("samples") or [],
-        "windows": ex.get("hold_windows") or [],
-        "t_offset": float(ex.get("t_offset") or 0.0),
-    }
-    return extract_service.extract_holds(req)
+    by_seq = {f["seq"]: f for f in fragments}
+    # Planning and selection are SQL (0022); this service only decodes and
+    # JPEG-encodes the frames the catalog asks for.
+    plan = _json("SELECT extraction_windows(%s)", (exec_id,)) or {}
+    holds, missed = [], []
+    for window in plan.get("windows") or []:
+        idx = window.get("index")
+        frags = [by_seq[s] for s in (window.get("fragments") or []) if s in by_seq]
+        if not frags:
+            missed.append(idx)
+            continue
+        frames = extract_service.decode_window_frames(frags, window["w0"], window["w1"])
+        if not frames:
+            missed.append(idx)
+            continue
+        choice = _json("SELECT select_hold_frame(%s,%s,%s::float8[])",
+                       (exec_id, idx, [t for t, _frame in frames]))
+        if not choice:
+            missed.append(idx)
+            continue
+        best_t = float(choice["t"])
+        _, frame = min(frames, key=lambda tf: abs(tf[0] - best_t))
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if not ok:
+            missed.append(idx)
+            continue
+        h, w = frame.shape[:2]
+        holds.append({"index": idx, "t": best_t, "score": choice["score"],
+                      "frame_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
+                      "width": w, "height": h})
+    return {"holds": holds, "missed": missed}
 
 
 def detect(exec_id):

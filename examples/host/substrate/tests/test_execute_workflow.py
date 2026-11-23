@@ -73,8 +73,20 @@ def encode(path):
 
 def cleanup(store):
     capture_execs = ("20261124T000000Z-abc123", "20261124T000001Z-def456",
-                     "20261124T000002Z-aaa111")
+                     "20261124T000002Z-aaa111", "20261124T000003Z-bbb222",
+                     "20261124T000004Z-ccc333")
     with store._conn() as c:
+        # Coverage-workflow fixture from the ad-hoc validation, if present.
+        c.execute("DELETE FROM evidence.execution_hold WHERE exec_id='wfc_exec'")
+        c.execute("DELETE FROM evidence.execution WHERE exec_id='wfc_exec'")
+        c.execute("DELETE FROM evidence.oracle_hold WHERE verdict_id IN "
+                  "(SELECT id FROM evidence.oracle_verdict WHERE exec_id='wfc_exec')")
+        c.execute("DELETE FROM evidence.oracle_verdict WHERE exec_id='wfc_exec'")
+        c.execute("DELETE FROM evidence.telemetry WHERE exec_id='wfc_exec'")
+        c.execute("DELETE FROM evidence.media_fragment WHERE episode_id='wfc_ep'")
+        c.execute("DELETE FROM evidence.still WHERE episode_id='wfc_ep'")
+        c.execute("DELETE FROM evidence.plan WHERE plan_id='wfc_plan'")
+        c.execute("DELETE FROM evidence.episode WHERE episode_id='wfc_ep'")
         for pid in capture_execs:
             c.execute("DELETE FROM evidence.execution_hold WHERE exec_id=%s", (pid,))
             c.execute("DELETE FROM evidence.media_fragment WHERE episode_id=%s",
@@ -100,6 +112,11 @@ def cleanup(store):
         c.execute("DELETE FROM evidence.telemetry WHERE exec_id=%s", (EXEC,))
         c.execute("DELETE FROM evidence.media_fragment WHERE episode_id=%s", (EPISODE,))
         c.execute("DELETE FROM evidence.still WHERE episode_id=%s", (EPISODE,))
+        c.execute("DELETE FROM evidence.oracle_hold WHERE verdict_id IN "
+                  "(SELECT id FROM evidence.oracle_verdict WHERE plan_id IN "
+                  " (SELECT plan_id FROM evidence.plan WHERE episode_id=%s))", (EPISODE,))
+        c.execute("DELETE FROM evidence.oracle_verdict WHERE plan_id IN "
+                  "(SELECT plan_id FROM evidence.plan WHERE episode_id=%s)", (EPISODE,))
         c.execute("DELETE FROM evidence.plan WHERE episode_id=%s", (EPISODE,))
         c.execute("DELETE FROM evidence.episode WHERE episode_id=%s", (EPISODE,))
         c.execute("DELETE FROM evidence.blob WHERE sha256 IN (%s,%s,'wf3_plan_blob')",
@@ -215,6 +232,13 @@ def run_checks(store):
         timeout_s=10, poll_s=1, await_s=90, label="wf2_dry")
     check("workflow completed", receipt.get("status") == "completed",
           json.dumps(receipt)[:500])
+    out = receipt.get("receipt") or {}
+    check("SQL receipt is ok/executed/not-pending",
+          bool(out.get("ok")) and bool(out.get("executed"))
+          and not out.get("pending") and out.get("workflow_status") == "completed",
+          json.dumps(out)[:300])
+    check("receipt carries the extracted hold count", int(out.get("holds") or 0) == 1,
+          "holds=%s" % out.get("holds"))
     health = execute_workflow.workflow_health(store, EXEC)
     ex = health["execution"] or {}
     check("execution verified + learned", ex.get("status") == "verified"

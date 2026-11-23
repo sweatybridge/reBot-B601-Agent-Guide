@@ -1826,58 +1826,29 @@ async def handle_execute(request: web.Request) -> web.Response:
             return web.json_response({"ok": False, "id": plan_id, "executed": False,
                                       "error": "durable workflow failed to start: %s" % exc},
                                      status=502)
-        result = receipt.get("result") or {}
-        if isinstance(result, dict):
-            rows = result.get("rows") or []
-            row = rows[0] if rows else {}
-            result = (row.get("execution_finalize") or row.get("execution_fail")
-                      or row.get("execution_get") or row)
-        doc = result.get("doc") if isinstance(result, dict) else None
-        # execution_finalize returns {doc, verdict}; the ledger row is the
-        # durable truth (status/learned), so read it for the response.
-        ledger = None
-        try:
-            def _ledger():
-                with store._conn() as c:
-                    return c.execute("SELECT execution_get(%s) AS ex",
-                                     (plan_id,)).fetchone()["ex"]
-            ledger = await asyncio.to_thread(_ledger)
-        except Exception:  # noqa: BLE001
-            pass
-        if receipt.get("status") not in ("completed", "failed", "cancelled"):
-            # The durable instance is still working (the caller's await budget
-            # is shorter than the recording deadline, or the activity is slow).
-            # The arm may already have played; report the ledger, not a failure.
-            return web.json_response({
-                "ok": True, "id": plan_id, "executed": bool(
-                    ledger and ledger.get("status") in ("playing", "played", "verified")),
-                "workflow": receipt.get("instance"),
-                "workflow_status": receipt.get("status"), "ledger": ledger,
-                "pending": True,
-            }, status=202)
-        executed = receipt.get("status") == "completed" and bool(
-            ledger and ledger.get("status") in ("played", "verified"))
-        verdict = (doc or {}).get("verdict") if isinstance(doc, dict) else None
-        error_text = (result or {}).get("error") if isinstance(result, dict) else None
+        # execution_receipt owns the ok/executed/pending/verdict/ledger
+        # composition; capture adds only the plan id and its trace event.
+        out = receipt.get("receipt") or {}
+        if out.get("pending"):
+            return web.json_response({"id": plan_id, **out,
+                                      "workflow_status": out.get("workflow_status")
+                                      or receipt.get("status")}, status=202)
+        executed = bool(out.get("ok"))
+        verdict = out.get("verdict")
+        error_text = out.get("error")
         await trace_event(app, sid, "execute", plan_id=plan_id, status=200,
-                          ok=executed, executed=executed, workflow=receipt.get("instance"),
+                          ok=executed, executed=bool(out.get("executed")),
+                          workflow=out.get("workflow") or receipt.get("instance"),
                           error=None if executed else error_text)
         if verdict:
             await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=verdict,
-                              holds=len((doc or {}).get("holds") or []),
-                              telemetry=bool((doc or {}).get("telemetry")),
+                              holds=int(out.get("holds") or 0),
+                              telemetry=bool((out.get("ledger") or {}).get("telemetry_sha")),
                               source="durable_offline_extract", error=None)
-        return web.json_response({
-            "ok": executed,
-            "id": plan_id,
-            "executed": executed,
-            "workflow": receipt.get("instance"),
-            "workflow_status": receipt.get("status"),
-            "ledger": ledger,
-            "verdict": verdict,
-            "holds": len((doc or {}).get("holds") or []),
-            "error": None if executed else error_text,
-        }, status=200 if executed else 502)
+        return web.json_response({"id": plan_id, **out,
+                                  "workflow_status": out.get("workflow_status")
+                                  or receipt.get("status")},
+                                 status=200 if executed else 502)
 
     # File mode / no activity service: the direct gateway path survives for
     # offline development. There is no live grab any more; the pre/post stills
@@ -2385,7 +2356,12 @@ def _finish_coverage_recording(app, recorder, record_wall, episode, play_wall):
         store.create_episode(episode, app.get("pg_workspace", "default"),
                              [app.get("arm_id", "b601")], kind="execution")
         import cv2
-        t = 0.0
+
+        def _add_segment(seq, sha, duration):
+            with store._conn() as c:
+                return c.execute("SELECT episode_add_segment(%s,%s,%s,%s,'mp4') AS r",
+                                 (episode, seq, sha, duration)).fetchone()["r"]
+
         first_start = None
         for seq, segment in enumerate(segments):
             data = segment.path.read_bytes()
@@ -2397,10 +2373,9 @@ def _finish_coverage_recording(app, recorder, record_wall, episode, play_wall):
                 duration = float(frames) / float(fps) if fps > 0 and frames > 0 else 10.0
             finally:
                 cap.release()
-            store.add_fragment(episode, sha, seq, t, t + duration, codec="mp4")
+            _add_segment(seq, sha, duration)
             if first_start is None:
                 first_start = float(segment.start)
-            t += duration
         return float(play_wall - (first_start if first_start is not None else play_wall))
     except Exception as exc:  # noqa: BLE001 - evidence loss is reported, not fatal
         logging.warning("coverage recording ingest failed: %s", exc)
@@ -2408,45 +2383,27 @@ def _finish_coverage_recording(app, recorder, record_wall, episode, play_wall):
 
 
 async def _recorded_coverage_oracle(app, plan_id, episode, t_offset, sid):
-    """Adopt a coverage execution and run extract -> detect -> finalize offline.
+    """Adopt a coverage execution and run the SQL coverage graph offline.
 
-    The same substrate functions as the durable graph, just driven from the
-    identify session (which already owns the synchronous motion). The activity
-    process does the native decode/detect; the database does the residuals and
-    the learning fold.
+    The graph is `coverage_workflow_start` (0022): adopt -> extract -> store
+    stills -> detect -> finalize. Capture only starts/awaits it and records the
+    trace event; the extract/detect decisions and the learning fold are SQL.
     """
+    import sys
+    substrate_dir = str(ROOT / "substrate")
+    if substrate_dir not in sys.path:
+        sys.path.insert(0, substrate_dir)
+    import execute_workflow
+
     store = app["pg_store"]
-    activity_url = app["workflow_url"].rstrip("/")
     arm = app.get("arm_id", "b601")
-
-    def _adopt():
-        with store._conn() as c:
-            c.execute("SELECT execution_adopt(%s,%s,%s,%s,%s,%s)",
-                      (plan_id, plan_id, arm, episode, float(t_offset),
-                       app.get("pg_workspace", "default")))
-    await asyncio.to_thread(_adopt)
-
-    async def _activity(path):
-        async with app["client"].post(activity_url + path,
-                                      json={"exec_id": plan_id}, timeout=300) as answer:
-            payload = await answer.json()
-            if answer.status != 200:
-                raise RuntimeError(payload.get("error", "%s returned %s" % (path, answer.status)))
-            return payload
-
-    extracted = await _activity("/extract")
-    def _stills():
-        with store._conn() as c:
-            return c.execute("SELECT execution_store_stills(%s,%s::jsonb) AS r",
-                             (plan_id, json.dumps(extracted))).fetchone()["r"]
-    await asyncio.to_thread(_stills)
-    detected = await _activity("/detect")
-    def _finalize():
-        with store._conn() as c:
-            return c.execute("SELECT execution_finalize(%s,%s::jsonb) AS r",
-                             (plan_id, json.dumps(detected))).fetchone()["r"]
-    result = await asyncio.to_thread(_finalize)
-    doc = (result or {}).get("doc") or {}
+    outcome = await asyncio.to_thread(
+        execute_workflow.start_coverage_workflow,
+        store, plan_id, plan_id, arm, episode, float(t_offset),
+        app["workflow_url"], app.get("pg_workspace", "default"), 300,
+        "coverage:" + plan_id)
+    receipt = outcome.get("receipt") or {}
+    doc = receipt.get("doc") or {}
     try:
         app["identify_monitor"].observe(doc, rig=app.get("rig"))
         mirror = app.get("pg_mirror")
@@ -2457,9 +2414,9 @@ async def _recorded_coverage_oracle(app, plan_id, episode, t_offset, sid):
                 last_doc={"proposals": app["identify_monitor"].proposals})
     except Exception as exc:  # noqa: BLE001
         logging.warning("coverage monitor for %s failed: %s", plan_id, exc)
-    await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=(result or {}).get("verdict"),
-                      holds=len(doc.get("holds") or []), source="durable_offline_extract",
-                      error=None)
+    await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=receipt.get("verdict"),
+                      holds=int(receipt.get("holds") or 0),
+                      source="durable_offline_extract", error=receipt.get("error"))
     return doc
 
 
