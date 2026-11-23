@@ -86,6 +86,8 @@ services:
         condition: service_started
       substrate:
         condition: service_healthy
+      activities:
+        condition: service_started
     ports:
       - "${REBOT_PORT:-8443}:8443"
     environment:
@@ -99,6 +101,9 @@ services:
       REBOT_TOKEN: ${REBOT_TOKEN:-}
       REBOT_MEDIAMTX: http://mediamtx:8889
       REBOT_PLANNER: http://planner:8000
+      # The isolated execute/extract/detect activity (capture/planner merge).
+      # /execute runs the durable chain when this and REBOT_PG_DSN are set.
+      REBOT_WORKFLOW_URL: ${REBOT_WORKFLOW_URL:-http://activities:8766}
       # Where a sweep is recorded (MediaMTX writes it; this server ingests it
       # into PG and deletes the spool file) and the API that starts/stops it.
       REBOT_RECORDINGS: /app/work/recordings
@@ -155,6 +160,47 @@ services:
       - ./export:/app/export
     healthcheck:
       test: ["CMD", "python", "app/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  activities:
+    # The isolated execute/extract/detect activity: the planner half (edge
+    # playback + telemetry) and the capture half (recording decode + tip
+    # detection) in ONE short-lived process, reached by pg_durable via df.http().
+    # Native cv2/FFmpeg work lives here, never in a postmaster child.
+    build: .
+    image: rebot-capture:local
+    restart: unless-stopped
+    depends_on:
+      mediamtx:
+        condition: service_started
+      substrate:
+        condition: service_healthy
+      planner:
+        condition: service_started
+    command: ["python", "/app/substrate/workflow_service.py", "--port", "8766"]
+    working_dir: /app
+    environment:
+      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:rebot@substrate:5432/postgres}
+      REBOT_PG_WORKSPACE: ${REBOT_PG_WORKSPACE:-default}
+      REBOT_PLANNER: http://planner:8000
+      REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
+      REBOT_EDGE_URL: ${REBOT_EDGE_URL:-http://raspberrypi:8081}
+      REBOT_MEDIAMTX_API: http://mediamtx:9997
+      REBOT_RECORDINGS: /app/work/recordings
+      REBOT_CAMERA: ${REBOT_CAMERA:-rtsp://mediamtx:8554/phone}
+      REBOT_EXECUTE: ${REBOT_EXECUTE:-0}
+      REBOT_WORKFLOW_DRY: ${REBOT_WORKFLOW_DRY:-0}
+      REBOT_KP: ${REBOT_KP:-50,2:150,3:150}
+      REBOT_KD: ${REBOT_KD:-3,2:10,3:10,4:5,5:4,6:4,7:4}
+    volumes:
+      - ./app:/app/app:ro
+      - ./substrate:/app/substrate:ro
+      - ./work:/app/work
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3

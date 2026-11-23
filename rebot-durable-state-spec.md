@@ -101,6 +101,10 @@ one invariant this design will not trade away.
   `embed_service.py` (separate HTTP process, pluggable `Embedder`) reached from a
   durable workflow via `df.http()` (`embed.start_embed_workflow`); inference crashes
   fail the step, never the cluster. Validated end-to-end (§9.1).
+- **Execute→oracle:** `0021` adds the durable graph and `workflow_service.py`, the
+  isolated activity that merges the planner half (record + play + telemetry) and the
+  capture half (decode + select hold stills + detect). `/execute` starts it; live
+  hold grabs are retired. Dry validation with the arm parked (§9.1).
 
 ## 3. Filesystem layout (flattened)
 
@@ -953,6 +957,17 @@ from PG with no file writes, `/trace` → `evidence.event`, rig seeded into
 `world.shared_rig`). The arm was never commanded; motor reads were unavailable (unpowered)
 during the work, and no motion path was exercised.
 
+**Execute→oracle wiring (0021):** the live hold-grab timer is retired. `/execute`
+now starts the durable graph (prepare → claim+play activity → wait for the recording
+→ extract stills offline → detect → `oracle_compute`/`oracle_learn`). The isolated
+activity service merges the planner half (record, play, ingest telemetry) and the
+capture half (decode, select, detect). Dry validation with the arm parked: the real
+graph against the real activity service in `REBOT_WORKFLOW_DRY=1` (no gateway/edge
+contact) produced a verified/learned execution, one extracted hold, one verdict, and
+an idempotent replay (no second verdict/cell/still, no re-claim). The planner log
+showed only health checks throughout. Full offline selftest: 682 checks, 0 failed.
+Live parity still needs a powered arm.
+
 ## 9. Test plan
 
 - **Schema/integrity (offline):** FK cascade, blob refcount triggers, orphan GC grace,
@@ -1101,18 +1116,30 @@ Live /move + oracle executions need a powered arm + bench go-ahead (dry plans on
   on read), redacted append-only events with per-episode advisory-lock seq assignment,
   episode/plan catalog. Round-trip tested.
 
-**Offline hold-frame extraction (recording-as-source, validated offline):**
-- The oracle's hold stills need not be grabbed live: the permanent executed-trajectory
+**Offline hold-frame extraction (recording-as-source, wired into the workflow):**
+- The oracle's hold stills are no longer grabbed live: the permanent executed-trajectory
   recording (`media_fragment.t_start/t_end`, episode-relative) + telemetry stillness let
   them be extracted after execution. `extract.py` (pure) aligns hold windows to fragments
   (`+t_offset`) and selects the stillest frame (min meas joint speed, midpoint tiebreak);
   `extract_service.py` is the isolated cv2-decode activity (`df.http`, crash-isolation §2).
-  This dissolves the grab/playback interleaving so execute→oracle becomes a sequential
-  durable workflow. Validated by `tests/test_extract.py` (19 checks) on a deterministic
-  synthetic rig: window→fragment alignment, stillest-frame selection (incl. jitter), and
-  tip-pixel parity with the live midpoint grab (<0.1 px). The live oracle path is NOT yet
-  switched — the durable-workflow wiring + retirement of `_oracle_hold_grabs` is the next
-  phase (bench-gated); real-episode parity pending a powered arm.
+  This dissolves the grab/playback interleaving so execute→oracle is a sequential durable
+  workflow. Validated by `tests/test_extract.py` (19 checks) on a deterministic synthetic
+  rig: window→fragment alignment, stillest-frame selection (incl. jitter), and tip-pixel
+  parity with the old live midpoint grab (<0.1 px).
+- **Wired end to end (`0021`):** `execute_workflow_start` builds the pg_durable graph
+  prepare → play (isolated activity owns the claim guard) → wait for recording fragments
+  → extract → detect → `oracle_compute`/`oracle_learn`. The activity service
+  (`workflow_service.py`) merges the planner half (play/telemetry/record/ingest) and the
+  capture half (decode/select/detect) in one isolated process. The live
+  `_oracle_hold_grabs` timer is deleted; `/execute` no longer interleaves camera grabs
+  with playback. Coverage/identify moves are recorded and use the same
+  extract/detect/finalize functions via `execution_adopt`.
+- **Dry validation (arm parked):** `tests/test_execute_workflow.py` runs the real
+  `df.start` graph against the real activity service in `REBOT_WORKFLOW_DRY=1` with a
+  synthetic recording; verified/learned, one extracted hold, one verdict, attempts==1,
+  and a replay that adds no verdict, folds no second cell, duplicates no still and does
+  not re-claim the play. The planner log shows only health checks — no `/execute` reached
+  it, so the arm never moved. Real-episode parity still needs a powered arm.
 
 **Two-arm coordination (Phase 2, validated):**
 - `rebot_self_collision_free` / `rebot_min_self_clearance` / `rebot_path_collision_free`
@@ -1152,6 +1179,12 @@ Live /move + oracle executions need a powered arm + bench go-ahead (dry plans on
 **Durable orchestration (pg_durable):** a workflow `df.start(df.sql('SELECT
 to_jsonb(rebot_fk(...))'))` ran to `status=completed` via the duroxide background
 worker; `df.result` returned `{"rows":[{"pose":[0.1355,…]}],"row_count":1}`.
+The execute→oracle graph (`execute_workflow_start`, `0021`) runs the same way:
+`df.sql` prepare/ledger steps, a `df.http` activity step (claim+record+play),
+a `df.loop(df.sleep)` recording-readiness loop, then `df.http` extract/detect and
+`df.sql` finalize. Dry (`REBOT_WORKFLOW_DRY=1`) completed with the arm parked; the
+activity returned `claimed:false` on replay, `execution_after_play` left the ledger
+alone, and `oracle_learn` returned the recorded verdict.
 
 **Gotchas found and fixed during validation:**
 1. HNSW cannot index a bare `vector` column ("column does not have dimensions") —
@@ -1227,9 +1260,17 @@ substrate/
   migrations/0001_substrate.sql   # the §4+§5 DDL in dependency order
   migrations/0002_learning_functions.sql # oracle_attribute, trace_redact, accuracy_cell_update
   migrations/0003_coordination.sql  # clearance_cell_update, coordination_oracle, rendezvous_transition
+  migrations/0020_execute_workflow.sql # execution ledger, claim guard, idempotent oracle_learn
+  migrations/0021_execute_oracle_workflow.sql # durable graph, offline stills, finalize
   store.py                        # PG-backed store seam (blobs/events/catalog), psycopg3
   ingest.py                       # HLS fragment ingester (no decode)
   embed.py                        # pluggable embedder + pgvector population
+  embed_service.py                # isolated embed activity (df.http)
+  extract.py                      # pure hold-window alignment + stillest-frame selection
+  extract_service.py              # isolated cv2 decode activity (unit/legacy)
+  workflow_service.py             # isolated execute + record + extract + detect activity
+  execute_workflow.py             # start/await the durable graph, dry receipt helpers
+  ../app/oracle_vision.py         # green-tip detector shared by capture and activity
   tests/mechanism_tests.sql       # refcount/GC/invalidation/CHECK/cascade/HNSW
   tests/kinematics_tests.sql      # FK/IK round-trip on the real arm
   tests/gravity_collision_tests.sql # gravity + path_safe vs the numpy reference
@@ -1240,6 +1281,10 @@ substrate/
   tests/coordination_tests.sql    # clearance/oracle/rendezvous primitives
   tests/test_store.py             # store seam round-trip (needs psycopg)
   tests/test_ingest_embed.py      # HLS ingest + embedding + similarity (needs psycopg)
+  tests/test_extract.py           # offline hold-frame extraction (synthetic rig)
+  tests/execute_workflow_tests.sql # 0020 ledger/claim/idempotent learning
+  tests/execute_oracle_workflow_tests.sql # 0021 prepare/ready/stills/finalize replay
+  tests/test_execute_workflow.py  # dry end-to-end df.start graph (arm parked)
   tests/df_workflow.sql           # pg_durable workflow calling rebot_fk
 ```
 
@@ -1273,6 +1318,9 @@ docker cp ../app/cad/ReBot_Arm_RS.urdf rebot-substrate:/tmp/rebot.urdf
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/kinematics_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/gravity_collision_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_workflow_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_oracle_workflow_tests.sql
+docker exec rebot-capture-capture-1 python /app/substrate/tests/test_execute_workflow.py
 ```
 
 **Durable workflow shape** (kinematics as a checkpointed step):
@@ -1283,6 +1331,25 @@ SELECT df.start(df.sql(
 SELECT df.await_instance(:'iid', 30);
 SELECT df.result(:'iid');     -- {"rows":[{"pose":[...]}],"row_count":1}
 ```
+
+**Durable execute→oracle shape** (`0021`; the activity owns the claim guard):
+```sql
+-- capture calls this through execute_workflow.start_execute_workflow():
+SELECT execute_workflow_start(
+  '20261124T000000Z-abc123',        -- exec_id
+  '20261124T000000Z-abc123',        -- plan_id
+  'b601', 'exec-20261124T000000Z-abc123',
+  'http://activities:8766', 'default', 60, 2, 'execute_oracle');
+-- graph: prepare -> /execute (claim+record+play) -> wait fragments
+--        -> /extract -> store stills -> /detect -> finalize/learn
+SELECT df.await_instance(:'iid', 240);
+SELECT df.status(:'iid'), df.result(:'iid');
+```
+
+Dry validation with the arm parked is `REBOT_WORKFLOW_DRY=1` on a **separate**
+activity process (refused when `REBOT_EXECUTE=1`); `tests/test_execute_workflow.py`
+seeds a synthetic recording and proves the graph, offline extraction, detection and
+idempotent replay without contacting the edge.
 
 **Deployment caveats:**
 - The published `pg_durable` image is for **evaluation/learning, not production**

@@ -5,9 +5,11 @@ pipelines that turn a pose into a trajectory.
 
 ```
 phone / workstation  --tap-->  capture_server (opencv)  -->  planner_server (Pinocchio)
-                                                                    |
-                                        rebot-edge serve  <-- HTTP --+
-                                        (board, :8081)
+                                      |                              |
+                                      |  durable execute->oracle     |
+                                      v                              v
+                              activities (decode/extract/detect)   rebot-edge serve
+                              <-- df.http -- Postgres -- HTTP -->  (board, :8081)
 ```
 
 ## What runs where
@@ -17,12 +19,13 @@ phone / workstation  --tap-->  capture_server (opencv)  -->  planner_server (Pin
 | `capture` | `Dockerfile` | `:8443` (LAN) | HTTPS for the phone, `/capture`, `/plan`, `/execute`, WHIP/WHEP relay |
 | `mediamtx` | `bluenviron/mediamtx` | `:8189/udp`, `:8554` (RTSP), `127.0.0.1:9997` (API, host loopback) | WebRTC relay: phone publishes, `/live` reads |
 | `planner` | `Dockerfile.pinocchio` | nothing | the arm gateway: edge `/pose`, planning, gated `/execute` |
+| `activities` | `rebot-capture:local` | `:8766` (compose network) | isolated execute + recording ingest + extract + detect for the durable workflow |
 | `tools` | `Dockerfile` | nothing | one-shot: calibration, tag, certificate, selftest |
 
-`docker compose up -d --build` starts the first three; `tools` is a profile.
+`docker compose up -d --build` starts the first four; `tools` is a profile.
 Paths inside and outside the containers are the same: the project root is `/app`,
-the code lives in `app/`, the pages in `web/`, and everything that persists in
-`state/`.
+the code lives in `app/`, the pages in `web/`, and authoritative state lives in
+the substrate (Postgres); `work/` is disposable scratch.
 
 ## Two pipelines, one trajectory format
 
