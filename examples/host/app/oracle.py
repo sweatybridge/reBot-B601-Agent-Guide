@@ -19,30 +19,33 @@ from __future__ import annotations
 
 import math
 
+import rebot_ik
+
 # --------------------------------------------------------------------------- #
 # Thresholds -- one block, tunable from measured noise floors (§5.4).
 # Conservative starting values: inside the arm's ~23 mm repeatability, above
-# the fit's ~5 mm normal.
+# the fit's ~5 mm normal. Single source: rebot_ik.ORACLE (world.arm_config
+# "oracle" group in PG mode); these alias it and apply_config re-syncs them.
 # --------------------------------------------------------------------------- #
-PIXEL_ERROR_MM = 10.0        # predicted-vs-detected tip, at the work plane
-TIP_ERROR_MM = 8.0           # FK(measured) vs FK(commanded) tip distance
-HOLD_ERROR_RAD = 0.030       # 30 mrad: ~18 mm at 0.6 m, above the fit's normal
+PIXEL_ERROR_MM = rebot_ik.ORACLE["pixel_error_mm"]        # predicted-vs-detected tip, at the work plane
+TIP_ERROR_MM = rebot_ik.ORACLE["tip_error_mm"]            # FK(measured) vs FK(commanded) tip distance
+HOLD_ERROR_RAD = rebot_ik.ORACLE["hold_error_rad"]        # 30 mrad: ~18 mm at 0.6 m, above the fit's normal
 HOLD_MIN_S = 0.8             # a window shorter than this is tracking-only
 MAX_SAMPLES = 2000           # wire budget for telemetry samples
-WITNESS_DRIFT_PX = 2.0       # the capture path's own refusal limit
-WITNESS_SCALE_TOL = 0.05     # focus/zoom changes the field of view
-SAG_CORRELATION = 0.8        # |cos(hold_error, tau_g/kp)| to call it sag
-TIP_VECTOR_COHERENCE = 0.8   # mean resultant length of the pixel-error directions:
+WITNESS_DRIFT_PX = rebot_ik.ORACLE["witness_drift_px"]    # the capture path's own refusal limit
+WITNESS_SCALE_TOL = rebot_ik.ORACLE["witness_scale_tol"]  # focus/zoom changes the field of view
+SAG_CORRELATION = rebot_ik.ORACLE["sag_correlation"]      # |cos(hold_error, tau_g/kp)| to call it sag
+TIP_VECTOR_COHERENCE = rebot_ik.ORACLE["tip_vector_coherence"]  # mean resultant length of the pixel-error directions:
                              # a rig/turns shift moves every hold the same way in
                              # camera space; a detector picking wrong blob ends at
                              # rotated wrists scatters. Below this, the pixel layer
                              # is a perception limitation, not a geometry ticket.
-ZERO_BIAS_SPREAD_RAD = 0.005 # per-joint bias this constant across poses = zeros
-REACH_FRACTION = 0.9         # "near the boundary" for the reach-model signature
-PLACEMENT_XY_MM = 10.0       # x/y small enough to call a placement error z-only
-PLACEMENT_Z_TOL_MM = 5.0     # z matches the object height within this
+ZERO_BIAS_SPREAD_RAD = rebot_ik.ORACLE["zero_bias_spread_rad"]  # per-joint bias this constant across poses = zeros
+REACH_FRACTION = rebot_ik.ORACLE["reach_fraction"]        # "near the boundary" for the reach-model signature
+PLACEMENT_XY_MM = rebot_ik.ORACLE["placement_xy_mm"]      # x/y small enough to call a placement error z-only
+PLACEMENT_Z_TOL_MM = rebot_ik.ORACLE["placement_z_tol_mm"]  # z matches the object height within this
 CMD_TOL = 1e-9               # waypoints repeat a hold's command exactly
-IK_RESIDUAL_MM = 10.0        # the sequence planner's own acceptance bound: a
+IK_RESIDUAL_MM = rebot_ik.ORACLE["ik_residual_mm"]        # the sequence planner's own acceptance bound: a
                              # solver residual above it missed its own gate
 HOLD_TIME_TOL = 1e-6         # plan-clock slack matching a hold window to its
                              # marker's declared hold span
