@@ -101,6 +101,16 @@ MOTION = {
 # matches calib.rs and the world.arm_config calibration group bit-for-bit).
 CALIBRATION = {"min_poses": 6, "max_camera_m": 5.0, "max_tip_m": 0.20}
 
+# Oracle attribution thresholds (oracle.PIXEL_ERROR_MM etc. alias this; matches
+# oracle_attribute's required config arg and the world.arm_config oracle group
+# bit-for-bit). CMD_TOL/HOLD_TIME_TOL stay in oracle.py (numeric epsilons).
+ORACLE = {
+    "pixel_error_mm": 10.0, "tip_error_mm": 8.0, "hold_error_rad": 0.030,
+    "witness_drift_px": 2.0, "witness_scale_tol": 0.05, "sag_correlation": 0.8,
+    "tip_vector_coherence": 0.8, "zero_bias_spread_rad": 0.005, "reach_fraction": 0.9,
+    "placement_xy_mm": 10.0, "placement_z_tol_mm": 5.0, "ik_residual_mm": 10.0,
+}
+
 
 # --------------------------------------------------------------------------- #
 # Small SO(3)/SE(3) helpers
@@ -354,6 +364,7 @@ def default_config():
         "calibration": {"min_poses": int(CALIBRATION["min_poses"]),
                         "max_camera_m": float(CALIBRATION["max_camera_m"]),
                         "max_tip_m": float(CALIBRATION["max_tip_m"])},
+        "oracle": {k: float(v) for k, v in ORACLE.items()},
     }
 
 
@@ -363,7 +374,7 @@ def apply_config(cfg):
     sweep motion). The seed is bit-identical to the defaults, so this is a no-op until
     the table is edited."""
     global LIMITS, LINK_INERTIALS, TOOL_XYZ, TOOL_RPY, GRAVITY
-    global LINK_RADII, CLEARANCE, LINK_RADIUS_MAX, GRIPPER, CHAIN, MOTION, CALIBRATION
+    global LINK_RADII, CLEARANCE, LINK_RADIUS_MAX, GRIPPER, CHAIN, MOTION, CALIBRATION, ORACLE
     import sys
     if "limits" in cfg:
         LIMITS = np.asarray(cfg["limits"], dtype=float)
@@ -390,6 +401,8 @@ def apply_config(cfg):
         CALIBRATION = {"min_poses": int(cfg["calibration"]["min_poses"]),
                        "max_camera_m": float(cfg["calibration"]["max_camera_m"]),
                        "max_tip_m": float(cfg["calibration"]["max_tip_m"])}
+    if "oracle" in cfg:
+        ORACLE = {k: float(v) for k, v in cfg["oracle"].items()}
     # Re-sync aliases bound at import time in already-loaded consumers.
     for name in ("sweep", "witness"):
         mod = sys.modules.get(name)
@@ -430,3 +443,16 @@ def apply_config(cfg):
             ext.MAX_CAMERA_M = CALIBRATION["max_camera_m"]
         if hasattr(ext, "MAX_TIP_M"):
             ext.MAX_TIP_M = CALIBRATION["max_tip_m"]
+    orc = sys.modules.get("oracle")
+    if orc is not None:
+        for attr, key in (
+            ("PIXEL_ERROR_MM", "pixel_error_mm"), ("TIP_ERROR_MM", "tip_error_mm"),
+            ("HOLD_ERROR_RAD", "hold_error_rad"), ("WITNESS_DRIFT_PX", "witness_drift_px"),
+            ("WITNESS_SCALE_TOL", "witness_scale_tol"), ("SAG_CORRELATION", "sag_correlation"),
+            ("TIP_VECTOR_COHERENCE", "tip_vector_coherence"),
+            ("ZERO_BIAS_SPREAD_RAD", "zero_bias_spread_rad"), ("REACH_FRACTION", "reach_fraction"),
+            ("PLACEMENT_XY_MM", "placement_xy_mm"), ("PLACEMENT_Z_TOL_MM", "placement_z_tol_mm"),
+            ("IK_RESIDUAL_MM", "ik_residual_mm"),
+        ):
+            if hasattr(orc, attr):
+                setattr(orc, attr, ORACLE[key])
