@@ -101,7 +101,7 @@ one invariant this design will not trade away.
   `embed_service.py` (separate HTTP process, pluggable `Embedder`) reached from a
   durable workflow via `df.http()` (`embed.start_embed_workflow`); inference crashes
   fail the step, never the cluster. Validated end-to-end (§9.1).
-- **Execute→oracle:** `0021` adds the durable graph and `workflow_service.py`, the
+- **Execute→oracle:** `0021`/`0022` add the durable graph and `workflow_service.py`, the
   isolated activity that merges the planner half (record + play + telemetry) and the
   capture half (decode + select hold stills + detect). `/execute` starts it; live
   hold grabs are retired. Dry validation with the arm parked (§9.1).
@@ -1134,6 +1134,13 @@ Live /move + oracle executions need a powered arm + bench go-ahead (dry plans on
   `_oracle_hold_grabs` timer is deleted; `/execute` no longer interleaves camera grabs
   with playback. Coverage/identify moves are recorded and use the same
   extract/detect/finalize functions via `execution_adopt`.
+- **Logic placement (`0022`):** the remaining pure decisions moved from the
+  activity/capture Python into SQL: `extraction_windows`, `extract_joint_speeds`,
+  `extract_speed_at`, `select_hold_frame`, `episode_add_segment`/`execution_add_segment`,
+  `execution_dry_telemetry`, `execution_receipt`, and the `coverage_workflow_start`
+  graph. Python keeps only HTTP/edge, MediaMTX/file I/O, cv2/FFmpeg decode + JPEG
+  encode, and the OpenCV detector. The large media payloads stay in the catalog; the
+  activity reads them by execution id, so `df.nodes` only holds small JSON.
 - **Dry validation (arm parked):** `tests/test_execute_workflow.py` runs the real
   `df.start` graph against the real activity service in `REBOT_WORKFLOW_DRY=1` with a
   synthetic recording; verified/learned, one extracted hold, one verdict, attempts==1,
@@ -1262,6 +1269,7 @@ substrate/
   migrations/0003_coordination.sql  # clearance_cell_update, coordination_oracle, rendezvous_transition
   migrations/0020_execute_workflow.sql # execution ledger, claim guard, idempotent oracle_learn
   migrations/0021_execute_oracle_workflow.sql # durable graph, offline stills, finalize
+  migrations/0022_workflow_logic.sql # extract planning/selection, timing, receipt, coverage graph
   store.py                        # PG-backed store seam (blobs/events/catalog), psycopg3
   ingest.py                       # HLS fragment ingester (no decode)
   embed.py                        # pluggable embedder + pgvector population
@@ -1269,7 +1277,7 @@ substrate/
   extract.py                      # pure hold-window alignment + stillest-frame selection
   extract_service.py              # isolated cv2 decode activity (unit/legacy)
   workflow_service.py             # isolated execute + record + extract + detect activity
-  execute_workflow.py             # start/await the durable graph, dry receipt helpers
+  execute_workflow.py             # start/await the durable graphs, receipt helpers
   ../app/oracle_vision.py         # green-tip detector shared by capture and activity
   tests/mechanism_tests.sql       # refcount/GC/invalidation/CHECK/cascade/HNSW
   tests/kinematics_tests.sql      # FK/IK round-trip on the real arm
@@ -1284,6 +1292,7 @@ substrate/
   tests/test_extract.py           # offline hold-frame extraction (synthetic rig)
   tests/execute_workflow_tests.sql # 0020 ledger/claim/idempotent learning
   tests/execute_oracle_workflow_tests.sql # 0021 prepare/ready/stills/finalize replay
+  tests/workflow_logic_tests.sql  # 0022 SQL extract planning/selection/timing/receipt
   tests/test_execute_workflow.py  # dry end-to-end df.start graph (arm parked)
   tests/df_workflow.sql           # pg_durable workflow calling rebot_fk
 ```
@@ -1320,6 +1329,7 @@ docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/gravit
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_workflow_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_oracle_workflow_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/workflow_logic_tests.sql
 docker exec rebot-capture-capture-1 python /app/substrate/tests/test_execute_workflow.py
 ```
 
@@ -1332,7 +1342,7 @@ SELECT df.await_instance(:'iid', 30);
 SELECT df.result(:'iid');     -- {"rows":[{"pose":[...]}],"row_count":1}
 ```
 
-**Durable execute→oracle shape** (`0021`; the activity owns the claim guard):
+**Durable execute→oracle shape** (`0021`/`0022`; the activity owns the claim guard):
 ```sql
 -- capture calls this through execute_workflow.start_execute_workflow():
 SELECT execute_workflow_start(
