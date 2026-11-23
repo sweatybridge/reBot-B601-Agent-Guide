@@ -82,7 +82,7 @@ python tests/test_embed_activity.py   # isolated embed activity via df.http()
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 ```
 
-Apply migrations `0001`–`0015` in order (each is idempotent).
+Apply migrations `0001`–`0018` in order (each is idempotent).
 
 Full offline app suite (file mode; 646 checks) — run inside the capture container with
 the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
@@ -167,7 +167,7 @@ named volume). From `examples/host`:
 
 1. `docker compose up -d --build` — substrate + mediamtx + capture + planner; capture/planner
    wait for substrate healthy. `REBOT_PG_DSN` defaults to the compose-network DSN.
-2. Apply migrations `0001`–`0015` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+2. Apply migrations `0001`–`0018` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
    Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`);
    `world.arm_config` is seeded for `b601` by `0014` (the cores require it).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
@@ -335,7 +335,10 @@ model, not the URDF inertials.
 
 `config_doc` groups: `gravity`, `limits`, `link_inertials`, `link_radii`, `tool`
 (xyz/rpy), `gripper` (motor7_open/closed, rad_per_mm), `collision` (clearance,
-link_radius_max), `motion` (speeds/ramp/limits tuning).
+link_radius_max), `motion` (speeds/ramp/limits tuning), `calibration` (min_poses/
+max_camera_m/max_tip_m fit gates, `0016`), `oracle` (12 attribution thresholds, `0017`),
+`learning` (21 identify thresholds — sag-fit gates, accuracy edges/min_n/sectors,
+marker/coverage/rig-age tuning, `0018`).
 
 - **Python single source + table-driven.** `rebot_ik` owns the constants
   (`LINK_RADII`, `GRIPPER`, `CLEARANCE`, `LINK_RADIUS_MAX`, `MOTION` added);
@@ -372,15 +375,16 @@ link_radius_max), `motion` (speeds/ramp/limits tuning).
 docker exec rebot-capture-capture-1 python /app/substrate/tests/arm_config_parity.py
 ```
 
-**Scope:** both the *physical-model* and *motion-tuning* groups are consolidated and
-the Rust cores are fully table-driven (option B, required config). The table is the
-canonical source; Python is table-driven in PG mode (defaults in file mode); the Rust
-cores consume the doc the wrapper passes. Parity is machine-exact (the seed equals the
-former constants). Out of scope (separate groups, still hardcoded): the `identify`
-learning thresholds (`SAG_HUBER_RAD`/`SAG_VALIDATE_*`/accuracy edges), the calibration
-gates (`MIN_POSES`/`MAX_CAMERA_M`/`MAX_TIP_M`), and the oracle attribution thresholds.
-Live `/move` + oracle executions still need a powered arm + bench go-ahead (dry plans
-only here).
+**Scope:** all gate groups are consolidated and table-driven (option B, required
+config): *physical-model*, *motion-tuning*, *calibration* (`rebot_calibrate_fit`),
+*oracle* attribution (`oracle_attribute`), and *learning* (`rebot_fit_sag_map`,
+`accuracy_cell_update`, `identify`). The table is the canonical source; Python is
+table-driven in PG mode (defaults in file mode); the Rust/SQL compute consumes the doc
+the wrapper passes. Parity is machine-exact (the seed equals the former constants).
+Only structural identifiers (`ARM_JOINTS`, parameter `NAMES`) and pure numeric
+epsilons (`CMD_TOL`, `HOLD_TIME_TOL`, the 4π MIT range) remain hardcoded — they are not
+tuning gates. Live `/move` + oracle executions still need a powered arm + bench
+go-ahead (dry plans only here).
 
 ## Notes / gotchas
 
