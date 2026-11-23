@@ -297,6 +297,32 @@ gated on bench validation. `t_offset` (recording clock zero vs playback start) i
 when they coincide; any offset is calibratable from telemetry motion onset. Real-episode
 parity is a follow-up once the arm runs again.
 
+## Durable execute→oracle workflow — foundation (`0020`)
+
+The execute→oracle chain becomes a pg_durable workflow. Durable replay raises two
+safety problems, encoded in `evidence.execution` (the durable ledger) + functions:
+
+- **Motion is at-most-once.** `execution_claim_play` claims `pending → playing`
+  *before* moving; only the caller that wins the claim may move the arm. A retry
+  sees a non-pending status and does **not** re-move; a crash after the claim leaves
+  `playing` → `execution_mark_dead` (dead-letter + operator review), never auto-replay.
+- **Learning is idempotent.** `accuracy_cell_update` increments `n` (not idempotent),
+  so `oracle_learn` writes the verdict + folds cells **once** per execution, gated by
+  a `learned` flag under a row lock; a replay returns the recorded verdict without
+  re-folding. Requires telemetry persisted first (`oracle_verdict.exec_id` FK).
+- `execution_begin` (idempotent create), `execution_mark_played`, `execution_get`,
+  and `wait_fragments` (recording-readiness gate: fragment span covers every hold).
+
+Validated by `tests/execute_workflow_tests.sql` (9 checks): idempotent begin,
+at-most-once claim, idempotent mark_played, wait_fragments gate, oracle_learn folds
+once + idempotent replay (n stays 1), ledger verified/learned, telemetry required,
+dead-letter no-replay.
+
+Remaining increments (not yet built): the `df.start` graph wiring prepare → play
+(activity owns the claim guard) → extract (offline) → detect → `oracle_learn`; the
+execution + detect activities; retiring `_oracle_hold_grabs`; and the capture/planner
+merge. Live motion validation is blocked by the unpowered arm → mock-execution validation.
+
 ## Plan as a SQL function (`rebot_plan` / `plan_one`)
 
 The plan logic runs in the substrate as a synchronous SQL function — no `df.start`,
