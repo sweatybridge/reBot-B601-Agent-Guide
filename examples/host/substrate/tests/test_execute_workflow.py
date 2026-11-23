@@ -74,7 +74,7 @@ def encode(path):
 def cleanup(store):
     capture_execs = ("20261124T000000Z-abc123", "20261124T000001Z-def456",
                      "20261124T000002Z-aaa111", "20261124T000003Z-bbb222",
-                     "20261124T000004Z-ccc333")
+                     "20261124T000004Z-ccc333", "20261124T000005Z-ddd444")
     with store._conn() as c:
         # Coverage-workflow fixture from the ad-hoc validation, if present.
         c.execute("DELETE FROM evidence.execution_hold WHERE exec_id='wfc_exec'")
