@@ -77,6 +77,7 @@ python tests/test_pg_trace.py
 python tests/test_pg_evidence.py
 python tests/test_ingest_embed.py tests/_spool/ep_ingest   # HLS ingest + similarity
 python tests/test_embed_activity.py   # isolated embed activity via df.http()
+docker exec rebot-capture-capture-1 python /app/substrate/tests/test_extract.py  # offline hold-frame extraction (cv2)
 # plan core/wrapper (run in the planner container; see "Plan as a SQL function"):
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/plan_parity.py
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
@@ -248,6 +249,53 @@ Deployment notes:
   serves the activity behind an approved HTTPS endpoint (`pg_durable.http_allowed_domains`).
 - A production CLIP/ONNX embedder implements `embed.Embedder` and is selected in
   `embed_service.py`; the workflow and database side do not change.
+
+## Offline hold-frame extraction (recording-as-source)
+
+The oracle's hold stills do **not** need to be grabbed live during playback. The
+executed-trajectory recording is permanent evidence, and its fragments carry
+episode-relative timestamps (`evidence.media_fragment.t_start/t_end`); telemetry
+(`{cmd, meas, t}`) says when the arm was actually still. So a hold still is extracted
+*after* execution, which dissolves the grab/playback interleaving and makes the
+execute→oracle chain a sequential durable workflow:
+
+```
+hold window (trajectory time) --(+t_offset)--> episode/video time
+  -> fragments covering the span -> decoded frames
+  -> pick the STILLEST frame (min measured joint speed), midpoint tiebreak
+```
+
+- `extract.py` — pure clock-alignment + stillness selection (no I/O, no cv2):
+  `joint_speeds`, `select_hold_frame`, `fragments_for_window`, `plan_extraction`.
+  Stillness comes from the full meas trajectory (richer than the live path's two
+  pose reads 120 ms apart); the midpoint tiebreak reproduces the live choice when
+  the whole window is still. A window with no decodable frame is *reported*
+  (`missed`), never guessed (§5.3).
+- `extract_service.py` — the **isolated decode activity** (cv2's FFmpeg backend is
+  the native crash island): a separate process reached via `df.http()`, same shape
+  as `embed_service.py`. POST `/extract` `{fragments[b64], samples, windows, t_offset}`
+  → `{holds[{index,t,score,frame_b64}], missed[]}`. Only in-window frames are
+  retained, so memory is bounded by the window, not the recording. A decode crash
+  fails the workflow step (retry/dead-letter); the cluster and arm gateway are untouched.
+
+```bash
+python extract_service.py --port 8766        # isolated activity (cv2-capable sidecar)
+python tests/test_extract.py                 # deterministic synthetic rig (capture container)
+```
+
+Validation (`tests/test_extract.py`, 19 checks): no real episode has synchronized
+video+telemetry+verdict with the arm unpowered, so the test encodes a known video
+(green tip moves then holds at exact positions) + matching telemetry and proves
+window→fragment alignment, stillest-frame selection (incl. a jitter case that picks
+the still plateau over the midpoint), and **tip-pixel parity with the live midpoint
+grab** (<0.1 px) — the oracle gate is verdict agreement, not pixel identity.
+
+Status / next phase: this is the extraction capability, validated offline. The
+**live oracle path is not switched yet** — wiring it into the execute→oracle durable
+workflow (and retiring the live `_oracle_hold_grabs` timer task) is the next phase,
+gated on bench validation. `t_offset` (recording clock zero vs playback start) is 0
+when they coincide; any offset is calibratable from telemetry motion onset. Real-episode
+parity is a follow-up once the arm runs again.
 
 ## Plan as a SQL function (`rebot_plan` / `plan_one`)
 
