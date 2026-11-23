@@ -77,6 +77,16 @@ LINK_INERTIALS = (
     ("gripper_end", 0.6500, (-0.11275169, 0.00012844, -0.00000573)),
 )
 
+# Per-link capsule radii for the worktop clearance gate (sweep.path_safe). Single
+# source: sweep.RADII and witness.LINK_RADII alias this (were three copies).
+LINK_RADII = (0.055, 0.055, 0.050, 0.045, 0.035, 0.030, 0.020)
+CLEARANCE = 0.012          # m above the worktop for a link's outer surface
+LINK_RADIUS_MAX = 0.85     # any link centre, for the interpolation check
+
+# Gripper (motor 7) calibration. Single source: plan_to_target / plan_with_pinocchio
+# alias MOTOR7_OPEN/CLOSED/GRIPPER_RAD_PER_MM from this (were three copies).
+GRIPPER = {"motor7_open": 4.90, "motor7_closed": -0.015, "rad_per_mm": 0.0412}
+
 
 # --------------------------------------------------------------------------- #
 # Small SO(3)/SE(3) helpers
@@ -309,3 +319,67 @@ def translation_target(current_pose, delta_xyz, keep_orientation=True):
     if not keep_orientation:
         target[:3, :3] = np.eye(3)
     return target
+
+
+# --------------------------------------------------------------------------- #
+# Canonical arm config (world.arm_config). rebot_ik is the single Python source
+# for the physical-model constants; the table is the system of record in PG mode.
+# `motion` tuning lives in traj/sweep and is a separate consolidation group.
+# --------------------------------------------------------------------------- #
+def default_config():
+    """The physical-model config built from the current constants (file-mode default)."""
+    return {
+        "gravity": float(GRAVITY),
+        "limits": [[float(lo), float(hi)] for lo, hi in LIMITS],
+        "link_inertials": [[n, float(m), [float(c) for c in com]] for n, m, com in LINK_INERTIALS],
+        "link_radii": [float(r) for r in LINK_RADII],
+        "tool": {"xyz": [float(v) for v in TOOL_XYZ], "rpy": [float(v) for v in TOOL_RPY]},
+        "gripper": {k: float(v) for k, v in GRIPPER.items()},
+        "collision": {"clearance": float(CLEARANCE), "link_radius_max": float(LINK_RADIUS_MAX)},
+    }
+
+
+def apply_config(cfg):
+    """Override the physical-model constants from a world.arm_config doc, and re-sync
+    the modules that alias them (sweep/witness radii, planner gripper). The seed is
+    bit-identical to the defaults, so this is a no-op until the table is edited."""
+    global LIMITS, LINK_INERTIALS, TOOL_XYZ, TOOL_RPY, GRAVITY
+    global LINK_RADII, CLEARANCE, LINK_RADIUS_MAX, GRIPPER, CHAIN
+    import sys
+    if "limits" in cfg:
+        LIMITS = np.asarray(cfg["limits"], dtype=float)
+        CHAIN = tuple((n, x, r, a, float(lo), float(hi))
+                      for (n, x, r, a, _lo, _hi), (lo, hi) in zip(CHAIN, cfg["limits"]))
+    if "link_inertials" in cfg:
+        LINK_INERTIALS = tuple((n, float(m), tuple(float(c) for c in com))
+                               for n, m, com in cfg["link_inertials"])
+    if "tool" in cfg:
+        TOOL_XYZ = tuple(float(v) for v in cfg["tool"]["xyz"])
+        TOOL_RPY = tuple(float(v) for v in cfg["tool"]["rpy"])
+    if "gravity" in cfg:
+        GRAVITY = float(cfg["gravity"])
+    if "link_radii" in cfg:
+        LINK_RADII = tuple(float(v) for v in cfg["link_radii"])
+    if "collision" in cfg:
+        CLEARANCE = float(cfg["collision"]["clearance"])
+        LINK_RADIUS_MAX = float(cfg["collision"]["link_radius_max"])
+    if "gripper" in cfg:
+        GRIPPER = {k: float(v) for k, v in cfg["gripper"].items()}
+    # Re-sync aliases bound at import time in already-loaded consumers.
+    for name in ("sweep", "witness"):
+        mod = sys.modules.get(name)
+        if mod is not None:
+            if hasattr(mod, "RADII"):
+                mod.RADII = LINK_RADII
+            if hasattr(mod, "LINK_RADII"):
+                mod.LINK_RADII = LINK_RADII
+            if hasattr(mod, "CLEARANCE"):
+                mod.CLEARANCE = CLEARANCE
+            if hasattr(mod, "LINK_RADIUS_MAX"):
+                mod.LINK_RADIUS_MAX = LINK_RADIUS_MAX
+    for name in ("plan_to_target", "plan_with_pinocchio"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "MOTOR7_OPEN"):
+            mod.MOTOR7_OPEN = GRIPPER["motor7_open"]
+            mod.MOTOR7_CLOSED = GRIPPER["motor7_closed"]
+            mod.GRIPPER_RAD_PER_MM = GRIPPER["rad_per_mm"]

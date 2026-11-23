@@ -45,9 +45,10 @@ from reBotArm_control_py.trajectory import IKParams
 
 from plan_to_target import PlanError, posture
 import traj
+import rebot_ik  # single source for the gripper calibration
 
-MOTOR7_OPEN = 4.90
-MOTOR7_CLOSED = -0.015
+MOTOR7_OPEN = rebot_ik.GRIPPER["motor7_open"]
+MOTOR7_CLOSED = rebot_ik.GRIPPER["motor7_closed"]
 
 
 def ease(x):

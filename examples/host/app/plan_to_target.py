@@ -62,9 +62,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sweep  # noqa: E402
 import traj  # noqa: E402
 from sweep import DEFAULT_MIN_Z  # noqa: E402  (single source; see sweep.py)
+import rebot_ik  # noqa: E402  (single source for the gripper calibration)
 
-MOTOR7_OPEN = 4.90
-MOTOR7_CLOSED = -0.015
+MOTOR7_OPEN = rebot_ik.GRIPPER["motor7_open"]
+MOTOR7_CLOSED = rebot_ik.GRIPPER["motor7_closed"]
 # Via points per marker: intermediate tip points the trajectory passes through
 # without stopping on the way to that marker (traj.chain_series).
 MAX_VIAS = 5
@@ -76,7 +77,7 @@ MOTOR7_HALF = (MOTOR7_OPEN + MOTOR7_CLOSED) / 2.0
 # rad/cm, linear from the measured closed stop. UNCALIBRATED -- measure once
 # with a ruler before trusting millimetres on hardware
 # (references/demo-validation-pi-zero.md).
-GRIPPER_RAD_PER_MM = 0.0412
+GRIPPER_RAD_PER_MM = rebot_ik.GRIPPER["rad_per_mm"]
 GRIPPER_MAX_WIDTH_MM = (MOTOR7_OPEN - MOTOR7_CLOSED) / GRIPPER_RAD_PER_MM
 TOOL_AXES = {
     "x+": (0, 1.0), "x-": (0, -1.0),

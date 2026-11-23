@@ -36,7 +36,7 @@ import rebot_ik
 # The same capsule radii the manuals' collision probe uses
 # (manuals/_build/under_cabinet_probe.py). Only used to mask the arm out of the
 # feature selection, so 5-10 mm of slack is harmless.
-LINK_RADII = (0.055, 0.055, 0.050, 0.045, 0.035, 0.030, 0.020)
+LINK_RADII = rebot_ik.LINK_RADII
 
 
 class WitnessError(Exception):

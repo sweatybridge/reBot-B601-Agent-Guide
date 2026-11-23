@@ -113,6 +113,11 @@ def pg_mirror():
         from store import SubstrateStore
         from pg_evidence import PgEvidenceMirror
         _pg_mirror = PgEvidenceMirror(SubstrateStore(PG_DSN), workspace_id=PG_WORKSPACE)
+        # The table is the system of record for the physical-model constants: load
+        # world.arm_config and apply it to rebot_ik (single Python source). The seed
+        # is bit-identical to the defaults, so this is a no-op until the table changes.
+        import arm_config
+        arm_config.load_config(dsn=PG_DSN, arm_id=PG_ARM)
     return _pg_mirror
 
 

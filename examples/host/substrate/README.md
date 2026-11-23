@@ -82,7 +82,7 @@ python tests/test_embed_activity.py   # isolated embed activity via df.http()
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 ```
 
-Apply migrations `0001`–`0013` in order (each is idempotent).
+Apply migrations `0001`–`0014` in order (each is idempotent).
 
 Full offline app suite (file mode; 646 checks) — run inside the capture container with
 the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
@@ -167,7 +167,7 @@ named volume). From `examples/host`:
 
 1. `docker compose up -d --build` — substrate + mediamtx + capture + planner; capture/planner
    wait for substrate healthy. `REBOT_PG_DSN` defaults to the compose-network DSN.
-2. Apply migrations `0001`–`0013` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+2. Apply migrations `0001`–`0014` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
    Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
    capture upload → PG, and `/trace` → PG. Re-verify the arm parked read-only.
@@ -319,6 +319,49 @@ docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 docker exec rebot-capture-capture-1 python /app/substrate/tests/oracle_parity.py
 docker exec rebot-capture-capture-1 python /app/substrate/tests/calib_parity.py
 ```
+
+## Canonical arm config (`world.arm_config`)
+
+The per-arm **physical-model constants** that were hardcoded — and duplicated 2–3×
+across `rebot_ik.py` / `sweep.py` / `witness.py` / `plan_to_target.py` /
+`plan_with_pinocchio.py` and the Rust cores — now have one table-backed source of
+truth: `world.arm_config` (migration `0014`, `arm_id` text PK + `config_doc` jsonb).
+The seed is **bit-identical** to the former constants, so the compute path is
+unchanged. It is deliberately *not* derived from the URDF: `link_inertials` is the
+simplified gravity model (gripper fingers omitted, tool mass lumped into
+`gripper_end`) that differs from raw URDF RNEA by ~2e-3 Nm — the table stores that
+model, not the URDF inertials.
+
+`config_doc` groups: `gravity`, `limits`, `link_inertials`, `link_radii`, `tool`
+(xyz/rpy), `gripper` (motor7_open/closed, rad_per_mm), `collision` (clearance,
+link_radius_max), `motion` (speeds/ramp/limits tuning).
+
+- **Python single source + table-driven.** `rebot_ik` owns the constants
+  (`LINK_RADII`, `GRIPPER`, `CLEARANCE`, `LINK_RADIUS_MAX` added); `sweep.RADII` /
+  `witness.LINK_RADII` and the planners' `MOTOR7_*` now alias it (the duplicate
+  literals are gone). `rebot_ik.default_config()` / `apply_config(cfg)` build/apply
+  the doc; `arm_config.load_config()` reads the table in PG mode (called at
+  capture/planner startup) and falls back to the defaults in file mode.
+- **Rust single source + export.** The intra-Rust duplicates (`LIMITS`, `RAMP_S`,
+  `MIN_CRUISE_SPEED` in both `lib.rs` and `plan.rs`) are consolidated into `lib.rs`
+  (`pub(crate)`); `plan.rs` imports them. `rebot_arm_config()` exports the Rust
+  constants as jsonb (omits `tool`, which is URDF-derived).
+- **Drift guard.** `tests/arm_config_parity.py` asserts table == Python == Rust
+  bit-exact (each compared on the keys it owns; together they cover the whole doc),
+  and that `apply_config` is a no-op on the seed. Any divergence between the numpy
+  reference and the Rust core fails the test.
+
+```bash
+docker exec rebot-capture-capture-1 python /app/substrate/tests/arm_config_parity.py
+```
+
+**Scope / follow-ups:** this consolidates the *physical-model* group. The `motion`
+tuning group is seeded in the table and exported by Rust, but the Python `traj`/
+`sweep` tuning literals are not yet rewired to it. Making the Rust cores *read* the
+table at runtime (config threaded through `plan_one`/`move_one` into the cores,
+~100 call sites) is the remaining motion-affecting step — it needs bench validation;
+until then the Rust constants are the single Rust source, guard-validated against
+the table.
 
 ## Notes / gotchas
 
