@@ -109,6 +109,14 @@ BEGIN
   IF n2 <> n1 THEN RAISE EXCEPTION 'replay double-counted cells: % -> %', n1, n2; END IF;
   RAISE NOTICE 'OK finalize replay idempotent (cells %)', n2;
 
+  -- The play claim is one-shot even if the status is manually reset: the
+  -- attempts counter, not only `status`, is the guard.
+  INSERT INTO evidence.execution(exec_id, plan_id, arm_id, status, attempts)
+  VALUES ('ewf_retry', 'ewf_plan', 'b601', 'pending', 1);
+  IF execution_claim_play('ewf_retry') <> false THEN
+    RAISE EXCEPTION 'attempts=1 row reclaimed motion'; END IF;
+  RAISE NOTICE 'OK one-shot play claim (attempts guard)';
+
   -- An abort WITH telemetry is played-but-failed: measured, not dead.
   r := execution_prepare('ewf_abort', 'ewf_plan', 'b601', 'ewf_ep', 'ewf', 10);
   IF NOT execution_claim_play('ewf_abort') THEN RAISE EXCEPTION 'abort claim'; END IF;

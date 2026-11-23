@@ -17,6 +17,20 @@
 ALTER TABLE evidence.execution
   ADD COLUMN IF NOT EXISTS workflow_instance text;
 
+-- Make the "one play attempt" rule explicit in the claim, not only in the
+-- status transition: a row whose status was manually reset still cannot claim
+-- a second motion attempt.
+CREATE OR REPLACE FUNCTION execution_claim_play(p_exec_id text) RETURNS boolean AS $$
+DECLARE claimed boolean;
+BEGIN
+  UPDATE evidence.execution
+     SET status = 'playing', attempts = attempts + 1,
+         play_started_at = COALESCE(play_started_at, now()), updated_at = now()
+   WHERE exec_id = p_exec_id AND status = 'pending' AND attempts = 0;
+  GET DIAGNOSTICS claimed = ROW_COUNT;
+  RETURN claimed;
+END $$ LANGUAGE plpgsql;
+
 -- ---------------------------------------------------------------------------
 -- Receipt: one JSON answer for capture. Includes the durable instance's own
 -- status (df.status) so the caller does not parse df.result or re-derive
@@ -328,12 +342,14 @@ BEGIN
 END $$ LANGUAGE plpgsql;
 
 -- 0021's graph, now stamping the instance id so execution_receipt can read
--- df.status without the caller remembering it.
+-- df.status without the caller remembering it, and taking a separate play
+-- timeout so a multi-minute trajectory is not cut off by the recording budget.
+DROP FUNCTION IF EXISTS execute_workflow_start(text,text,text,text,text,text,integer,integer,text);
 CREATE OR REPLACE FUNCTION execute_workflow_start(
   p_exec_id text, p_plan_id text, p_arm_id text, p_episode_id text,
   p_activity_url text, p_workspace text DEFAULT 'default',
-  p_timeout_s integer DEFAULT 120, p_poll_s integer DEFAULT 2,
-  p_label text DEFAULT 'execute_oracle'
+  p_timeout_s integer DEFAULT 120, p_play_timeout_s integer DEFAULT 900,
+  p_poll_s integer DEFAULT 2, p_label text DEFAULT 'execute_oracle'
 ) RETURNS text AS $$
 DECLARE
   url text := rtrim(p_activity_url, '/');
@@ -349,7 +365,7 @@ BEGIN
     p_exec_id, p_plan_id, p_arm_id, p_episode_id, p_workspace, p_timeout_s));
 
   play := df.seq(
-    df.as(df.http(url || '/execute', 'POST', body, '{}'::jsonb, greatest(30, p_timeout_s)), 'play'),
+    df.as(df.http(url || '/execute', 'POST', body, '{}'::jsonb, greatest(30, p_play_timeout_s)), 'play'),
     df.sql(format('SELECT execution_after_play(%L, ($play.body)::jsonb)', p_exec_id))
   );
 
