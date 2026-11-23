@@ -66,6 +66,7 @@ DRY = os.environ.get("REBOT_WORKFLOW_DRY", "0") == "1"
 EXECUTE = os.environ.get("REBOT_EXECUTE", "0") == "1"
 KP = os.environ.get("REBOT_KP", "50,2:150,3:150")
 KD = os.environ.get("REBOT_KD", "3,2:10,3:10,4:5,5:4,6:4,7:4")
+PLAY_TIMEOUT = int(os.environ.get("REBOT_PLAY_TIMEOUT", "900"))
 
 STORE = SubstrateStore(DSN) if DSN else None
 
@@ -181,7 +182,7 @@ def execute(exec_id):
         play_wall = time.time()
         status, payload = _http_json(PLANNER + "/execute",
                                      {"id": plan_id, "kp": KP, "kd": KD},
-                                     timeout=600, token=PLANNER_TOKEN)
+                                     timeout=PLAY_TIMEOUT, token=PLANNER_TOKEN)
         if status != 200 or not payload.get("ok") or payload.get("executed") is not True:
             # The edge may have aborted with a telemetry log. Return it; the
             # graph's execution_after_play stores it and marks the ledger played

@@ -88,6 +88,7 @@ EXECUTE = os.environ.get("REBOT_EXECUTE", "0") == "1"
 KP = os.environ.get("REBOT_KP", "50,2:150,3:150")
 KD = os.environ.get("REBOT_KD", "3,2:10,3:10,4:5,5:4,6:4,7:4")
 MAX_AGE_S = float(os.environ.get("REBOT_PLAN_MAX_AGE", "600"))
+PLAY_TIMEOUT = float(os.environ.get("REBOT_PLAY_TIMEOUT", "900"))
 
 # §8 flatten: when REBOT_PG_DSN is set, the substrate is the system of record —
 # plans/telemetry are written and read there ONLY (no file fallback). The pure
@@ -635,7 +636,7 @@ def move_one(body):
                                         "kd": str(body.get("kd") or KD)})
         total = sum(seconds) + hold * len(targets)
         status, payload = edge_request("POST", "/play?" + query, body=trajectory,
-                                       timeout=max(600.0, 4.0 * total))
+                                       timeout=max(PLAY_TIMEOUT, 4.0 * total))
         if status != 200:
             save_telemetry(move_id, payload.get("telemetry"))
             logging.warning("edge aborted move %s: %s", move_id, payload.get("error"))
@@ -766,7 +767,7 @@ def move_one(body):
     })
     total = sum(seconds) + hold * len(targets)
     status, payload = edge_request("POST", "/play?" + query, body=trajectory,
-                                   timeout=max(600.0, 4.0 * total))
+                                   timeout=max(PLAY_TIMEOUT, 4.0 * total))
     if status != 200:
         # The edge attaches the playback log even on abort (§5.1): the abort
         # timestamp and the per-sample cmd/meas pairs are exactly the evidence
@@ -826,7 +827,7 @@ def execute_one(body):
         "kp": str(body.get("kp") or KP),
         "kd": str(body.get("kd") or KD),
     })
-    status, payload = edge_request("POST", "/play?" + query, body=trajectory, timeout=600)
+    status, payload = edge_request("POST", "/play?" + query, body=trajectory, timeout=PLAY_TIMEOUT)
     if status != 200:
         # Same rule as /move: an aborted playback's log is evidence, not noise.
         save_telemetry(plan_id, payload.get("telemetry"))

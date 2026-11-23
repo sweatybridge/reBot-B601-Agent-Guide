@@ -1818,7 +1818,10 @@ async def handle_execute(request: web.Request) -> web.Response:
                 execute_workflow.start_execute_workflow,
                 store, plan_id, plan_id, app.get("arm_id", "b601"), episode,
                 workflow_url, app.get("pg_workspace", "default"),
-                60, 2, 240, "execute_oracle")
+                timeout_s=60,
+                play_timeout_s=int(os.environ.get("REBOT_PLAY_TIMEOUT", "900")),
+                poll_s=2, await_s=600,
+                label="execute_oracle")
         except Exception as exc:  # noqa: BLE001 - the workflow is the execution path
             logging.exception("durable execute for %s failed to start", plan_id)
             await trace_event(app, sid, "execute", plan_id=plan_id, status=502,

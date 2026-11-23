@@ -119,6 +119,7 @@ services:
       REBOT_TIP_MM: ${REBOT_TIP_MM:-35}
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_EXECUTE: ${REBOT_EXECUTE:-0}
+      REBOT_PLAY_TIMEOUT: ${REBOT_PLAY_TIMEOUT:-900}
       # A fitted rig is read from the substrate (PG) at startup; the scratch
       # cache under /app/work/calib is materialized from it.
       REBOT_CALIB_DIR: /app/work/calib
@@ -192,6 +193,7 @@ services:
       REBOT_RECORDINGS: /app/work/recordings
       REBOT_CAMERA: ${REBOT_CAMERA:-rtsp://mediamtx:8554/phone}
       REBOT_EXECUTE: ${REBOT_EXECUTE:-0}
+      REBOT_PLAY_TIMEOUT: ${REBOT_PLAY_TIMEOUT:-900}
       REBOT_WORKFLOW_DRY: ${REBOT_WORKFLOW_DRY:-0}
       REBOT_KP: ${REBOT_KP:-50,2:150,3:150}
       REBOT_KD: ${REBOT_KD:-3,2:10,3:10,4:5,5:4,6:4,7:4}
@@ -223,6 +225,7 @@ services:
       REBOT_EDGE_URL: ${REBOT_EDGE_URL:-http://raspberrypi:8081}
       REBOT_EDGE_TOKEN: ${REBOT_EDGE_TOKEN:-}
       REBOT_EXECUTE: ${REBOT_EXECUTE:-0}
+      REBOT_PLAY_TIMEOUT: ${REBOT_PLAY_TIMEOUT:-900}
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_KP: ${REBOT_KP:-50,2:150,3:150}
       REBOT_KD: ${REBOT_KD:-3,2:10,3:10,4:5,5:4,6:4,7:4}

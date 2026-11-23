@@ -1141,6 +1141,13 @@ Live /move + oracle executions need a powered arm + bench go-ahead (dry plans on
   graph. Python keeps only HTTP/edge, MediaMTX/file I/O, cv2/FFmpeg decode + JPEG
   encode, and the OpenCV detector. The large media payloads stay in the catalog; the
   activity reads them by execution id, so `df.nodes` only holds small JSON.
+- **Play vs record timeouts:** `execute_workflow_start` has a separate
+  `p_play_timeout_s` (default 900) for the in-flight `/execute` `df.http` step;
+  `p_timeout_s` is only the recording wait. The activity→planner and planner→edge
+  hops use `REBOT_PLAY_TIMEOUT` (default 900). A controlled 130 s `df.http`
+  probe completed (`duration_ms=130003`, `timeout_seconds=180`), confirming
+  duroxide has no shorter implicit step timeout. The one-shot claim (attempts=0)
+  remains the motion guard; no pg_durable per-step `max_attempts` is needed.
 - **Dry validation (arm parked):** `tests/test_execute_workflow.py` runs the real
   `df.start` graph against the real activity service in `REBOT_WORKFLOW_DRY=1` with a
   synthetic recording; verified/learned, one extracted hold, one verdict, attempts==1,
@@ -1349,10 +1356,11 @@ SELECT execute_workflow_start(
   '20261124T000000Z-abc123',        -- exec_id
   '20261124T000000Z-abc123',        -- plan_id
   'b601', 'exec-20261124T000000Z-abc123',
-  'http://activities:8766', 'default', 60, 2, 'execute_oracle');
+  'http://activities:8766', 'default', 60, 900, 2, 'execute_oracle');
+-- args: workspace, record_timeout_s, play_timeout_s, poll_s, label
 -- graph: prepare -> /execute (claim+record+play) -> wait fragments
 --        -> /extract -> store stills -> /detect -> finalize/learn
-SELECT df.await_instance(:'iid', 240);
+SELECT df.await_instance(:'iid', 1200);
 SELECT df.status(:'iid'), df.result(:'iid');
 ```
 

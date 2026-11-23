@@ -342,6 +342,12 @@ Safety is structural, not conventional:
 - **Recording is evidence, not a gate.** If MediaMTX is unavailable the play still
   runs and the oracle reports `no recording` after the deadline; a missing camera
   never blocks motion.
+- **Play and record have separate time budgets.** `execute_workflow_start` takes
+  `p_play_timeout_s` (default 900) for the in-flight `/execute` `df.http` step;
+  `p_timeout_s` is only the recording wait. The activity→planner and planner→edge
+  hops use `REBOT_PLAY_TIMEOUT` (default 900). A controlled 130 s `df.http` probe
+  completed with `duration_ms=130003` under `timeout_seconds=180`, so duroxide
+  does not impose a shorter step timeout of its own.
 
 ### Python / SQL split (`0022`)
 

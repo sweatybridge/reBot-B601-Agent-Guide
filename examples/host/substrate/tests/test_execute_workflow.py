@@ -229,7 +229,7 @@ def run_checks(store):
 
     receipt = execute_workflow.start_execute_workflow(
         store, EXEC, PLAN, "b601", EPISODE, ACTIVITY, WORKSPACE,
-        timeout_s=10, poll_s=1, await_s=90, label="wf2_dry")
+        timeout_s=10, play_timeout_s=30, poll_s=1, await_s=90, label="wf2_dry")
     check("workflow completed", receipt.get("status") == "completed",
           json.dumps(receipt)[:500])
     out = receipt.get("receipt") or {}
@@ -239,6 +239,14 @@ def run_checks(store):
           json.dumps(out)[:300])
     check("receipt carries the extracted hold count", int(out.get("holds") or 0) == 1,
           "holds=%s" % out.get("holds"))
+    with store._conn() as c:
+        step = c.execute(
+            "SELECT count(*) AS n FROM df.nodes WHERE instance_id=%s "
+            "AND node_type='HTTP' AND right(query::jsonb->>'url', 8)='/execute' "
+            "AND (query::jsonb->>'timeout_seconds')::int = 30",
+            (receipt.get("instance"),)).fetchone()["n"]
+    check("play step timeout uses the play budget, not the record budget", step == 1,
+          "matching play nodes=%s" % step)
     health = execute_workflow.workflow_health(store, EXEC)
     ex = health["execution"] or {}
     check("execution verified + learned", ex.get("status") == "verified"
@@ -258,7 +266,7 @@ def run_checks(store):
                           "WHERE rig_fingerprint=%s", (RIG,)).fetchone()["n"]
     again = execute_workflow.start_execute_workflow(
         store, EXEC, PLAN, "b601", EPISODE, ACTIVITY, WORKSPACE,
-        timeout_s=10, poll_s=1, await_s=90, label="wf2_replay")
+        timeout_s=10, play_timeout_s=30, poll_s=1, await_s=90, label="wf2_replay")
     check("replay completed idempotently", again.get("status") == "completed",
           json.dumps(again)[:300])
     with store._conn() as c:
