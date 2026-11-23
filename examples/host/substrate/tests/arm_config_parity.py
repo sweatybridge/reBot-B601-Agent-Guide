@@ -1,11 +1,13 @@
-"""Arm-config drift guard: world.arm_config (table) == rebot_ik (Python) ==
-rebot_arm_config() (Rust), bit-exact. The table is the canonical source; this test
-fails if any of the three diverges, so the physical-model constants cannot drift
-between the numpy reference and the Rust core. Run in the capture container.
+"""Arm-config drift guard + required-config guarantee.
 
-The Rust export omits `tool` (URDF-derived, not a Rust const); the Python default
-omits `motion` (traj/sweep tuning, a separate consolidation group). Each is compared
-against the table on the keys it owns, so together they cover the whole doc.
+The Rust cores no longer carry hardcoded tuning constants (option B, config
+REQUIRED): they take the config doc as a jsonb arg passed by the SQL wrapper from
+world.arm_config. So there is no independent Rust source to drift — the guard now
+asserts the table == the Python single source (rebot_ik.default_config) bit-exact,
+that apply_config is a no-op on the seed, and that a core HARD-REFUSES when the
+config is missing/empty (no silent fallback to a baked-in value).
+
+Run in the capture container (psycopg + rebot_ik + substrate access).
 """
 import sys, json
 sys.path.insert(0, "/app/app")
@@ -18,7 +20,6 @@ conn = psycopg.connect(DSN)
 table = conn.execute("SELECT config_doc FROM world.arm_config WHERE arm_id='b601'").fetchone()[0]
 if isinstance(table, str):
     table = json.loads(table)
-rust = conn.execute("SELECT rebot_arm_config()").fetchone()[0]
 py = rebot_ik.default_config()
 
 
@@ -31,17 +32,27 @@ def check(label, a, b):
 
 
 ok = True
-for key in rust:                      # gravity/limits/link_inertials/link_radii/collision/gripper/motion
-    ok &= check("table==rust[%s]" % key, table.get(key), rust[key])
-for key in py:                        # gravity/limits/link_inertials/link_radii/tool/gripper/collision
+# table and Python now cover the same keys (gravity/limits/link_inertials/link_radii/
+# tool/gripper/collision/motion); the Rust cores consume the table doc directly.
+for key in py:
     ok &= check("table==python[%s]" % key, table.get(key), py[key])
+for key in table:
+    ok &= check("python covers table[%s]" % key, key in py, True)
 
 # apply_config must be a no-op on the seed (defaults already equal the table).
 before = rebot_ik.default_config()
 rebot_ik.apply_config(table)
-after = rebot_ik.default_config()
-ok &= check("apply_config no-op on seed", before, after)
+ok &= check("apply_config no-op on seed", before, rebot_ik.default_config())
 
-print("keys: table=%d rust=%d python=%d" % (len(table), len(rust), len(py)))
+# Required-config guarantee: an empty/missing config must raise, not fall back.
+try:
+    conn.execute("SELECT rebot_within_limits(%s, '{}'::jsonb, 0.0)", ([0.0] * 6,)).fetchone()
+    print("DRIFT: core accepted an empty config (expected a hard refusal)")
+    ok = False
+except psycopg.Error:
+    conn.rollback()
+    print("required-config refusal OK (empty config raises)")
+
+print("keys: table=%d python=%d" % (len(table), len(py)))
 print("ARM_CONFIG PARITY", "OK" if ok else "DRIFT")
 sys.exit(0 if ok else 1)

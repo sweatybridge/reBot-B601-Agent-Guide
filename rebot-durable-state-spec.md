@@ -1061,12 +1061,19 @@ collision/motion). The seed is bit-identical to the former constants (compute un
 vs raw RNEA). Python: `rebot_ik` is the single source (`sweep.RADII`/`witness.LINK_RADII`/planner
 `MOTOR7_*` and the `traj`/`sweep` motion tuning alias it; default-arg functions resolve
 at call time so table edits propagate); `arm_config.load_config()` reads the table in PG
-mode at startup, defaults in file mode. Rust: intra-Rust duplicates (`LIMITS`/`RAMP_S`/
-`MIN_CRUISE_SPEED`) consolidated into `lib.rs`; `rebot_arm_config()` exports the Rust
-constants. Drift guard `tests/arm_config_parity.py`: table == Python == Rust bit-exact
-(covers the whole doc incl. motion). Both physical-model and motion groups consolidated.
-Follow-up: thread the table config into the Rust cores at runtime (~100 call sites,
-motion-affecting, needs bench validation).
+mode at startup, defaults in file mode. Rust (option B, config REQUIRED): the cores stay
+pure jsonb→jsonb and take a mandatory `config jsonb` arg parsed by `config.rs::Config::from_json`
+(missing doc/field → hard refusal); `PlanCtx` owns the Config, helpers take &Config; the
+hardcoded tuning consts are removed from the compute path (only structural ARM_JOINTS, the
+4π MIT range, and out-of-scope learning/calib gates remain). The wrappers `plan_one`/`move_one`/
+`oracle_compute` (`0015`) read `world.arm_config` and pass the doc in (missing row → refusal).
+A required param cannot follow a defaulted one in PG, so config precedes the first optional arg.
+Drift guard `tests/arm_config_parity.py`: table == Python bit-exact (whole doc incl. motion),
+apply_config no-op on seed, and a core hard-refuses an empty config. Both physical-model and
+motion groups consolidated; Rust fully table-driven. Parity machine-exact; selftest 646/0;
+gravity/collision SQL test + SQL suites pass. Out of scope (still hardcoded): identify learning
+thresholds, calibration gates, oracle attribution thresholds. Live /move + oracle executions
+need a powered arm + bench go-ahead (dry plans only here).
 
 **Learning plane (Phase 1, ports validated against the Python reference):**
 - `oracle_attribute(jsonb)` (PLpgSQL, `0002`) reproduces `oracle.attribute` across all

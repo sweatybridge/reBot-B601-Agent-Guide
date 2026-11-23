@@ -82,7 +82,7 @@ python tests/test_embed_activity.py   # isolated embed activity via df.http()
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 ```
 
-Apply migrations `0001`–`0014` in order (each is idempotent).
+Apply migrations `0001`–`0015` in order (each is idempotent).
 
 Full offline app suite (file mode; 646 checks) — run inside the capture container with
 the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
@@ -167,8 +167,9 @@ named volume). From `examples/host`:
 
 1. `docker compose up -d --build` — substrate + mediamtx + capture + planner; capture/planner
    wait for substrate healthy. `REBOT_PG_DSN` defaults to the compose-network DSN.
-2. Apply migrations `0001`–`0014` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
-   Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`).
+2. Apply migrations `0001`–`0015` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+   Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`);
+   `world.arm_config` is seeded for `b601` by `0014` (the cores require it).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
    capture upload → PG, and `/trace` → PG. Re-verify the arm parked read-only.
 
@@ -347,25 +348,39 @@ link_radius_max), `motion` (speeds/ramp/limits tuning).
   propagates. `rebot_ik.default_config()` / `apply_config(cfg)` build/apply the doc;
   `arm_config.load_config()` reads the table in PG mode (called at capture/planner
   startup) and falls back to the defaults in file mode.
-- **Rust single source + export.** The intra-Rust duplicates (`LIMITS`, `RAMP_S`,
-  `MIN_CRUISE_SPEED` in both `lib.rs` and `plan.rs`) are consolidated into `lib.rs`
-  (`pub(crate)`); `plan.rs` imports them. `rebot_arm_config()` exports the Rust
-  constants as jsonb (omits `tool`, which is URDF-derived).
-- **Drift guard.** `tests/arm_config_parity.py` asserts table == Python == Rust
-  bit-exact (each compared on the keys it owns; together they cover the whole doc),
-  and that `apply_config` is a no-op on the seed. Any divergence between the numpy
-  reference and the Rust core fails the test.
+- **Rust cores: config REQUIRED, no hardcoded constants (option B).** The cores stay
+  pure `jsonb -> jsonb` (never read the table via SPI). Each compute core
+  (`rebot_plan`/`rebot_plan_sequence`/`rebot_move_build`/`rebot_joint_move`/
+  `rebot_joint_sequence`/`rebot_traj_build`/`rebot_traj_validate`/`rebot_unpark_pose`/
+  `rebot_sag_rad`, and `rebot_gravity_torques`/`rebot_path_safe`/`rebot_path_collision_free`/
+  `rebot_within_limits`/`rebot_seconds_for`) takes a mandatory `config jsonb` arg,
+  parsed by `config.rs::Config::from_json` — a missing doc/field is a hard refusal
+  (panic → SQL ERROR), so the live path can never silently run on a baked-in value.
+  `PlanCtx` owns the `Config`; helpers take `&Config`. The former hardcoded tuning
+  consts are **removed** from the compute path (only structural `ARM_JOINTS`, the
+  mathematical MIT range 4π, and the out-of-scope learning/calib gates remain). The
+  SQL wrappers (`plan_one`/`move_one`/`oracle_compute`, migration `0015`) read
+  `world.arm_config` and pass the doc in; a missing row is a hard refusal there too.
+  Because a required param cannot follow a defaulted one in PG, `config` sits before
+  the first optional arg in the signatures that have defaults.
+- **Drift guard.** With no independent Rust constants left, `tests/arm_config_parity.py`
+  asserts table == Python (`rebot_ik.default_config`) bit-exact across the whole doc,
+  that `apply_config` is a no-op on the seed, and that a core **hard-refuses an empty
+  config** (the required-config guarantee).
 
 ```bash
 docker exec rebot-capture-capture-1 python /app/substrate/tests/arm_config_parity.py
 ```
 
-**Scope / follow-ups:** both the *physical-model* and *motion-tuning* groups are
-consolidated — the table is the canonical source, Python is table-driven, and the
-drift guard covers the whole doc. Making the Rust cores *read* the table at runtime
-(config threaded through `plan_one`/`move_one` into the cores, ~100 call sites) is the
-remaining motion-affecting step — it needs bench validation; until then the Rust
-constants are the single Rust source, guard-validated against the table.
+**Scope:** both the *physical-model* and *motion-tuning* groups are consolidated and
+the Rust cores are fully table-driven (option B, required config). The table is the
+canonical source; Python is table-driven in PG mode (defaults in file mode); the Rust
+cores consume the doc the wrapper passes. Parity is machine-exact (the seed equals the
+former constants). Out of scope (separate groups, still hardcoded): the `identify`
+learning thresholds (`SAG_HUBER_RAD`/`SAG_VALIDATE_*`/accuracy edges), the calibration
+gates (`MIN_POSES`/`MAX_CAMERA_M`/`MAX_TIP_M`), and the oracle attribution thresholds.
+Live `/move` + oracle executions still need a powered arm + bench go-ahead (dry plans
+only here).
 
 ## Notes / gotchas
 

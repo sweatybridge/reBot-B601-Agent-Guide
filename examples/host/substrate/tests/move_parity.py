@@ -12,6 +12,8 @@ import planner_server as ps
 URDF = open("/app/app/cad/ReBot_Arm_RS.urdf").read()
 DSN = "postgresql://postgres:rebot@substrate:5432/postgres"
 conn = psycopg.connect(DSN)
+CFG = json.dumps(conn.execute(
+    "SELECT config_doc FROM world.arm_config WHERE arm_id='b601'").fetchone()[0])
 
 def rust(sql, args):
     return conn.execute(sql, args).fetchone()[0]
@@ -22,8 +24,8 @@ q_from = [0.0, 0.2, 0.3, 0.0, 0.1, 0.0, 4.9]
 q_to = [0.2, 0.4, 0.5, 0.1, 0.2, 0.1, 2.0]
 ref = traj.joint_move(np.array(q_from), np.array(q_to), 2.0, hold_s=0.5,
                       limits=[list(l) for l in sweep.rebot_ik.LIMITS] + [[-0.1, 5.0]])
-got = rust("SELECT rebot_joint_move(%s,%s,%s,%s,%s,%s::jsonb,%s::text)",
-           (q_from, q_to, 2.0, 30.0, 0.5,
+got = rust("SELECT rebot_joint_move(%s,%s,%s,%s::jsonb,%s,%s,%s::jsonb,%s::text)",
+           (q_from, q_to, 2.0, CFG, 30.0, 0.5,
             json.dumps([list(l) for l in sweep.rebot_ik.LIMITS] + [[-0.1, 5.0]]), ""))
 assert len(ref["waypoints"]) == len(got["waypoints"]), "joint_move count"
 for a, b in zip(ref["waypoints"], got["waypoints"]):
@@ -35,8 +37,8 @@ print("joint_move wp", len(got["waypoints"]), "maxdiff %.2e" % worst)
 poses = [q_from, q_to, [0.1, 0.3, 0.4, 0.05, 0.15, 0.05, 4.9]]
 ref = traj.joint_sequence([np.array(p) for p in poses], [2.0, 1.5], hold_s=0.4,
                           limits=[list(l) for l in sweep.rebot_ik.LIMITS] + [[-0.1, 5.0]])
-got = rust("SELECT rebot_joint_sequence(%s::jsonb,%s::jsonb,%s,%s,%s::jsonb,%s::text)",
-           (json.dumps(poses), json.dumps([2.0, 1.5]), 30.0, 0.4,
+got = rust("SELECT rebot_joint_sequence(%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,%s::jsonb,%s::text)",
+           (json.dumps(poses), json.dumps([2.0, 1.5]), CFG, 30.0, 0.4,
             json.dumps([list(l) for l in sweep.rebot_ik.LIMITS] + [[-0.1, 5.0]]), ""))
 assert len(ref["waypoints"]) == len(got["waypoints"]), "joint_sequence count"
 for a, b in zip(ref["waypoints"], got["waypoints"]):
@@ -61,8 +63,8 @@ def compare_move(body, opts_extra):
     ref_payload = json.loads(open(res["path"]).read())
     pose = {"ids": [1, 2, 3, 4, 5, 6, 7], "q": q_from6 + [4.9]}
     opts = {"kp_spec": "50,2:150,3:150", "gripper": 4.9}; opts.update(opts_extra)
-    got = rust("SELECT rebot_move_build(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)",
-               (URDF, json.dumps(pose), json.dumps(tgt), json.dumps(opts), json.dumps({})))
+    got = rust("SELECT rebot_move_build(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)",
+               (URDF, json.dumps(pose), json.dumps(tgt), json.dumps(opts), json.dumps({}), CFG))
     rw, fw = got["payload"]["waypoints"], ref_payload["waypoints"]
     if len(rw) != len(fw):
         print("  move count differs rust", len(rw), "ref", len(fw)); return 1e9

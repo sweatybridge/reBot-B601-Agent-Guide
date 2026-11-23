@@ -49,6 +49,10 @@ seeds = [[0.2, 0.3, 0.4, 0.2, 0.1, 0.0],
          [0.0, 0.5, 0.8, 0.0, 0.3, 0.0],
          [-0.4, 0.6, 0.9, 0.2, 0.2, 0.3]]
 conn = psycopg.connect(DSN)
+# Required arm config (option B): the cores take it as a jsonb arg, sourced from
+# world.arm_config — the same doc the SQL wrappers pass in production.
+CFG = json.dumps(conn.execute(
+    "SELECT config_doc FROM world.arm_config WHERE arm_id='b601'").fetchone()[0])
 worst_q = worst_tau = worst_v = 0.0
 cases = 0
 for q6 in seeds:
@@ -60,9 +64,9 @@ for q6 in seeds:
         ref_payload, ref_sum = ptt.plan(dump, target, opts(), log=lambda *a: None)
     except ptt.PlanError as e:
         print("seed", q6, "REFUSED by reference:", str(e)[:80]); continue
-    row = conn.execute("SELECT rebot_plan(%s, %s, %s, %s, %s)",
+    row = conn.execute("SELECT rebot_plan(%s, %s, %s, %s, %s, %s::jsonb)",
                        (URDF, json.dumps(dump), json.dumps(target),
-                        json.dumps(opts_json()), json.dumps({}))).fetchone()
+                        json.dumps(opts_json()), json.dumps({}), CFG)).fetchone()
     rust = row[0]
     rp, rs = rust["payload"], rust["summary"]
     rw, fw = rp["waypoints"], ref_payload["waypoints"]
@@ -119,9 +123,9 @@ for q6, tips in marker_sets:
         ref_payload, ref_sum = ptt.plan_sequence(dump, targets, seq_opts(), log=lambda *a: None)
     except ptt.PlanError as e:
         print("seq seed", q6, "REFUSED by reference:", str(e)[:80]); continue
-    row = conn.execute("SELECT rebot_plan_sequence(%s, %s, %s, %s, %s)",
+    row = conn.execute("SELECT rebot_plan_sequence(%s, %s, %s, %s, %s, %s::jsonb)",
                        (URDF, json.dumps(dump), json.dumps(targets),
-                        json.dumps(seq_opts_json()), json.dumps({}))).fetchone()
+                        json.dumps(seq_opts_json()), json.dumps({}), CFG)).fetchone()
     rust = row[0]
     rw, fw = rust["payload"]["waypoints"], ref_payload["waypoints"]
     if len(rw) != len(fw):

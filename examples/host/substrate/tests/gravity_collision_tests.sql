@@ -4,6 +4,7 @@
 DO $$
 DECLARE
   u text := pg_read_file('/tmp/rebot.urdf');
+  cfg jsonb := (SELECT config_doc FROM world.arm_config WHERE arm_id='b601');
   q float8[] := ARRAY[0.2,0.3,0.4,0.2,0.1,0.0];
   fold float8[] := ARRAY[0.0,2.5,0.5,0.0,0.0,0.0];
   ref_g float8[] := ARRAY[0.0, 1.845377, 5.741341, 1.520166, -0.019008, -0.000782];
@@ -12,7 +13,7 @@ DECLARE
   i int;
 BEGIN
   -- Gravity torques must match the reference model within 1e-3 Nm.
-  g := rebot_gravity_torques(u, q);
+  g := rebot_gravity_torques(u, q, cfg);
   RAISE NOTICE 'gravity torques: %', g;
   IF array_length(g,1) <> 6 THEN RAISE EXCEPTION 'gravity must return 6 torques'; END IF;
   FOR i IN 1..6 LOOP
@@ -29,10 +30,10 @@ BEGIN
   END IF;
 
   -- Collision gate: a high pose to itself is clear; folding down is not.
-  IF NOT rebot_path_safe(u, q, q, 40) THEN
+  IF NOT rebot_path_safe(u, q, q, cfg, 40) THEN
     RAISE EXCEPTION 'path_safe(q,q) should be true';
   END IF;
-  IF rebot_path_safe(u, q, fold, 40) THEN
+  IF rebot_path_safe(u, q, fold, cfg, 40) THEN
     RAISE EXCEPTION 'path_safe(q,fold) should be false (worktop dip)';
   END IF;
 
