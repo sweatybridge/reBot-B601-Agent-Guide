@@ -37,7 +37,8 @@ MIN_HZ, MAX_HZ = 5.0, 200.0
 # 0.0048 rad (edge-rust README's rate table) -- finer ticks than 30 Hz at no
 # timing cost. The player is timestamp-driven and accepts 5..200 Hz, so a file
 # planned at another rate still plays; this is only the default.
-DEFAULT_HZ = 50.0
+# Single source: rebot_ik.MOTION (world.arm_config motion group).
+DEFAULT_HZ = rebot_ik.MOTION["default_hz"]
 
 # Velocity ramp at each end of a leg, seconds. The profile is an S-ramp
 # trapezoid: velocity rises as a smoothstep into a constant-velocity cruise,
@@ -169,7 +170,7 @@ def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def joint_move(q_from, q_to, seconds, control_hz=DEFAULT_HZ, hold_s=0.4, limits=None, label=None):
+def joint_move(q_from, q_to, seconds, control_hz=None, hold_s=0.4, limits=None, label=None):
     """A joint-space move the player can replay, with a hold at the end.
 
     Used by the arm gateway's `/move` so a calibration sweep does not need a
@@ -190,7 +191,7 @@ def joint_move(q_from, q_to, seconds, control_hz=DEFAULT_HZ, hold_s=0.4, limits=
     travel = float(np.max(np.abs(q_to - q_from)))
     if travel < 1e-6:
         seconds = max(0.2, float(seconds))
-    hz = float(control_hz)
+    hz = float(DEFAULT_HZ if control_hz is None else control_hz)
     count = max(2, int(round(max(0.2, float(seconds)) * hz)))
     period = 1.0 / hz
 
@@ -215,7 +216,7 @@ def joint_move(q_from, q_to, seconds, control_hz=DEFAULT_HZ, hold_s=0.4, limits=
                             MAX_JOINT_STEP)) from error
 
 
-def joint_sequence(poses, seconds, hold_s=0.4, control_hz=DEFAULT_HZ, limits=None, label=None):
+def joint_sequence(poses, seconds, hold_s=0.4, control_hz=None, limits=None, label=None):
     """One file that walks through `poses` in order, holding at each.
 
     The player returns the arm to where the move started when the file ends, so a
@@ -233,7 +234,7 @@ def joint_sequence(poses, seconds, hold_s=0.4, control_hz=DEFAULT_HZ, limits=Non
         [float(seconds)] * (len(points) - 1)
     if len(durations) != len(points) - 1:
         raise ValueError("%d durations for %d legs" % (len(durations), len(points) - 1))
-    hz = float(control_hz)
+    hz = float(DEFAULT_HZ if control_hz is None else control_hz)
     period = 1.0 / hz
     hold = max(1, int(round(max(0.0, float(hold_s)) * hz)))
 
@@ -260,9 +261,11 @@ def joint_sequence(poses, seconds, hold_s=0.4, control_hz=DEFAULT_HZ, limits=Non
 # stays within radius/2 of the knot -- a few mm at the tip for typical turns,
 # below the arm's ~23 mm repeatability -- and at the 0.5 rad/s cruise cap the
 # centripetal budget s^2/r is a few rad/s^2 spread over ticks, not a spike.
-CORNER_RADIUS_RAD = 0.05
-CHAIN_LINE_SAMPLES = 40    # per straight portion: the path_safe gate's density
-CHAIN_FILLET_SAMPLES = 16
+# Single source: rebot_ik.MOTION (world.arm_config motion group); the sample
+# counts are ints here (range densities), floats in the config doc.
+CORNER_RADIUS_RAD = rebot_ik.MOTION["corner_radius_rad"]
+CHAIN_LINE_SAMPLES = int(rebot_ik.MOTION["chain_line_samples"])    # per straight portion: the path_safe gate's density
+CHAIN_FILLET_SAMPLES = int(rebot_ik.MOTION["chain_fillet_samples"])
 
 
 def _chain_knots(poses):
@@ -277,7 +280,7 @@ def _chain_knots(poses):
     return points
 
 
-def _chain_path(poses, radius=CORNER_RADIUS_RAD):
+def _chain_path(poses, radius=None):
     """Dense samples + cumulative arc of the filleted knot path.
 
     Straight portions are sampled at the capsule gate's own density and
@@ -286,6 +289,7 @@ def _chain_path(poses, radius=CORNER_RADIUS_RAD):
     never overlap. A degenerate corner (zero radius or a zero-length segment)
     keeps the sharp knot.
     """
+    radius = CORNER_RADIUS_RAD if radius is None else radius
     points = _chain_knots(poses)
     lengths = [float(np.linalg.norm(b - a)) for a, b in zip(points, points[1:])]
     samples = [points[0]]
@@ -318,7 +322,7 @@ def _chain_path(poses, radius=CORNER_RADIUS_RAD):
     return samples, arc
 
 
-def chain_samples(poses, radius=CORNER_RADIUS_RAD):
+def chain_samples(poses, radius=None):
     """Dense samples of the filleted path, for the worktop capsule gate: a
     rounded corner leaves the chord near the knot, so the gate must see the
     fillets, not just the straight segments."""
@@ -326,7 +330,7 @@ def chain_samples(poses, radius=CORNER_RADIUS_RAD):
     return samples
 
 
-def chain_travel(poses, radius=CORNER_RADIUS_RAD):
+def chain_travel(poses, radius=None):
     """The furthest-travelling joint's path length along the filleted path, rad.
 
     A joint that reverses direction at a via travels more than its endpoint
@@ -336,7 +340,7 @@ def chain_travel(poses, radius=CORNER_RADIUS_RAD):
     return float(np.max(np.sum(np.abs(np.diff(samples, axis=0)), axis=0)))
 
 
-def chain_series(poses, seconds, control_hz=DEFAULT_HZ, radius=CORNER_RADIUS_RAD):
+def chain_series(poses, seconds, control_hz=None, radius=None):
     """Joint poses for one continuous leg through `poses`, tick by tick.
 
     Straight joint-space segments with tangent quadratic fillets at the
@@ -353,7 +357,7 @@ def chain_series(poses, seconds, control_hz=DEFAULT_HZ, radius=CORNER_RADIUS_RAD
     """
     samples, arc = _chain_path(poses, radius)
     total = float(arc[-1])
-    hz = float(control_hz)
+    hz = float(DEFAULT_HZ if control_hz is None else control_hz)
     count = max(2, int(round(max(0.2, float(seconds)) * hz)))
     duration = count / hz
     out = []

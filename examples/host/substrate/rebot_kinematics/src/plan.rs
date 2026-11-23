@@ -21,13 +21,10 @@ type M3 = Matrix3<f64>;
 
 const MIT_POSITION_LIMIT: f64 = 4.0 * std::f64::consts::PI;
 
-// traj.DEFAULT_HZ / plan_to_target.MAX_VIAS / traj chain constants: parity-first
-// mirrors of the Python values (not config fields in this pass).
-const DEFAULT_HZ: f64 = 50.0;
+// MAX_VIAS is a structural cap on the via list (not tuning config). The stream
+// rate / via-chain tuning (traj.DEFAULT_HZ / CORNER_RADIUS_RAD / CHAIN_*_SAMPLES)
+// lives in the required motion config (world.arm_config), like the speed policy.
 const MAX_VIAS: usize = 5;
-const CORNER_RADIUS_RAD: f64 = 0.05;
-const CHAIN_LINE_SAMPLES: usize = 40;
-const CHAIN_FILLET_SAMPLES: usize = 16;
 
 fn json_v3(v: &Value) -> V3 {
     let a = v.as_array().unwrap_or_else(|| panic!("expected [x, y, z]"));
@@ -154,7 +151,9 @@ fn gripper_seconds(travel: f64, cfg: &Config) -> f64 {
 //    chain_series): straight joint-space segments with tangent quadratic
 //    fillets at the interior knots, one S-ramp time law over the whole arc. ── //
 
-fn chain_path(poses: &[[f64; 6]], radius: f64) -> (Vec<[f64; 6]>, Vec<f64>) {
+fn chain_path(poses: &[[f64; 6]], radius: f64, cfg: &Config) -> (Vec<[f64; 6]>, Vec<f64>) {
+    let line_samples = cfg.chain_line_samples;
+    let fillet_samples = cfg.chain_fillet_samples;
     if poses.len() < 2 { panic!("a chain needs at least two poses, got {}", poses.len()); }
     if !poses.iter().all(|p| p.iter().all(|v| v.is_finite())) {
         panic!("chain poses must be finite");
@@ -187,14 +186,14 @@ fn chain_path(poses: &[[f64; 6]], radius: f64) -> (Vec<[f64; 6]>, Vec<f64>) {
                 a[j] = knot[j] - u_in[j] * r;
                 b[j] = knot[j] + u_out[j] * r;
             }
-            for step in 1..=CHAIN_LINE_SAMPLES {
-                let f = step as f64 / CHAIN_LINE_SAMPLES as f64;
+            for step in 1..=line_samples {
+                let f = step as f64 / line_samples as f64;
                 let mut s = [0.0; 6];
                 for j in 0..6 { s[j] = cursor[j] + (a[j] - cursor[j]) * f; }
                 samples.push(s);
             }
-            for step in 1..=CHAIN_FILLET_SAMPLES {
-                let t = step as f64 / CHAIN_FILLET_SAMPLES as f64;
+            for step in 1..=fillet_samples {
+                let t = step as f64 / fillet_samples as f64;
                 let omt = 1.0 - t;
                 let mut s = [0.0; 6];
                 for j in 0..6 {
@@ -204,8 +203,8 @@ fn chain_path(poses: &[[f64; 6]], radius: f64) -> (Vec<[f64; 6]>, Vec<f64>) {
             }
             cursor = b;
         } else {
-            for step in 1..=CHAIN_LINE_SAMPLES {
-                let f = step as f64 / CHAIN_LINE_SAMPLES as f64;
+            for step in 1..=line_samples {
+                let f = step as f64 / line_samples as f64;
                 let mut s = [0.0; 6];
                 for j in 0..6 { s[j] = cursor[j] + (knot[j] - cursor[j]) * f; }
                 samples.push(s);
@@ -213,8 +212,8 @@ fn chain_path(poses: &[[f64; 6]], radius: f64) -> (Vec<[f64; 6]>, Vec<f64>) {
             cursor = knot;
         }
     }
-    for step in 1..=CHAIN_LINE_SAMPLES {
-        let f = step as f64 / CHAIN_LINE_SAMPLES as f64;
+    for step in 1..=line_samples {
+        let f = step as f64 / line_samples as f64;
         let mut s = [0.0; 6];
         for j in 0..6 { s[j] = cursor[j] + (poses[poses.len() - 1][j] - cursor[j]) * f; }
         samples.push(s);
@@ -795,7 +794,7 @@ impl<'a> Planner<'a> {
             if max_diff(knot, unique.last().unwrap()) > 1e-6 { unique.push(*knot); }
         }
         if unique.len() < 2 { return self.last_q6(); }
-        let (samples, arc) = chain_path(&unique, CORNER_RADIUS_RAD);
+        let (samples, arc) = chain_path(&unique, self.ctx.cfg.corner_radius_rad, &self.ctx.cfg);
         if !self.ctx.samples_safe(&samples) {
             panic!("the via chain into marker {into_marker} dips within a link radius of the \
                     worktop; raise the via points or move the arm clear");
@@ -865,7 +864,7 @@ fn rebot_plan(urdf: &str, dump: pgrx::JsonB, target: pgrx::JsonB,
     let tool_axis = opt_s(&options, "tool_axis", "current").to_string();
     let yaw = opt_f(&options, "yaw", 0.0);
     let approach = opt_f(&options, "approach", 0.06);
-    let hz = opt_f(&options, "hz", DEFAULT_HZ);
+    let hz = opt_f(&options, "hz", cfg.default_hz);
     let hold_s = opt_f(&options, "hold_s", 0.6);
     let no_return = opt_b(&options, "no_return", false);
     let unpark_j2 = opt_f(&options, "unpark_j2", 0.0);
@@ -1088,7 +1087,7 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
     let tool_axis = opt_s(&options, "tool_axis", "current").to_string();
     let yaw = opt_f(&options, "yaw", 0.0);
     let approach = opt_f(&options, "approach", 0.06);
-    let hz = opt_f(&options, "hz", DEFAULT_HZ);
+    let hz = opt_f(&options, "hz", cfg.default_hz);
     let hold_s = opt_f(&options, "hold_s", 0.6);
     let grasp_q = opt_f(&options, "grasp_q", 2.0);
     let close_width_mm = options.get("close_width_mm").and_then(|v| v.as_f64());
@@ -1346,7 +1345,7 @@ fn rebot_plan_sequence(urdf: &str, dump: pgrx::JsonB, targets: pgrx::JsonB,
                     "closed": cfg.motor7_closed, "odd_close": odd_close},
     });
     if total_vias > 0 {
-        provenance["via_corner_radius_rad"] = json!(CORNER_RADIUS_RAD);
+        provenance["via_corner_radius_rad"] = json!(cfg.corner_radius_rad);
     }
     let extra = json!({
         "capture": provenance,
@@ -1467,9 +1466,11 @@ fn rebot_traj_build(waypoints: pgrx::JsonB, hz: f64, limits: pgrx::JsonB,
 #[pg_extern]
 fn rebot_joint_move(q_from: Vec<f64>, q_to: Vec<f64>, seconds: f64,
                     config: pgrx::JsonB,
-                    hz: default!(f64, 50.0), hold_s: default!(f64, 0.4),
+                    hz: default!(Option<f64>, "NULL"), hold_s: default!(f64, 0.4),
                     limits: default!(pgrx::JsonB, "null"), label: default!(&str, "''")) -> pgrx::JsonB {
     let cfg = Config::from_json(&config.0);
+    // Omitted hz resolves from the required motion config (no baked-in default).
+    let hz = hz.unwrap_or(cfg.default_hz);
     if q_from.len() != 7 || q_to.len() != 7 { panic!("a joint move needs 7 angles at both ends"); }
     if !q_from.iter().chain(q_to.iter()).all(|v| v.is_finite()) { panic!("joint angles must be finite"); }
     let travel = q_from.iter().zip(q_to.iter()).map(|(a, b)| (b - a).abs()).fold(0.0_f64, f64::max);
@@ -1507,9 +1508,11 @@ fn q_from_arr(v: &[f64]) -> [f64; 7] {
 #[pg_extern]
 fn rebot_joint_sequence(poses: pgrx::JsonB, seconds: pgrx::JsonB,
                         config: pgrx::JsonB,
-                        hz: default!(f64, 50.0), hold_s: default!(f64, 0.4),
+                        hz: default!(Option<f64>, "NULL"), hold_s: default!(f64, 0.4),
                         limits: default!(pgrx::JsonB, "null"), label: default!(&str, "''")) -> pgrx::JsonB {
     let cfg = Config::from_json(&config.0);
+    // Omitted hz resolves from the required motion config (no baked-in default).
+    let hz = hz.unwrap_or(cfg.default_hz);
     let parr = poses.0.as_array().unwrap_or_else(|| panic!("poses must be an array"));
     let points: Vec<[f64; 7]> = parr.iter().map(q7).collect();
     if points.len() < 2 { panic!("a sequence needs at least two poses"); }
@@ -1654,14 +1657,14 @@ fn rebot_move_build(urdf: &str, pose: pgrx::JsonB, targets: pgrx::JsonB,
         let label = format!("calibration move to [{}]",
             targets6[0].iter().map(|v| format!("{v:+.2}")).collect::<Vec<_>>().join(", "));
         rebot_joint_move(q_from7.to_vec(), points[points.len() - 1].to_vec(),
-                         seconds[0], pgrx::JsonB(config.0.clone()), DEFAULT_HZ, hold,
+                         seconds[0], pgrx::JsonB(config.0.clone()), Some(cfg.default_hz), hold,
                          pgrx::JsonB(limits), &label).0
     } else {
         let poses = json!(points.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
         let secs = json!(seconds);
         let label = format!("{} poses, one pass", targets6.len());
         rebot_joint_sequence(pgrx::JsonB(poses), pgrx::JsonB(secs),
-                             pgrx::JsonB(config.0.clone()), DEFAULT_HZ, hold,
+                             pgrx::JsonB(config.0.clone()), Some(cfg.default_hz), hold,
                              pgrx::JsonB(limits), &label).0
     };
     let stats = validate_payload(&payload, &cfg);

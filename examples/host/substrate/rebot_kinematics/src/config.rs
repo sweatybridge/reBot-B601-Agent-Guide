@@ -32,6 +32,10 @@ pub(crate) struct Config {
     pub max_seconds: f64,
     pub peak_speed: f64,
     pub gripper_peak_speed: f64,
+    pub default_hz: f64,
+    pub corner_radius_rad: f64,
+    pub chain_line_samples: usize,
+    pub chain_fillet_samples: usize,
 }
 
 impl Config {
@@ -97,6 +101,15 @@ impl Config {
         let mf = |key: &str| -> f64 {
             f(motion.get(key).unwrap_or_else(|| panic!("arm config motion.{key} required")), key)
         };
+        // Chain sample counts are floats in the doc (motion-group convention)
+        // but must be positive integers at the use sites (range densities).
+        let chain_n = |key: &str| -> usize {
+            let v = mf(key);
+            if !v.is_finite() || v.fract() != 0.0 || v < 1.0 {
+                panic!("arm config motion.{key} must be a positive integer");
+            }
+            v as usize
+        };
 
         Config {
             gravity, limits, link_inertials, link_radii, clearance, link_radius_max,
@@ -106,6 +119,9 @@ impl Config {
             ramp_s: mf("ramp_s"), min_cruise_speed: mf("min_cruise_speed"),
             min_seconds: mf("min_seconds"), max_seconds: mf("max_seconds"),
             peak_speed: mf("peak_speed"), gripper_peak_speed: mf("gripper_peak_speed"),
+            default_hz: mf("default_hz"), corner_radius_rad: mf("corner_radius_rad"),
+            chain_line_samples: chain_n("chain_line_samples"),
+            chain_fillet_samples: chain_n("chain_fillet_samples"),
         }
     }
 }
