@@ -75,6 +75,7 @@ docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_wor
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_workflow_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_oracle_workflow_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/workflow_logic_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/default_intrinsics_tests.sql
 python tests/test_store.py   # needs psycopg; container on localhost:5433
 python tests/test_pg_trace.py
 python tests/test_pg_evidence.py
@@ -87,7 +88,7 @@ docker exec rebot-capture-capture-1 python /app/substrate/tests/test_execute_wor
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 ```
 
-Apply migrations `0001`–`0022` in order (each is idempotent).
+Apply migrations `0001`–`0023` in order (each is idempotent).
 
 Full offline app suite (file mode; 682 checks) — run inside the capture container with
 the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
@@ -175,7 +176,7 @@ volume). From `examples/host`:
    activities; capture/planner/activities wait for substrate healthy.
    `REBOT_PG_DSN` defaults to the compose-network DSN; capture's
    `REBOT_WORKFLOW_URL` defaults to `http://activities:8766`.
-2. Apply migrations `0001`–`0022` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+2. Apply migrations `0001`–`0023` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
    Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`);
    `world.arm_config` is seeded for `b601` by `0014` (the cores require it).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
@@ -189,6 +190,31 @@ volume). From `examples/host`:
 
 **Rollback**: unset `REBOT_PG_DSN` and restart — the servers run in file mode under `work/`.
 PG data is untouched; switching back resumes from the substrate.
+
+### Default intrinsics (`0023`)
+
+The bench-default calibration is the 1080x1920 portrait fit for device
+`4f68b7f34a702b1c043f44fcf805ac9a63e2a3d9` (fingerprint `9acd8707e4ad`). It is
+the calibration the active rig `9caf6f58d22f` was fitted against.
+
+- **Postgres** is authoritative: `0023` seeds `world.calibration` with
+  `calib_doc`, `is_default = true`; `store.read_latest_calib_doc()` orders by
+  `is_default DESC, created_at DESC`, so a stale test calibration cannot win.
+- **Files**: the same bytes live in `config/calib/`, which survives a wiped
+  `work/` and a fresh checkout. Compose sets
+  `REBOT_CALIB=/app/config/calib/4f68b7f34a702b1c043f44fcf805ac9a63e2a3d9.json`.
+- **Selection**: explicit `--calib`/request, then `REBOT_CALIB`, then the active
+  rig's device file, then a real (non-`synthetic`) file by mtime. `synthetic.json`
+  can never outrank a device calibration just because its name sorts last.
+- **Orientation**: a 1920x1080 landscape stream is a quarter turn of this
+  1080x1920 portrait fit. `stream_turn` now discards a cached/phone turn whose
+  parity disagrees with the frame shape, so `upright_frame` rotates first and
+  then uses the native `K`; the tag solve no longer reports an aspect change.
+
+A fresh work directory materializes `work/calib/4f68....json` from the PG
+`calib_doc` at capture startup. To replace the default, run
+`calibrate_intrinsics.py`, then upsert that `calib_doc` and set `is_default`; do
+not hand-edit `work/` (it is disposable).
 
 ### What lives in PG now (comprehensive move)
 

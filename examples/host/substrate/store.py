@@ -244,11 +244,12 @@ class SubstrateStore:
         return row
 
     def read_latest_calib_doc(self):
-        """The newest intrinsics calibration doc (for scratch-cache materialization)."""
+        """The default intrinsics doc (fallback: newest) for scratch materialization."""
         with self._conn() as c:
             row = c.execute(
                 "SELECT calib_fingerprint, calib_doc FROM world.calibration "
-                "WHERE calib_doc IS NOT NULL ORDER BY created_at DESC LIMIT 1").fetchone()
+                "WHERE calib_doc IS NOT NULL "
+                "ORDER BY is_default DESC, created_at DESC LIMIT 1").fetchone()
         return row
 
     # -- durable app state (kv / monitor / tags) ------------------------ #

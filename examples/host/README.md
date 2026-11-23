@@ -85,7 +85,7 @@ app/
   planner_server.py       arm gateway: edge /pose, plan(), gated execute
   locate_target.py        capture -> base-frame point (rig or tag PnP + plane)
   calib.py                intrinsics: load, rescale, fingerprint
-  calibrate_intrinsics.py checkerboard fit -> state/calib/<device>.json
+  calibrate_intrinsics.py checkerboard fit -> work/calib/<device>.json
   calibrate_extrinsics.py capture -> base-tag rig or tool-tip sweep -> extrinsics-<mount>.json
   extrinsics.py           the rig: DLT + LM, covariance, predicted click error
   witness.py              did the camera move? background patches, arm masked
@@ -107,7 +107,8 @@ tests/                    selftest.py (the whole pipeline, no hardware), browser
                           agent_eval.py (chat trajectories against the model)
 deploy/                   mediamtx.yml, repeat_pino.ps1
 docs/                     phone-camera.md, arm_model.png
-state/                    captures, calib, tls, tags, out, work  (gitignored)
+config/                   tls + bootstrap + calib/ (bench-default intrinsics, durable)
+work/                     captures, calib cache, tags, out, recordings (disposable)
 ```
 
 ## Notes
