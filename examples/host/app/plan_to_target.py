@@ -92,7 +92,9 @@ class PlanError(Exception):
 
 @dataclass
 class Options:
-    hz: float = traj.DEFAULT_HZ
+    # Resolved at instantiation so a world.arm_config edit propagates (the
+    # motion group's default_hz; a def-time default would freeze the import value).
+    hz: float = field(default_factory=lambda: traj.DEFAULT_HZ)
     approach: float = 0.06
     approach_s: float = 3.0
     slide_s: float = 1.5

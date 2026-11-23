@@ -1077,7 +1077,12 @@ oracle attribution thresholds (`0017`, `oracle_attribute(doc, config)` fed `cfg-
 `oracle_compute`), and learning thresholds (`0018`, `rebot_fit_sag_map` + `accuracy_cell_update`
 + `identify`; `store.update_accuracy_cells` reads the learning group). `rebot_ik` is the Python
 single source for all groups (CALIBRATION/ORACLE/LEARNING dicts; `apply_config` re-syncs the
-aliasing modules). Only structural identifiers and pure numeric epsilons remain hardcoded.
+aliasing modules). The via-chain + stream-rate tuning (`traj.DEFAULT_HZ`/`CORNER_RADIUS_RAD`/
+`CHAIN_LINE_SAMPLES`/`CHAIN_FILLET_SAMPLES`, added by the S-ramp/via re-port) is consolidated
+too (`0019`, motion group): the Rust cores read them from the required config, `rebot_joint_move`/
+`rebot_joint_sequence` take `hz` as an optional arg resolved from `motion.default_hz` when omitted
+(no baked-in 50.0 SQL default), and the sample counts are integer-validated at parse. Only
+structural identifiers (ARM_JOINTS, MAX_VIAS) and pure numeric epsilons remain hardcoded.
 Live /move + oracle executions need a powered arm + bench go-ahead (dry plans only here).
 
 **Learning plane (Phase 1, ports validated against the Python reference):**

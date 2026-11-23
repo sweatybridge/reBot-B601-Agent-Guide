@@ -82,7 +82,7 @@ python tests/test_embed_activity.py   # isolated embed activity via df.http()
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 ```
 
-Apply migrations `0001`–`0018` in order (each is idempotent).
+Apply migrations `0001`–`0019` in order (each is idempotent).
 
 Full offline app suite (file mode; 646 checks) — run inside the capture container with
 the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
@@ -167,7 +167,7 @@ named volume). From `examples/host`:
 
 1. `docker compose up -d --build` — substrate + mediamtx + capture + planner; capture/planner
    wait for substrate healthy. `REBOT_PG_DSN` defaults to the compose-network DSN.
-2. Apply migrations `0001`–`0018` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+2. Apply migrations `0001`–`0019` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
    Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`);
    `world.arm_config` is seeded for `b601` by `0014` (the cores require it).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
@@ -335,7 +335,9 @@ model, not the URDF inertials.
 
 `config_doc` groups: `gravity`, `limits`, `link_inertials`, `link_radii`, `tool`
 (xyz/rpy), `gripper` (motor7_open/closed, rad_per_mm), `collision` (clearance,
-link_radius_max), `motion` (speeds/ramp/limits tuning), `calibration` (min_poses/
+link_radius_max), `motion` (speeds/ramp/limits tuning + stream rate `default_hz`
+and via-chain `corner_radius_rad`/`chain_line_samples`/`chain_fillet_samples`,
+`0019`), `calibration` (min_poses/
 max_camera_m/max_tip_m fit gates, `0016`), `oracle` (12 attribution thresholds, `0017`),
 `learning` (21 identify thresholds — sag-fit gates, accuracy edges/min_n/sectors,
 marker/coverage/rig-age tuning, `0018`).
@@ -343,12 +345,16 @@ marker/coverage/rig-age tuning, `0018`).
 - **Python single source + table-driven.** `rebot_ik` owns the constants
   (`LINK_RADII`, `GRIPPER`, `CLEARANCE`, `LINK_RADIUS_MAX`, `MOTION` added);
   `sweep.RADII` / `witness.LINK_RADII`, the planners' `MOTOR7_*`, and the motion
-  tuning (`traj.MAX_JOINT_STEP`/`LIMIT_TOL`/`RAMP_S`, `sweep.DEFAULT_MIN_Z`/
+  tuning (`traj.MAX_JOINT_STEP`/`LIMIT_TOL`/`RAMP_S`/`DEFAULT_HZ`/`CORNER_RADIUS_RAD`/
+  `CHAIN_LINE_SAMPLES`/`CHAIN_FILLET_SAMPLES`, `sweep.DEFAULT_MIN_Z`/
   `PEAK_SPEED`/`MIN_CRUISE_SPEED`/`MIN_SECONDS`/`MAX_SECONDS`/`GRIPPER_PEAK_SPEED`/
   `SAG_LIMIT_RAD`) now alias it — the duplicate literals are gone. Functions that
-  took these as default args (`traj.ease_fraction`/`ease_velocity`, `sweep.seconds_for`/
-  `gripper_seconds`/`gravity_sag`) resolve them at call time, so a table edit
-  propagates. `rebot_ik.default_config()` / `apply_config(cfg)` build/apply the doc;
+  took these as default args (`traj.ease_fraction`/`ease_velocity`/`joint_move`/
+  `joint_sequence`/`chain_series`/`_chain_path`, `sweep.seconds_for`/
+  `gripper_seconds`/`gravity_sag`, `plan_to_target.Options.hz`) resolve them at
+  call time, so a table edit propagates. The chain sample counts are floats in the
+  doc (motion-group convention) and ints at the use sites; the Rust parser refuses
+  a non-integer count. `rebot_ik.default_config()` / `apply_config(cfg)` build/apply the doc;
   `arm_config.load_config()` reads the table in PG mode (called at capture/planner
   startup) and falls back to the defaults in file mode.
 - **Rust cores: config REQUIRED, no hardcoded constants (option B).** The cores stay

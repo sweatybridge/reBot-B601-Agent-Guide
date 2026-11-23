@@ -88,13 +88,17 @@ LINK_RADIUS_MAX = 0.85     # any link centre, for the interpolation check
 GRIPPER = {"motor7_open": 4.90, "motor7_closed": -0.015, "rad_per_mm": 0.0412}
 
 # Motion tuning (traj/sweep speed policy + gates). Single source: traj.MAX_JOINT_STEP/
-# LIMIT_TOL/RAMP_S and sweep.DEFAULT_MIN_Z/PEAK_SPEED/MIN_CRUISE_SPEED/MIN_SECONDS/
-# MAX_SECONDS/GRIPPER_PEAK_SPEED/SAG_LIMIT_RAD alias this. Matches the Rust cores'
-# motion constants (rebot_arm_config) and the world.arm_config seed bit-for-bit.
+# LIMIT_TOL/RAMP_S/DEFAULT_HZ/CORNER_RADIUS_RAD/CHAIN_*_SAMPLES and sweep.DEFAULT_MIN_Z/
+# PEAK_SPEED/MIN_CRUISE_SPEED/MIN_SECONDS/MAX_SECONDS/GRIPPER_PEAK_SPEED/SAG_LIMIT_RAD
+# alias this. Matches the Rust cores' required motion config and the world.arm_config
+# seed bit-for-bit. The chain sample counts stay floats here (group convention) and
+# are coerced to ints at the use sites.
 MOTION = {
     "default_min_z": 0.04, "sag_limit_rad": 0.15, "limit_tol": 0.002, "max_joint_step": 0.5,
     "ramp_s": 0.15, "min_cruise_speed": 0.25, "min_seconds": 0.3, "max_seconds": 25.0,
     "peak_speed": 0.5, "gripper_peak_speed": 3.0,
+    "default_hz": 50.0, "corner_radius_rad": 0.05,
+    "chain_line_samples": 40.0, "chain_fillet_samples": 16.0,
 }
 
 # Hand-eye fit sanity gates (extrinsics.MIN_POSES/MAX_CAMERA_M/MAX_TIP_M alias this;
@@ -459,7 +463,8 @@ def apply_config(cfg):
     # Motion tuning aliases (traj/sweep). Their default-arg functions resolve these
     # globals at call time, so re-syncing here propagates a table edit.
     for name, keys in (
-        ("traj", {"MAX_JOINT_STEP": "max_joint_step", "LIMIT_TOL": "limit_tol", "RAMP_S": "ramp_s"}),
+        ("traj", {"MAX_JOINT_STEP": "max_joint_step", "LIMIT_TOL": "limit_tol", "RAMP_S": "ramp_s",
+                  "DEFAULT_HZ": "default_hz", "CORNER_RADIUS_RAD": "corner_radius_rad"}),
         ("sweep", {"DEFAULT_MIN_Z": "default_min_z", "PEAK_SPEED": "peak_speed",
                    "MIN_CRUISE_SPEED": "min_cruise_speed", "MIN_SECONDS": "min_seconds",
                    "MAX_SECONDS": "max_seconds", "GRIPPER_PEAK_SPEED": "gripper_peak_speed",
@@ -470,6 +475,13 @@ def apply_config(cfg):
             for attr, key in keys.items():
                 if hasattr(mod, attr):
                     setattr(mod, attr, MOTION[key])
+    # Chain sample counts are ints at the use sites (range densities).
+    traj_mod = sys.modules.get("traj")
+    if traj_mod is not None:
+        if hasattr(traj_mod, "CHAIN_LINE_SAMPLES"):
+            traj_mod.CHAIN_LINE_SAMPLES = int(MOTION["chain_line_samples"])
+        if hasattr(traj_mod, "CHAIN_FILLET_SAMPLES"):
+            traj_mod.CHAIN_FILLET_SAMPLES = int(MOTION["chain_fillet_samples"])
     ext = sys.modules.get("extrinsics")
     if ext is not None:
         if hasattr(ext, "MIN_POSES"):
