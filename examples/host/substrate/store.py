@@ -317,8 +317,12 @@ class SubstrateStore:
 
     def update_accuracy_cells(self, arm_id: str, rig_fingerprint: str, doc: dict, threshold_mm: float = 10.0) -> None:
         with self._conn() as c:
-            c.execute("SELECT accuracy_cell_update(%s, %s, %s::jsonb, %s)",
-                      (arm_id, rig_fingerprint, json.dumps(doc), threshold_mm))
+            row = c.execute("SELECT config_doc->'learning' AS learning FROM world.arm_config WHERE arm_id=%s",
+                            (arm_id,)).fetchone()
+            cfg = row["learning"] if row else None
+            c.execute("SELECT accuracy_cell_update(%s, %s, %s::jsonb, %s::jsonb, %s)",
+                      (arm_id, rig_fingerprint, json.dumps(doc),
+                       json.dumps(cfg) if cfg is not None else None, threshold_mm))
 
     def read_accuracy_map(self, arm_id: str, rig_fingerprint: str) -> dict:
         """Reconstruct the identify.load_accuracy_map doc from PG cells."""

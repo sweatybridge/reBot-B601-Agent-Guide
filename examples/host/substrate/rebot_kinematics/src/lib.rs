@@ -241,12 +241,6 @@ fn rebot_path_safe(urdf: &str, a: Vec<f64>, b: Vec<f64>, config: pgrx::JsonB,
 // Huber IRLS affine per joint, hold-out validation, FK sensitivity for validated_mm.
 // --------------------------------------------------------------------------- //
 
-const SAG_HUBER_RAD: f64 = 0.010;
-const SAG_VALIDATE_MAX_MRAD: f64 = 15.0;
-const SAG_VALIDATE_RATIO: f64 = 2.0;
-const SAG_SPAN_RADIUS_M: f64 = 0.10;
-const SAG_SPAN_HEIGHT_M: f64 = 0.05;
-
 struct SagHold { q: Vec<f64>, tau: Vec<f64>, r: Vec<f64>, tip: Vec<f64> }
 
 fn json_f64_arr(v: &serde_json::Value) -> Vec<f64> {
@@ -274,14 +268,15 @@ fn wls_affine(x: &[f64], y: &[f64], w: &[f64]) -> (f64, f64) {
 }
 
 /// Huber IRLS affine fit (identify._huber_affine): OLS then 20 reweight iterations.
-fn huber_affine(x: &[f64], y: &[f64]) -> (f64, f64) {
+/// `huber_rad` is the learning config's sag_huber_rad (required, no fallback).
+fn huber_affine(x: &[f64], y: &[f64], huber_rad: f64) -> (f64, f64) {
     let n = x.len();
     let ones = vec![1.0; n];
     let mut coef = wls_affine(x, y, &ones);
     for _ in 0..20 {
         let w: Vec<f64> = (0..n).map(|i| {
             let r = (y[i] - (coef.0 * x[i] + coef.1)).abs();
-            if r > SAG_HUBER_RAD { SAG_HUBER_RAD / r.max(1e-12) } else { 1.0 }
+            if r > huber_rad { huber_rad / r.max(1e-12) } else { 1.0 }
         }).collect();
         coef = wls_affine(x, y, &w);
     }
@@ -319,14 +314,30 @@ fn tool_mm_per_rad(urdf: &str, q6: &[f64]) -> [f64; 6] {
 
 /// Fit the per-joint sag residual map from hold samples (identify.fit_sag_map).
 /// `holds` is a jsonb array of {q[7], tau[6], r[6], tip[3]}. Returns the fit doc.
+/// `config` is the REQUIRED world.arm_config "learning" group (no hardcoded
+/// fallback); `min_holds` defaults to the config's sag_min_holds when NULL.
 #[pg_extern]
 fn rebot_fit_sag_map(
     urdf: &str, holds: pgrx::JsonB, kp_key: &str, rig_fingerprint: &str, zeros_key: &str,
-    min_holds: default!(i32, 30),
+    config: pgrx::JsonB, min_holds: default!(Option<i32>, "NULL"),
 ) -> pgrx::JsonB {
     use serde_json::json;
+    let cfg = config.0.as_object()
+        .unwrap_or_else(|| panic!("learning config must be a jsonb object"));
+    let gate = |key: &str| -> f64 {
+        cfg.get(key).unwrap_or_else(|| panic!("learning config missing required key '{key}'"))
+            .as_f64().unwrap_or_else(|| panic!("learning config {key} must be a number"))
+    };
+    let sag_huber_rad = gate("sag_huber_rad");
+    let sag_validate_max_mrad = gate("sag_validate_max_mrad");
+    let sag_validate_ratio = gate("sag_validate_ratio");
+    let sag_span_radius_m = gate("sag_span_radius_m");
+    let sag_span_height_m = gate("sag_span_height_m");
     let hs = parse_holds(&holds.0);
-    let min_holds = min_holds as usize;
+    let min_holds = match min_holds {
+        Some(v) => v as usize,
+        None => gate("sag_min_holds") as usize,
+    };
     if hs.len() < min_holds {
         return pgrx::JsonB(json!({"ok": false, "reasons": [
             format!("only {} holds (need {}): let more executions accumulate", hs.len(), min_holds)]}));
@@ -337,7 +348,7 @@ fn rebot_fit_sag_map(
     let rmax = radius.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let hmin = height.iter().cloned().fold(f64::INFINITY, f64::min);
     let hmax = height.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if rmax - rmin < SAG_SPAN_RADIUS_M || hmax - hmin < SAG_SPAN_HEIGHT_M {
+    if rmax - rmin < sag_span_radius_m || hmax - hmin < sag_span_height_m {
         return pgrx::JsonB(json!({"ok": false, "reasons": [
             format!("the holds do not span the workspace (radius span {:.2} m, height span {:.2} m)", rmax - rmin, hmax - hmin)]}));
     }
@@ -347,14 +358,14 @@ fn rebot_fit_sag_map(
     for j in 0..6 {
         let x: Vec<f64> = train.iter().map(|h| h.tau[j]).collect();
         let y: Vec<f64> = train.iter().map(|h| h.r[j]).collect();
-        pm[j] = huber_affine(&x, &y);
+        pm[j] = huber_affine(&x, &y, sag_huber_rad);
     }
     let to_owned = |v: &[&SagHold]| -> Vec<SagHold> {
         v.iter().map(|h| SagHold { q: h.q.clone(), tau: h.tau.clone(), r: h.r.clone(), tip: h.tip.clone() }).collect()
     };
     let train_rms = per_joint_rms(&to_owned(&train), &pm);
     let test_rms = per_joint_rms(&to_owned(&test), &pm);
-    if test_rms > SAG_VALIDATE_MAX_MRAD || test_rms > (SAG_VALIDATE_RATIO * train_rms).max(1.0) {
+    if test_rms > sag_validate_max_mrad || test_rms > (sag_validate_ratio * train_rms).max(1.0) {
         return pgrx::JsonB(json!({"ok": false, "rms_mrad": (test_rms * 1000.0).round() / 1000.0,
             "reasons": [format!("hold-out validation failed: {:.1} mrad held out vs {:.1} mrad train (an overfit map is not applied)", test_rms, train_rms)]}));
     }

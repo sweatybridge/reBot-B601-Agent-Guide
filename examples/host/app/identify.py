@@ -84,32 +84,33 @@ class IdentifyError(Exception):
 
 
 # --------------------------------------------------------------------------- #
-# Gates -- one block, like oracle.py's thresholds.
+# Gates -- one block, like oracle.py's thresholds. Single source: rebot_ik.LEARNING
+# (world.arm_config learning group); apply_config re-syncs these on a table edit.
 # --------------------------------------------------------------------------- #
-RIG_MAX_AGE_DAYS = 30.0      # a rig older than this is stale even without drift
-TAG_GROWTH_PX = 2.0          # tag reprojection growth over the session baseline
-EWMA_ALPHA = 0.3             # weight of the newest oracle pixel error
-MARKER_MIN_USABLE = 3        # §7.3a: fewer good solves than this is not an average
-MARKER_SPREAD_MAX_MM = 6.0   # solves disagreeing by more than this are not one camera
-HOLDOUT_MAX_PX = 3.0         # §7.3a: the held-out capture's tag reprojection bound
-TAG_PRIOR_DEPTH = 0.01       # §7.3a: ~1% of range is a 4 cm tag's depth error at 1 m
-SAG_MIN_HOLDS = 30           # §7.3b: fewer holds cannot span the workspace
-SAG_HUBER_RAD = 0.010        # 10 mrad: a stall is an outlier, not a measurement
-SAG_VALIDATE_MAX_MRAD = 15.0 # hold-out rms above this is not a usable map
-SAG_VALIDATE_RATIO = 2.0     # hold-out may be at most this times the train rms
-SAG_SPAN_RADIUS_M = 0.10     # holds must span this much radius...
-SAG_SPAN_HEIGHT_M = 0.05     # ...and this much height, or they are one pose
-ACCURACY_MIN_N = 3           # §7.4: a cell validates only with 3 good holds
-ACCURACY_RADIUS_EDGES = (0.10, 0.20, 0.30, 0.40, 0.50, 0.60)
-ACCURACY_HEIGHT_EDGES = (0.00, 0.10, 0.20, 0.30, 0.40)
-ACCURACY_SECTORS = 8
-COVERAGE_MAX_POSES = 12      # §7.4: one trajectory's worth of measurement poses
-COVERAGE_HOLD_S = 2.0        # long enough for the oracle's two grabs at the middle
-COVERAGE_PERTURBATIONS = 24  # extra poses around sweep.POSES, to reach more cells
+RIG_MAX_AGE_DAYS = rebot_ik.LEARNING["rig_max_age_days"]      # a rig older than this is stale even without drift
+TAG_GROWTH_PX = rebot_ik.LEARNING["tag_growth_px"]            # tag reprojection growth over the session baseline
+EWMA_ALPHA = rebot_ik.LEARNING["ewma_alpha"]                  # weight of the newest oracle pixel error
+MARKER_MIN_USABLE = rebot_ik.LEARNING["marker_min_usable"]    # §7.3a: fewer good solves than this is not an average
+MARKER_SPREAD_MAX_MM = rebot_ik.LEARNING["marker_spread_max_mm"]  # solves disagreeing by more than this are not one camera
+HOLDOUT_MAX_PX = rebot_ik.LEARNING["holdout_max_px"]          # §7.3a: the held-out capture's tag reprojection bound
+TAG_PRIOR_DEPTH = rebot_ik.LEARNING["tag_prior_depth"]        # §7.3a: ~1% of range is a 4 cm tag's depth error at 1 m
+SAG_MIN_HOLDS = rebot_ik.LEARNING["sag_min_holds"]            # §7.3b: fewer holds cannot span the workspace
+SAG_HUBER_RAD = rebot_ik.LEARNING["sag_huber_rad"]            # 10 mrad: a stall is an outlier, not a measurement
+SAG_VALIDATE_MAX_MRAD = rebot_ik.LEARNING["sag_validate_max_mrad"]  # hold-out rms above this is not a usable map
+SAG_VALIDATE_RATIO = rebot_ik.LEARNING["sag_validate_ratio"]  # hold-out may be at most this times the train rms
+SAG_SPAN_RADIUS_M = rebot_ik.LEARNING["sag_span_radius_m"]    # holds must span this much radius...
+SAG_SPAN_HEIGHT_M = rebot_ik.LEARNING["sag_span_height_m"]    # ...and this much height, or they are one pose
+ACCURACY_MIN_N = rebot_ik.LEARNING["accuracy_min_n"]          # §7.4: a cell validates only with 3 good holds
+ACCURACY_RADIUS_EDGES = tuple(rebot_ik.LEARNING["accuracy_radius_edges"])
+ACCURACY_HEIGHT_EDGES = tuple(rebot_ik.LEARNING["accuracy_height_edges"])
+ACCURACY_SECTORS = rebot_ik.LEARNING["accuracy_sectors"]
+COVERAGE_MAX_POSES = rebot_ik.LEARNING["coverage_max_poses"]  # §7.4: one trajectory's worth of measurement poses
+COVERAGE_HOLD_S = rebot_ik.LEARNING["coverage_hold_s"]        # long enough for the oracle's two grabs at the middle
+COVERAGE_PERTURBATIONS = rebot_ik.LEARNING["coverage_perturbations"]  # extra poses around sweep.POSES, to reach more cells
 # Mirrors plan_to_target.Options.max_reach. Duplicated, not imported: identify.py
 # runs in the capture image, which has no Pinocchio; the planner re-checks reach
 # with its own value when it plans, so this only pre-filters obvious misses.
-COVERAGE_MAX_REACH_M = 0.75
+COVERAGE_MAX_REACH_M = rebot_ik.LEARNING["coverage_max_reach_m"]
 
 
 def _stamp():
@@ -129,9 +130,9 @@ class TriggerMonitor:
     human (or the agent) to act on with an explicit confirm.
     """
 
-    def __init__(self, pixel_mm=oracle.PIXEL_ERROR_MM, alpha=EWMA_ALPHA):
+    def __init__(self, pixel_mm=oracle.PIXEL_ERROR_MM, alpha=None):
         self.pixel_mm = float(pixel_mm)
-        self.alpha = float(alpha)
+        self.alpha = float(EWMA_ALPHA if alpha is None else alpha)
         self.ewma = None
         self.tag_baseline = None
         self.proposals = []
@@ -581,8 +582,9 @@ def sag_holds(telemetry_docs, kp=None):
     return holds
 
 
-def _huber_affine(x, y, delta=SAG_HUBER_RAD, iterations=20):
+def _huber_affine(x, y, delta=None, iterations=20):
     """IRLS affine fit y ~ a*x + b; a stalled hold is down-weighted, not followed."""
+    delta = SAG_HUBER_RAD if delta is None else delta
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     A = np.column_stack([x, np.ones_like(x)])
@@ -620,7 +622,7 @@ def _tool_mm_per_rad(q):
     return np.asarray(out)
 
 
-def fit_sag_map(holds, kp_key, rig_fingerprint, zeros_key="none", min_holds=SAG_MIN_HOLDS):
+def fit_sag_map(holds, kp_key, rig_fingerprint, zeros_key="none", min_holds=None):
     """Fit the per-joint affine residual map, with a hold-out validation gate.
 
     Refuses below `min_holds`, refuses holds that do not span the workspace,
@@ -629,6 +631,7 @@ def fit_sag_map(holds, kp_key, rig_fingerprint, zeros_key="none", min_holds=SAG_
     an overfit map, and applying it would make the arm worse, not better.
     """
     reasons = []
+    min_holds = SAG_MIN_HOLDS if min_holds is None else min_holds
     if len(holds) < int(min_holds):
         reasons.append("only %d holds (need %d): let more executions accumulate"
                        % (len(holds), int(min_holds)))
@@ -854,8 +857,8 @@ def coverage_cells(map_doc):
     return out
 
 
-def coverage_poses(current_q, map_doc, tip, seed=11, top_k=COVERAGE_MAX_POSES,
-                   perturbations=COVERAGE_PERTURBATIONS, per_cell=2):
+def coverage_poses(current_q, map_doc, tip, seed=11, top_k=None,
+                   perturbations=None, per_cell=2):
     """The safe poses whose tip lands in the least-covered cells (§7.4).
 
     Pool = `sweep.POSES` plus seeded perturbations, filtered by `pose_ok` and a
@@ -870,6 +873,8 @@ def coverage_poses(current_q, map_doc, tip, seed=11, top_k=COVERAGE_MAX_POSES,
     layer grows in the places nobody has been.
     """
     rng = np.random.default_rng(int(seed))
+    top_k = COVERAGE_MAX_POSES if top_k is None else top_k
+    perturbations = COVERAGE_PERTURBATIONS if perturbations is None else perturbations
     base = [np.asarray(pose, dtype=float) for pose in sweep.POSES]
     pool = list(base)
     for _ in range(int(perturbations)):
@@ -918,7 +923,7 @@ def coverage_poses(current_q, map_doc, tip, seed=11, top_k=COVERAGE_MAX_POSES,
     return ordered
 
 
-def coverage_plan(current_q, poses, gripper=0.0, hold_s=COVERAGE_HOLD_S):
+def coverage_plan(current_q, poses, gripper=0.0, hold_s=None):
     """The `/move` request a coverage session makes, and the cells it measures.
 
     Pure: the leg durations come from `sweep.seconds_for`, the same speed policy
@@ -932,6 +937,7 @@ def coverage_plan(current_q, poses, gripper=0.0, hold_s=COVERAGE_HOLD_S):
     stays pure policy so both halves are unit-testable offline.
     """
     targets = [[float(v) for v in entry["q"]] for entry in poses]
+    hold_s = COVERAGE_HOLD_S if hold_s is None else hold_s
     chain = [np.asarray(current_q, dtype=float).reshape(6)] + \
             [np.asarray(target, dtype=float) for target in targets]
     seconds = [sweep.seconds_for(start, end) for start, end in zip(chain, chain[1:])]
@@ -950,8 +956,8 @@ def coverage_plan(current_q, poses, gripper=0.0, hold_s=COVERAGE_HOLD_S):
     }
 
 
-def cartesian_targets(map_doc, top_k=COVERAGE_MAX_POSES, min_z=sweep.DEFAULT_MIN_Z,
-                      max_reach=COVERAGE_MAX_REACH_M):
+def cartesian_targets(map_doc, top_k=None, min_z=sweep.DEFAULT_MIN_Z,
+                      max_reach=None):
     """The centre points of the least-covered cells, as Cartesian targets (§7.4).
 
     The complement of `coverage_poses`: instead of FK-ing joint poses and hoping
@@ -973,6 +979,8 @@ def cartesian_targets(map_doc, top_k=COVERAGE_MAX_POSES, min_z=sweep.DEFAULT_MIN
     one the map says is unvalidated.
     """
     chosen, taken = [], set()
+    top_k = COVERAGE_MAX_POSES if top_k is None else top_k
+    max_reach = COVERAGE_MAX_REACH_M if max_reach is None else max_reach
     skipped = {"below_min_z": 0, "beyond_reach": 0}
     entries = []
     for entry in coverage_cells(map_doc):
