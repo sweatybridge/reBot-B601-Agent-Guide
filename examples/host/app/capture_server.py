@@ -53,6 +53,7 @@ import identify as identify_mod
 import locate_target as locator
 import mediamtx
 import oracle as oracle_mod
+import oracle_vision
 import rebot_ik
 import sweep
 import trace as trace_mod
@@ -561,6 +562,8 @@ async def handle_health(request: web.Request) -> web.Response:
         "tls": app["tls"],
         "auth": bool(app["token"]),
         "planner": app["planner"],
+        "workflow": app.get("workflow_url") or None,
+        "substrate": app.get("pg_store") is not None,
         "execute": app["execute"],
         "calib": sorted(p.name for p in app["calib"].glob("*.json")
                         if not p.name.startswith(("extrinsics-", "witness-", "sag-",
@@ -1792,10 +1795,94 @@ async def handle_execute(request: web.Request) -> web.Response:
     except json.JSONDecodeError as exc:
         raise web.HTTPBadRequest(text="body is not JSON: %s" % exc) from exc
     sid = request.headers.get("X-Rebot-Session", "")
-    # The oracle piggybacks on the plan's own holds (§5.3): no extra arm motion,
-    # no new path to /execute. Preparation is wrapped -- a broken camera or a
-    # missing plan file costs the evidence, never the execution (§8.4).
     plan_id = str(body.get("id") or "")
+
+    # Durable execute -> oracle (PG mode with an activity service configured).
+    # The graph owns the whole chain: claim the play (at-most-once), run the
+    # isolated execute/extract/detect activity, then fold the verdict. Capture
+    # no longer schedules live hold grabs, so nothing here races playback.
+    workflow_url = app.get("workflow_url")
+    store = app.get("pg_store")
+    if store is not None and workflow_url and CAPTURE_ID.match(plan_id):
+        import sys
+        substrate_dir = str(ROOT / "substrate")
+        if substrate_dir not in sys.path:
+            sys.path.insert(0, substrate_dir)
+        import execute_workflow
+        # The recording episode is per execution, not per chat session: the
+        # fragments must be attachable to this execution regardless of which
+        # sidebar conversation triggered it.
+        episode = "exec-" + plan_id
+        try:
+            receipt = await asyncio.to_thread(
+                execute_workflow.start_execute_workflow,
+                store, plan_id, plan_id, app.get("arm_id", "b601"), episode,
+                workflow_url, app.get("pg_workspace", "default"),
+                60, 2, 240, "execute_oracle")
+        except Exception as exc:  # noqa: BLE001 - the workflow is the execution path
+            logging.exception("durable execute for %s failed to start", plan_id)
+            await trace_event(app, sid, "execute", plan_id=plan_id, status=502,
+                              ok=False, error=str(exc))
+            return web.json_response({"ok": False, "id": plan_id, "executed": False,
+                                      "error": "durable workflow failed to start: %s" % exc},
+                                     status=502)
+        result = receipt.get("result") or {}
+        if isinstance(result, dict):
+            rows = result.get("rows") or []
+            row = rows[0] if rows else {}
+            result = (row.get("execution_finalize") or row.get("execution_fail")
+                      or row.get("execution_get") or row)
+        doc = result.get("doc") if isinstance(result, dict) else None
+        # execution_finalize returns {doc, verdict}; the ledger row is the
+        # durable truth (status/learned), so read it for the response.
+        ledger = None
+        try:
+            def _ledger():
+                with store._conn() as c:
+                    return c.execute("SELECT execution_get(%s) AS ex",
+                                     (plan_id,)).fetchone()["ex"]
+            ledger = await asyncio.to_thread(_ledger)
+        except Exception:  # noqa: BLE001
+            pass
+        if receipt.get("status") not in ("completed", "failed", "cancelled"):
+            # The durable instance is still working (the caller's await budget
+            # is shorter than the recording deadline, or the activity is slow).
+            # The arm may already have played; report the ledger, not a failure.
+            return web.json_response({
+                "ok": True, "id": plan_id, "executed": bool(
+                    ledger and ledger.get("status") in ("playing", "played", "verified")),
+                "workflow": receipt.get("instance"),
+                "workflow_status": receipt.get("status"), "ledger": ledger,
+                "pending": True,
+            }, status=202)
+        executed = receipt.get("status") == "completed" and bool(
+            ledger and ledger.get("status") in ("played", "verified"))
+        verdict = (doc or {}).get("verdict") if isinstance(doc, dict) else None
+        error_text = (result or {}).get("error") if isinstance(result, dict) else None
+        await trace_event(app, sid, "execute", plan_id=plan_id, status=200,
+                          ok=executed, executed=executed, workflow=receipt.get("instance"),
+                          error=None if executed else error_text)
+        if verdict:
+            await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=verdict,
+                              holds=len((doc or {}).get("holds") or []),
+                              telemetry=bool((doc or {}).get("telemetry")),
+                              source="durable_offline_extract", error=None)
+        return web.json_response({
+            "ok": executed,
+            "id": plan_id,
+            "executed": executed,
+            "workflow": receipt.get("instance"),
+            "workflow_status": receipt.get("status"),
+            "ledger": ledger,
+            "verdict": verdict,
+            "holds": len((doc or {}).get("holds") or []),
+            "error": None if executed else error_text,
+        }, status=200 if executed else 502)
+
+    # File mode / no activity service: the direct gateway path survives for
+    # offline development. There is no live grab any more; the pre/post stills
+    # are the only camera evidence, and the oracle doc reports the missing
+    # holds rather than guessing them.
     prep = None
     if CAPTURE_ID.match(plan_id):
         prep = await oracle_prepare(app, plan_id)
@@ -1805,13 +1892,9 @@ async def handle_execute(request: web.Request) -> web.Response:
                       error=payload.get("error"))
     if prep is not None:
         if status == 200 and payload.get("ok") and payload.get("executed"):
-            # Both gates agreed and the arm played: verify off the response
-            # path so the page is not held up by the camera and the FK calls.
             task = asyncio.create_task(oracle_finish(app, prep, sid))
             app["oracle_tasks"].add(task)
             task.add_done_callback(app["oracle_tasks"].discard)
-        else:
-            prep["grabs"].cancel()
     return web.json_response(payload, status=status)
 
 
@@ -1846,11 +1929,13 @@ def _oracle_grab_frame(app):
 
 
 async def oracle_prepare(app, plan_id):
-    """Pre-execution evidence: one still, the plan's hold windows, a grab task.
+    """Pre-execution evidence: one still and the plan's hold windows.
 
     Returns None on any failure -- the execution proceeds unverified (§8.4).
     The pre-still goes through grab_one, the existing capture path, so its
     witness report and tag solve are recorded exactly as a manual capture's.
+    Hold stills are NOT grabbed here any more: the durable workflow extracts
+    them offline from the executed-trajectory recording.
     """
     try:
         if not app["camera"]:
@@ -1896,107 +1981,20 @@ async def oracle_prepare(app, plan_id):
             "holds": {},
             "started": time.monotonic(),
         }
-        prep["grabs"] = asyncio.create_task(_oracle_hold_grabs(app, prep))
+        # No live hold grabs: hold stills are extracted offline from the
+        # executed-trajectory recording by the durable workflow. The pre-still
+        # and the hold windows are still captured here for the coverage/legacy
+        # paths that finish synchronously.
         return prep
     except Exception as exc:  # noqa: BLE001 - the oracle never fails /execute
         logging.warning("oracle prep for %s failed: %s", plan_id, exc)
         return None
 
 
-async def _oracle_hold_grabs(app, prep):
-    """Two grabs 300 ms apart at each hold's midpoint; keep the later.
-
-    The middle of the window is chosen so stream latency up to half the window
-    cannot pull the frame out of the hold (the sweep_video.select argument).
-    Windows under HOLD_MIN_S never reach here: tracking-only oracle for those.
-    """
-    import cv2
-
-    try:
-        for window in prep["windows"]:
-            midpoint = 0.5 * (window["t_start"] + window["t_end"])
-            delay = prep["started"] + midpoint - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            frame = None
-            for attempt in range(2):
-                if attempt:
-                    await asyncio.sleep(0.3)
-                shot = await asyncio.to_thread(_oracle_grab_frame, app)
-                if shot is not None:
-                    frame = shot
-            if frame is None:
-                continue
-            number = window["index"]
-            path = app["oracle_dir"] / prep["plan_id"] / ("hold-%d.jpg" % number)
-            ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-            if not ok:
-                continue
-            data = buffer.tobytes()
-            # Scratch materialization for cv2; the authoritative copy is the PG
-            # blob, cataloged as a hold still so retention refcounts protect it.
-            await asyncio.to_thread(path.write_bytes, data)
-            blob = await trace_blob(app, data)
-            mirror = app.get("pg_mirror")
-            if mirror is not None:
-                try:
-                    await asyncio.to_thread(
-                        mirror.mirror_still, prep["plan_id"], data, "hold",
-                        app.get("arm_id", "b601"), midpoint)
-                except Exception as exc:  # noqa: BLE001 - a missed catalog row is not fatal
-                    logging.warning("hold still catalog for %s failed: %s", prep["plan_id"], exc)
-            prep["holds"][number] = {"path": str(path), "blob": blob}
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - a missed hold is a missed sample
-        logging.warning("oracle hold grabs for %s failed: %s", prep["plan_id"], exc)
-
-
-def _oracle_detect(frame, q6, K, dist, T_base_cam, t_tip, scale=1.0):
-    """The tip pixel: green, with a fragment-cleaned retry. None, never a guess.
-
-    A failed detection is `detected: null` (§5.3): the oracle reports what it
-    saw, and a missing measurement is not a zero error.
-
-    There is no template fallback. Its template came from the PRE-execution
-    still, where the arm is parked: at a hold pose that patch is background,
-    and on the 20261120T064648Z coverage run it "matched" blank wall at 0.87
-    and produced 16-221 mm pixel errors. A guess from background is worse than
-    no measurement.
-
-    Green itself can fail on a fragmented cover: the nearest component is a
-    sliver below GREEN_MIN_BLOB_PX while the substantial cover sits a little
-    farther out. The retry keeps only sizeable blobs -- still colour evidence
-    from this frame, never background, never another frame.
-
-    `scale` is the frame grid's ratio to the calibration grid (`Calib.scale`):
-    a WebRTC bandwidth drop shrinks every blob, so the area gates follow s^2.
-    """
-    import cv2
-
-    options = auto_calibrate.DetectOptions()
-    area_scale = float(scale) * float(scale)
-    size = (int(frame.shape[1]), int(frame.shape[0]))
-    try:
-        found = auto_calibrate.detect_tip_green(frame, q6, K, dist, T_base_cam, t_tip,
-                                                options, size, scale=scale)
-        return {"detector": "green", "uv": [found.u, found.v], "score": found.score}
-    except auto_calibrate.AutoError:
-        pass
-    mask = auto_calibrate.green_mask(frame)
-    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
-    clean = np.zeros_like(mask)
-    for index in range(1, count):
-        if stats[index, cv2.CC_STAT_AREA] >= auto_calibrate.GREEN_MIN_BLOB_PX * area_scale:
-            clean[labels == index] = 255
-    if int(clean.sum()) // 255 < auto_calibrate.MIN_GREEN_PX * area_scale:
-        return None
-    try:
-        found = auto_calibrate.detect_tip_green(frame, q6, K, dist, T_base_cam, t_tip,
-                                                options, size, mask=clean, scale=scale)
-    except auto_calibrate.AutoError:
-        return None
-    return {"detector": "green", "uv": [found.u, found.v], "score": found.score}
+# The detector lives in one module so the isolated workflow activity can run it
+# without importing this aiohttp server (camera, routes, LLM client). Keep the
+# old name for the selftest and the synchronous Python oracle path.
+_oracle_detect = oracle_vision.detect_tip
 
 
 def _oracle_tool_tip(app, rig):
@@ -2093,7 +2091,6 @@ async def oracle_finish(app, prep, sid):
     try:
         import cv2
 
-        await prep["grabs"]
         status, payload = await planner_call(app, "/telemetry/" + plan_id, {},
                                              timeout=30, method="GET", sid=sid)
         telemetry = payload.get("telemetry") if status == 200 else None
@@ -2350,6 +2347,120 @@ async def oracle_finish(app, prep, sid):
                               holds=len(doc["holds"]), error=doc["error"])
         except Exception as inner:  # noqa: BLE001 - not even the report is fatal
             logging.warning("oracle report for %s failed: %s", plan_id, inner)
+
+
+def _start_coverage_recording(app):
+    """Record the coverage excursion so its holds are extractable offline.
+
+    Coverage moves are not the durable /execute path (they are driven by the
+    identify session), so this function owns the recording window. A missing
+    MediaMTX is reported and the run proceeds: motion is gated by the planner,
+    evidence is additive (§8.4).
+    """
+    path = mediamtx.path_from_camera(app["camera"])
+    if not path:
+        return None, None
+    try:
+        recorder = mediamtx.Recorder(app["mediamtx_api"], path=path,
+                                     recordings=app["recordings"])
+        recorder.enable()
+        started = time.time()
+        time.sleep(0.2)
+        return recorder, started
+    except Exception as exc:  # noqa: BLE001 - a missing recorder costs evidence only
+        logging.warning("coverage recording unavailable: %s", exc)
+        return None, None
+
+
+def _finish_coverage_recording(app, recorder, record_wall, episode, play_wall):
+    if recorder is None or record_wall is None:
+        return None
+    try:
+        recorder.disable()
+        time.sleep(0.5)
+        segments = recorder.segments(since=record_wall - 2.0)
+        if not segments:
+            return None
+        store = app["pg_store"]
+        store.create_episode(episode, app.get("pg_workspace", "default"),
+                             [app.get("arm_id", "b601")], kind="execution")
+        import cv2
+        t = 0.0
+        first_start = None
+        for seq, segment in enumerate(segments):
+            data = segment.path.read_bytes()
+            sha = store.put_blob(data, "fragment")
+            cap = cv2.VideoCapture(str(segment.path))
+            try:
+                fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+                frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+                duration = float(frames) / float(fps) if fps > 0 and frames > 0 else 10.0
+            finally:
+                cap.release()
+            store.add_fragment(episode, sha, seq, t, t + duration, codec="mp4")
+            if first_start is None:
+                first_start = float(segment.start)
+            t += duration
+        return float(play_wall - (first_start if first_start is not None else play_wall))
+    except Exception as exc:  # noqa: BLE001 - evidence loss is reported, not fatal
+        logging.warning("coverage recording ingest failed: %s", exc)
+        return None
+
+
+async def _recorded_coverage_oracle(app, plan_id, episode, t_offset, sid):
+    """Adopt a coverage execution and run extract -> detect -> finalize offline.
+
+    The same substrate functions as the durable graph, just driven from the
+    identify session (which already owns the synchronous motion). The activity
+    process does the native decode/detect; the database does the residuals and
+    the learning fold.
+    """
+    store = app["pg_store"]
+    activity_url = app["workflow_url"].rstrip("/")
+    arm = app.get("arm_id", "b601")
+
+    def _adopt():
+        with store._conn() as c:
+            c.execute("SELECT execution_adopt(%s,%s,%s,%s,%s,%s)",
+                      (plan_id, plan_id, arm, episode, float(t_offset),
+                       app.get("pg_workspace", "default")))
+    await asyncio.to_thread(_adopt)
+
+    async def _activity(path):
+        async with app["client"].post(activity_url + path,
+                                      json={"exec_id": plan_id}, timeout=300) as answer:
+            payload = await answer.json()
+            if answer.status != 200:
+                raise RuntimeError(payload.get("error", "%s returned %s" % (path, answer.status)))
+            return payload
+
+    extracted = await _activity("/extract")
+    def _stills():
+        with store._conn() as c:
+            return c.execute("SELECT execution_store_stills(%s,%s::jsonb) AS r",
+                             (plan_id, json.dumps(extracted))).fetchone()["r"]
+    await asyncio.to_thread(_stills)
+    detected = await _activity("/detect")
+    def _finalize():
+        with store._conn() as c:
+            return c.execute("SELECT execution_finalize(%s,%s::jsonb) AS r",
+                             (plan_id, json.dumps(detected))).fetchone()["r"]
+    result = await asyncio.to_thread(_finalize)
+    doc = (result or {}).get("doc") or {}
+    try:
+        app["identify_monitor"].observe(doc, rig=app.get("rig"))
+        mirror = app.get("pg_mirror")
+        if mirror is not None:
+            mirror.mirror_monitor(
+                arm, ewma_pixel_error_mm=app["identify_monitor"].ewma,
+                ewma_tag_rms_px=app["identify_monitor"].tag_baseline,
+                last_doc={"proposals": app["identify_monitor"].proposals})
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("coverage monitor for %s failed: %s", plan_id, exc)
+    await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=(result or {}).get("verdict"),
+                      holds=len(doc.get("holds") or []), source="durable_offline_extract",
+                      error=None)
+    return doc
 
 
 async def handle_pose(request: web.Request) -> web.Response:
@@ -2651,12 +2762,27 @@ async def run_coverage(app, body, sid):
         raise identify_mod.IdentifyError(
             "the oracle could not prepare for this coverage run (no hold windows, or no "
             "camera): the arm would move and nothing would be measured")
+    recorded = app.get("pg_store") is not None and bool(app.get("workflow_url"))
+    recorder, record_wall = (await asyncio.to_thread(_start_coverage_recording, app)
+                             if recorded else (None, None))
+    episode = "coverage-" + plan_id
     started = time.time()
+    play_wall = time.time()
     try:
         answer = await asyncio.to_thread(arm.move_sequence, plan["targets"], plan["seconds"],
                                          plan["hold"], plan["gripper"], plan_id)
     finally:
-        await oracle_finish(app, prep, sid)
+        t_offset = (await asyncio.to_thread(
+            _finish_coverage_recording, app, recorder, record_wall, episode, play_wall)
+            if recorded else None)
+        try:
+            if t_offset is not None:
+                await _recorded_coverage_oracle(app, plan_id, episode, t_offset, sid)
+            else:
+                # File mode / no recording: keep the synchronous evidence path.
+                await oracle_finish(app, prep, sid)
+        except Exception as exc:  # noqa: BLE001 - evidence never fails the move report
+            logging.warning("coverage oracle for %s failed: %s", plan_id, exc)
     return dict(plan, ok=True, mode="coverage", motion=True,
                 poses=len(plan["targets"]), plan_id=plan_id,
                 move_id=(answer or {}).get("id"),
@@ -2743,7 +2869,12 @@ async def run_cartesian_coverage(app, body, sid):
         raise identify_mod.IdentifyError(
             "the oracle could not prepare for this coverage run (no hold windows, or no "
             "camera): the arm would move and nothing would be measured")
+    recorded = app.get("pg_store") is not None and bool(app.get("workflow_url"))
+    recorder, record_wall = (await asyncio.to_thread(_start_coverage_recording, app)
+                             if recorded else (None, None))
+    episode = "coverage-" + plan_id
     started = time.time()
+    play_wall = time.time()
     answer = {}
     try:
         status, answer = await planner_call(app, "/execute", {"id": plan_id},
@@ -2757,7 +2888,16 @@ async def run_cartesian_coverage(app, body, sid):
     finally:
         # Even a refused/aborted execution is measured: the edge persists the
         # abort log, and the oracle doc is exactly the evidence a fault needs.
-        await oracle_finish(app, prep, sid)
+        t_offset = (await asyncio.to_thread(
+            _finish_coverage_recording, app, recorder, record_wall, episode, play_wall)
+            if recorded else None)
+        try:
+            if t_offset is not None:
+                await _recorded_coverage_oracle(app, plan_id, episode, t_offset, sid)
+            else:
+                await oracle_finish(app, prep, sid)
+        except Exception as exc:  # noqa: BLE001 - evidence never fails the move report
+            logging.warning("coverage oracle for %s failed: %s", plan_id, exc)
     return {
         "ok": True, "mode": "cartesian", "motion": True,
         "plan_id": plan_id,
@@ -3473,6 +3613,8 @@ def build_app(args) -> web.Application:
     app["whep_url"] = "" if args.no_whip else "%s/%s/whep" % (app["mediamtx"], app["whip_path"])
     app["planner"] = args.planner.rstrip("/")
     app["planner_token"] = args.planner_token
+    app["workflow_url"] = str(getattr(args, "workflow_url", "")
+                              or os.environ.get("REBOT_WORKFLOW_URL", "")).rstrip("/")
     app["execute"] = bool(args.execute)
     app["calib"] = Path(args.calib_dir).resolve()
     app["calib_file"] = args.calib
@@ -3811,6 +3953,9 @@ def main(argv=None):
                              "instead of the file log (spec §8 cutover)")
     parser.add_argument("--pg-workspace", default=os.environ.get("REBOT_PG_WORKSPACE", "default"),
                         help="workspace id for trace sessions in the substrate")
+    parser.add_argument("--workflow-url", default=os.environ.get("REBOT_WORKFLOW_URL", ""),
+                        help="isolated execute/extract/detect activity URL; when set with a "
+                             "PG DSN, /execute runs the durable execute->oracle workflow")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 

@@ -72,20 +72,23 @@ docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/coordi
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/judge_protocol_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/ray_plane_tests.sql
 docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_workflow_tests.sql
+docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_oracle_workflow_tests.sql
 python tests/test_store.py   # needs psycopg; container on localhost:5433
 python tests/test_pg_trace.py
 python tests/test_pg_evidence.py
 python tests/test_ingest_embed.py tests/_spool/ep_ingest   # HLS ingest + similarity
 python tests/test_embed_activity.py   # isolated embed activity via df.http()
 docker exec rebot-capture-capture-1 python /app/substrate/tests/test_extract.py  # offline hold-frame extraction (cv2)
+docker exec rebot-capture-capture-1 python /app/substrate/tests/test_execute_workflow.py  # dry execute->oracle (arm parked)
 # plan core/wrapper (run in the planner container; see "Plan as a SQL function"):
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/plan_parity.py
 #   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
 ```
 
-Apply migrations `0001`–`0019` in order (each is idempotent).
+Apply migrations `0001`–`0021` in order (each is idempotent).
 
-Full offline app suite (file mode; 646 checks) — run inside the capture container with
+Full offline app suite (file mode; 682 checks) — run inside the capture container with
 the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
 atomicity and produces spurious empty lines in the event log):
 
@@ -144,7 +147,7 @@ of record and the authoritative writes/reads are PG-only (no file fallback):
   (`calib_doc`) and the sag map are materialized into the scratch cache at startup, so a
   cache wipe loses nothing. Accuracy reads are PG-only.
 - Validated: `tests/test_pg_evidence.py`, `tests/test_pg_trace.py`, and the full offline
-  selftest (646 checks, file mode) + live PG-mode dry checks (plan/capture/trace round-trips).
+  selftest (682 checks, file mode) + live PG-mode dry checks (plan/capture/trace round-trips).
 
 ### The flatten — complete
 
@@ -163,16 +166,25 @@ artifacts under `work/` instead of `state/`.
 
 ### Deployment (arm parked)
 
-The host compose includes the `substrate` service (reuses the `substrate_rebot-pgdata`
-named volume). From `examples/host`:
+The host compose includes the `substrate`, `activities`, `capture`, `planner` and
+`mediamtx` services (the database reuses the `substrate_rebot-pgdata` named
+volume). From `examples/host`:
 
-1. `docker compose up -d --build` — substrate + mediamtx + capture + planner; capture/planner
-   wait for substrate healthy. `REBOT_PG_DSN` defaults to the compose-network DSN.
-2. Apply migrations `0001`–`0019` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
+1. `docker compose up -d --build` — substrate + mediamtx + capture + planner +
+   activities; capture/planner/activities wait for substrate healthy.
+   `REBOT_PG_DSN` defaults to the compose-network DSN; capture's
+   `REBOT_WORKFLOW_URL` defaults to `http://activities:8766`.
+2. Apply migrations `0001`–`0021` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
    Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`);
    `world.arm_config` is seeded for `b601` by `0014` (the cores require it).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
-   capture upload → PG, and `/trace` → PG. Re-verify the arm parked read-only.
+   capture upload → PG, and `/trace` → PG. `/health` on capture reports `workflow` and
+   `substrate`; the durable `/execute` requires both. Re-verify the arm parked read-only.
+4. Dry execute→oracle with the arm parked:
+   `REBOT_WORKFLOW_DRY=1` on a **separate** activity process (never on a host with
+   `REBOT_EXECUTE=1`), seed a synthetic recording, and run
+   `tests/test_execute_workflow.py` (see "Validation"). Live motion validation still
+   needs a powered arm + bench go-ahead.
 
 **Rollback**: unset `REBOT_PG_DSN` and restart — the servers run in file mode under `work/`.
 PG data is untouched; switching back resumes from the substrate.
@@ -182,15 +194,21 @@ PG data is untouched; switching back resumes from the substrate.
 **State / evidence (mirrored or PG-primary):**
 - Traces (events/blobs/manifests) — full switch (`PgTraceRecorder`).
 - Captures (meta/frame/target) — catalog + serving PG-primary; `locate_target` mirrors target.json.
-- Oracle verdicts + hold/pre/post frames — `oracle_verdict` + `evidence.still`/blobs (via `trace_blob`).
+- Oracle verdicts + hold/pre/post frames — `oracle_verdict`, `execution_hold` +
+  `evidence.still`/blobs (extracted offline from the recording; pre/post still
+  only where the capture path ran).
+- Executions — `evidence.execution` ledger (status/attempts/learned/verdict),
+  written by the durable graph; hold stills map through `evidence.execution_hold`.
 - Plans + telemetry — `evidence.plan`/`telemetry` (planner mirrors at plan time; PG-primary reads).
 - Rig — `world.shared_rig.rig_doc` (lossless `Rig.from_dict`), PG-primary startup load.
 - Intrinsics — `world.calibration.calib_doc` + corners blob (`calibrate_intrinsics` mirrors).
-- Accuracy envelope — `learning.accuracy_cell` (PG-primary reads).
+- Accuracy envelope — `learning.accuracy_cell` (PG-primary reads; folded once by `oracle_learn`).
 - Sag maps — `learning.sag_map` (mirrored at fit time).
 - Identify/CAD session evidence — episodes + blobs (`pg_cli.mirror_session`).
 - Sweep poses — `sweep_video` mirrors poses.json.
-- Recordings — periodic ingest loop mirrors completed mp4s to blobs.
+- Recordings — the durable execute activity records + ingests the executed
+  trajectory under `exec-<plan>`; the periodic ingest loop still mirrors other
+  completed mp4s.
 - Tags — `world.tag`; in-memory state (monitor EWMA, llm context) — `learning.monitor_state`/`substrate_kv`.
   The monitor EWMA/tag baseline/proposals are **restored at startup**, so a restart
   doesn't reset the drift trend.
@@ -279,7 +297,7 @@ hold window (trajectory time) --(+t_offset)--> episode/video time
   fails the workflow step (retry/dead-letter); the cluster and arm gateway are untouched.
 
 ```bash
-python extract_service.py --port 8766        # isolated activity (cv2-capable sidecar)
+python extract_service.py --port 8766        # pure decode activity (unit/legacy)
 python tests/test_extract.py                 # deterministic synthetic rig (capture container)
 ```
 
@@ -290,38 +308,72 @@ window→fragment alignment, stillest-frame selection (incl. a jitter case that 
 the still plateau over the midpoint), and **tip-pixel parity with the live midpoint
 grab** (<0.1 px) — the oracle gate is verdict agreement, not pixel identity.
 
-Status / next phase: this is the extraction capability, validated offline. The
-**live oracle path is not switched yet** — wiring it into the execute→oracle durable
-workflow (and retiring the live `_oracle_hold_grabs` timer task) is the next phase,
-gated on bench validation. `t_offset` (recording clock zero vs playback start) is 0
-when they coincide; any offset is calibratable from telemetry motion onset. Real-episode
-parity is a follow-up once the arm runs again.
+## Durable execute→oracle workflow (`0020` + `0021`)
 
-## Durable execute→oracle workflow — foundation (`0020`)
+The execute→oracle chain is one pg_durable graph. The live hold-grab timer is
+retired: hold stills are extracted from the executed-trajectory recording after
+playback. The graph (built by SQL so capture, psql and tests share it):
 
-The execute→oracle chain becomes a pg_durable workflow. Durable replay raises two
-safety problems, encoded in `evidence.execution` (the durable ledger) + functions:
+```
+execution_prepare
+  -> activity /execute (claim pending->playing BEFORE moving; play; record; ingest)
+  -> execution_after_play (ledger + telemetry)
+  -> loop until recording fragments cover every hold (or the deadline)
+  -> activity /extract (decode only the hold windows; stillest frame)
+  -> execution_store_stills (content-addressed stills + execution_hold)
+  -> activity /detect (green tip on each extracted still)
+  -> execution_finalize (oracle_compute + oracle_learn)
+```
 
-- **Motion is at-most-once.** `execution_claim_play` claims `pending → playing`
-  *before* moving; only the caller that wins the claim may move the arm. A retry
-  sees a non-pending status and does **not** re-move; a crash after the claim leaves
-  `playing` → `execution_mark_dead` (dead-letter + operator review), never auto-replay.
-- **Learning is idempotent.** `accuracy_cell_update` increments `n` (not idempotent),
-  so `oracle_learn` writes the verdict + folds cells **once** per execution, gated by
-  a `learned` flag under a row lock; a replay returns the recorded verdict without
-  re-folding. Requires telemetry persisted first (`oracle_verdict.exec_id` FK).
-- `execution_begin` (idempotent create), `execution_mark_played`, `execution_get`,
-  and `wait_fragments` (recording-readiness gate: fragment span covers every hold).
+Safety is structural, not conventional:
 
-Validated by `tests/execute_workflow_tests.sql` (9 checks): idempotent begin,
-at-most-once claim, idempotent mark_played, wait_fragments gate, oracle_learn folds
-once + idempotent replay (n stays 1), ledger verified/learned, telemetry required,
-dead-letter no-replay.
+- **Motion is at-most-once.** The isolated execute activity calls
+  `execution_claim_play` (`pending → playing`) *before* it starts recording or
+  contacts the gateway. Only the caller that wins the claim moves. A replay gets
+  `claimed:false` and never re-moves; a claimed-but-failed play is
+  `execution_mark_dead` (operator review), never auto-replayed.
+- **Learning is idempotent.** `accuracy_cell_update` increments `n`, so
+  `execution_finalize` goes through `oracle_learn`, which folds cells **once** per
+  execution under the `learned` flag. A replay returns the recorded verdict.
+- **Evidence is blob-first and idempotent.** `execution_store_stills` inserts the
+  content-addressed blob, the `evidence.still` (purpose `hold`) and the
+  `(execution, hold_index)` mapping; a replay does not duplicate any of them.
+- **Recording is evidence, not a gate.** If MediaMTX is unavailable the play still
+  runs and the oracle reports `no recording` after the deadline; a missing camera
+  never blocks motion.
 
-Remaining increments (not yet built): the `df.start` graph wiring prepare → play
-(activity owns the claim guard) → extract (offline) → detect → `oracle_learn`; the
-execution + detect activities; retiring `_oracle_hold_grabs`; and the capture/planner
-merge. Live motion validation is blocked by the unpowered arm → mock-execution validation.
+### Isolated activity service (the capture/planner merge)
+
+`workflow_service.py` is the **one isolated activity process** that merges the
+planner half (play on the edge, persist telemetry, record + ingest) and the capture
+half (decode the recording, select hold stills, detect the tip). pg_durable reaches
+it via `df.http()`; a decode/cv2/FFmpeg crash fails the workflow step and can never
+reset the Postgres cluster (spec §2). The pure extraction/selection stays in
+`extract.py`; the detector is shared with the capture server through
+`app/oracle_vision.py`.
+
+The `activities` compose service runs it on the compose network (`:8766`);
+capture's `REBOT_WORKFLOW_URL` points at it. Coverage/identify moves use the same
+activity service through `execution_adopt` + the same extract/detect/finalize
+functions, so they are recorded and extracted too (no live grabs).
+
+### Validation
+
+- `tests/execute_oracle_workflow_tests.sql`: prepare, at-most-once claim,
+  recording readiness, still storage idempotence, detect request geometry,
+  finalize verified/learned, replay does not add a verdict or fold a cell.
+- `tests/test_execute_workflow.py`: **dry end-to-end, arm parked**. It seeds a
+  deterministic synthetic recording + plan, runs the real `df.start` graph against
+  the real activity service in `REBOT_WORKFLOW_DRY=1` (no gateway/edge call), and
+  proves: verified/learned, one extracted hold, a persisted verdict, attempts==1,
+  and a replay that writes no second verdict, folds no second cell, duplicates no
+  still and does not re-claim the play. The planner log shows only health checks
+  during the run — no `/execute` reached it.
+- The existing `tests/execute_workflow_tests.sql` (0020) still covers the ledger
+  primitives.
+
+Live motion validation still needs a powered arm + bench go-ahead; the dry proof
+covers durability, ordering, extraction and idempotence, not physical parity.
 
 ## Plan as a SQL function (`rebot_plan` / `plan_one`)
 
@@ -381,7 +433,7 @@ witness/sweep), the oracle predicted-tip overlay, fit diagnostics, joint-limit c
 and file-mode fallbacks — not the motion/oracle/calibration solve.
 
 Validated: `tests/plan_parity.py`, `move_parity.py`, `oracle_parity.py`, `calib_parity.py`
-(incl. the live `ex.fit` dispatch), `fk_parity.py`; the full offline selftest (646 checks);
+(incl. the live `ex.fit` dispatch), `fk_parity.py`; the full offline selftest (682 checks);
 SQL suites `test_plan_one`/`test_store`/`test_pg_trace`/`test_pg_evidence`. The `/move` and
 oracle live executions need a powered arm + bench go-ahead (motors unpowered here; compute
 parity proven separately, dry plans only).

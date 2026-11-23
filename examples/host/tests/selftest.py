@@ -2020,6 +2020,33 @@ async def test_oracle_server(workdir: Path, geometry):
     camera_mod.open_source = lambda url, **kw: SimpleNamespace(
         read=lambda: frame.copy(), close=lambda: None)
 
+    # The live hold-grab timer is retired. In production the durable workflow
+    # extracts these from the recording; this offline test double materialises
+    # the same stills from the fake camera after prepare, so oracle_finish's
+    # post-extraction path (detection, residuals, persistence) is still covered.
+    real_prepare = capture_server.oracle_prepare
+
+    async def prepare_with_extracted_holds(app_, plan_id):
+        prep = await real_prepare(app_, plan_id)
+        if prep is None:
+            return None
+        for window in prep["windows"]:
+            shot = capture_server._oracle_grab_frame(app_)
+            if shot is None:
+                continue
+            ok, buffer = cv2.imencode(".jpg", shot, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            if not ok:
+                continue
+            data = buffer.tobytes()
+            path = app_["oracle_dir"] / plan_id / ("hold-%d.jpg" % window["index"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            prep["holds"][window["index"]] = {
+                "path": str(path), "blob": await capture_server.trace_blob(app_, data)}
+        return prep
+
+    capture_server.oracle_prepare = prepare_with_extracted_holds
+
     sid = "20261118T102320Z-abc123"
     headers = {"X-Rebot-Token": "oracle-token", "X-Rebot-Session": sid}
     try:
@@ -2152,6 +2179,7 @@ async def test_oracle_server(workdir: Path, geometry):
                   fourth.status == 200 and doc_path.is_file())
     finally:
         camera_mod.open_source = real_open
+        capture_server.oracle_prepare = real_prepare
         edge.shutdown()
 
 
