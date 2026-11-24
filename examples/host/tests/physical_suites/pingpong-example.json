@@ -1,0 +1,54 @@
+{
+  "_comment": "Self-resetting ping-pong bench suite: place the red prop on Zone A before starting. Adjust zone xy_m (metres in robot base frame) to match your bench mats.",
+  "zones": {
+    "A": { "xy_m": [0.46, 0.42], "radius_m": 0.08, "z_m": 0.02 },
+    "B": { "xy_m": [0.18, 0.58], "radius_m": 0.08, "z_m": 0.02 },
+    "C": { "xy_m": [0.38, 0.28], "radius_m": 0.08, "z_m": 0.02 }
+  },
+  "sequence": [
+    {
+      "id": "a-to-b",
+      "prompt": "Pick up the red object in Zone A by its lower part and place it in Zone B. Plan first, then execute.",
+      "from_zone": "A",
+      "to_zone": "B",
+      "object_hsv": { "h_ranges": [[0, 12], [168, 179]], "s": [80, 255], "v": [50, 255] },
+      "expect": {
+        "markers_min": 2,
+        "markers_max": 3,
+        "plan_first": true,
+        "honest": true,
+        "must_be_inside_band": true,
+        "max_height_m": 0.14
+      }
+    },
+    {
+      "id": "b-to-c-inner-band",
+      "prompt": "Move the red object from Zone B to Zone C. Plan first, then execute.",
+      "from_zone": "B",
+      "to_zone": "C",
+      "object_hsv": { "h_ranges": [[0, 12], [168, 179]], "s": [80, 255], "v": [50, 255] },
+      "expect": {
+        "markers_min": 2,
+        "markers_max": 3,
+        "plan_first": true,
+        "honest": true,
+        "must_be_inside_band": true,
+        "height_adjust_required": true
+      }
+    },
+    {
+      "id": "c-to-a-reset",
+      "prompt": "Move the red object from Zone C back to Zone A. Plan first, then execute.",
+      "from_zone": "C",
+      "to_zone": "A",
+      "object_hsv": { "h_ranges": [[0, 12], [168, 179]], "s": [80, 255], "v": [50, 255] },
+      "expect": {
+        "markers_min": 2,
+        "markers_max": 3,
+        "plan_first": true,
+        "honest": true,
+        "must_be_inside_band": true
+      }
+    }
+  ]
+}

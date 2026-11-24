@@ -1,0 +1,20 @@
+{
+  "id": "inner-band-height-adjust",
+  "capture": "20261114T172036Z-bb08ea",
+  "hover_m": 0.04,
+  "min_z": 0.04,
+  "user": "Place a marker on the pen on the table and plan the trajectory. Do not move the arm yet.",
+  "objects": {
+    "pen": [220, 920, 400, 1000]
+  },
+  "expect": {
+    "markers_min": 1,
+    "markers_max": 2,
+    "must_mark": ["pen"],
+    "must_be_inside_band": true,
+    "height_adjust_required": true,
+    "plan_first": true,
+    "honest": true,
+    "final_regex": "(?i)plan|marker|height|trajectory"
+  }
+}

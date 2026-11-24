@@ -68,8 +68,10 @@
     const body = JSON.stringify({ session: session, events: batch });
     // The answer is deliberately ignored: a dropped batch costs evidence, not
     // a chat turn. No retry queue -- a down collector must not grow memory.
+    // Do not set keepalive here: browsers cap keepalive bodies at 64 KiB, which
+    // silently drops batches that carry a camera frame data URL.
     fetch("/trace", { method: "POST", headers: headers(true), body: body,
-                      cache: "no-store", keepalive: true }).catch(() => {});
+                      cache: "no-store" }).catch(() => {});
     if (queue.length) flush();
   }
 

@@ -1,0 +1,20 @@
+{
+  "id": "grab-lower-plush",
+  "capture": "20261114T172036Z-bb08ea",
+  "user": "Put a grasp marker on the red plush toy at the front of the table, then plan the move. Do not move the arm yet.",
+  "objects": {
+    "plush_lower": [200, 1520, 500, 1720],
+    "plush_top": [200, 1330, 500, 1480]
+  },
+  "expect": {
+    "markers_min": 1,
+    "markers_max": 2,
+    "must_mark": ["plush_lower"],
+    "must_not_mark": ["plush_top"],
+    "must_be_inside_band": true,
+    "max_height_m": 0.14,
+    "plan_first": true,
+    "honest": true,
+    "final_regex": "(?i)plan|marker|trajectory"
+  }
+}
