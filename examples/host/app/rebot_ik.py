@@ -239,18 +239,20 @@ def com_positions(q):
     return points
 
 
-def potential_energy(q, gravity=GRAVITY):
+def potential_energy(q, gravity=None):
     """Gravitational potential of the moving links (only its gradient matters)."""
-    return sum(mass * gravity * p[2] for mass, p in com_positions(q))
+    g = GRAVITY if gravity is None else gravity
+    return sum(mass * g * p[2] for mass, p in com_positions(q))
 
 
-def gravity_torques(q, gravity=GRAVITY):
+def gravity_torques(q, gravity=None):
     """Joint torques needed to hold this pose against gravity.
 
     tau_g = dU/dq: the motor torque required to stay still, in the same sign
     convention as the joint angles (so it can be fed straight into the MIT
     frame's torque field).
     """
+    gravity = GRAVITY if gravity is None else gravity
     _tool, frames = forward(q, with_frames=True)
     coms = com_positions(q)
     tau = np.zeros(DOF)
@@ -454,12 +456,15 @@ def apply_config(cfg):
                 mod.CLEARANCE = CLEARANCE
             if hasattr(mod, "LINK_RADIUS_MAX"):
                 mod.LINK_RADIUS_MAX = LINK_RADIUS_MAX
-    for name in ("plan_to_target", "plan_with_pinocchio"):
-        mod = sys.modules.get(name)
-        if mod is not None and hasattr(mod, "MOTOR7_OPEN"):
-            mod.MOTOR7_OPEN = GRIPPER["motor7_open"]
-            mod.MOTOR7_CLOSED = GRIPPER["motor7_closed"]
-            mod.GRIPPER_RAD_PER_MM = GRIPPER["rad_per_mm"]
+    mod = sys.modules.get("plan_to_target")
+    if mod is not None and hasattr(mod, "MOTOR7_OPEN"):
+        mod.MOTOR7_OPEN = GRIPPER["motor7_open"]
+        mod.MOTOR7_CLOSED = GRIPPER["motor7_closed"]
+        mod.MOTOR7_HALF = (GRIPPER["motor7_open"] + GRIPPER["motor7_closed"]) / 2.0
+        mod.GRIPPER_RAD_PER_MM = GRIPPER["rad_per_mm"]
+        mod.GRIPPER_MAX_WIDTH_MM = (GRIPPER["motor7_open"] - GRIPPER["motor7_closed"]) / GRIPPER["rad_per_mm"]
+        if hasattr(mod, "DEFAULT_MIN_Z"):
+            mod.DEFAULT_MIN_Z = MOTION["default_min_z"]
     # Motion tuning aliases (traj/sweep). Their default-arg functions resolve these
     # globals at call time, so re-syncing here propagates a table edit.
     for name, keys in (

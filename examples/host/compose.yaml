@@ -34,13 +34,12 @@ services:
     container_name: rebot-substrate
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: rebot
-      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_PASSWORD: ${REBOT_PG_PASSWORD:-rebot}
     ports:
-      - "5433:5432"
+      # Loopback only: never expose Postgres on the LAN.
+      - "127.0.0.1:5433:5432"
     volumes:
-      # Reuse the validated dev database (migrations 0001-0008 + extensions
-      # already applied by the substrate standalone compose).
+      # Named volume (auto-created on fresh hosts; shares existing dev volume).
       - substrate_rebot-pgdata:/var/lib/postgresql
       - ./substrate/migrations:/migrations:ro
       - ./substrate/tests:/tests:ro
@@ -96,9 +95,11 @@ services:
       REBOT_KEY: /app/config/tls/key.pem
       # Durable substrate (§8 cutover): PG-primary reads when set; file fallback otherwise.
       # The substrate service is on the compose network; 5433 is also published on the host.
-      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:rebot@substrate:5432/postgres}
+      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:${REBOT_PG_PASSWORD:-rebot}@substrate:5432/postgres}
       REBOT_PG_WORKSPACE: ${REBOT_PG_WORKSPACE:-default}
+      REBOT_PG_ARM: ${REBOT_PG_ARM:-b601}
       REBOT_TOKEN: ${REBOT_TOKEN:-}
+      REBOT_ACTIVITY_TOKEN: ${REBOT_ACTIVITY_TOKEN:-}
       REBOT_MEDIAMTX: http://mediamtx:8889
       REBOT_PLANNER: http://planner:8000
       # The isolated execute/extract/detect activity (capture/planner merge).
@@ -188,8 +189,10 @@ services:
     command: ["python", "/app/substrate/workflow_service.py", "--port", "8766"]
     working_dir: /app
     environment:
-      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:rebot@substrate:5432/postgres}
+      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:${REBOT_PG_PASSWORD:-rebot}@substrate:5432/postgres}
       REBOT_PG_WORKSPACE: ${REBOT_PG_WORKSPACE:-default}
+      REBOT_PG_ARM: ${REBOT_PG_ARM:-b601}
+      REBOT_ACTIVITY_TOKEN: ${REBOT_ACTIVITY_TOKEN:-}
       REBOT_PLANNER: http://planner:8000
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_EDGE_URL: ${REBOT_EDGE_URL:-http://raspberrypi:8081}
@@ -233,8 +236,9 @@ services:
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_KP: ${REBOT_KP:-50,2:150,3:150}
       REBOT_KD: ${REBOT_KD:-3,2:10,3:10,4:5,5:4,6:4,7:4}
-      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:rebot@substrate:5432/postgres}
+      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:${REBOT_PG_PASSWORD:-rebot}@substrate:5432/postgres}
       REBOT_PG_WORKSPACE: ${REBOT_PG_WORKSPACE:-default}
+      REBOT_PG_ARM: ${REBOT_PG_ARM:-b601}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -256,11 +260,20 @@ services:
     entrypoint: ["python"]
     environment:
       REBOT_HOST_IP: ${REBOT_HOST_IP:-}
+      REBOT_PG_DSN: ${REBOT_PG_DSN:-postgresql://postgres:${REBOT_PG_PASSWORD:-rebot}@substrate:5432/postgres}
+      REBOT_PG_WORKSPACE: ${REBOT_PG_WORKSPACE:-default}
+      REBOT_PG_ARM: ${REBOT_PG_ARM:-b601}
     volumes:
+      - ./app:/app/app:ro
+      - ./web:/app/web:ro
+      - ./substrate:/app/substrate:ro
+      - ./tests:/app/tests:ro
+      - ./config:/app/config
+      - ./export:/app/export
       - ./work:/app/work
 
 volumes:
-  # Created by the substrate standalone compose (examples/host/substrate);
-  # holds the validated dev database. External so both composes share it.
+  # Explicit volume name so both composes share the database AND a fresh host
+  # creates it automatically without needing `external: true`.
   substrate_rebot-pgdata:
-    external: true
+    name: ${REBOT_PG_VOLUME:-substrate_rebot-pgdata}

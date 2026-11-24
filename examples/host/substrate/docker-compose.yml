@@ -9,10 +9,10 @@ services:
     image: rebot-substrate:pg18
     container_name: rebot-substrate
     environment:
-      POSTGRES_PASSWORD: rebot
-      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_PASSWORD: ${REBOT_PG_PASSWORD:-rebot}
     ports:
-      - "5433:5432"
+      # Loopback only: never expose Postgres on the LAN.
+      - "127.0.0.1:5433:5432"
     volumes:
       # PG18+ images want the mount at /var/lib/postgresql (they create a
       # major-version subdir); mounting .../data directly is rejected.

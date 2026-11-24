@@ -1,31 +1,37 @@
 """HLS fragment ingester (spec §5 / §11).
 
-MediaMTX records HLS segments to a spool dir; this moves completed segments into
-evidence.blob + evidence.media_fragment. It is safe byte-shuffling + hashing + INSERT
-— NO decode. FFmpeg is an isolated activity, used only for retrospective re-extraction
-or transcoding, never in this hot path. Content-addressed and idempotent.
-
-Spool layout: <spool>/<episode_id>/playlist.m3u8 + segN.m4s (or .ts). The playlist's
-#EXTINF durations give fragment timing; without a playlist, segments are globbed in
-sorted order with zero durations.
-
-    from store import SubstrateStore
-    from ingest import ingest_hls
-    n = ingest_hls(SubstrateStore(dsn), sid, workspace_id, [arm_id], spool_dir)
+Hardened against path traversal in `playlist.m3u8` (every segment path must
+resolve inside `spool_dir`), uses natural numeric sorting when no playlist is
+present, ensures workspace exists, and ingests segments atomically in one call.
 """
 from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 
 
-def ingest_hls(store, episode_id: str, workspace_id: str, arm_ids, spool_dir: str, codec: str = "h264") -> int:
+def _nat_key(name: str):
+    return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", name)]
+
+
+def _safe_segment_path(root: Path, entry: str) -> Path:
+    candidate = (root / entry).resolve()
+    if not candidate.is_relative_to(root):
+        raise ValueError("playlist segment escapes spool_dir: %r" % entry)
+    return candidate
+
+
+def ingest_hls(store, episode_id: str, workspace_id: str, arm_ids, spool_dir: str,
+               codec: str = "h264") -> int:
+    root = Path(spool_dir).resolve()
+    store.ensure_workspace(workspace_id)
     store.create_episode(episode_id, workspace_id, arm_ids)
-    playlist = os.path.join(spool_dir, "playlist.m3u8")
-    segments = []  # (filename, duration_s)
-    if os.path.exists(playlist):
+    playlist = root / "playlist.m3u8"
+    segments: list[tuple[str, float]] = []
+    if playlist.is_file():
         dur = None
-        with open(playlist, encoding="utf-8") as fh:
+        with playlist.open(encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 m = re.match(r"#EXTINF:([0-9.]+)", line)
@@ -35,17 +41,19 @@ def ingest_hls(store, episode_id: str, workspace_id: str, arm_ids, spool_dir: st
                     segments.append((line, dur or 0.0))
                     dur = None
     else:
-        for fn in sorted(os.listdir(spool_dir)):
-            if fn.endswith((".m4s", ".ts")):
+        for fn in sorted(os.listdir(root), key=_nat_key):
+            if fn.endswith((".m4s", ".ts", ".mp4")):
                 segments.append((fn, 0.0))
 
-    t = 0.0
-    n = 0
-    for seq, (fn, dur) in enumerate(segments):
-        with open(os.path.join(spool_dir, fn), "rb") as fh:
-            data = fh.read()
-        sha = store.put_blob(data, kind="fragment")
-        store.add_fragment(episode_id, sha, seq, t, t + dur, codec=codec)
-        t += dur
-        n += 1
-    return n
+    if not segments:
+        return 0
+    blobs: list[bytes] = []
+    durations: list[float] = []
+    for fn, dur in segments:
+        seg_path = _safe_segment_path(root, fn)
+        blobs.append(seg_path.read_bytes())
+        durations.append(dur)
+
+    arm_id = list(arm_ids)[0] if arm_ids else None
+    store.ingest_episode_segments(episode_id, workspace_id, arm_id, blobs, durations, codec=codec)
+    return len(blobs)

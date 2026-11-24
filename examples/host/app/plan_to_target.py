@@ -103,7 +103,7 @@ class Options:
     # When set it overrides grasp_q, the close angle shared by the pick and the
     # sequence's odd markers; None keeps that default.
     close_width_mm: float | None = None
-    open_q: float = MOTOR7_OPEN
+    open_q: float = field(default_factory=lambda: MOTOR7_OPEN)
     grasp_s: float = 1.2
     hold_s: float = 0.6
     lift: float = 0.10
@@ -113,7 +113,7 @@ class Options:
     # come back, because the board ends every move where it began). A tap that
     # only marks a place on the table wants this, not a grasp sequence.
     hover: bool = False
-    hover_m: float = DEFAULT_MIN_Z
+    hover_m: float = field(default_factory=lambda: sweep.DEFAULT_MIN_Z)
     # Where the tool tip sits below `gripper_end`, in metres. The planner aims the
     # *frame*; the tip is this far along the tool axis, so the flange has to be
     # lifted by it for the tip to reach the requested height. Fixed mode can take
@@ -124,7 +124,7 @@ class Options:
     payload: float = 0.0
     # The lowest z the planner accepts for a target point. The default is the
     # default hover height: the tip must not sit closer to the table than a tap.
-    min_z: float = DEFAULT_MIN_Z
+    min_z: float = field(default_factory=lambda: sweep.DEFAULT_MIN_Z)
     max_z: float = 0.95
     max_reach: float = 0.75
     no_return: bool = False

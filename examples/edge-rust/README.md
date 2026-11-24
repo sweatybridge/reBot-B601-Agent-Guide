@@ -1,7 +1,7 @@
 # rebot-edge — the edge player as one Rust binary
 
 The edge half of the B601-RS pipeline, in one static executable. Input is the
-trajectory JSON that `host/app/plan_with_pinocchio.py` writes:
+trajectory JSON that `host/app/plan_to_target.py` (or the Postgres planner) writes:
 
 ```
 seq_pino_peel.json ──► rebot-edge ──► SocketCAN can0 ──► motors 1-7
@@ -231,7 +231,7 @@ Checks performed before anything is enabled:
 
 `control_hz` is accepted up to 200 Hz. Playback is driven by the waypoint
 timestamps, so generate a trajectory at the rate you want — either replan with
-`plan_with_pinocchio.py --hz 100` (which also recomputes `tau`) or resample an
+`plan_to_target.py --hz 100` (which also recomputes `tau`) or resample an
 existing file (which preserves its path but linearly interpolates `tau`).
 `--speed` is not a rate control: it shortens the whole motion and makes the arm
 move faster.

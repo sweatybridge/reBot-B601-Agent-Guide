@@ -109,14 +109,16 @@ def cleanup(store):
         c.execute("DELETE FROM evidence.oracle_hold WHERE verdict_id IN "
                   "(SELECT id FROM evidence.oracle_verdict WHERE exec_id=%s)", (EXEC,))
         c.execute("DELETE FROM evidence.oracle_verdict WHERE exec_id=%s", (EXEC,))
-        c.execute("DELETE FROM evidence.telemetry WHERE exec_id=%s", (EXEC,))
-        c.execute("DELETE FROM evidence.media_fragment WHERE episode_id=%s", (EPISODE,))
+        c.execute("DELETE FROM evidence.media_fragment WHERE episode_id=%s OR sha256=%s",
+                  (EPISODE, REC_SHA))
         c.execute("DELETE FROM evidence.still WHERE episode_id=%s", (EPISODE,))
         c.execute("DELETE FROM evidence.oracle_hold WHERE verdict_id IN "
                   "(SELECT id FROM evidence.oracle_verdict WHERE plan_id IN "
                   " (SELECT plan_id FROM evidence.plan WHERE episode_id=%s))", (EPISODE,))
         c.execute("DELETE FROM evidence.oracle_verdict WHERE plan_id IN "
                   "(SELECT plan_id FROM evidence.plan WHERE episode_id=%s)", (EPISODE,))
+        c.execute("DELETE FROM evidence.telemetry WHERE exec_id=%s OR plan_id IN "
+                  "(SELECT plan_id FROM evidence.plan WHERE episode_id=%s)", (EXEC, EPISODE))
         c.execute("DELETE FROM evidence.plan WHERE episode_id=%s", (EPISODE,))
         c.execute("DELETE FROM evidence.episode WHERE episode_id=%s", (EPISODE,))
         c.execute("DELETE FROM evidence.blob WHERE sha256 IN (%s,%s,'wf3_plan_blob')",

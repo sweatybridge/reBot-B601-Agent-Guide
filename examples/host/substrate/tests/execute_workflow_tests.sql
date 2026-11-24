@@ -24,7 +24,7 @@ VALUES ('wf_rig', 'default', 'wf_calib',
         '[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]', '[640,480]', '[0,0,0]',
         'base-marker', '{}', 'superseded');
 INSERT INTO evidence.blob(sha256, kind, bytes, size_bytes, status)
-VALUES ('wf_blob', 'telemetry', '\x00', 1, 'verified');
+VALUES ('wf_blob', 'telemetry', convert_to('{"waypoints":[]}', 'UTF8'), 16, 'verified');
 INSERT INTO evidence.episode(episode_id, workspace_id, kind) VALUES ('wf_ep', 'default', 'execution');
 INSERT INTO evidence.plan(plan_id, episode_id, arm_id, blob_sha, metadata, snapshot)
 VALUES ('wf_plan', 'wf_ep', 'b601', 'wf_blob', '{}', '{}');
@@ -39,11 +39,11 @@ DECLARE
   v jsonb; n1 bigint; n2 bigint; ex jsonb;
 BEGIN
   -- 1. Idempotent creation.
-  IF execution_begin('wf_exec','wf_plan','b601','wf_ep') <> 'pending' THEN
-    RAISE EXCEPTION 'begin should return pending'; END IF;
-  IF execution_begin('wf_exec','wf_plan','b601','wf_ep') <> 'pending' THEN
-    RAISE EXCEPTION 'begin should be idempotent'; END IF;
-  RAISE NOTICE 'OK execution_begin idempotent';
+  IF (execution_prepare('wf_exec','wf_plan','b601','wf_ep')->>'status') <> 'pending' THEN
+    RAISE EXCEPTION 'prepare should return pending'; END IF;
+  IF (execution_prepare('wf_exec','wf_plan','b601','wf_ep')->>'status') <> 'pending' THEN
+    RAISE EXCEPTION 'prepare should be idempotent'; END IF;
+  RAISE NOTICE 'OK execution_prepare idempotent';
 
   -- 2. AT-MOST-ONCE motion guard: first claim true, every later claim false.
   IF execution_claim_play('wf_exec') <> true THEN

@@ -3,7 +3,7 @@
 A phone in the browser is a camera the kitchen already owns. This turns one
 still from it into a point in the arm's base frame, then into a joint trajectory
 the Pi replays -- the same `rebot-joint-trajectory` file as
-`plan_with_pinocchio.py`, with the same safety gates.
+`plan_to_target.py`, with the same safety gates.
 
 The design is two planes, not one video pipe:
 
@@ -175,8 +175,8 @@ it is:
 
 ```bash
 python examples/host/app/capture_server.py \
-    --cert examples/host/state/tls/cert.pem \
-    --key  examples/host/state/tls/key.pem \
+    --cert examples/host/config/tls/cert.pem \
+    --key  examples/host/config/tls/key.pem \
     --token pick-something
 ```
 
@@ -244,7 +244,7 @@ docker compose --profile tools run --rm tools app/calibrate_extrinsics.py \
     --capture-pose --camera rtsp://mediamtx:8554/phone
 # 2. open the frame it names, read the tool tip's pixel, then sweep and fit
 ... app/calibrate_extrinsics.py --auto --camera rtsp://mediamtx:8554/phone \
-    --from /app/state/captures/<id> --uv 812 455
+    --from /app/work/captures/<id> --uv 812 455
 # 3. audit it: residuals, leave-one-out, the error a tap costs
 ... app/calibrate_extrinsics.py --check
 ```
@@ -305,20 +305,20 @@ it is received, so a timestamp alone would pair it with the wrong pose; but
 latency is. A pose the arm merely passed through has no window and is refused
 rather than guessed.
 
-    state/recordings/phone/2026-11-13_10-23-21-813025.mp4   MediaMTX segments
-    state/captures/<id>/poses.jsonl                         pose, 15 Hz
-    state/captures/<id>/pose-1.jpg .. pose-8.jpg            one per pose
-    state/captures/<id>/poses.json                          how each was chosen
+    work/recordings/phone/2026-11-13_10-23-21-813025.mp4   MediaMTX segments
+    work/captures/<id>/poses.jsonl                         pose, 15 Hz
+    work/captures/<id>/pose-1.jpg .. pose-8.jpg            one per pose
+    work/captures/<id>/poses.json                          how each was chosen
 
 Recording is off by default (`record: no` on the path) and switched on per sweep,
 so the disk only fills with passes someone asked for. Three things must be true:
 `api: yes` in `mediamtx.yml` (it is, and the API is published on loopback only),
-a `./state/recordings` volume for MediaMTX, and the camera must be that stream --
+a `./work/recordings` volume for MediaMTX, and the camera must be that stream --
 `REBOT_CAMERA=rtsp://mediamtx:8554/phone`, since a USB device or a snapshot URL
 has no path to record. `REBOT_MEDIAMTX_API` and `REBOT_RECORDINGS` point at the
 API and the shared directory.
 
-The rig is written to `state/calib/extrinsics-fixed.json`. The running server
+The rig is written to `work/calib/extrinsics-fixed.json`. The running server
 hot-loads it, and a restart picks it up automatically — there is no env var to
 set — so `/health` reports `"mode": "fixed"` with the rig's fingerprint. Taps no
 longer look for a marker.
@@ -369,7 +369,7 @@ biases every plan with nothing in the log to show for it.
 # REBOT_MARKER_AT set, this response already carries "written" and the rig.
 curl -sk -X POST https://127.0.0.1:8443/capture/pose -H "X-Rebot-Token: $REBOT_TOKEN"
 # {"ok": true, "id": "20261113T101500Z-a1b2c3", "image_url": "/captures/.../frame.jpg",
-#  "marker": {"detected": true, ...}, "written": "state/calib/extrinsics-fixed.json"}
+#  "marker": {"detected": true, ...}, "written": "work/calib/extrinsics-fixed.json"}
 
 curl -sk -X POST https://127.0.0.1:8443/calibrate/extrinsics \
   -H "X-Rebot-Token: $REBOT_TOKEN" -H 'Content-Type: application/json' \
@@ -446,8 +446,8 @@ Take 15-20 shots of a printed checkerboard with **Calibration mode** on: tilt it
 put it in the corners, fill the frame, then pull back. Then:
 
 ```bash
-python examples/host/app/state/calibrate_intrinsics.py \
-    --captures examples/host/state/captures --cols 9 --rows 6 --square 0.025
+python examples/host/app/calibrate_intrinsics.py \
+    --captures examples/host/work/captures --cols 9 --rows 6 --square 0.025
 ```
 
 It writes `calib/<device>.json`. The RMS gate is 1 px; drop views above 2 px
@@ -712,15 +712,15 @@ commands:
 ```bash
 # 1. capture -> base-frame point, with a picture of what it believed
 docker compose --profile tools run --rm tools app/locate_target.py \
-    --capture /app/state/captures/<id> --calib /app/state/calib/<device>.json \
+    --capture /app/work/captures/<id> --calib /app/work/calib/<device>.json \
     --tag-size 0.080 --tag-x 0.35 --tag-y -0.20 --tag-yaw 15 \
-    --annotate /app/state/captures/<id>/annotated.jpg
+    --annotate /app/work/captures/<id>/annotated.jpg
 
 # 2. point -> trajectory, through the same code the gateway runs
 docker compose run --rm --entrypoint python planner /app/app/plan_to_target.py \
-    --joints /app/state/work/current.json \
-    --target /app/state/captures/<id>/target.json \
-    --out /app/state/out/seq.json --tool-axis z-
+    --joints /app/work/current.json \
+    --target /app/work/captures/<id>/target.json \
+    --out /app/work/out/seq.json --tool-axis z-
 
 # 3. the gate as always
 ./rebot-edge seq.json --check
@@ -735,7 +735,7 @@ out of the gripper. Ask the model instead of guessing:
 
 ```bash
 docker compose run --rm --entrypoint python planner /app/app/plan_to_target.py \
-    --joints /app/state/work/current.json --inspect
+    --joints /app/work/current.json --inspect
 ```
 
 It prints each local axis of `gripper_end` in the base frame and its angle from
@@ -744,7 +744,7 @@ vertical. (On the reference arm at the parked pose, `z-` is 0 deg and everything
 else is 90 or 180.) Put both in `.env` as `REBOT_TOOL_AXIS` / `REBOT_YAW`.
 
 The plan starts with a joint-space "unpark": 8 deg on j3 by default, the same
-peel `plan_with_pinocchio.py` uses, because the parked pose rests on the j2/j3
+peel `plan_to_target.py` uses, because the parked pose rests on the j2/j3
 lower stops and a Cartesian IK that begins exactly on a stop often refuses to
 move. `--unpark-j3 0` disables it; the leg is mirrored at the end of the plan.
 
@@ -1149,7 +1149,7 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | tap: "the camera moved since the extrinsics were fitted" | the witness caught a knock: refit, or put the mount back |
 | tap: "cannot verify the camera mount: only N of 64 witness patches" | the view changed too much to compare -- lens covered, lights off, or the camera moved far |
 | tap: "this rig was fitted at 4032x3024 but the camera is calibrated at ..." | the capture size changed (a different page mode or phone); refit at that size |
-| "no extrinsics at ..." on start-up | an explicit `--extrinsics` names a file that is not there; drop the flag to use the standard `state/calib/extrinsics-fixed.json`, or fit one with `--auto` |
+| "no extrinsics at ..." on start-up | an explicit `--extrinsics` names a file that is not there; drop the flag to use the standard `work/calib/extrinsics-fixed.json`, or fit one with `--auto` |
 | the panel: "not reachable: cannot reach the arm gateway" | the capture server can not open a socket to `REBOT_PLANNER`; in compose it is `http://planner:8000` -- check `docker compose ps planner` |
 | the panel: "the gateway refused /pose" | the gateway answered, so the route or the method is wrong; `/pose` is a GET, `/plan`, `/execute`, `/move` are POSTs |
 | "pose N never stood still where it was sent" | the arm never reached the pose inside the hold: `/play` returned 200, so check `can_up`, the e-stop and the motor enables first |
@@ -1166,7 +1166,7 @@ browser harness), streaming, and the arm actually moving. Those stay in
 | `/live` header: "host unreachable" | no token (open `/live?token=...` once) or the capture service is down; the dot is the `/health` poll |
 | Rig modal: "the tag needs intrinsics at this size: ... quarter turn ..." | the still is a quarter turn from the calibration and no direction was published; start the camera on the phone so it posts `POST /orientation`, or fit with the phone held the way it will be mounted |
 | a rig fitted in landscape is rolled | the published angle and the calibration's disagree; check `stream_orientation` in `/health` against the calibration's `orientation_deg`, and re-run the camera start so the page republishes, then fit again |
-| `/live` header: "no fixed rig: fit one with Rig" | `/live` plans through a rig only: **Capture one pose** with the base tag in view (no arm motion), or run the sweep (`Rig`, or `calibrate_extrinsics.py --auto`); the rig is written to `state/calib/extrinsics-fixed.json` and loaded on the next start |
+| `/live` header: "no fixed rig: fit one with Rig" | `/live` plans through a rig only: **Capture one pose** with the base tag in view (no arm motion), or run the sweep (`Rig`, or `calibrate_extrinsics.py --auto`); the rig is written to `work/calib/extrinsics-fixed.json` and loaded on the next start |
 | Rig: "Capture one pose" writes no rig | the tag was not in the still, is under 16 px across, is more than 75 deg edge-on, or its corners reproject worse than 2 px; the card shows which. Retake with the tag in view, or tap the tool tip and sweep |
 | `/live` tap: "fixed mode needs a rig" | same thing from the server's side; nothing on that page can plan without a fitted rig |
 | `/live` tap: "the camera moved since the extrinsics were fitted" | the witness caught a knock since the rig was fitted; refit, or put the bracket back |

@@ -49,55 +49,37 @@ can never crash the cluster (see "Isolated embed activity" below).
 ```bash
 cd examples/host/substrate
 docker build -t rebot-substrate:pg18 .
-docker compose up -d                       # named volume; host port 5433
-# psql "postgresql://postgres@localhost:5433/postgres"
-
-docker exec rebot-substrate psql -U postgres \
-  -c "CREATE EXTENSION IF NOT EXISTS rebot_kinematics;"
-docker exec rebot-substrate psql -U postgres --single-transaction \
-  -v ON_ERROR_STOP=1 -f /migrations/0001_substrate.sql
+docker compose up -d                       # named volume; loopback port 127.0.0.1:5433
+# Apply all 6 idempotent migrations, install rebot_kinematics, and seed the URDF:
+python migrate.py --dsn "postgresql://postgres:rebot@127.0.0.1:5433/postgres"
 ```
 
 ## Tests
 
-```bash
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/mechanism_tests.sql
-docker cp ../app/cad/ReBot_Arm_RS.urdf rebot-substrate:/tmp/rebot.urdf
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/kinematics_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/gravity_collision_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/oracle_attribute_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/accuracy_cell_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/sag_fit_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/coordination_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/judge_protocol_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/ray_plane_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/df_workflow.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_workflow_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/execute_oracle_workflow_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/workflow_logic_tests.sql
-docker exec rebot-substrate psql -U postgres -v ON_ERROR_STOP=1 -f /tests/default_intrinsics_tests.sql
-python tests/test_store.py   # needs psycopg; container on localhost:5433
-python tests/test_pg_trace.py
-python tests/test_pg_evidence.py
-python tests/test_ingest_embed.py tests/_spool/ep_ingest   # HLS ingest + similarity
-python tests/test_embed_activity.py   # isolated embed activity via df.http()
-docker exec rebot-capture-capture-1 python /app/substrate/tests/test_extract.py  # offline hold-frame extraction (cv2)
-docker exec rebot-capture-capture-1 python /app/substrate/tests/test_execute_workflow.py  # dry execute->oracle (arm parked)
-# plan core/wrapper (run in the planner container; see "Plan as a SQL function"):
-#   docker exec rebot-capture-planner-1 python /app/substrate/tests/plan_parity.py
-#   docker exec rebot-capture-planner-1 python /app/substrate/tests/test_plan_one.py
-```
-
-Apply migrations `0001`–`0023` in order (each is idempotent).
-
-Full offline app suite (file mode; 682 checks) — run inside the capture container with
-the workdir on container-local storage (the Windows bind mount breaks `O_APPEND`
-atomicity and produces spurious empty lines in the event log):
+Use the unified test runner (`tests/run_all.py`) — supports `--fresh-db` (creates a
+disposable DB, proves fresh-boot + idempotent re-run of `migrate.py`, runs tests, drops DB):
 
 ```bash
-docker run --rm -v "<examples/host>:/app" -w /app rebot-capture:local \
-  python tests/selftest.py --workdir /tmp/selftest-work
+# SQL (14 suites) + substrate/parity (9 suites) + P0/RPC regression suite on a fresh DB:
+docker exec rebot-capture-capture-1 python /app/substrate/tests/run_all.py \
+  --fresh-db --suite sql substrate rpcs
+
+# Pinocchio <-> Rust parity (plan, move, calib, plan_one) inside the planner container:
+docker exec rebot-capture-planner-1 python /app/substrate/tests/run_all.py \
+  --fresh-db --suite planner
+
+# End-to-end pg_durable workflows (execute->oracle dry run + embed activity + df_workflow):
+docker exec rebot-capture-capture-1 python /app/substrate/tests/run_all.py \
+  --suite workflow
+
+# Full offline host app suite (file mode; 682 checks):
+docker exec rebot-capture-capture-1 python /app/substrate/tests/run_all.py \
+  --suite selftest
 ```
+
+Migrations are squashed into **6 idempotent files** (`0001_schema.sql` through
+`0006_coordination_and_eval.sql`), tracked by SHA-256 checksum in `substrate_migrations`
+and applied via `migrate.py` (safe on both fresh databases and existing clusters).
 
 Needs the gitignored assets provisioned: `app/cad/meshes/` (app/cad/fetch.py) and a
 fitted rig in the default calib dir for the environment-dependent Bench tests.
@@ -140,14 +122,13 @@ of record and the authoritative writes/reads are PG-only (no file fallback):
 - **Oracle**: plan read from `evidence.plan`; verdict → `evidence.oracle_verdict` (the
   mirror IS the write); hold/pre/post frames cataloged as `evidence.still` rows (refcount-
   protected) with scratch materializations for cv2; accuracy cells via `update_accuracy_cells`.
-- **Planner**: plans/telemetry written and read PG-only (`evidence.plan`/`telemetry`); plan
-  age from the catalog `created_at`; `/health` reports PG counts. The pure planner paths
-  (plan_to_target/sweep) keep their file contract via a rig+sag read-cache materialized
-  from PG per plan/move (`refresh_calib_cache`).
+- **Planner**: plans/telemetry written and read PG-only (`plan_one`, `move_one`,
+  `plan_fetch`, `telemetry_record`, `fk_one`, `calibrate_fit_one`); `/health` reports PG
+  counts. `planner_server.py` lazy-imports Pinocchio only for file-mode fallback.
 - **Calib**: rig is PG-authoritative (`world.shared_rig.rig_doc`, lossless `Rig.from_dict`);
-  the witness reference frame is a blob (`witness_sha`, migration `0009`); intrinsics
-  (`calib_doc`) and the sag map are materialized into the scratch cache at startup, so a
-  cache wipe loses nothing. Accuracy reads are PG-only.
+  the witness reference frame is a blob (`witness_sha`); `app_bootstrap` loads `arm_config`,
+  intrinsics, rig, witness, sag map, monitor state, and `llm_context` in a single round trip
+  at startup so a cache wipe loses nothing. Accuracy reads are PG-only.
 - Validated: `tests/test_pg_evidence.py`, `tests/test_pg_trace.py`, and the full offline
   selftest (682 checks, file mode) + live PG-mode dry checks (plan/capture/trace round-trips).
 
@@ -176,9 +157,8 @@ volume). From `examples/host`:
    activities; capture/planner/activities wait for substrate healthy.
    `REBOT_PG_DSN` defaults to the compose-network DSN; capture's
    `REBOT_WORKFLOW_URL` defaults to `http://activities:8766`.
-2. Apply migrations `0001`–`0023` (idempotent) and `CREATE EXTENSION rebot_kinematics`.
-   Seed `world.robot_model` with the URDF if using `plan_one` (`tests/test_plan_one.py`);
-   `world.arm_config` is seeded for `b601` by `0014` (the cores require it).
+2. Run `python substrate/migrate.py` (applies `0001`–`0006` idempotently, installs
+   `rebot_kinematics`, seeds `world.arm_config` for `b601` and `world.robot_model` URDF).
 3. Verify `/health` (capture + planner), a dry `/plan` (synthetic pose — no motion), a
    capture upload → PG, and `/trace` → PG. `/health` on capture reports `workflow` and
    `substrate`; the durable `/execute` requires both. Re-verify the arm parked read-only.
@@ -191,15 +171,16 @@ volume). From `examples/host`:
 **Rollback**: unset `REBOT_PG_DSN` and restart — the servers run in file mode under `work/`.
 PG data is untouched; switching back resumes from the substrate.
 
-### Default intrinsics (`0023`)
+### Default intrinsics (`0005_seed_bench_intrinsics.sql`)
 
 The bench-default calibration is the 1080x1920 portrait fit for device
 `4f68b7f34a702b1c043f44fcf805ac9a63e2a3d9` (fingerprint `9acd8707e4ad`). It is
 the calibration the active rig `9caf6f58d22f` was fitted against.
 
-- **Postgres** is authoritative: `0023` seeds `world.calibration` with
-  `calib_doc`, `is_default = true`; `store.read_latest_calib_doc()` orders by
-  `is_default DESC, created_at DESC`, so a stale test calibration cannot win.
+- **Postgres** is authoritative: `0005_seed_bench_intrinsics.sql` seeds `world.calibration`
+  with `calib_doc`, `is_default = true` (guarded so it never clobbers an operator default);
+  `store.read_latest_calib_doc()` orders by `is_default DESC, created_at DESC`, so a stale
+  test calibration cannot win.
 - **Files**: the same bytes live in `config/calib/`, which survives a wiped
   `work/` and a fresh checkout. Compose sets
   `REBOT_CALIB=/app/config/calib/4f68b7f34a702b1c043f44fcf805ac9a63e2a3d9.json`.
@@ -241,22 +222,27 @@ not hand-edit `work/` (it is disposable).
   doesn't reset the drift trend.
 
 **Logic ported to PG functions (all validated against the Python reference):**
-- Rust pgrx (`rebot_kinematics`): FK/IK/dof, gravity torques, worktop `path_safe`, capsule
-  self-collision + `seg_seg_distance`, traj time law (`ease_fraction`/`ease_velocity`),
-  `seconds_for`/`within_limits`, `project` (no-dist + distortion), `ray_plane` (iterative
-  undistortion + plane intersection, matches `extrinsics.ray_plane` to 1e-9 incl. the
-  parallel/away-ray rejections).
+- Rust pgrx (`rebot_kinematics` — 16 live `IMMUTABLE PARALLEL SAFE` exports, shared
+  `ArmModel` parsed once per SQL call and shared `camera.rs` optics): FK/IK/dof,
+  `rebot_fk_tip`/`rebot_tip_point`/`rebot_sag_rad`, gravity torques, worktop `path_safe`,
+  capsule self-collision + `seg_seg_distance`, `within_limits`, `project_dist`, `ray_plane`
+  (iterative undistortion + plane intersection, matches `extrinsics.ray_plane` to 1e-9).
 - Rust motion cores (`plan.rs`): `rebot_plan`/`rebot_plan_sequence` (hover + multi-marker,
   faithful CLIK port of `reBotArm_control_py.solve_ik`), `rebot_joint_move`/`rebot_joint_sequence`,
-  `rebot_traj_build`/`rebot_traj_validate`, `rebot_unpark_pose`, `rebot_move_build` (the `/move`
-  builder). Parity: joint commands to ~6e-15 rad, move builders exact (multi 2.8e-17).
-- Rust oracle helpers (`rebot_fk_tip`/`rebot_tip_point`/`rebot_sag_rad`) + `oracle_compute`
-  (migration `0013`, the hold-window verdict): parity 2.1e-17.
+  `rebot_move_build` (the `/move` builder). Parity: joint commands to ~6e-15 rad, move
+  builders exact (multi 2.8e-17).
 - Rust hand-eye fit (`calib.rs`): `rebot_calibrate_fit` — DLT+SVD+RQ init, Huber LM,
   covariance, conditioning + predicted-error gates (port of `extrinsics.fit`). Parity:
-  exact rig 1.9e-15, noisy 1.9e-12, identical rms; `extrinsics.fit` dispatches to it in PG mode.
-- SQL: `oracle_attribute`, `trace_redact`, `accuracy_cell_update`, `accuracy_cell_key`/
-  `accuracy_validated_fraction`/`accuracy_warnings`, `judge_protocol`, sag fit (`rebot_fit_sag_map` Rust).
+  exact rig 1.9e-15, noisy 1.9e-12, identical rms; `extrinsics.fit` dispatches via
+  single-call `calibrate_fit_one` in PG mode.
+- SQL single-round-trip RPCs (`0002_learning_and_oracle.sql` + `0003_execute_workflow.sql`):
+  `oracle_compute`, `oracle_attribute`, `trace_redact`, `trace_record_batch`,
+  `extraction_plan`, `sag_fit_and_save`, `monitor_observe`, `accuracy_cell_update`/
+  `accuracy_cell_key`/`accuracy_validated_fraction`/`accuracy_warnings`, `fk_one`,
+  `calibrate_fit_one`, `plan_one`, `move_one` (returns trajectory inline and honors
+  caller `p_plan_id`), `plan_fetch`, `telemetry_record`, `execution_await_receipt`,
+  `execution_ingest_segments`, `episode_ingest_segments`, `capture_record`,
+  `rig_activate`, `oracle_record`, `app_bootstrap`, `health_summary`, and `judge_protocol`.
 
 **Residual (correctly NOT in-worker):**
 - OpenCV core (calibrate_intrinsics/auto_calibrate feature matching, `witness.check` drift/scale
@@ -504,9 +490,9 @@ docker exec rebot-capture-capture-1 python /app/substrate/tests/calib_parity.py
 ## Canonical arm config (`world.arm_config`)
 
 The per-arm **physical-model constants** that were hardcoded — and duplicated 2–3×
-across `rebot_ik.py` / `sweep.py` / `witness.py` / `plan_to_target.py` /
-`plan_with_pinocchio.py` and the Rust cores — now have one table-backed source of
-truth: `world.arm_config` (migration `0014`, `arm_id` text PK + `config_doc` jsonb).
+across `rebot_ik.py` / `sweep.py` / `witness.py` / `plan_to_target.py`
+and the Rust cores — now have one table-backed source of
+truth: `world.arm_config` (seeded by `0004_seed_b601_config.sql`, `arm_id` text PK + `config_doc` jsonb).
 The seed is **bit-identical** to the former constants, so the compute path is
 unchanged. It is deliberately *not* derived from the URDF: `link_inertials` is the
 simplified gravity model (gripper fingers omitted, tool mass lumped into

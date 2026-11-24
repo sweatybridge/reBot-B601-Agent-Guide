@@ -46,7 +46,7 @@ SELECT world.invalidate_rig('rig1');
 DO $$ BEGIN
   IF (SELECT status FROM learning.sag_map WHERE arm_id='arm1')<>'superseded' THEN RAISE EXCEPTION 'sag not superseded'; END IF;
   IF (SELECT validated_at FROM learning.accuracy_cell WHERE arm_id='arm1') IS NOT NULL THEN RAISE EXCEPTION 'accuracy cell not unvalidated'; END IF;
-  IF (SELECT validated_at FROM learning.clearance_cell) IS NOT NULL THEN RAISE EXCEPTION 'clearance not unvalidated'; END IF;
+  IF (SELECT validated_at FROM learning.clearance_cell WHERE workspace_id='ws1' AND cell_key='c0') IS NOT NULL THEN RAISE EXCEPTION 'clearance not unvalidated'; END IF;
   IF (SELECT count(*) FROM world.invalidation WHERE source_id='rig1')<1 THEN RAISE EXCEPTION 'no invalidation rows'; END IF;
 END $$;
 
@@ -64,11 +64,11 @@ INSERT INTO evidence.plan(plan_id,episode_id,arm_id,blob_sha,metadata,snapshot) 
 INSERT INTO evidence.telemetry(exec_id,plan_id,arm_id,blob_sha,kp_key,summary) VALUES ('e1','p1','arm1',repeat('c',64),'kp50','{}');
 INSERT INTO evidence.oracle_verdict(plan_id,exec_id,arm_id,layer,confidence,doc) VALUES ('p1','e1','arm1','none','high','{}');
 INSERT INTO evidence.oracle_hold(verdict_id,hold_index,q_cmd,q_meas,still_sha)
-  VALUES (1,1,'[0,0,0,0,0,0,0]','[0,0,0,0,0,0,0]',repeat('c',64));
+  VALUES ((SELECT id FROM evidence.oracle_verdict WHERE exec_id='e1'),1,'[0,0,0,0,0,0,0]','[0,0,0,0,0,0,0]',repeat('c',64));
 DO $$ BEGIN IF (SELECT refcount FROM evidence.blob WHERE sha256=repeat('c',64))<>4
   THEN RAISE EXCEPTION 'multi-table refcount failed (fragment+plan+telemetry+hold)'; END IF; END $$;
-DELETE FROM evidence.oracle_verdict WHERE id=1;
-DO $$ BEGIN IF EXISTS(SELECT 1 FROM evidence.oracle_hold WHERE verdict_id=1)
+DELETE FROM evidence.oracle_verdict WHERE exec_id='e1';
+DO $$ BEGIN IF EXISTS(SELECT 1 FROM evidence.oracle_hold WHERE still_sha=repeat('c',64))
   THEN RAISE EXCEPTION 'oracle_hold cascade failed'; END IF; END $$;
 
 -- GC last: orphan 'a' removed; referenced 'b','c' kept

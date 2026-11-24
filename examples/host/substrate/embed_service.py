@@ -24,15 +24,18 @@ import argparse
 import base64
 import binascii
 import json
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from embed import Embedder, HistogramEmbedder
 
 
 def make_handler(embedder: Embedder):
+    lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, obj: dict):
-            body = json.dumps(obj).encode("utf-8")
+            body = json.dumps(obj, allow_nan=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -51,13 +54,18 @@ def make_handler(embedder: Embedder):
                 return
             try:
                 length = int(self.headers.get("Content-Length", 0))
+                if length < 0 or length > 32 * 1024 * 1024:
+                    raise ValueError("invalid content length")
                 req = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(req, dict):
+                    raise TypeError("body must be object")
                 data = base64.b64decode(req["data_b64"], validate=True)
-            except (KeyError, ValueError, binascii.Error, json.JSONDecodeError):
+            except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError):
                 self._send(400, {"error": "expected JSON {data_b64: base64}"})
                 return
             try:
-                vec = embedder.embed(data)
+                with lock:
+                    vec = embedder.embed(data)
             except Exception as e:  # inference failure -> 5xx -> durable retry
                 self._send(500, {"error": str(e)})
                 return

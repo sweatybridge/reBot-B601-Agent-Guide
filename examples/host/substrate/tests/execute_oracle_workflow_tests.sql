@@ -59,7 +59,8 @@ BEGIN
   RAISE NOTICE 'OK at-most-once claim';
 
   PERFORM execution_mark_played('ewf_exec', 'ewf_tel_blob');
-  PERFORM execution_add_recording('ewf_exec', 'ewf_rec', 2.0, 0.0);
+  PERFORM execution_add_segment('ewf_exec', 0, 'ewf_rec', 2.0, 'mp4');
+  PERFORM execution_set_recording('ewf_exec', 0.0);
   IF NOT execution_ready('ewf_exec') THEN RAISE EXCEPTION 'not ready after ingest'; END IF;
   IF execution_waiting('ewf_exec') THEN RAISE EXCEPTION 'waiting after ready'; END IF;
   RAISE NOTICE 'OK recording readiness gate';

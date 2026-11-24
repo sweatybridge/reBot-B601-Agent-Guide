@@ -1,8 +1,15 @@
 # Build context for examples/host/Dockerfile.
 state/
+work/
+config/
+export/
+calibration-log/
 .env
+.tmp/
 tests/.selftest-work/
+tests/.browser-check-work/
 tests/.e2e-*
+substrate/rebot_kinematics/target/
 docs/
 deploy/
 __pycache__/

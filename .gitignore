@@ -24,11 +24,12 @@ examples/host/export/
 # CAD visual meshes (~37 MB, fetched on demand by app/cad/fetch.py)
 examples/host/app/cad/meshes/
 
-# Local tooling / venvs (machine-specific, not part of the guide)
+# Local tooling / venvs / scratch (machine-specific, not part of the guide)
 .rebot-venv/
 .venv/
 .uv-cache/
 .uv-python/
+.tmp/
 
 # Editors
 .vscode/
