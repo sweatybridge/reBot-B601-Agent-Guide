@@ -24,13 +24,14 @@ import argparse
 import base64
 import binascii
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from embed import Embedder, HistogramEmbedder
 
 
-def make_handler(embedder: Embedder):
+def make_handler(embedder: Embedder, store=None):
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -59,9 +60,18 @@ def make_handler(embedder: Embedder):
                 req = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(req, dict):
                     raise TypeError("body must be object")
-                data = base64.b64decode(req["data_b64"], validate=True)
+                if isinstance(req.get("still_sha"), str) and req["still_sha"]:
+                    if store is None:
+                        raise ValueError("still_sha requires REBOT_PG_DSN")
+                    try:
+                        data = store.get_blob(req["still_sha"])
+                    except KeyError as exc:
+                        self._send(404, {"error": "blob not found: %s" % exc})
+                        return
+                else:
+                    data = base64.b64decode(req["data_b64"], validate=True)
             except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError):
-                self._send(400, {"error": "expected JSON {data_b64: base64}"})
+                self._send(400, {"error": "expected JSON {still_sha} or {data_b64: base64}"})
                 return
             try:
                 with lock:
@@ -85,10 +95,19 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8765)
     args = ap.parse_args()
+    dsn = os.environ.get("REBOT_PG_DSN", "")
+    store = None
+    if dsn:
+        from store import SubstrateStore
+        store = SubstrateStore(dsn)
     embedder = HistogramEmbedder()  # production: plug the CLIP/ONNX Embedder here
-    srv = ThreadingHTTPServer((args.host, args.port), make_handler(embedder))
+    srv = ThreadingHTTPServer((args.host, args.port), make_handler(embedder, store=store))
     print("embed activity listening on %s:%d (model %s)" % (args.host, args.port, embedder.model_id), flush=True)
-    srv.serve_forever()
+    try:
+        srv.serve_forever()
+    finally:
+        if store is not None:
+            store.close()
 
 
 if __name__ == "__main__":

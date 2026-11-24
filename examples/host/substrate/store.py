@@ -441,6 +441,29 @@ class SubstrateStore:
                     }
         return plan, by_seq
 
+    def store_execution_stills(self, exec_id: str, holds_meta: list[dict],
+                               blobs: list[bytes]) -> dict:
+        """Store extracted hold JPEGs directly as binary bytea[] (no base64 in HTTP/df.history)."""
+        return self.scalar(
+            "SELECT execution_store_stills_bin(%s, %s::jsonb, %s::bytea[])",
+            (exec_id, json.dumps(holds_meta), blobs),
+        ) or {"stored": 0, "holds": []}
+
+    def detect_request_with_stills(self, exec_id: str) -> tuple[dict, dict[str, bytes]]:
+        """Single-connection fetch of detect metadata + binary still bytes (no base64)."""
+        with self.conn() as c:
+            req = c.execute("SELECT execution_detect_request(%s) AS r", (exec_id,)).fetchone()["r"] or {}
+            shas = list({h["frame"] for h in (req.get("holds") or []) if h.get("frame")})
+            by_sha: dict[str, bytes] = {}
+            if shas:
+                rows = c.execute(
+                    "SELECT sha256, bytes FROM evidence.blob WHERE sha256 = ANY(%s::text[])",
+                    (shas,),
+                ).fetchall()
+                for r in rows:
+                    by_sha[r["sha256"]] = bytes(r["bytes"])
+        return req, by_sha
+
     def await_execution_receipt(self, iid: str, exec_id: str, wait_s: int) -> dict:
         """Item 5: await durable instance + fetch receipt in 1 SQL call."""
         return self.scalar(

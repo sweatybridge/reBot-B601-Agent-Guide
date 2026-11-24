@@ -231,6 +231,11 @@ BEGIN
     w0 := (w->>'t_start')::float8 + COALESCE(p_t_offset, 0.0);
     w1 := (w->>'t_end')::float8 + COALESCE(p_t_offset, 0.0);
     IF w1 < w0 THEN SELECT w1, w0 INTO w0, w1; END IF;
+    -- Recordings begin at t = 0.0 (first IDR keyframe). A slightly negative
+    -- t_offset clips only the leading edge of an early hold (e.g. [-0.6, +2.0]);
+    -- no fragment can ever arrive for t < 0, so require coverage of [max(0, w0), w1].
+    IF w1 <= 0.0 THEN CONTINUE; END IF;
+    w0 := greatest(0.0, w0);
     covered := NULL;
     FOR f IN
       SELECT t_start, t_end FROM evidence.media_fragment
@@ -625,14 +630,15 @@ BEGIN
     w0 := t_start + ex.t_offset;
     w1 := t_end + ex.t_offset;
     IF w1 < w0 THEN SELECT w1, w0 INTO w0, w1; END IF;
+    IF w0 < 0.0 AND w1 > 0.0 THEN w0 := 0.0; END IF;
     mid := 0.5 * (w0 + w1);
 
-    -- Pick the stillest telemetry sample inside [t_start, t_end], tiebreak by midpoint.
+    -- Pick the stillest telemetry sample inside the recorded span [w0, w1], tiebreak by midpoint.
     SELECT (s->>'t')::float8 + ex.t_offset, (s->>'v')::float8
       INTO best_t, best_score
       FROM jsonb_array_elements(speeds) s
-     WHERE (s->>'t')::float8 >= least(t_start, t_end) - 1e-6
-       AND (s->>'t')::float8 <= greatest(t_start, t_end) + 1e-6
+     WHERE (s->>'t')::float8 + ex.t_offset >= w0 - 1e-6
+       AND (s->>'t')::float8 + ex.t_offset <= w1 + 1e-6
      ORDER BY (s->>'v')::float8 ASC, abs(((s->>'t')::float8 + ex.t_offset) - mid) ASC, (s->>'t')::float8 ASC
      LIMIT 1;
     IF best_t IS NULL THEN
@@ -674,8 +680,65 @@ BEGIN
 END $$ LANGUAGE plpgsql STABLE;
 
 -- ---------------------------------------------------------------------------
--- Store stills, build detect request, finalize + idempotent oracle_learn
+-- Store stills (binary + legacy base64), build detect request (by-ref, no base64),
+-- finalize + idempotent oracle_learn
 -- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION execution_store_stills_bin(
+  p_exec_id text, p_holds jsonb, p_blobs bytea[]
+) RETURNS jsonb AS $$
+DECLARE
+  ex evidence.execution%ROWTYPE;
+  n int := COALESCE(array_length(p_blobs, 1), 0);
+  i int;
+  hold jsonb;
+  data bytea;
+  sha text;
+  idx int;
+  ht float8;
+  stored int := 0;
+  ins int;
+  out_holds jsonb := '[]'::jsonb;
+BEGIN
+  SELECT * INTO ex FROM evidence.execution WHERE exec_id = p_exec_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'unknown execution %', p_exec_id; END IF;
+  IF ex.episode_id IS NULL THEN RAISE EXCEPTION 'execution % has no episode', p_exec_id; END IF;
+  IF p_holds IS NULL OR jsonb_typeof(p_holds) <> 'array' THEN
+    RAISE EXCEPTION 'execution_store_stills_bin: holds must be a json array';
+  END IF;
+  IF jsonb_array_length(p_holds) <> n THEN
+    RAISE EXCEPTION 'execution_store_stills_bin: holds length % != blobs length %',
+      jsonb_array_length(p_holds), n;
+  END IF;
+
+  FOR i IN 1..n LOOP
+    hold := p_holds -> (i - 1);
+    data := p_blobs[i];
+    idx := (hold->>'index')::int;
+    ht  := (hold->>'t')::float8;
+    sha := encode(digest(data, 'sha256'), 'hex');
+    INSERT INTO evidence.blob(sha256, kind, bytes, size_bytes, status)
+      VALUES (sha, 'still', data, octet_length(data), 'verified')
+      ON CONFLICT (sha256) DO UPDATE SET created_at = now();
+    IF NOT EXISTS (
+      SELECT 1 FROM evidence.still s
+       WHERE s.episode_id = ex.episode_id AND s.sha256 = sha AND s.purpose = 'hold'
+         AND s.t IS NOT DISTINCT FROM ht) THEN
+      INSERT INTO evidence.still(episode_id, sha256, arm_id, purpose, t, width, height)
+      VALUES (ex.episode_id, sha, ex.arm_id, 'hold', ht,
+              NULLIF(hold->>'width', '')::int, NULLIF(hold->>'height', '')::int);
+    END IF;
+    INSERT INTO evidence.execution_hold(exec_id, hold_index, still_sha, t, score)
+      VALUES (p_exec_id, idx, sha, ht, NULLIF(hold->>'score', '')::float8)
+      ON CONFLICT (exec_id, hold_index) DO NOTHING;
+    GET DIAGNOSTICS ins = ROW_COUNT;
+    stored := stored + ins;
+    out_holds := out_holds || jsonb_build_object(
+      'index', idx, 'still_sha', sha, 't', ht,
+      'score', hold->'score', 'width', hold->'width', 'height', hold->'height');
+  END LOOP;
+  RETURN jsonb_build_object('stored', stored, 'holds', out_holds);
+END $$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION execution_store_stills(p_exec_id text, p_extract jsonb)
 RETURNS jsonb AS $$
 DECLARE
@@ -697,11 +760,18 @@ BEGIN
   ) LOOP
     idx := (hold->>'index')::int;
     ht  := (hold->>'t')::float8;
-    data := decode(replace(hold->>'frame_b64', E'\n', ''), 'base64');
-    sha := encode(digest(data, 'sha256'), 'hex');
-    INSERT INTO evidence.blob(sha256, kind, bytes, size_bytes, status)
-      VALUES (sha, 'still', data, octet_length(data), 'verified')
-      ON CONFLICT (sha256) DO UPDATE SET created_at = now();
+    IF hold ? 'frame_b64' AND NULLIF(hold->>'frame_b64', '') IS NOT NULL THEN
+      data := decode(replace(hold->>'frame_b64', E'\n', ''), 'base64');
+      sha := encode(digest(data, 'sha256'), 'hex');
+      INSERT INTO evidence.blob(sha256, kind, bytes, size_bytes, status)
+        VALUES (sha, 'still', data, octet_length(data), 'verified')
+        ON CONFLICT (sha256) DO UPDATE SET created_at = now();
+    ELSE
+      sha := NULLIF(hold->>'still_sha', '');
+      IF sha IS NULL THEN
+        RAISE EXCEPTION 'execution_store_stills: hold % missing frame_b64 and still_sha', idx;
+      END IF;
+    END IF;
     IF NOT EXISTS (
       SELECT 1 FROM evidence.still s
        WHERE s.episode_id = ex.episode_id AND s.sha256 = sha AND s.purpose = 'hold'
@@ -711,7 +781,7 @@ BEGIN
               NULLIF(hold->>'width', '')::int, NULLIF(hold->>'height', '')::int);
     END IF;
     INSERT INTO evidence.execution_hold(exec_id, hold_index, still_sha, t, score)
-      VALUES (p_exec_id, idx, sha, ht, (hold->>'score')::float8)
+      VALUES (p_exec_id, idx, sha, ht, NULLIF(hold->>'score', '')::float8)
       ON CONFLICT (exec_id, hold_index) DO NOTHING;
     GET DIAGNOSTICS ins = ROW_COUNT;
     stored := stored + ins;
@@ -721,8 +791,8 @@ BEGIN
     'missed', CASE WHEN jsonb_typeof(p_extract->'missed') = 'array' THEN p_extract->'missed' ELSE '[]'::jsonb END);
 END $$ LANGUAGE plpgsql;
 
--- Fixed P1 bugs: LATERAL still join (no Cartesian fan-out), HAVING count(*)>0
--- (no [null,...] -> NaN), 1e-6 tolerance, deterministic ORDER BY hold_index.
+-- Lightweight metadata-only detect request (no base64 JPEG bloat — callers fetch
+-- binary blobs directly by `frame` SHA-256).
 CREATE OR REPLACE FUNCTION execution_detect_request(p_exec_id text) RETURNS jsonb AS $$
 DECLARE
   ex evidence.execution%ROWTYPE;
@@ -751,7 +821,6 @@ BEGIN
 
   SELECT jsonb_agg(jsonb_build_object(
            'index', h.hold_index,
-           'frame_b64', replace(encode(b.bytes, 'base64'), E'\n', ''),
            'frame', h.still_sha,
            'image_size', jsonb_build_array(s.width, s.height),
            'grid_scale', CASE WHEN (cal.image_size->>0)::float8 > 0 AND s.width IS NOT NULL
@@ -773,7 +842,6 @@ BEGIN
            ORDER BY h.hold_index)
     INTO holds
     FROM evidence.execution_hold h
-    JOIN evidence.blob b ON b.sha256 = h.still_sha
     LEFT JOIN LATERAL (
       SELECT width, height FROM evidence.still st
        WHERE st.episode_id = ex.episode_id AND st.sha256 = h.still_sha AND st.purpose = 'hold'
@@ -990,11 +1058,10 @@ DECLARE
   url text := rtrim(p_url, '/');
   body text := jsonb_build_object('exec_id', p_exec_id)::text;
 BEGIN
+  -- /extract persists hold JPEGs directly in binary via execution_store_stills_bin
+  -- and returns only lightweight metadata (no base64 in df.http / df.* history).
   RETURN df.seq(
-    df.seq(
-      df.as(df.http(url || '/extract', 'POST', body, '{}'::jsonb, 300), 'extract'),
-      df.sql(format('SELECT execution_store_stills(%L, ($extract.body)::jsonb)', p_exec_id))
-    ),
+    df.as(df.http(url || '/extract', 'POST', body, '{}'::jsonb, 300), 'extract'),
     df.seq(
       df.as(df.http(url || '/detect', 'POST', body, '{}'::jsonb, 300), 'detect'),
       df.sql(format('SELECT execution_finalize(%L, ($detect.body)::jsonb)', p_exec_id))

@@ -178,9 +178,16 @@ def execute(exec_id: str) -> dict:
             path_name = mediamtx.path_from_camera(CAMERA) or "phone"
             try:
                 recorder = mediamtx.Recorder(MEDIAMTX_API, path=path_name, recordings=RECORDINGS)
+                existing_paths = {s.path for s in recorder.segments()}
                 recorder.enable()
                 record_wall = time.time()
-                time.sleep(0.2)
+                # Wait up to 2.5 s for MediaMTX to lock onto the first H.264 IDR
+                # keyframe and open segment 0 before arm motion starts, so t_offset >= 0.
+                deadline = record_wall + 2.5
+                while time.time() < deadline:
+                    if any(s.path not in existing_paths for s in recorder.segments(since=record_wall)):
+                        break
+                    time.sleep(0.1)
             except Exception as exc:  # noqa: BLE001
                 recorder = None
                 record_wall = None
@@ -288,7 +295,7 @@ def extract(exec_id: str) -> dict:
         return {"holds": [], "missed": [w.get("index") for w in windows],
                 "error": "no recording fragments"}
 
-    holds, missed = [], []
+    hold_metas, jpeg_blobs, missed = [], [], []
     for window in windows:
         idx = window.get("index")
         frags = [by_seq[int(s)] for s in (window.get("fragments") or []) if int(s) in by_seq]
@@ -309,17 +316,24 @@ def extract(exec_id: str) -> dict:
         score = window.get("score")
         if score is not None and not math.isfinite(float(score)):
             score = None
-        holds.append({
+        hold_metas.append({
             "index": idx, "t": round(float(best_t), 6), "score": score,
-            "frame_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
             "width": int(w), "height": int(h),
         })
-    return {"holds": holds, "missed": missed}
+        jpeg_blobs.append(buf.tobytes())
+    if hold_metas:
+        persisted = STORE.store_execution_stills(exec_id, hold_metas, jpeg_blobs)
+        return {
+            "stored": int(persisted.get("stored") or 0),
+            "holds": persisted.get("holds") or [],
+            "missed": missed,
+        }
+    return {"stored": 0, "holds": [], "missed": missed}
 
 
 def detect(exec_id: str) -> dict:
     try:
-        req = _json("SELECT execution_detect_request(%s)", (exec_id,))
+        req, by_sha = STORE.detect_request_with_stills(exec_id)
     except Exception as exc:
         if "unknown execution" in str(exc):
             raise NotFoundError(str(exc)) from exc
@@ -334,7 +348,12 @@ def detect(exec_id: str) -> dict:
         tip = np.asarray(req["tip_offset"], dtype=float).reshape(-1)
     detections = {}
     for hold in req.get("holds") or []:
-        raw = base64.b64decode(hold["frame_b64"].replace("\n", ""), validate=True)
+        sha = hold.get("frame")
+        raw = by_sha.get(sha) if sha else None
+        if raw is None and hold.get("frame_b64"):
+            raw = base64.b64decode(hold["frame_b64"].replace("\n", ""), validate=True)
+        if not raw:
+            continue
         frame = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             continue
@@ -354,19 +373,28 @@ def detect(exec_id: str) -> dict:
                 "detector": found["detector"],
                 "image_size": [int(frame.shape[1]), int(frame.shape[0])],
                 "grid_scale": round(float(hold.get("grid_scale") or 1.0), 4),
-                "frame": hold.get("frame"),
+                "frame": sha,
             }
     return {"detections": detections}
 
 
 def embed_frame(body: dict) -> dict:
-    data_b64 = body.get("data_b64")
-    if not isinstance(data_b64, str) or not data_b64:
-        raise BadRequestError("data_b64 is required")
-    try:
-        raw = base64.b64decode(data_b64, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise BadRequestError("invalid base64 data_b64") from exc
+    still_sha = body.get("still_sha")
+    if isinstance(still_sha, str) and still_sha:
+        if STORE is None:
+            raise BadRequestError("still_sha requires REBOT_PG_DSN")
+        try:
+            raw = STORE.get_blob(still_sha)
+        except KeyError as exc:
+            raise NotFoundError("unknown blob %s" % still_sha) from exc
+    else:
+        data_b64 = body.get("data_b64")
+        if not isinstance(data_b64, str) or not data_b64:
+            raise BadRequestError("still_sha or data_b64 is required")
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise BadRequestError("invalid base64 data_b64") from exc
     with _EMBED_LOCK:
         vec = _EMBEDDER.embed(raw)
         return {

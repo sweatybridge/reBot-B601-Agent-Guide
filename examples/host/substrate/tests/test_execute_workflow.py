@@ -249,6 +249,13 @@ def run_checks(store):
             (receipt.get("instance"),)).fetchone()["n"]
     check("play step timeout uses the play budget, not the record budget", step == 1,
           "matching play nodes=%s" % step)
+    with store._conn() as c:
+        b64_nodes = c.execute(
+            "SELECT count(*) AS n FROM df.nodes WHERE instance_id=%s "
+            "AND (COALESCE(query::text, '') LIKE '%%frame_b64%%' "
+            "  OR COALESCE(result::text, '') LIKE '%%frame_b64%%')",
+            (receipt.get("instance"),)).fetchone()["n"]
+    check("no base64 JPEG in df.nodes history", b64_nodes == 0, "b64_nodes=%s" % b64_nodes)
     health = execute_workflow.workflow_health(store, EXEC)
     ex = health["execution"] or {}
     check("execution verified + learned", ex.get("status") == "verified"
