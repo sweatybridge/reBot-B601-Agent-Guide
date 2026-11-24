@@ -130,8 +130,8 @@ class TriggerMonitor:
     human (or the agent) to act on with an explicit confirm.
     """
 
-    def __init__(self, pixel_mm=oracle.PIXEL_ERROR_MM, alpha=None):
-        self.pixel_mm = float(pixel_mm)
+    def __init__(self, pixel_mm=None, alpha=None):
+        self.pixel_mm = float(oracle.PIXEL_ERROR_MM if pixel_mm is None else pixel_mm)
         self.alpha = float(EWMA_ALPHA if alpha is None else alpha)
         self.ewma = None
         self.tag_baseline = None
@@ -756,7 +756,7 @@ def load_accuracy_map(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def update_accuracy_map(path, oracle_doc, rig=None, threshold_mm=oracle.PIXEL_ERROR_MM):
+def update_accuracy_map(path, oracle_doc, rig=None, threshold_mm=None):
     """Fold one oracle doc's holds into the map; called after the doc is written.
 
     A cell validates only with ACCURACY_MIN_N measured holds under threshold;
@@ -767,6 +767,8 @@ def update_accuracy_map(path, oracle_doc, rig=None, threshold_mm=oracle.PIXEL_ER
     what validates, and a cell with no measured holds stays unvalidated however
     confident the prior looks.
     """
+    if threshold_mm is None:
+        threshold_mm = oracle.PIXEL_ERROR_MM
     path = Path(path)
     try:
         doc = load_accuracy_map(path)
@@ -956,7 +958,7 @@ def coverage_plan(current_q, poses, gripper=0.0, hold_s=None):
     }
 
 
-def cartesian_targets(map_doc, top_k=None, min_z=sweep.DEFAULT_MIN_Z,
+def cartesian_targets(map_doc, top_k=None, min_z=None,
                       max_reach=None):
     """The centre points of the least-covered cells, as Cartesian targets (§7.4).
 
@@ -980,6 +982,7 @@ def cartesian_targets(map_doc, top_k=None, min_z=sweep.DEFAULT_MIN_Z,
     """
     chosen, taken = [], set()
     top_k = COVERAGE_MAX_POSES if top_k is None else top_k
+    min_z = sweep.DEFAULT_MIN_Z if min_z is None else min_z
     max_reach = COVERAGE_MAX_REACH_M if max_reach is None else max_reach
     skipped = {"below_min_z": 0, "beyond_reach": 0}
     entries = []

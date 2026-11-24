@@ -31,15 +31,13 @@ the substrate (Postgres); `work/` is disposable scratch.
 
 Both end in `rebot-joint-trajectory` JSON, validated by the player on the board.
 
-**Measured pipeline** — the one behind the numbers in `examples/README.md`:
+**CLI planning** (offline / Pinocchio fallback):
 
 ```bash
 docker build -t rebot-pino -f examples/host/Dockerfile.pinocchio .
-pwsh -File examples/host/deploy/repeat_pino.ps1     # dump -> plan -> save
-# or by hand, from the repository root:
 docker run --rm -v "$PWD:/work" rebot-pino python \
-    /work/examples/host/app/plan_with_pinocchio.py \
-    --joints /work/current.json --out /work/seq.json
+    /work/examples/host/app/plan_to_target.py \
+    --joints /work/current.json --target /work/target.json --out /work/seq.json
 ```
 
 **Tap pipeline** — phone or `/live`, no shell in the loop:
@@ -64,7 +62,8 @@ python examples/host/tests/agent_eval.py --runs 3  # same set, three times each
 The tap pipeline is documented end to end in
 [`docs/phone-camera.md`](docs/phone-camera.md); the board side is
 [`../edge-rust/README.md`](../edge-rust/README.md#http-server). Once a rig has
-been fitted, `state/calib/extrinsics-fixed.json` is picked up at startup: the
+been fitted, it is stored in the Postgres substrate (and materialized to
+`work/calib/extrinsics-fixed.json` as scratch cache at startup): the
 camera is fixed and no tag is placed anywhere. Until then, the handheld phone
 path uses the ArUco tag. The rig comes either from one still that sees the base
 tag (`POST /capture/pose` — no arm motion) or from one tap:
@@ -96,16 +95,17 @@ app/
   sweep_video.py          the sweep's pose log -> the recorded frame for each pose
   plan_to_target.py       plan(): target + pose -> trajectory (CLI and gateway)
   traj.py                 payload assembly + the player's schema checks
-  plan_with_pinocchio.py  the measured demo trajectory (peel / lift / grip)
   rebot_ik.py             the URDF transcription, model reference for the docs
   base_marker.py          the base ArUco tag: printable sheet, placement spec, PnP pose
-  make_cert.py            local CA + leaf certificate for the phone
+  make_cert.py            local CA + leaf certificate for the phone (writes config/tls/)
   healthcheck.py          compose healthcheck for the capture service
 
+substrate/                Postgres substrate: pgrx rebot_kinematics, 6 migrations, migrate.py,
+                          store/RPC client, workflow activity service, unified test runner
 web/                      phone page, shared api/stream/video/geometry modules, reach, locate
 tests/                    selftest.py (the whole pipeline, no hardware), browser_check.py (Chromium),
                           agent_eval.py (chat trajectories against the model)
-deploy/                   mediamtx.yml, repeat_pino.ps1
+deploy/                   mediamtx.yml
 docs/                     phone-camera.md, arm_model.png
 config/                   tls + bootstrap + calib/ (bench-default intrinsics, durable)
 work/                     captures, calib cache, tags, out, recordings (disposable)

@@ -18,8 +18,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Mirrors the host layout: /app is the project root, the code is in /app/app,
-# the pages in /app/web, the bind mounts in /app/state. The scripts compute
-# ROOT = parent(__file__), so both layouts behave the same.
+# the pages in /app/web, durable deploy files in /app/config, scratch in /app/work.
+# The scripts compute ROOT = parent(__file__), so both layouts behave the same.
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt

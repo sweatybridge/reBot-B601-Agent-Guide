@@ -8,8 +8,8 @@
 #
 #   docker build -t rebot-pino -f examples/host/Dockerfile.pinocchio .
 #   docker run --rm -v "$PWD:/work" rebot-pino \
-#       python /work/examples/host/app/plan_with_pinocchio.py \
-#       --joints /work/current.json --out /work/seq_pino.json
+#       python /work/examples/host/app/plan_to_target.py \
+#       --joints /work/current.json --target /work/target.json --out /work/seq.json
 FROM python:3.11-slim
 
 RUN apt-get update \
@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir "pin>=3.9" numpy pyyaml "motorbridge>=0.4.9" \
 
 # PG store seam (§8 cutover). Separate layer so adding it doesn't invalidate
 # the expensive Pinocchio layer above.
-RUN pip install --no-cache-dir "psycopg[binary]>=3.1"
+RUN pip install --no-cache-dir "psycopg[binary]>=3.1" "psycopg-pool>=3.2"
 
 # Pinned to the commit this repo's numbers were validated against.
 ARG REBOT_COMMIT=d4f3591bc0183de03f3ae8651298db0269aadfdd

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import codecs
 import hashlib
 import hmac
@@ -178,127 +179,20 @@ async def handle_live(request: web.Request) -> web.StreamResponse:
     return await _page(request, "live.html")
 
 
-async def handle_viewer_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "viewer.js"
+WEB_JS_ASSETS = frozenset({
+    "viewer.js", "api.js", "video.js", "reach-config.js", "geometry.js",
+    "arm-model.js", "reach.js", "aruco.js", "markers.js", "height.js",
+    "locate.js", "ekf.js", "stream.js", "trace.js",
+})
+
+
+async def handle_web_js(request: web.Request) -> web.StreamResponse:
+    name = request.path.lstrip("/")
+    if name not in WEB_JS_ASSETS:
+        raise web.HTTPNotFound()
+    script = WEB_DIR / name
     if not script.is_file():
-        return web.Response(text="viewer.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_api_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "api.js"
-    if not script.is_file():
-        return web.Response(text="api.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_video_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "video.js"
-    if not script.is_file():
-        return web.Response(text="video.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_reach_config_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "reach-config.js"
-    if not script.is_file():
-        return web.Response(text="reach-config.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_geometry_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "geometry.js"
-    if not script.is_file():
-        return web.Response(text="geometry.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_arm_model_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "arm-model.js"
-    if not script.is_file():
-        return web.Response(text="arm-model.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_reach_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "reach.js"
-    if not script.is_file():
-        return web.Response(text="reach.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_aruco_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "aruco.js"
-    if not script.is_file():
-        return web.Response(text="aruco.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_markers_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "markers.js"
-    if not script.is_file():
-        return web.Response(text="markers.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_height_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "height.js"
-    if not script.is_file():
-        return web.Response(text="height.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_locate_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "locate.js"
-    if not script.is_file():
-        return web.Response(text="locate.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_ekf_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "ekf.js"
-    if not script.is_file():
-        return web.Response(text="ekf.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_stream_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "stream.js"
-    if not script.is_file():
-        return web.Response(text="stream.js is missing next to capture_server.py", status=500)
-    return web.Response(text=script.read_text(encoding="utf-8"),
-                        content_type="text/javascript",
-                        headers={"Cache-Control": "no-store"})
-
-
-async def handle_trace_js(request: web.Request) -> web.StreamResponse:
-    script = WEB_DIR / "trace.js"
-    if not script.is_file():
-        return web.Response(text="trace.js is missing next to capture_server.py", status=500)
+        return web.Response(text="%s is missing next to capture_server.py" % name, status=500)
     return web.Response(text=script.read_text(encoding="utf-8"),
                         content_type="text/javascript",
                         headers={"Cache-Control": "no-store"})
@@ -328,8 +222,10 @@ def trace_manifest(app, sid):
     fingerprinted: the live files may be refitted later, and a replay must see
     the geometry this session actually ran with.
     """
-    directory = app["traces"].session_dir(sid)
-    directory.mkdir(parents=True, exist_ok=True)
+    is_pg = bool(getattr(app["traces"], "is_pg", False))
+    directory = None if is_pg else app["traces"].session_dir(sid)
+    if directory is not None:
+        directory.mkdir(parents=True, exist_ok=True)
     live = WEB_DIR / "live.html"
     measured = app.get("measured_turn")
     marker = app.get("marker")
@@ -371,11 +267,12 @@ def trace_manifest(app, sid):
     try:
         calib_path = resolve_calibration(app)
         snapshot["calib_fingerprint"] = calib_mod.load(calib_path).fingerprint
-        (directory / "calib.json").write_bytes(calib_path.read_bytes())
-        snapshot["calib_file"] = "calib.json"
+        if directory is not None:
+            (directory / "calib.json").write_bytes(calib_path.read_bytes())
+            snapshot["calib_file"] = "calib.json"
     except Exception as exc:  # noqa: BLE001 - a session without calib still traces
         logging.warning("trace manifest for %s has no calibration: %s", sid, exc)
-    if app["rig"] is not None and app["extrinsics_path"]:
+    if directory is not None and app["rig"] is not None and app["extrinsics_path"]:
         try:
             (directory / "rig.json").write_bytes(Path(app["extrinsics_path"]).read_bytes())
             snapshot["rig_file"] = "rig.json"
@@ -447,8 +344,14 @@ async def handle_trace_read(request: web.Request) -> web.Response:
         raise web.HTTPNotFound()
     kind = request.path.rsplit("/", 1)[-1]
     try:
+        if getattr(recorder, "is_pg", False):
+            exists = await asyncio.to_thread(recorder.store.episode_exists, sid)
+            if not exists:
+                raise FileNotFoundError(sid)
         if kind == "manifest":
             manifest = await recorder.read_manifest(sid)
+            if manifest is None:
+                raise FileNotFoundError(sid)
             return web.json_response({"ok": True, "session": sid, "manifest": manifest})
         events = await recorder.read_events(sid)
         return web.json_response({"ok": True, "session": sid, "events": events})
@@ -537,7 +440,7 @@ async def ensure_llm_context(app):
         store = app.get("pg_store")
         if store is not None:
             try:
-                store.set_kv("llm_context", info)
+                await asyncio.to_thread(store.set_kv, "llm_context", info)
             except Exception as exc:  # noqa: BLE001
                 logging.warning("llm_context persist failed: %s", exc)
         if info["tokens"]:
@@ -550,20 +453,43 @@ async def ensure_llm_context(app):
 async def handle_health(request: web.Request) -> web.Response:
     app = request.app
     await ensure_llm_context(app)
-    captures = capture_dirs(app["captures"])
+    store = app.get("pg_store")
+    pg_summary = None
+    if store is not None:
+        try:
+            pg_summary = await asyncio.to_thread(
+                store.health_summary, app.get("pg_workspace", "default"),
+                app.get("arm_id", "b601"))
+        except Exception as exc:  # noqa: BLE001 - health must survive DB hiccup
+            logging.warning("health_summary failed: %s", exc)
+    if pg_summary is not None:
+        cap_count = int(pg_summary.get("captures") or 0)
+        latest_cap = pg_summary.get("latest")
+        trace_sessions = int(pg_summary.get("trace_sessions") or 0) if app.get("traces") is not None else 0
+        acc_map = pg_summary.get("accuracy_map") or {"version": 1, "cells": {}}
+        cells = acc_map.get("cells") or {}
+        validated = sum(1 for cell in cells.values() if cell.get("validated_at"))
+        accuracy_info = {"cells": len(cells), "validated": validated,
+                         "validated_fraction": round(identify_mod.validated_fraction(acc_map), 4)}
+    else:
+        captures = capture_dirs(app["captures"])
+        cap_count = len(captures)
+        latest_cap = captures[0].name if captures else None
+        trace_sessions = _trace_session_count(app)
+        accuracy_info = _accuracy_health(app)
     return web.json_response({
         "ok": True,
         "version": VERSION,
         "server_time": utc_now(),
-        "captures": len(captures),
-        "latest": captures[0].name if captures else None,
+        "captures": cap_count,
+        "latest": latest_cap,
         "whip": app["whip_url"],
         "whep": app["whep_url"],
         "tls": app["tls"],
         "auth": bool(app["token"]),
         "planner": app["planner"],
         "workflow": app.get("workflow_url") or None,
-        "substrate": app.get("pg_store") is not None,
+        "substrate": store is not None,
         "execute": app["execute"],
         "calib": sorted(p.name for p in app["calib"].glob("*.json")
                         if not p.name.startswith(("extrinsics-", "witness-", "sag-",
@@ -579,20 +505,12 @@ async def handle_health(request: web.Request) -> web.Response:
         "hover_m": app["hover_m"],
         "tip_m": app["tip_m"],
         "min_z": app["min_z"],
-        # What the phone last published about its stream. A quarter turn has no
-        # sign in the frame size, so this is the only way to know which way the
-        # camera is turned, and every consumer of `K` reads it here.
         "stream_orientation": app["stream_orientation"],
-        # ... and the correction the host last worked out, with who decided.
-        # /reach.json carries the same pair for the page's own projections.
         "stream_turn": ({"turns": int(app["measured_turn"]["turns"]),
                          "source": "measured", "error_px":
                          round(float(app["measured_turn"]["error_px"]), 2),
                          "size": app["measured_turn"]["size"]}
                         if app.get("measured_turn") else None),
-        # The chat sidebar is configured from the host's environment, never from
-        # the page; all the page needs to know is whether it is there and what
-        # it is talking to.
         "agent": {
             "configured": bool(app["llm_url"]),
             "model": app["llm_model"] if app["llm_url"] else "",
@@ -604,12 +522,10 @@ async def handle_health(request: web.Request) -> web.Response:
         },
         "traces": {
             "enabled": app.get("traces") is not None,
-            "sessions": _trace_session_count(app),
+            "sessions": trace_sessions,
             "retention_days": app.get("trace_retention_days", 30),
         },
-        # The measured accuracy envelope (§7.4): what fraction of the explored
-        # grid has been validated by oracle holds.
-        "accuracy": _accuracy_health(app),
+        "accuracy": accuracy_info,
     })
 
 
@@ -630,8 +546,8 @@ def _trace_session_count(app) -> int:
         return 0
     try:
         return len(recorder.session_ids())
-    except OSError:
-        return 0  # health must survive an unreadable traces dir
+    except Exception:  # noqa: BLE001 - health must survive an unreadable store/dir
+        return 0
 
 
 async def handle_reach(request: web.Request) -> web.Response:
@@ -869,8 +785,10 @@ async def handle_capture(request: web.Request) -> web.Response:
             # cannot be persisted is refused, not stranded on disk.
             kind = "calibration" if purpose in ("extrinsics", "calib") else "execution"
             try:
-                mirror.mirror_capture(directory.name, record, partial.read_bytes(),
-                                      kind=kind, image_size=meta.get("image_size"))
+                frame_bytes = await asyncio.to_thread(partial.read_bytes)
+                await asyncio.to_thread(
+                    mirror.mirror_capture, directory.name, record, frame_bytes,
+                    kind=kind, image_size=meta.get("image_size"))
             except Exception as exc:  # noqa: BLE001
                 partial.unlink(missing_ok=True)
                 try:
@@ -1265,7 +1183,7 @@ async def handle_sequence(request: web.Request) -> web.Response:
     # band, min_z, IK) stay where they are; a missing or broken map degrades to
     # no warning, never to a failed plan (§8.4).
     try:
-        map_doc = _accuracy_map(app)
+        map_doc = await asyncio.to_thread(_accuracy_map, app)
         warnings = identify_mod.accuracy_warnings(map_doc, tips)
     except Exception as exc:  # noqa: BLE001
         logging.warning("accuracy map read failed: %s", exc)
@@ -1299,7 +1217,20 @@ async def handle_plan(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="'capture' must be a capture id")
     directory = app["captures"] / capture_id
     if not (directory / "frame.jpg").is_file():
-        raise web.HTTPNotFound(text="no frame for %s" % capture_id)
+        if app.get("pg_store") is not None:
+            def _materialize_for_plan():
+                frame_path = materialize_capture_frame(app, capture_id)
+                if frame_path is None:
+                    return False
+                meta_path = directory / "meta.json"
+                if not meta_path.is_file():
+                    meta_doc = app["pg_store"].read_capture_meta(capture_id) or {}
+                    meta_path.write_text(json.dumps(meta_doc, indent=2) + "\n", encoding="utf-8")
+                return True
+            if not await asyncio.to_thread(_materialize_for_plan):
+                raise web.HTTPNotFound(text="no frame for %s" % capture_id)
+        else:
+            raise web.HTTPNotFound(text="no frame for %s" % capture_id)
 
     calibration_path = resolve_calibration(app, body.get("calib"))
     try:
@@ -1846,14 +1777,15 @@ async def handle_execute(request: web.Request) -> web.Response:
         # fragments must be attachable to this execution regardless of which
         # sidebar conversation triggered it.
         episode = "exec-" + plan_id
+        play_timeout_s = int(float(os.environ.get("REBOT_PLAY_TIMEOUT", "900")))
         try:
             receipt = await asyncio.to_thread(
                 execute_workflow.start_execute_workflow,
                 store, plan_id, plan_id, app.get("arm_id", "b601"), episode,
                 workflow_url, app.get("pg_workspace", "default"),
                 timeout_s=60,
-                play_timeout_s=int(os.environ.get("REBOT_PLAY_TIMEOUT", "900")),
-                poll_s=2, await_s=600,
+                play_timeout_s=play_timeout_s,
+                poll_s=2, await_s=max(600, play_timeout_s + 120),
                 label="execute_oracle")
         except Exception as exc:  # noqa: BLE001 - the workflow is the execution path
             logging.exception("durable execute for %s failed to start", plan_id)
@@ -1862,8 +1794,6 @@ async def handle_execute(request: web.Request) -> web.Response:
             return web.json_response({"ok": False, "id": plan_id, "executed": False,
                                       "error": "durable workflow failed to start: %s" % exc},
                                      status=502)
-        # execution_receipt owns the ok/executed/pending/verdict/ledger
-        # composition; capture adds only the plan id and its trace event.
         out = receipt.get("receipt") or {}
         if out.get("pending"):
             return web.json_response({"id": plan_id, **out,
@@ -1872,7 +1802,7 @@ async def handle_execute(request: web.Request) -> web.Response:
         executed = bool(out.get("ok"))
         verdict = out.get("verdict")
         error_text = out.get("error")
-        await trace_event(app, sid, "execute", plan_id=plan_id, status=200,
+        await trace_event(app, sid, "execute", plan_id=plan_id, status=200 if executed else 502,
                           ok=executed, executed=bool(out.get("executed")),
                           workflow=out.get("workflow") or receipt.get("instance"),
                           error=None if executed else error_text)
@@ -1972,9 +1902,10 @@ async def oracle_prepare(app, plan_id):
         # cv2 reads a path: the scratch materialization of the PG blob (PG mode)
         # or the capture file (file mode). The authoritative copy is the blob.
         frame_path = await asyncio.to_thread(materialize_capture_frame, app, pre["id"])
-        directory = app["oracle_dir"] / plan_id
-        await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread((directory / "pre.jpg").write_bytes, pre_bytes)
+        if store is None:
+            directory = app["oracle_dir"] / plan_id
+            await asyncio.to_thread(directory.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread((directory / "pre.jpg").write_bytes, pre_bytes)
         prep = {
             "plan_id": plan_id,
             "windows": windows,
@@ -2067,14 +1998,13 @@ async def _oracle_pg_compute(app, prep, samples, doc, K, dist, rig, t_tip, turn)
     tip_flat = [float(v) for v in np.asarray(t_tip, dtype=float).reshape(-1)]
 
     def _call():
-        with store._conn() as c:
-            row = c.execute(
-                "SELECT oracle_compute(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,"
-                "%s,%s,%s,%s,%s,%s::jsonb)",
-                (urdf, json.dumps(prep["waypoints"]), json.dumps(samples),
-                 json.dumps(prep.get("targets") or []), json.dumps(detections),
-                 K_flat, dist_flat, T_flat, tip_flat, kp_spec, json.dumps(doc_extra))).fetchone()
-        return next(iter(row.values()))
+        return store.scalar(
+            "SELECT oracle_compute(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,"
+            "%s,%s,%s,%s,%s,%s::jsonb,%s)",
+            (urdf, json.dumps(prep["waypoints"]), json.dumps(samples),
+             json.dumps(prep.get("targets") or []), json.dumps(detections),
+             K_flat, dist_flat, T_flat, tip_flat, kp_spec, json.dumps(doc_extra),
+             app.get("arm_id", "b601")))
     res = await asyncio.to_thread(_call)
     doc["holds"] = res["holds"]
     doc["verdict"] = res["verdict"]
@@ -2098,9 +2028,14 @@ async def oracle_finish(app, prep, sid):
     try:
         import cv2
 
-        status, payload = await planner_call(app, "/telemetry/" + plan_id, {},
-                                             timeout=30, method="GET", sid=sid)
-        telemetry = payload.get("telemetry") if status == 200 else None
+        # Item 5: in PG mode read telemetry straight from the substrate (skip planner HTTP hop).
+        telemetry = None
+        if app.get("pg_store") is not None:
+            telemetry = await asyncio.to_thread(app["pg_store"].read_telemetry_doc, plan_id)
+        if telemetry is None:
+            status, payload = await planner_call(app, "/telemetry/" + plan_id, {},
+                                                 timeout=30, method="GET", sid=sid)
+            telemetry = payload.get("telemetry") if status == 200 else None
         if telemetry:
             doc["telemetry"] = {key: telemetry.get(key) for key in
                                 ("version", "abort", "gripper_stall", "tick",
@@ -2301,7 +2236,8 @@ async def oracle_finish(app, prep, sid):
                 arm_id = app.get("arm_id", "b601")
                 mirror.store.ensure_arm(arm_id)
                 rig_fp = rig.fingerprint if rig is not None else None
-                mirror.store.create_episode(sid, mirror.workspace_id, [arm_id], kind="execution")
+                if sid:
+                    mirror.store.create_episode(sid, mirror.workspace_id, [arm_id], kind="execution")
                 mirror.mirror_oracle(plan_id, arm_id, doc, rig_fingerprint=rig_fp)
             try:
                 await asyncio.to_thread(_mirror_oracle)
@@ -2314,24 +2250,15 @@ async def oracle_finish(app, prep, sid):
         await trace_event(app, sid, "oracle", plan_id=plan_id, verdict=doc["verdict"],
                           holds=len(doc["holds"]),
                           telemetry=bool(telemetry), error=None)
-        # §7.4/§7.1: the oracle's holds populate the accuracy envelope, and the
-        # monitor watches them for identification proposals. Both are strictly
-        # additive (§8.4): a failure here never touches the doc or the execution.
-        # PG mode: the cells were already updated by mirror_oracle; no file map.
         try:
             if app.get("pg_mirror") is None:
                 identify_mod.update_accuracy_map(app["accuracy_map_path"], doc, rig=rig)
         except Exception as exc:  # noqa: BLE001
             logging.warning("accuracy map update for %s failed: %s", plan_id, exc)
         try:
+            # In PG mode mirror_oracle already updated learning.monitor_state via SQL monitor_observe;
+            # keep the in-process TriggerMonitor mirrored for immediate local reads.
             app["identify_monitor"].observe(doc, rig=app.get("rig"))
-            mirror = app.get("pg_mirror")
-            if mirror is not None:
-                mon = app["identify_monitor"]
-                mirror.mirror_monitor(app.get("arm_id", "b601"),
-                                      ewma_pixel_error_mm=mon.ewma,
-                                      ewma_tag_rms_px=mon.tag_baseline,
-                                      last_doc={"proposals": mon.proposals})
         except Exception as exc:  # noqa: BLE001
             logging.warning("identify monitor for %s failed: %s", plan_id, exc)
     except asyncio.CancelledError:
@@ -2345,7 +2272,8 @@ async def oracle_finish(app, prep, sid):
                 def _mirror_error():
                     arm_id = app.get("arm_id", "b601")
                     mirror.store.ensure_arm(arm_id)
-                    mirror.store.create_episode(sid, mirror.workspace_id, [arm_id], kind="execution")
+                    if sid:
+                        mirror.store.create_episode(sid, mirror.workspace_id, [arm_id], kind="execution")
                     mirror.mirror_oracle(plan_id, arm_id, doc)
                 await asyncio.to_thread(_mirror_error)
             else:
@@ -2387,33 +2315,37 @@ def _finish_coverage_recording(app, recorder, record_wall, episode, play_wall):
     try:
         recorder.disable()
         time.sleep(0.5)
-        segments = recorder.segments(since=record_wall - 2.0)
+        # mediamtx.Recorder.segments() already subtracts 2.0 s internally.
+        segments = recorder.segments(since=record_wall)
         if not segments:
             return None
         store = app["pg_store"]
-        store.create_episode(episode, app.get("pg_workspace", "default"),
-                             [app.get("arm_id", "b601")], kind="execution")
         import cv2
 
-        def _add_segment(seq, sha, duration):
-            with store._conn() as c:
-                return c.execute("SELECT episode_add_segment(%s,%s,%s,%s,'mp4') AS r",
-                                 (episode, seq, sha, duration)).fetchone()["r"]
-
+        blobs, durations, paths = [], [], []
         first_start = None
-        for seq, segment in enumerate(segments):
-            data = segment.path.read_bytes()
-            sha = store.put_blob(data, "fragment")
-            cap = cv2.VideoCapture(str(segment.path))
+        for segment in segments:
+            p = Path(segment.path)
+            blobs.append(p.read_bytes())
+            cap = cv2.VideoCapture(str(p))
             try:
                 fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
                 frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
                 duration = float(frames) / float(fps) if fps > 0 and frames > 0 else 10.0
             finally:
                 cap.release()
-            _add_segment(seq, sha, duration)
+            durations.append(duration)
+            paths.append(p)
             if first_start is None:
                 first_start = float(segment.start)
+        store.ingest_episode_segments(
+            episode, app.get("pg_workspace", "default"), app.get("arm_id", "b601"),
+            blobs, durations, codec="mp4")
+        for p in paths:
+            try:
+                p.unlink()
+            except OSError:
+                pass
         return float(play_wall - (first_start if first_start is not None else play_wall))
     except Exception as exc:  # noqa: BLE001 - evidence loss is reported, not fatal
         logging.warning("coverage recording ingest failed: %s", exc)
@@ -2642,7 +2574,7 @@ async def handle_calibrate(request: web.Request) -> web.Response:
         else:
             app["rig"] = rig
             app["extrinsics_path"] = payload["written"]
-            _pg_mirror_rig(app, rig)
+            await asyncio.to_thread(_pg_mirror_rig, app, rig)
             try:
                 app["witness"] = witness.load_for(rig, Path(payload["written"]).parent)
             except witness.WitnessError as error:
@@ -2732,7 +2664,7 @@ async def run_coverage(app, body, sid):
         raise identify_mod.IdentifyError("coverage measures against a rig: capture the base "
                                          "marker first")
     arm = auto_calibrate.ArmGateway(app["planner"], app["planner_token"])
-    map_doc = _accuracy_map(app)
+    map_doc = await asyncio.to_thread(_accuracy_map, app)
     tip = _oracle_tool_tip(app, rig)
     start = await asyncio.to_thread(arm.pose)
     q = np.asarray(start["q"], dtype=float).reshape(-1)
@@ -2809,7 +2741,7 @@ async def run_cartesian_coverage(app, body, sid):
     if rig is None:
         raise identify_mod.IdentifyError("coverage measures against a rig: capture the base "
                                          "marker first")
-    map_doc = _accuracy_map(app)
+    map_doc = await asyncio.to_thread(_accuracy_map, app)
     wanted = int(body.get("poses", identify_mod.COVERAGE_MAX_POSES))
     # Screen the whole grid, keep the first `wanted` survivors. The need-then-
     # cell order puts the inner band first, and whole rings can be unreachable
@@ -3015,7 +2947,7 @@ async def handle_identify_run(request: web.Request) -> web.Response:
         else:
             app["rig"] = rig
             app["extrinsics_path"] = payload["written"]
-            _pg_mirror_rig(app, rig)
+            await asyncio.to_thread(_pg_mirror_rig, app, rig)
             try:
                 app["witness"] = witness.load_for(rig, Path(payload["written"]).parent)
             except witness.WitnessError as error:
@@ -3041,12 +2973,25 @@ async def handle_identify_status(request: web.Request) -> web.Response:
         if proposal["kind"] not in {p["kind"] for p in proposals}:
             proposals.append(proposal)
     try:
-        gaps = identify_mod.unlearned(
-            identify_mod.active_sag_map(app["calib"], sweep.KP_DEFAULT),
-            _accuracy_map(app))
+        def _status_gaps_and_health():
+            store = app.get("pg_store")
+            rig = app.get("rig")
+            sag_map = (store.read_sag_map_doc(app.get("arm_id", "b601"),
+                                              rig.fingerprint if rig is not None else None)
+                       if store is not None
+                       else identify_mod.active_sag_map(app["calib"], sweep.KP_DEFAULT))
+            acc_map = _accuracy_map(app)
+            gaps_list = identify_mod.unlearned(sag_map, acc_map)
+            cells = acc_map.get("cells") or {}
+            validated = sum(1 for cell in cells.values() if cell.get("validated_at"))
+            health = {"cells": len(cells), "validated": validated,
+                      "validated_fraction": round(identify_mod.validated_fraction(acc_map), 4)}
+            return gaps_list, health
+        gaps, acc_health = await asyncio.to_thread(_status_gaps_and_health)
     except Exception as exc:  # noqa: BLE001 - a report never fails the route
         logging.warning("the unlearned report failed: %s", exc)
         gaps = []
+        acc_health = {"cells": 0, "validated": 0, "validated_fraction": 0.0}
     return web.json_response({
         "ok": True,
         "running": bool(app["calibrating"]),
@@ -3062,7 +3007,7 @@ async def handle_identify_status(request: web.Request) -> web.Response:
                                "IK residual attributed; moves the arm (§7.4)"},
         "unlearned": gaps,
         "rig": (None if app["rig"] is None else app["rig"].provenance()),
-        "accuracy": _accuracy_health(app),
+        "accuracy": acc_health,
     })
 
 
@@ -3086,6 +3031,20 @@ async def handle_identify_sag(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         body = {}
     kp_spec = str(body.get("kp") or sweep.KP_DEFAULT)
+    store = app.get("pg_store")
+    if store is not None:
+        # Item 3 + C4 fix: aggregate holds from PG telemetry corpus + fit + persist in 1 SQL call.
+        try:
+            result = await asyncio.to_thread(
+                store.fit_sag_map_from_corpus,
+                app.get("arm_id", "b601"), app["rig"].fingerprint, kp_spec,
+                identify_mod.zeros_key(app["rig"]))
+        except Exception as error:  # noqa: BLE001
+            logging.warning("sag fit (PG) failed: %s", error)
+            return web.json_response({"ok": False, "error": str(error)}, status=500)
+        if result.get("ok") and result.get("map"):
+            await asyncio.to_thread(identify_mod.save_sag_map, app["calib"], result["map"])
+        return web.json_response(result, status=200 if result.get("ok") else 422)
     docs = []
     for directory in (app["telemetry_dir"], app["oracle_dir"]):
         if directory.is_dir():
@@ -3104,8 +3063,6 @@ async def handle_identify_sag(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": str(error)}, status=500)
     if result["ok"]:
         identify_mod.save_sag_map(app["calib"], result["map"])
-        if result.get("ok"):
-            _pg_mirror_sag(app, result["map"])
     return web.json_response(dict(result, holds=len(holds)),
                              status=200 if result["ok"] else 422)
 
@@ -3375,6 +3332,7 @@ def _load_active_rig(app):
             name = Path(image).name
             (calib / name).write_bytes(data)
             if Path(image).is_absolute():
+                Path(image).parent.mkdir(parents=True, exist_ok=True)
                 Path(image).write_bytes(data)
         return rig
     except Exception as exc:  # noqa: BLE001
@@ -3486,7 +3444,7 @@ async def handle_capture_pose(request: web.Request) -> web.Response:
         else:
             app["rig"] = rig
             app["extrinsics_path"] = written
-            _pg_mirror_rig(app, rig)
+            await asyncio.to_thread(_pg_mirror_rig, app, rig)
             try:
                 app["witness"] = witness.load_for(rig, Path(written).parent)
             except witness.WitnessError as error:
@@ -3543,27 +3501,34 @@ async def trace_prune_loop(app):
 
 
 async def recordings_ingest_loop(app):
-    """Mirror completed MediaMTX recordings into the substrate (§8); never fatal."""
+    """Sweep ONLY orphaned MediaMTX segments into PG; never race active recordings.
+
+    Active executions and coverage sweeps own and unlink their own segments via
+    workflow_service._ingest_recording / _finish_coverage_recording. This loop
+    waits until a file's mtime is older than the maximum play budget before
+    sweeping it as an orphan, eliminating the mid-trajectory deletion race (C6).
+    """
     mirror = app.get("pg_mirror")
     rec_dir = app.get("recordings")
+    orphan_age_s = max(float(os.environ.get("REBOT_PLAY_TIMEOUT", "900")) + 60.0, 180.0)
     seen = set()
     while True:
         try:
             if mirror is not None and rec_dir is not None and rec_dir.is_dir():
+                now = time.time()
                 for mp4 in sorted(rec_dir.rglob("*.mp4")):
                     key = str(mp4)
                     if key in seen:
                         continue
-                    size = mp4.stat().st_size
-                    await asyncio.sleep(0.2)
-                    if not mp4.is_file() or mp4.stat().st_size != size:
-                        continue  # still being written
+                    try:
+                        st = mp4.stat()
+                    except OSError:
+                        continue
+                    if (now - st.st_mtime) < orphan_age_s:
+                        continue  # may belong to an in-flight execution or sweep
                     ep = "rec-" + mp4.stem
-                    mirror.store.create_episode(ep, app.get("pg_workspace", "default"), [], kind="execution")
-                    await asyncio.to_thread(mirror.mirror_recording, ep, mp4)
-                    # The spool is transient: remove the file after the confirmed
-                    # PG write. If it is still open, retry next pass — re-ingest
-                    # is idempotent (content-addressed blob, fixed episode/seq).
+                    await asyncio.to_thread(
+                        mirror.mirror_recording, ep, mp4, app.get("arm_id", "b601"))
                     try:
                         await asyncio.to_thread(mp4.unlink)
                         seen.add(key)
@@ -3599,6 +3564,9 @@ async def on_cleanup(app: web.Application):
     if task is not None:
         task.cancel()
     await app["client"].close()
+    store = app.get("pg_store")
+    if store is not None:
+        await asyncio.to_thread(store.close)
 
 
 async def handle_favicon(request: web.Request) -> web.Response:
@@ -3619,6 +3587,7 @@ def build_app(args) -> web.Application:
     app["whep_url"] = "" if args.no_whip else "%s/%s/whep" % (app["mediamtx"], app["whip_path"])
     app["planner"] = args.planner.rstrip("/")
     app["planner_token"] = args.planner_token
+    app["arm_id"] = str(getattr(args, "pg_arm", "") or os.environ.get("REBOT_PG_ARM", "b601"))
     app["workflow_url"] = str(getattr(args, "workflow_url", "")
                               or os.environ.get("REBOT_WORKFLOW_URL", "")).rstrip("/")
     app["execute"] = bool(args.execute)
@@ -3646,19 +3615,14 @@ def build_app(args) -> web.Application:
     # handheld profile and the planner's fallback need a number.
     app["tip_m"] = float(getattr(args, "tip_mm", 0.0)
                          or os.environ.get("REBOT_TIP_MM", "35")) / 1000.0
-    app["hover_m"] = float(getattr(args, "hover_m", 0.0)
-                           or os.environ.get("REBOT_HOVER_M", str(sweep.DEFAULT_MIN_Z)))
-    # The lowest tip z the planner will accept: the worktop plane plus the
-    # hover height above it -- the same sum the page's fallback and
-    # .env.example use -- so a tap can never plan closer to the table than the
-    # hover height, whatever plane the worktop sits at.
-    app["min_z"] = float(args.plane_z) + app["hover_m"]
     app["calibrating"] = False
     app["last_calibration"] = None
     app["progress"] = None
     app["calibration_started"] = None
     app["rig"] = None
     app["witness"] = None
+    app["captures"].mkdir(parents=True, exist_ok=True)
+    app["calib"].mkdir(parents=True, exist_ok=True)
     # A fitted rig is picked up from the standard path at startup. Both the tag
     # capture and the sweep write it there, so nothing has to be copied into the
     # environment. It is loaded even when the default mode is handheld: the two
@@ -3716,41 +3680,32 @@ def build_app(args) -> web.Application:
     app["trace_retention_days"] = int(getattr(args, "trace_retention_days", 30) or 30)
     app["traces_dir"] = Path(getattr(args, "traces_dir", "") or WORK / "traces").resolve()
     app["tool_schemas_sha256"] = None
-    if getattr(args, "no_trace", False):
-        app["traces"] = None
-        app["pg_mirror"] = None
-    elif getattr(args, "pg_dsn", ""):
-        # §8 cutover: traces go to the substrate (PG), not the file log. The
-        # store seam lives in examples/host/substrate; psycopg must be installed.
-        import sys
+    # The hillclimb (§7): the monitor only proposes; the accuracy map is the
+    # measured envelope /sequence warns from and /health reports.
+    app["identify_monitor"] = identify_mod.TriggerMonitor()
+    app["pg_mirror"] = None
+    pg_dsn = str(getattr(args, "pg_dsn", "") or "")
+    if pg_dsn:
+        # §8 cutover: PG is the system of record. Load arm_config, calib, rig,
+        # witness, sag_map, monitor_state and llm_context in ONE round trip
+        # (app_bootstrap), independent of --no-trace.
         substrate_dir = str(ROOT / "substrate")
         if substrate_dir not in sys.path:
             sys.path.insert(0, substrate_dir)
         from pg_trace import PgTraceRecorder
         from pg_evidence import PgEvidenceMirror
         from store import SubstrateStore
-        pg_store = SubstrateStore(args.pg_dsn)
-        # world.arm_config is the system of record for the physical-model constants;
-        # apply it to rebot_ik (single Python source). Seed == defaults -> no-op.
-        import arm_config
-        arm_config.load_config(dsn=args.pg_dsn)
+        pg_store = SubstrateStore(pg_dsn)
         pg_workspace = getattr(args, "pg_workspace", "default")
         app["pg_store"] = pg_store
         app["pg_workspace"] = pg_workspace
-        # The deeper evidence paths (capture/oracle/plan/telemetry) mirror into PG
-        # additively; the file-based realtime serving stays intact.
         app["pg_mirror"] = PgEvidenceMirror(pg_store, workspace_id=pg_workspace)
-        app["traces"] = PgTraceRecorder(
-            pg_store, workspace_id=pg_workspace,
-            snapshot=lambda sid: trace_manifest(app, sid))
-        # Startup rig: PG is the system of record. _load_active_rig materializes
-        # the rig doc + witness into the scratch cache; with no PG rig yet, seed
-        # PG from a file-mode rig if one exists.
+        boot = pg_store.app_bootstrap(pg_workspace, app["arm_id"]) or {}
+        if boot.get("arm_config"):
+            rebot_ik.apply_config(boot["arm_config"])
         try:
-            # Intrinsics too: the vision flow reads a calib file, so materialize
-            # the newest PG calibration into the cache after a wipe.
-            crow = pg_store.read_latest_calib_doc()
-            if crow and crow["calib_doc"]:
+            crow = boot.get("calibration")
+            if crow and crow.get("calib_doc"):
                 cdoc = crow["calib_doc"]
                 cname = str(cdoc.get("device") or crow["calib_fingerprint"])
                 cpath = Path(app["calib"]) / ("%s.json" % cname)
@@ -3759,46 +3714,85 @@ def build_app(args) -> web.Application:
                     cpath.write_text(json.dumps(cdoc, indent=2) + "\n", encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             logging.warning("intrinsics cache materialization failed: %s", exc)
-        pg_rig = _load_active_rig(app)
-        if pg_rig is not None:
-            app["rig"] = pg_rig
-            app["extrinsics_path"] = str(Path(app["calib"]) / "extrinsics-fixed.json")
+        rig_boot = boot.get("rig")
+        if rig_boot and rig_boot.get("rig_doc"):
             try:
-                app["witness"] = witness.load_for(pg_rig, Path(app["calib"]))
-            except witness.WitnessError as error:
-                logging.warning("the PG rig's witness cannot be used: %s", error)
-                app["witness"] = None
-            try:
-                smap = pg_store.read_sag_map_doc(app.get("arm_id", "b601"))
-                if smap:
-                    (Path(app["calib"]) / ("sag-%s.json" % smap["rig_fingerprint"])).write_text(
-                        json.dumps(smap), encoding="utf-8")
+                doc = rig_boot["rig_doc"]
+                pg_rig = extrinsics.Rig.from_dict(doc)
+                calib_dir = Path(app["calib"])
+                (calib_dir / "extrinsics-fixed.json").write_text(json.dumps(doc), encoding="utf-8")
+                record = getattr(pg_rig, "witness", None) or {}
+                image = record.get("image")
+                if image and rig_boot.get("witness_b64"):
+                    wbytes = base64.b64decode(rig_boot["witness_b64"])
+                    name = Path(image).name
+                    (calib_dir / name).write_bytes(wbytes)
+                    if Path(image).is_absolute():
+                        Path(image).parent.mkdir(parents=True, exist_ok=True)
+                        Path(image).write_bytes(wbytes)
+                app["rig"] = pg_rig
+                app["extrinsics_path"] = str(calib_dir / "extrinsics-fixed.json")
+                try:
+                    app["witness"] = witness.load_for(pg_rig, calib_dir)
+                except witness.WitnessError as error:
+                    logging.warning("the PG rig's witness cannot be used: %s", error)
+                    app["witness"] = None
             except Exception as exc:  # noqa: BLE001
-                logging.warning("sag cache materialization failed: %s", exc)
+                logging.warning("PG rig bootstrap failed: %s", exc)
         elif app.get("rig") is not None:
             _pg_mirror_rig(app, app["rig"])
-        # Mirror the base marker spec into world.tag; restore the llm context cache.
+        try:
+            smap = boot.get("sag_map")
+            if smap and smap.get("rig_fingerprint"):
+                (Path(app["calib"]) / ("sag-%s.json" % smap["rig_fingerprint"])).write_text(
+                    json.dumps(smap), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("sag cache materialization failed: %s", exc)
         try:
             marker = app.get("marker") or {}
-            if marker:
+            if marker and marker.get("at"):
+                at = list(marker["at"])
+                tag_id = str(marker["id"]) if marker.get("id") is not None else "base"
                 app["pg_mirror"].mirror_tag(
-                    str(marker.get("id", "base")), "base",
-                    float(marker.get("size_m", 0.04)),
-                    [marker.get("x"), marker.get("y"), marker.get("z"), marker.get("yaw")])
-            cached_ctx = pg_store.get_kv("llm_context")
+                    tag_id, "base",
+                    float(marker.get("size_m", 0.04)) * 1000.0,
+                    [float(at[0]), float(at[1]), float(at[2]), float(marker.get("yaw", 0.0))])
+            cached_ctx = boot.get("llm_context")
             if cached_ctx and not app["llm_context"]["tokens"]:
                 app["llm_context"] = cached_ctx
+            mon_state = boot.get("monitor")
+            if mon_state:
+                mon = app["identify_monitor"]
+                mon.ewma = mon_state.get("ewma_pixel_error_mm")
+                mon.tag_baseline = mon_state.get("ewma_tag_rms_px")
+                mon.proposals = (mon_state.get("last_doc") or {}).get("proposals", [])
         except Exception as exc:  # noqa: BLE001
-            logging.warning("tag/context restore failed: %s", exc)
+            logging.warning("tag/context/monitor restore failed: %s", exc)
+
+    if getattr(args, "no_trace", False):
+        app["traces"] = None
+    elif app.get("pg_store") is not None:
+        from pg_trace import PgTraceRecorder
+        app["traces"] = PgTraceRecorder(
+            app["pg_store"], workspace_id=app["pg_workspace"],
+            snapshot=lambda sid: trace_manifest(app, sid))
     else:
         # The snapshot callable runs lazily at a session's first event, when
         # the app state (rig, calib, gates) is fully populated.
         app["traces"] = trace_mod.TraceRecorder(
             app["traces_dir"], retention_days=app["trace_retention_days"],
             snapshot=lambda sid: trace_manifest(app, sid))
-        app["pg_mirror"] = None
-    app["captures"].mkdir(parents=True, exist_ok=True)
-    app["calib"].mkdir(parents=True, exist_ok=True)
+
+    # Compute hover_m and min_z AFTER world.arm_config has been applied to
+    # rebot_ik/sweep so custom min_z_m takes effect on startup.
+    hover_arg = getattr(args, "hover_m", None)
+    app["hover_m"] = float(hover_arg if hover_arg not in (None, 0, 0.0)
+                           else os.environ.get("REBOT_HOVER_M", str(sweep.DEFAULT_MIN_Z)))
+    # The lowest tip z the planner will accept: the worktop plane plus the
+    # hover height above it -- the same sum the page's fallback and
+    # .env.example use -- so a tap can never plan closer to the table than the
+    # hover height, whatever plane the worktop sits at.
+    app["min_z"] = float(args.plane_z) + app["hover_m"]
     # Scratch dirs for cv2 materializations and file-mode artifacts (§8 flatten):
     # in PG mode the authoritative records are in the substrate, these are cache.
     # Deriving from --captures keeps a test workdir entirely self-contained.
@@ -3806,20 +3800,6 @@ def build_app(args) -> web.Application:
     app["oracle_dir"] = app["captures"].parent / "oracle"
     app["telemetry_dir"] = app["captures"].parent / "telemetry"
     app["oracle_tasks"] = set()
-    # The hillclimb (§7): the monitor only proposes; the accuracy map is the
-    # measured envelope /sequence warns from and /health reports.
-    app["identify_monitor"] = identify_mod.TriggerMonitor()
-    # Restore the persisted drift trend so a restart doesn't reset the EWMA.
-    if app.get("pg_mirror") is not None:
-        try:
-            st = pg_store.get_monitor_state(app.get("arm_id", "b601"))
-            if st:
-                mon = app["identify_monitor"]
-                mon.ewma = st["ewma_pixel_error_mm"]
-                mon.tag_baseline = st["ewma_tag_rms_px"]
-                mon.proposals = (st["last_doc"] or {}).get("proposals", [])
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("monitor state restore failed: %s", exc)
     app["identify_last"] = None
     app["accuracy_map_path"] = app["calib"] / "accuracy-map.json"
 
@@ -3844,20 +3824,8 @@ def build_app(args) -> web.Application:
     app.router.add_post("/identify/sag", handle_identify_sag)
     app.router.add_get("/identify", handle_identify_status)
     app.router.add_post("/capture/pose", handle_capture_pose)
-    app.router.add_get("/viewer.js", handle_viewer_js)
-    app.router.add_get("/reach.js", handle_reach_js)
-    app.router.add_get("/api.js", handle_api_js)
-    app.router.add_get("/video.js", handle_video_js)
-    app.router.add_get("/reach-config.js", handle_reach_config_js)
-    app.router.add_get("/geometry.js", handle_geometry_js)
-    app.router.add_get("/arm-model.js", handle_arm_model_js)
-    app.router.add_get("/aruco.js", handle_aruco_js)
-    app.router.add_get("/markers.js", handle_markers_js)
-    app.router.add_get("/height.js", handle_height_js)
-    app.router.add_get("/locate.js", handle_locate_js)
-    app.router.add_get("/ekf.js", handle_ekf_js)
-    app.router.add_get("/stream.js", handle_stream_js)
-    app.router.add_get("/trace.js", handle_trace_js)
+    for _asset in WEB_JS_ASSETS:
+        app.router.add_get("/" + _asset, handle_web_js)
     app.router.add_get("/captures/{id}/{name}", handle_file)
     app.router.add_get("/favicon.ico", handle_favicon)
     if not args.no_whip:
@@ -3902,8 +3870,7 @@ def main(argv=None):
     parser.add_argument("--marker-size", type=float,
                         default=float(os.environ.get("REBOT_MARKER_SIZE", "0.04")),
                         help="the marker's printed side in metres (default 0.04)")
-    parser.add_argument("--hover-m", type=float,
-                        default=float(os.environ.get("REBOT_HOVER_M", str(sweep.DEFAULT_MIN_Z))),
+    parser.add_argument("--hover-m", type=float, default=None,
                         help="height of the tap plane above the worktop, in metres; "
                              "also the lowest tip z the planner accepts")
     parser.add_argument("--extrinsics", default="",
@@ -3959,6 +3926,8 @@ def main(argv=None):
                              "instead of the file log (spec §8 cutover)")
     parser.add_argument("--pg-workspace", default=os.environ.get("REBOT_PG_WORKSPACE", "default"),
                         help="workspace id for trace sessions in the substrate")
+    parser.add_argument("--pg-arm", default=os.environ.get("REBOT_PG_ARM", "b601"),
+                        help="arm id in the substrate (default: REBOT_PG_ARM or b601)")
     parser.add_argument("--workflow-url", default=os.environ.get("REBOT_WORKFLOW_URL", ""),
                         help="isolated execute/extract/detect activity URL; when set with a "
                              "PG DSN, /execute runs the durable execute->oracle workflow")

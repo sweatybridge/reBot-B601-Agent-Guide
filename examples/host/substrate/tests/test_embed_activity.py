@@ -19,36 +19,42 @@ from store import SubstrateStore
 from embed import HistogramEmbedder, start_embed_workflow
 
 DSN = os.environ.get("REBOT_PG_DSN", "postgresql://postgres@localhost:5433/postgres")
+ACTIVITY_URL = os.environ.get("REBOT_EMBED_ACTIVITY_URL", "").strip()
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# free port for the isolated activity
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-port = s.getsockname()[1]
-s.close()
+proc = None
+if ACTIVITY_URL:
+    target_url = ACTIVITY_URL
+    health_url = ACTIVITY_URL.rsplit("/", 1)[0] + "/health"
+else:
+    # free port for the isolated activity
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    proc = subprocess.Popen([sys.executable, os.path.join(HERE, "embed_service.py"),
+                             "--host", "127.0.0.1", "--port", str(port)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    health_url = "http://127.0.0.1:%d/health" % port
+    target_url = "http://host.docker.internal:%d/embed" % port
 
-proc = subprocess.Popen([sys.executable, os.path.join(HERE, "embed_service.py"),
-                         "--host", "127.0.0.1", "--port", str(port)],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 try:
     # wait for health
-    url = "http://127.0.0.1:%d" % port
     for _ in range(50):
         try:
-            with urllib.request.urlopen(url + "/health", timeout=1) as r:
+            with urllib.request.urlopen(health_url, timeout=1) as r:
                 assert json.loads(r.read())["ok"]
             break
         except Exception:
             time.sleep(0.2)
     else:
-        raise RuntimeError("embed service did not start")
+        raise RuntimeError("embed service did not start (%s)" % health_url)
 
     store = SubstrateStore(DSN)
     data = bytes((i * 7 + 3) % 256 for i in range(4096))
     sha = store.put_blob(data, kind="still")
 
-    # the container reaches the host service via host.docker.internal
-    iid = start_embed_workflow(store, sha, "http://host.docker.internal:%d/embed" % port)
+    iid = start_embed_workflow(store, sha, target_url)
     assert iid, "no instance id"
 
     emb = HistogramEmbedder()
@@ -71,7 +77,7 @@ try:
     assert hits[0]["still_sha"] == sha and hits[0]["distance"] < 1e-9
 
     # replay is idempotent (durable re-run must not duplicate)
-    start_embed_workflow(store, sha, "http://host.docker.internal:%d/embed" % port)
+    start_embed_workflow(store, sha, target_url)
     with psycopg.connect(DSN, row_factory=dict_row) as c:
         n = c.execute("SELECT count(*) AS n FROM search.frame_embedding "
                       "WHERE still_sha=%s AND model_id=%s", (sha, emb.model_id)).fetchone()["n"]
@@ -79,5 +85,6 @@ try:
 
     print("ISOLATED EMBED ACTIVITY (df.http) OK")
 finally:
-    proc.terminate()
-    proc.wait(timeout=10)
+    if proc is not None:
+        proc.terminate()
+        proc.wait(timeout=10)

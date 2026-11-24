@@ -696,33 +696,26 @@ def predicted_error(theta, covariance, free, K, dist, plane_z, options: FitOptio
 
 
 def _fit_pg(observations, K, dist, options, calib_fingerprint, device, mount, dsn):
-    """PG-mode fit: rebot_calibrate_fit (Rust DLT+LM) builds the rig. Raises on a
-    substrate refusal; the caller falls back to the Python fit on any failure."""
+    """PG-mode fit: single-call calibrate_fit_one (Rust DLT+LM) builds the rig.
+    Raises ExtrinsicsError on a substrate refusal; caller falls back to Python on DB outage."""
     import psycopg
-    with psycopg.connect(dsn) as c:
-        urow = c.execute("SELECT urdf FROM world.robot_model ORDER BY created_at LIMIT 1").fetchone()
-        if urow is None:
-            raise ExtrinsicsError("no robot model seeded (world.robot_model)")
-        urdf = next(iter(urow.values()))
-        crow = c.execute("SELECT config_doc->'calibration' FROM world.arm_config "
-                         "ORDER BY updated_at LIMIT 1").fetchone()
-        calib_cfg = next(iter(crow.values())) if crow is not None else None
-        if calib_cfg is None:
-            raise ExtrinsicsError("no arm config calibration seeded (world.arm_config)")
-        obs = [{"q": [float(v) for v in o.q], "uv": [float(o.uv[0]), float(o.uv[1])]}
-               for o in observations]
-        opts = {"refine_tip": options.refine_tip, "refine_zeros": options.refine_zeros,
-                "plane_z": options.plane_z, "huber_px": options.huber_px,
-                "max_iterations": options.max_iterations, "max_weak_mm": options.max_weak_mm,
-                "work_radius": options.work_radius,
-                "image_size": list(options.image_size) if options.image_size else None}
+    from psycopg.rows import dict_row
+    arm_id = os.environ.get("REBOT_PG_ARM", "b601")
+    obs = [{"q": [float(v) for v in o.q], "uv": [float(o.uv[0]), float(o.uv[1])]}
+           for o in observations]
+    opts = {"refine_tip": options.refine_tip, "refine_zeros": options.refine_zeros,
+            "plane_z": options.plane_z, "huber_px": options.huber_px,
+            "max_iterations": options.max_iterations, "max_weak_mm": options.max_weak_mm,
+            "work_radius": options.work_radius,
+            "image_size": list(options.image_size) if options.image_size else None}
+    with psycopg.connect(dsn, row_factory=dict_row, connect_timeout=10) as c:
         row = c.execute(
-            "SELECT rebot_calibrate_fit(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb)",
-            (urdf, json.dumps(obs),
+            "SELECT calibrate_fit_one(%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s) AS r",
+            (json.dumps(obs),
              json.dumps(np.asarray(K, dtype=float).reshape(-1).tolist()),
              json.dumps(np.asarray(dist, dtype=float).reshape(-1).tolist() if dist is not None else []),
-             json.dumps(opts), json.dumps(calib_cfg))).fetchone()
-    r = next(iter(row.values()))
+             json.dumps(opts), arm_id)).fetchone()
+    r = row["r"]
     T = np.asarray(r["T_base_cam"], dtype=float).reshape(4, 4)
     tip = np.asarray(r["tip_offset"], dtype=float)
     zeros = np.asarray(r["joint_zeros"], dtype=float) if r.get("joint_zeros") else None

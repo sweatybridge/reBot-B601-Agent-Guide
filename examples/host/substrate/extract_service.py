@@ -104,7 +104,7 @@ def extract_holds(req):
     samples = req["samples"]
     windows = req["windows"]
     t_offset = float(req.get("t_offset", 0.0))
-    quality = int(req.get("jpeg_quality", 92))
+    quality = max(1, min(100, int(req.get("jpeg_quality", 92))))
     # Decode base64 fragment payloads once.
     by_seq = {}
     for frag in fragments:
@@ -139,7 +139,7 @@ def extract_holds(req):
 def make_handler():
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, obj):
-            body = json.dumps(obj).encode("utf-8")
+            body = json.dumps(obj, allow_nan=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -158,15 +158,22 @@ def make_handler():
                 return
             try:
                 length = int(self.headers.get("Content-Length", 0))
+                if length < 0 or length > 32 * 1024 * 1024:
+                    raise ValueError("invalid content length")
                 req = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(req, dict):
+                    raise TypeError("body must be object")
                 for key in ("fragments", "samples", "windows"):
                     if key not in req:
                         raise KeyError(key)
-            except (KeyError, ValueError, binascii.Error, json.JSONDecodeError):
+            except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError):
                 self._send(400, {"error": "expected JSON {fragments, samples, windows}"})
                 return
             try:
                 result = extract_holds(req)
+            except (KeyError, TypeError, ValueError, binascii.Error) as e:
+                self._send(400, {"error": str(e)})
+                return
             except Exception as e:  # decode failure -> 5xx -> durable retry
                 self._send(500, {"error": str(e)})
                 return

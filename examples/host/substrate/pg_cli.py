@@ -16,15 +16,17 @@ def _store():
     if sub not in sys.path:
         sys.path.insert(0, sub)
     from store import SubstrateStore
-    return SubstrateStore(dsn)
+    return SubstrateStore(dsn, pool_size=2)
 
 
-def mirror_session(session_id, workspace_id="default", arm_id="b601", meta=None,
+def mirror_session(session_id, workspace_id=None, arm_id=None, meta=None,
                    files=None, kind="calibration"):
-    """Mirror a session: episode + manifest + image blobs + other file blobs."""
+    """Mirror a session: episode + manifest + image stills + referenced artifact events."""
     store = _store()
     if store is None:
         return
+    workspace_id = workspace_id or os.environ.get("REBOT_PG_WORKSPACE", "default")
+    arm_id = arm_id or os.environ.get("REBOT_PG_ARM", "b601")
     try:
         from pg_evidence import PgEvidenceMirror
         mirror = PgEvidenceMirror(store, workspace_id=workspace_id)
@@ -39,6 +41,11 @@ def mirror_session(session_id, workspace_id="default", arm_id="b601", meta=None,
             if p.suffix.lower() in (".jpg", ".jpeg", ".png"):
                 mirror.mirror_still(session_id, p.read_bytes(), purpose="witness", arm_id=arm_id)
             else:
-                store.put_blob(p.read_bytes(), "other")
+                sha = store.put_blob(p.read_bytes(), "other")
+                # Reference the blob from an event so refcount >= 1 protects it from orphan GC.
+                store.record_event(session_id, "server", "cli_artifact",
+                                   payload={"name": p.name}, arm_id=arm_id, blob_sha=sha)
     except Exception as exc:  # noqa: BLE001
         print("  warning: session PG mirror failed: %s" % exc)
+    finally:
+        store.close()

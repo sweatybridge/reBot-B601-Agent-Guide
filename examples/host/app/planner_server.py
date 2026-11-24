@@ -54,6 +54,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -62,10 +63,57 @@ sys.path.insert(0, str(HERE))
 
 import numpy as np  # noqa: E402
 
-import plan_to_target as planner  # noqa: E402
 import rebot_ik  # noqa: E402
 import sweep  # noqa: E402
 import traj  # noqa: E402
+
+_planner_mod = None
+
+
+def _file_planner():
+    """Lazy-import plan_to_target (Pinocchio) only in offline file mode."""
+    global _planner_mod
+    if _planner_mod is None:
+        import plan_to_target as mod
+        _planner_mod = mod
+    return _planner_mod
+
+
+@dataclass
+class _GatewayOptions:
+    """Pure-Python option schema matching plan_to_target.Options (no Pinocchio needed)."""
+    hz: float = field(default_factory=lambda: traj.DEFAULT_HZ)
+    approach: float = 0.06
+    approach_s: float = 3.0
+    slide_s: float = 1.5
+    grasp_q: float = 2.0
+    close_width_mm: float | None = None
+    open_q: float = field(default_factory=lambda: rebot_ik.GRIPPER["motor7_open"])
+    grasp_s: float = 1.2
+    hold_s: float = 0.6
+    lift: float = 0.10
+    lift_s: float = 1.5
+    return_s: float = 3.0
+    hover: bool = False
+    hover_m: float = field(default_factory=lambda: sweep.DEFAULT_MIN_Z)
+    tip_m: float = 0.0
+    tool_axis: str = "current"
+    yaw: float = 0.0
+    payload: float = 0.0
+    min_z: float = field(default_factory=lambda: sweep.DEFAULT_MIN_Z)
+    max_z: float = 0.95
+    max_reach: float = 0.75
+    no_return: bool = False
+    unpark_j2: float = 0.0
+    unpark_j3: float = 8.0
+    unpark_s: float = 2.0
+    ik_pos_tol: float = 0.002
+    ik_angle_tol: float = 0.5
+    urdf: str = ""
+    quiet: bool = False
+    extra: dict = field(default_factory=dict)
+    kp_spec: str = ""
+    calib_dir: str = ""
 
 ROOT = HERE.parent
 # Flattened layout (§8): no state/. File mode (no substrate; offline selftest)
@@ -122,14 +170,6 @@ def pg_mirror():
     return _pg_mirror
 
 
-def _pg_json(sql, args):
-    """Run a substrate SQL function returning a single jsonb value (PG mode)."""
-    mirror = pg_mirror()
-    with mirror.store._conn() as c:
-        row = c.execute(sql, args).fetchone()
-    return next(iter(row.values())) if row else None
-
-
 def _options_json(options):
     """Map the planner Options dataclass to the json the substrate cores read."""
     return {
@@ -144,49 +184,17 @@ def _options_json(options):
     }
 
 
-def _mirror_plan(plan_id, payload, summary=None):
-    """Persist a plan into the substrate. Returns True on success; a plan that
-    cannot be persisted cannot be executed, so callers in PG mode refuse it."""
-    mirror = pg_mirror()
-    if mirror is None:
-        return False
-    try:
-        mirror.store.ensure_arm(PG_ARM)
-        mirror.store.create_episode(plan_id, PG_WORKSPACE, [PG_ARM], kind="execution")
-        mirror.mirror_plan(plan_id, plan_id, PG_ARM,
-                           json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-                           metadata=summary or {}, snapshot={})
-        return True
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("plan persist for %s failed: %s", plan_id, exc)
-        return False
+def _check_edge_can_up():
+    """Refuse to move when the edge CAN interface is down (safety gate)."""
+    h_status, health = edge_request("GET", "/health", timeout=3)
+    if h_status == 200 and health.get("can_up") is False:
+        raise GatewayError(
+            "the arm's CAN bus (can0) is down on the edge; check the interface before moving", 503)
 
 
-def refresh_calib_cache():
-    """The calib dir the pure planner paths should read. File mode: the shared
-    calib dir. PG mode: a local read-cache materialized from the substrate's
-    active rig + sag map (refreshed per plan/move, so a refit takes effect on
-    the next plan without signaling between processes)."""
-    mirror = pg_mirror()
-    if mirror is None:
-        return str(CALIB_DIR)
-    try:
-        store = mirror.store
-        PG_CALIB_CACHE.mkdir(parents=True, exist_ok=True)
-        rig_doc = store.read_active_rig_doc(PG_WORKSPACE)
-        if rig_doc:
-            (PG_CALIB_CACHE / "extrinsics-fixed.json").write_text(
-                json.dumps(rig_doc), encoding="utf-8")
-            fp = str(rig_doc.get("fingerprint") or "")
-            map_doc = store.read_sag_map_doc(PG_ARM) if fp else None
-            sag_path = PG_CALIB_CACHE / ("sag-%s.json" % fp)
-            if map_doc:
-                sag_path.write_text(json.dumps(map_doc), encoding="utf-8")
-            elif sag_path.is_file():
-                sag_path.unlink()  # invalidated map: no learned term, never a stale one
-    except Exception as exc:  # noqa: BLE001 - a stale cache beats a failed plan
-        logging.warning("calib cache refresh failed: %s", exc)
-    return str(PG_CALIB_CACHE)
+def _is_db_outage(exc: Exception) -> bool:
+    name = type(exc).__name__
+    return name in ("OperationalError", "InterfaceError", "DatabaseError") and "RaiseException" not in name
 
 PLAN_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
 
@@ -309,21 +317,11 @@ def fk_one(body):
     if not all(math.isfinite(value) for value in values):
         raise GatewayError("'q' must be finite")
     if pg_mirror() is not None:
-        # PG mode: the substrate computes FK (rebot_fk_tip + rebot_joint_points).
+        # PG mode: single-call SQL fk_one (Item 5; fixes dict_row[0] KeyError).
         try:
-            mirror = pg_mirror()
-            with mirror.store._conn() as c:
-                urow = c.execute(
-                    "SELECT urdf FROM world.robot_model ORDER BY created_at LIMIT 1").fetchone()
-                if urow is not None:
-                    urdf = next(iter(urow.values()))
-                    tip = c.execute("SELECT rebot_fk_tip(%s,%s)", (urdf, values[:6])).fetchone()[0]
-                    pts = c.execute("SELECT rebot_joint_points(%s,%s)",
-                                    (urdf, values[:6])).fetchone()[0]
-            if urow is not None:
-                jp = [[float(pts[i]), float(pts[i + 1]), float(pts[i + 2])]
-                      for i in range(0, len(pts), 3)]
-                return {"ok": True, "tip_m": [float(v) for v in tip], "joint_points": jp}
+            res = pg_mirror().store.fk_one(values[:6], PG_ARM)
+            if isinstance(res, dict) and res.get("ok"):
+                return res
         except Exception:  # noqa: BLE001
             pass  # substrate unavailable -> the numpy FK below
     tool, links = rebot_ik.forward(np.asarray(values[:6], dtype=float), with_links=True)
@@ -356,7 +354,7 @@ def request_options(body):
             raise GatewayError(
                 "%s is deprecated in the planner API; send tip points and "
                 "'tip_offset_m' at the top level" % name)
-    options = planner.Options()
+    options = _GatewayOptions() if pg_mirror() is not None else _file_planner().Options()
     for name, value in raw.items():
         if not hasattr(options, name):
             raise GatewayError("unknown option %r" % name)
@@ -460,27 +458,18 @@ def plan_targets(body):
     # trajectory will be played at, plus the learned residual where a keyed map
     # exists for the active rig.
     options.kp_spec = str(body.get("kp") or KP)
-    options.calib_dir = refresh_calib_cache()
-
-    # Every hover plan -- single tap or marker sequence -- drives the same
-    # Cartesian approach, which passes close to the reach boundary mid-leg:
-    # there the IK stalls a few mm short with the orientation already solved.
-    # The arm's repeatability is ~23 mm, so a 2 mm acceptance band rejects poses
-    # the hardware could not hold anyway. Floor the band at 10 mm for both.
     options.ik_pos_tol = max(float(options.ik_pos_tol), 0.010)
     started = time.time()
     if pg_mirror() is not None:
-        # PG mode: the substrate computes (rebot_plan / rebot_plan_sequence) and
-        # persists in one transaction; the gateway is a thin HTTP->SQL adapter.
+        # PG mode: 1 SQL round trip (plan_one computes + persists; no disk cache writes).
         if gripper == "none" and len(targets) != 1:
             raise GatewayError('gripper "none" takes exactly one target')
         target_arg = targets[0] if gripper == "none" else targets
         try:
-            res = _pg_json("SELECT plan_one(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)",
-                           (PG_WORKSPACE, json.dumps(pose), json.dumps(target_arg),
-                            json.dumps(_options_json(options)), PG_ARM))
+            res = pg_mirror().store.plan_one(
+                PG_WORKSPACE, pose, target_arg, _options_json(options), PG_ARM)
         except Exception as error:
-            raise GatewayError(str(error), 422) from error
+            raise GatewayError(str(error), 503 if _is_db_outage(error) else 422) from error
         plan_id = res["plan_id"]
         summary = res["summary"]
         summary["compute_s"] = round(time.time() - started, 2)
@@ -489,31 +478,26 @@ def plan_targets(body):
                      time.time() - started)
         return {"ok": True, "id": plan_id, "path": "pg:evidence.plan/%s" % plan_id,
                 "bytes": 0, "summary": summary, "execute": EXECUTE}
+    options.calib_dir = str(CALIB_DIR)
+    fp = _file_planner()
     try:
         if gripper == "none":
             if len(targets) != 1:
                 raise GatewayError('gripper "none" takes exactly one target')
-            payload, summary = planner.plan(pose, targets[0], options)
+            payload, summary = fp.plan(pose, targets[0], options)
             label = "plan"
         else:
-            payload, summary = planner.plan_sequence(pose, targets, options)
+            payload, summary = fp.plan_sequence(pose, targets, options)
             label = "sequence"
-    except planner.PlanError as error:
+    except fp.PlanError as error:
         raise GatewayError(str(error), 422) from error
 
     plan_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
     raw = json.dumps(payload, separators=(",", ":"))
-    if pg_mirror() is not None:
-        # PG mode: the substrate is the only persistence. A plan that cannot be
-        # persisted cannot be executed, so refuse it rather than strand it.
-        if not _mirror_plan(plan_id, payload, summary):
-            raise GatewayError("cannot persist plan %s to the substrate" % plan_id, 503)
-        location, size = "pg:evidence.plan/%s" % plan_id, len(raw.encode("utf-8"))
-    else:
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-        path = OUT_DIR / ("%s.json" % plan_id)
-        path.write_text(raw, encoding="utf-8")
-        location, size = str(path), path.stat().st_size
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUT_DIR / ("%s.json" % plan_id)
+    path.write_text(raw, encoding="utf-8")
+    location, size = str(path), path.stat().st_size
 
     if label == "sequence":
         tap_heights = summary.get("tap_heights_m") or []
@@ -605,8 +589,8 @@ def move_one(body):
     gripper = float(body["gripper"]) if "gripper" in body else float(q_from[6])
 
     if pg_mirror() is not None:
-        # PG mode: the substrate computes peel + worktop gates + sag commands +
-        # trajectory (rebot_move_build) and persists; the gateway plays it.
+        # PG mode: 1 SQL call computes + persists + returns trajectory inline,
+        # honoring requested_id (fixes coverage C5) and enforcing CAN bus health.
         opts = {"kp_spec": str(body.get("kp") or KP), "gripper": gripper,
                 "hold": max(0.0, min(30.0, float(body.get("hold") or 0.0)))}
         if body.get("seconds") is not None:
@@ -614,14 +598,13 @@ def move_one(body):
         pose_arg = {"ids": current["ids"], "q": [float(v) for v in q_from]}
         tgt_arg = [[float(v) for v in t] for t in targets]
         try:
-            res = _pg_json("SELECT move_one(%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)",
-                           (PG_WORKSPACE, json.dumps(pose_arg), json.dumps(tgt_arg),
-                            json.dumps(opts), PG_ARM))
+            res = pg_mirror().store.move_one(
+                PG_WORKSPACE, pose_arg, tgt_arg, opts, PG_ARM, plan_id=requested_id or None)
         except Exception as error:
-            raise GatewayError(str(error), 422) from error
+            raise GatewayError(str(error), 503 if _is_db_outage(error) else 422) from error
         move_id = res["plan_id"]
         summary = res["summary"]
-        trajectory = json.loads(pg_mirror().store.read_plan_blob(move_id))
+        trajectory = res["payload"]
         seconds = summary.get("leg_seconds") or [summary["seconds"]]
         hold = summary["hold"]
         applied = summary["sag_mrad"]
@@ -632,6 +615,7 @@ def move_one(body):
                     "seconds": [round(float(v), 3) for v in seconds], "hold": hold,
                     "waypoints": len(trajectory["waypoints"]),
                     "duration_s": trajectory.get("duration_s")}
+        _check_edge_can_up()
         query = urllib.parse.urlencode({"kp": str(body.get("kp") or KP),
                                         "kd": str(body.get("kd") or KD)})
         total = sum(seconds) + hold * len(targets)
@@ -672,13 +656,7 @@ def move_one(body):
                 "leg %d of the move dips within a link radius of the worktop; move the arm "
                 "clear first" % index, 422)
 
-    # A player that cannot reach the bus still exits 0, so the move "succeeds"
-    # and the arm never leaves its pose. Ask the board before sending anything.
-    health_status, health = edge_request("GET", "/health", timeout=5)
-    if health_status == 200 and health.get("can_up") is False:
-        raise GatewayError(
-            "the board's CAN channel is down (%s): bring it up before moving"
-            % (health.get("channel") or "can0"), 503)
+    _check_edge_can_up()
 
     # The controller has no integral term, so a joint under load rests tau_g/kp
     # away from its command. Command the offset so the arm *holds* the poses the
@@ -686,7 +664,7 @@ def move_one(body):
     # in the file, and a 6 deg set-down is 60 mm at the tool.
     kp_spec = str(body.get("kp") or KP)
     kp = sweep.kp_vector(kp_spec)
-    calib_dir = refresh_calib_cache()
+    calib_dir = str(CALIB_DIR)
     commands = []
     applied = []
     for index, target in enumerate(targets):
@@ -745,15 +723,10 @@ def move_one(body):
     # and a dry run lets the caller read the REAL windows before the arm moves,
     # which is what schedules the coverage session's hold grabs (§7.4).
     raw = json.dumps(trajectory, separators=(",", ":"))
-    if pg_mirror() is not None:
-        if not _mirror_plan(move_id, trajectory, {"kind": "move", "poses": len(targets)}):
-            raise GatewayError("cannot persist move %s to the substrate" % move_id, 503)
-        location, size = "pg:evidence.plan/%s" % move_id, len(raw.encode("utf-8"))
-    else:
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-        path = OUT_DIR / ("%s.json" % move_id)
-        path.write_text(raw, encoding="utf-8")
-        location, size = str(path), path.stat().st_size
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUT_DIR / ("%s.json" % move_id)
+    path.write_text(raw, encoding="utf-8")
+    location, size = str(path), path.stat().st_size
     if body.get("dry_run"):
         return {"ok": True, "id": move_id, "dry_run": True, "path": location,
                 "bytes": size, "poses": len(targets),
@@ -799,21 +772,17 @@ def execute_one(body):
         raise GatewayError("'id' must be a plan id")
     mirror = pg_mirror()
     if mirror is not None:
-        # PG mode: the substrate is the only plan store; age comes from the
-        # catalog row, not a file mtime.
+        # PG mode: 1 SQL round trip (plan_fetch returns verified bytes + age check).
         try:
-            raw = mirror.store.read_plan_blob(plan_id)
-            created = mirror.store.read_plan_created_at(plan_id)
+            row = mirror.store.plan_fetch(plan_id, MAX_AGE_S)
         except Exception as exc:  # noqa: BLE001
             raise GatewayError("plan store unavailable: %s" % exc, 503) from exc
-        if raw is None:
+        if row is None:
             raise GatewayError("no plan %s in the substrate" % plan_id, 404)
-        trajectory = json.loads(raw)
-        if created is not None:
-            age = time.time() - created.timestamp()
-            if age > MAX_AGE_S:
-                raise GatewayError("plan %s is %.0f s old (limit %.0f s): plan again"
-                                   % (plan_id, age, MAX_AGE_S), 409)
+        if row["expired"]:
+            raise GatewayError("plan %s is %.0f s old (limit %.0f s): plan again"
+                               % (plan_id, row["age_s"], MAX_AGE_S), 409)
+        trajectory = json.loads(row["bytes"])
     else:
         path = OUT_DIR / ("%s.json" % plan_id)
         if not path.is_file():

@@ -1,17 +1,29 @@
-"""Additive PG evidence mirror (spec §8, deeper paths).
+"""PG evidence mirror seam (spec §8) — delegates to atomic single-round-trip RPCs.
 
-The calibration flow stays file-based (the rig hot-reload reads calib files); the
-capture catalog/serving reads are PG-primary with file fallback. This mirrors the
-evidence into the substrate learning plane as it is produced: PG is the learning
-system of record, files are the realtime serving cache. The trace pipeline
-(pg_trace.py) is fully switched; these deeper paths mirror additively.
-
-Every method is synchronous; the caller offloads to a thread and wraps it so a PG
-failure never breaks the arm/chat path (§8.4). Dependency order: a plan must be mirrored
-before its oracle verdict / telemetry (oracle_verdict.plan_id and telemetry.plan_id are
-FKs to evidence.plan).
+Each compound write (`mirror_capture`, `mirror_oracle`, `mirror_telemetry`,
+`mirror_rig`, `mirror_recording`) executes in ONE SQL transaction on `SubstrateStore`.
 """
 from __future__ import annotations
+
+from pathlib import Path
+import hashlib
+
+
+def _probe_video_duration(path: Path, default: float = 10.0) -> float:
+    try:
+        import cv2
+        cap = cv2.VideoCapture(str(path))
+        try:
+            if cap.isOpened():
+                fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+                frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+                if fps > 0 and frames > 0:
+                    return float(frames) / float(fps)
+        finally:
+            cap.release()
+    except Exception:  # noqa: BLE001
+        pass
+    return default
 
 
 class PgEvidenceMirror:
@@ -22,13 +34,9 @@ class PgEvidenceMirror:
 
     def mirror_capture(self, capture_id: str, meta: dict, frame_bytes: bytes,
                        arm_id=None, kind: str = "calibration", image_size=None) -> str:
-        self.store.create_episode(capture_id, self.workspace_id,
-                                  [arm_id] if arm_id else [], kind=kind)
-        sha = self.store.put_blob(frame_bytes, "still")
-        w, h = (image_size or [None, None])[:2]
-        self.store.add_still(capture_id, sha, purpose="witness", arm_id=arm_id, width=w, height=h)
-        self.store.write_manifest(capture_id, meta)
-        return sha
+        return self.store.record_capture(
+            capture_id, self.workspace_id, meta, frame_bytes,
+            arm_id=arm_id, kind=kind, image_size=image_size)
 
     def mirror_plan(self, plan_id: str, episode_id: str, arm_id: str, trajectory_bytes: bytes,
                     metadata=None, snapshot=None, group_id=None) -> str:
@@ -39,19 +47,16 @@ class PgEvidenceMirror:
 
     def mirror_oracle(self, plan_id: str, arm_id: str, doc: dict,
                       rig_fingerprint=None, exec_id=None) -> None:
-        verdict = doc.get("verdict") or {}
-        self.store.add_oracle_verdict(plan_id, arm_id, verdict, doc, exec_id=exec_id)
-        if rig_fingerprint and arm_id:
-            self.store.update_accuracy_cells(arm_id, rig_fingerprint, doc)
+        self.store.record_oracle(
+            plan_id, arm_id, doc, rig_fingerprint=rig_fingerprint, exec_id=exec_id)
 
     def mirror_telemetry(self, exec_id: str, plan_id: str, arm_id: str, samples_bytes: bytes,
                          kp_key: str, summary=None) -> str:
-        sha = self.store.put_blob(samples_bytes, "telemetry")
-        self.store.add_telemetry(exec_id, plan_id, arm_id, sha, kp_key, summary or {})
-        return sha
+        return self.store.record_telemetry(
+            exec_id, plan_id, arm_id, samples_bytes, kp_key, summary=summary)
 
-    def mirror_rig(self, rig, witness_sha=None) -> None:
-        """Mirror an extrinsics.Rig as the active shared rig (numpy -> lists)."""
+    def mirror_rig(self, rig, witness_sha=None, calib=None) -> None:
+        """Mirror an extrinsics.Rig as the active shared rig (atomic + scoped invalidation)."""
         def lst(x):
             return x.tolist() if hasattr(x, "tolist") else x
         self.store.upsert_rig(
@@ -62,7 +67,10 @@ class PgEvidenceMirror:
             witness=getattr(rig, "witness", None),
             provenance=rig.provenance() if hasattr(rig, "provenance") else None,
             rig_doc=rig.to_dict() if hasattr(rig, "to_dict") else None,
-            witness_sha=witness_sha)
+            witness_sha=witness_sha,
+            calib_K=lst(calib.K) if calib is not None and hasattr(calib, "K") else None,
+            calib_dist=lst(calib.dist) if calib is not None and hasattr(calib, "dist") else None,
+            calib_image_size=list(calib.image_size) if calib is not None and hasattr(calib, "image_size") else None)
 
     def mirror_sag(self, arm_id: str, map_doc: dict) -> None:
         self.store.ensure_arm(arm_id)
@@ -82,8 +90,9 @@ class PgEvidenceMirror:
         self.store.upsert_tag(tag_id, self.workspace_id, kind, side_mm, pose_world)
 
     def mirror_recording(self, episode_id: str, path, arm_id=None, seq: int = 0) -> str:
-        from pathlib import Path
-        data = Path(path).read_bytes()
-        sha = self.store.put_blob(data, "other")
-        self.store.add_fragment(episode_id, sha, seq=seq, t_start=0.0, t_end=0.0, codec="mp4")
-        return sha
+        p = Path(path)
+        data = p.read_bytes()
+        dur = _probe_video_duration(p, default=10.0)
+        self.store.ingest_episode_segments(
+            episode_id, self.workspace_id, arm_id, [data], [dur], codec="mp4")
+        return hashlib.sha256(data).hexdigest()

@@ -125,7 +125,7 @@ def make_leaf(ca_key, ca_cert, hostname, ips, days):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local CA + TLS certificate for the capture page.")
-    parser.add_argument("--out", default=str(Path(__file__).resolve().parent.parent / "state" / "tls"),
+    parser.add_argument("--out", default=str(Path(__file__).resolve().parent.parent / "config" / "tls"),
                         help="directory for the PEM files")
     parser.add_argument("--host", default="rebot-host.local", help="DNS name the phone will use")
     parser.add_argument("--ip", action="append", default=[], help="extra IP SAN, repeatable")
