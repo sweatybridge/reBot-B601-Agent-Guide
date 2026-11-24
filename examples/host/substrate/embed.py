@@ -49,19 +49,19 @@ def populate_frame_embedding(store, still_sha: str, embedder: Embedder):
     return vec
 
 
-def embed_workflow_sql(still_sha: str, service_url: str) -> str:
-    """SQL expression building the durable graph: read blob -> POST to embedder -> upsert vector."""
+def embed_workflow_sql(still_sha: str, service_url: str, by_ref: bool = True) -> str:
+    """SQL expression building the durable graph: POST to embedder -> upsert vector.
+
+    When `by_ref=True` (default), sends only `{"still_sha": sha}` so raw image
+    bytes are read in binary by the activity and never base64-encoded into
+    `df.http()` or `pg_durable` workflow history.
+    """
     if not isinstance(still_sha, str) or not _SHA256_RE.match(still_sha):
         raise ValueError("still_sha must be a 64-char lowercase hex sha256")
     if not isinstance(service_url, str) or not _URL_RE.match(service_url):
         raise ValueError("service_url must be a valid http(s) URL without quotes or '$'")
     sha = still_sha
     url = service_url
-    step_req = (
-        f"df.as(df.sql($wf$SELECT replace(encode(bytes, 'base64'), chr(10), '') AS b64 "
-        f"FROM evidence.blob WHERE sha256 = '{sha}'$wf$), 'req')"
-    )
-    step_http = f"df.as(df.http('{url}', 'POST', '{{\"data_b64\": \"$req.b64\"}}'), 'resp')"
     step_model = (
         "df.sql($wf$INSERT INTO search.embedding_model(model_id, name, version, dim, kind) "
         "SELECT j->>'model_id', j->>'name', j->>'version', (j->>'dim')::int, 'frame' "
@@ -74,11 +74,20 @@ def embed_workflow_sql(still_sha: str, service_url: str) -> str:
         "FROM (SELECT ($resp.body)::jsonb AS j) r WHERE ($resp.ok)::boolean "
         "ON CONFLICT (still_sha, model_id) DO NOTHING RETURNING still_sha, model_id$wf$)"
     )
+    if by_ref:
+        step_http = f"df.as(df.http('{url}', 'POST', '{{\"still_sha\": \"{sha}\"}}'), 'resp')"
+        return f"df.seq(df.seq({step_http}, {step_model}), {step_vec})"
+    step_req = (
+        f"df.as(df.sql($wf$SELECT replace(encode(bytes, 'base64'), chr(10), '') AS b64 "
+        f"FROM evidence.blob WHERE sha256 = '{sha}'$wf$), 'req')"
+    )
+    step_http = f"df.as(df.http('{url}', 'POST', '{{\"data_b64\": \"$req.b64\"}}'), 'resp')"
     return f"df.seq(df.seq(df.seq({step_req}, {step_http}), {step_model}), {step_vec})"
 
 
-def start_embed_workflow(store, still_sha: str, service_url: str, timeout: int = 60) -> str:
-    graph = embed_workflow_sql(still_sha, service_url)
+def start_embed_workflow(store, still_sha: str, service_url: str, timeout: int = 60,
+                         by_ref: bool = True) -> str:
+    graph = embed_workflow_sql(still_sha, service_url, by_ref=by_ref)
     with store.conn() as c:
         iid = c.execute(f"SELECT df.start({graph}, 'embed_still') AS iid").fetchone()["iid"]
     with store.conn() as c:

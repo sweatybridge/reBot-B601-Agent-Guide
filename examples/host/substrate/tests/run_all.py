@@ -306,7 +306,35 @@ def run_rpcs_suite(dsn: str) -> list[tuple[str, bool, float, str]]:
             raise AssertionError("invalid sha not blocked")
         except ValueError:
             pass
-        assert "WHERE ($resp.ok)::boolean" in embed_workflow_sql("a" * 64, "http://activities:8766/embed")
+        wf_sql = embed_workflow_sql("a" * 64, "http://activities:8766/embed")
+        assert "WHERE ($resp.ok)::boolean" in wf_sql
+        assert "still_sha" in wf_sql and "data_b64" not in wf_sql
+        # Binary still storage + metadata-only detect request (zero frame_b64)
+        st = store.store_execution_stills(
+            "rpc_exec",
+            [{"index": 1, "t": 4.0, "score": 0.0, "width": 16, "height": 16}],
+            [b"\xff\xd8\xff\xd9"],
+        )
+        assert st["stored"] >= 0 and len(st["holds"]) == 1 and st["holds"][0]["still_sha"]
+        det_req, det_blobs = store.detect_request_with_stills("rpc_exec")
+        assert "frame_b64" not in json.dumps(det_req)
+        for h in det_req.get("holds") or []:
+            assert h["frame"] in det_blobs
+
+        # Negative t_offset (H.264 keyframe lag) must not fail wait_fragments when [0, w1] is covered
+        with store.conn() as c:
+            c.execute("INSERT INTO evidence.episode(episode_id, workspace_id, kind) "
+                      "VALUES ('neg_off_ep', 'default', 'execution') ON CONFLICT DO NOTHING")
+            c.execute("INSERT INTO evidence.blob(sha256, kind, bytes, size_bytes, status) "
+                      "VALUES ('neg_off_frag', 'fragment', %s, 1, 'verified') ON CONFLICT DO NOTHING", (b"\x00",))
+            c.execute("INSERT INTO evidence.media_fragment(episode_id, sha256, seq, t_start, t_end) "
+                      "VALUES ('neg_off_ep', 'neg_off_frag', 0, 0.0, 20.0) ON CONFLICT DO NOTHING")
+            ws = json.dumps([{"index": 1, "t_start": 0.02, "t_end": 2.58},
+                             {"index": 2, "t_start": 9.96, "t_end": 11.96}])
+            assert c.execute("SELECT wait_fragments('neg_off_ep', %s::jsonb, -0.6) AS v", (ws,)).fetchone()["v"] is True
+            ws_uncov = json.dumps([{"index": 1, "t_start": 0.02, "t_end": 2.58},
+                                   {"index": 2, "t_start": 22.0, "t_end": 24.0}])
+            assert c.execute("SELECT wait_fragments('neg_off_ep', %s::jsonb, -0.6) AS v", (ws_uncov,)).fetchone()["v"] is False
 
         return [("rpcs/p0_and_items_1_to_6", True, time.monotonic() - t0, "")]
     except Exception as exc:  # noqa: BLE001
