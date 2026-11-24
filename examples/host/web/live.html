@@ -591,13 +591,13 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "pixel_to_arm",
-      description: "Convert an image pixel to the arm-base tool-tip point at an approach height. Reports whether the point is inside the reach band and above the height floor. Use it to check a target before adding a marker.",
+      description: "Read-only check: convert an image pixel to the arm-base tool-tip point at an approach height without moving the page's height badge. Reports whether the point is inside the reach band and above the height floor; if out of range, also returns reason, reachable_heights_m, suggested_height_m (the lowest reachable height), and suggested_pixel. Use it to check a target before adding a marker.",
       parameters: {
         type: "object",
         properties: {
-          u: { type: "number", description: "image column in pixels" },
-          v: { type: "number", description: "image row in pixels" },
-          height_m: { type: "number", description: "approach height above the worktop, metres; omit for the page's badge height" },
+          u: { type: "number", description: "image column in pixels (read from the top grid axis)" },
+          v: { type: "number", description: "image row in pixels (read from the left grid axis; larger v is lower on the object)" },
+          height_m: { type: "number", description: "approach height above the worktop in metres; start low (default_height_m / height_floor_m) and omit to probe at the page's badge height" },
         },
         required: ["u", "v"],
       },
@@ -623,13 +623,13 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "add_marker",
-      description: "Queue a numbered target at an image pixel; it appears on the screen. The arm visits queued markers in order, alternating the gripper. Returns the tip point and whether it is reachable.",
+      description: "Queue a numbered target at an image pixel; it appears on the screen. The arm visits queued markers in order, alternating the gripper (odd = close/grasp, even = open/release). For grasping an object, aim at its lower third (larger v) at the lowest reachable height_m. Returns the tip point and whether it is reachable.",
       parameters: {
         type: "object",
         properties: {
           u: { type: "number", description: "image column in pixels" },
-          v: { type: "number", description: "image row in pixels" },
-          height_m: { type: "number", description: "approach height above the worktop, metres; omit for the page's badge height" },
+          v: { type: "number", description: "image row in pixels (for grasping, aim at the lower third of the object, near its base)" },
+          height_m: { type: "number", description: "approach height above the worktop in metres; pass explicitly once verified with pixel_to_arm" },
         },
         required: ["u", "v"],
       },
@@ -677,7 +677,7 @@ const AGENT_TOOLS = [
     type: "function",
     function: {
       name: "capture_view",
-      description: "Ask for a fresh camera frame; it arrives as the next user message. Use it after the arm moves, or when the view may have changed.",
+      description: "Ask for a fresh camera frame (with the pixel grid and any queued marker pins overlaid); it arrives as the next user message. Use it to visually verify marker placement on the object, after the arm moves, or when the view may have changed.",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -748,9 +748,9 @@ function trimHistory(limit) {
   return dropped;
 }
 
-// Rough but conservative: text at ~3.5 chars/token, and a vision frame at the
-// server's minimum of ~1024 tokens. It only has to be good enough to trigger a
-// compaction before the real tokenizer refuses the request.
+// Rough but conservative: text at ~3.5 chars/token, and a vision frame at
+// ~1200 tokens. prepareContext also uses the server's real usage.prompt_tokens
+// as a floor, and context_overflow auto-compacts if a high-res mmproj runs larger.
 function estimateTokens(messages) {
   let chars = systemPrompt().length + JSON.stringify(AGENT_TOOLS).length;
   let images = 0;
@@ -769,26 +769,39 @@ function estimateTokens(messages) {
   return Math.ceil(chars / 3.5) + images * 1200;
 }
 
-function compactHistory(targetTokens) {
+// Synthetic user messages injected by capture_view() belong to the current
+// task, not a new user turn; compaction must not drop the real user prompt
+// before them mid-task.
+function isRealUserTurn(message) {
+  if (!message || message.role !== "user") return false;
+  if (Array.isArray(message.content)) {
+    const firstText = message.content.find((p) => p && p.type === "text");
+    if (firstText && firstText.text === "A fresh camera frame, taken just now.") return false;
+  }
+  return true;
+}
+
+function compactHistory(targetTokens, reason) {
   const framesBefore = countFrames(CHAT.history);
   pruneFrames(1);
   let dropped = 0;
-  // Drop whole old turns, not one message at a time: an assistant left without
-  // its user is as invalid as a tool result left without its assistant call.
-  // The last user message and everything after it are the current request.
+  // Drop whole old user tasks, not one message at a time: an assistant left
+  // without its user is as invalid as a tool result left without its assistant
+  // call, and a capture_view frame must never orphan the active user request.
   while (estimateTokens(CHAT.history) > targetTokens) {
     const nextUser = CHAT.history.findIndex((message, index) =>
-      index > 0 && message.role === "user");
+      index > 0 && isRealUserTurn(message));
     if (nextUser <= 0) break;
     CHAT.history.splice(0, nextUser);
     dropped += nextUser;
   }
   const droppedFrames = framesBefore - countFrames(CHAT.history);
   if (dropped || droppedFrames) {
+    CHAT.promptTokens = 0;
     RebotTrace.trace("compaction", {
       dropped_messages: dropped,
       dropped_frames: droppedFrames,
-      reason: "context_tokens",
+      reason: reason || "context_tokens",
     });
   }
   if (dropped) {
@@ -796,13 +809,15 @@ function compactHistory(targetTokens) {
       + "continue from the latest messages and the current frame.";
     pushChat("meta", "context compacted: dropped " + dropped + " older message(s)");
   }
+  return dropped || droppedFrames;
 }
 
 function prepareContext() {
   if (!CHAT.contextTokens) return;
-  const reserve = CHAT.maxTokens > 0 ? CHAT.maxTokens : 1024;
+  const reserve = CHAT.maxTokens > 0 ? CHAT.maxTokens : 2048;
   const promptBudget = Math.max(1024, CHAT.contextTokens - reserve - 256);
-  if (estimateTokens(CHAT.history) > promptBudget * 0.85) {
+  const current = Math.max(estimateTokens(CHAT.history), CHAT.promptTokens || 0);
+  if (current > promptBudget * 0.85) {
     compactHistory(promptBudget * 0.6);
   }
 }
@@ -958,20 +973,30 @@ function systemPrompt() {
     "You operate a B601 arm through a workstation page; the engineer watches the same view.",
     "You are shown a still from the fixed camera looking down at the workbench (" + size + ").",
     "Image coordinates are pixels: u grows right, v grows down, origin at the top-left.",
+    "A labeled pixel grid is overlaid on the image (u along the top, v along the left) — read coordinates directly from it.",
     "Arm coordinates are metres in the robot base frame: x and y on the worktop, z up.",
     "",
     "Tools:",
     "- rig(): camera matrix, worktop plane, height floor, reach band, queued markers.",
-    "- pixel_to_arm(u, v, height_m): the tool-tip point for a pixel, and whether it is reachable.",
+    "- pixel_to_arm(u, v, height_m): read-only check of the tool-tip point for a pixel, whether it is reachable, and if out of range, suggested_height_m / suggested_pixel.",
     "- arm_to_pixel(x, y, z): where an arm point lands in the image; use it to check yourself.",
-    "- add_marker(u, v, height_m): queue a numbered target; markers are visited in order.",
+    "- add_marker(u, v, height_m): queue a numbered target; odd markers close (grasp), even markers open (release).",
     "- add_via(u, v, height_m): attach a pass-through point to the last marker; the arm",
     "  crosses it without stopping on the way to that marker (max 5 per marker).",
     "- clear_markers(): drop the queued targets.",
     "- move_arm(execute): plan the markers; execute=false plans without moving.",
-    "- capture_view(): get a fresh frame, delivered in the next user message.",
+    "- capture_view(): get a fresh frame (showing the pixel grid and any queued marker pins), delivered in the next user message.",
     "",
-    "Work in this order: look at the image, check a pixel with pixel_to_arm, add the markers,",
+    "Grasping & height rules:",
+    "- The gripper slides in horizontally at the marker's height. To grasp an object, aim at the LOWER THIRD of the object (just above where it rests on the worktop — larger v), NOT its visual center or top.",
+    "- Start at the lowest practical height (default_height_m / height_floor_m) and keep height_m as low as reachable so the arm grabs the lower part of the object.",
+    "- If pixel_to_arm returns inside_band: false, do NOT stop or ask the user to adjust the height. Read reason, suggested_height_m, and suggested_pixel from the tool result:",
+    "  * When suggested_height_m is given, immediately re-check with pixel_to_arm at (suggested_pixel or the lower-body pixel, height_m=suggested_height_m) and use that lowest reachable height.",
+    "  * Only tell the user a target is unreachable when reachable_heights_m is null.",
+    "- Pass height_m explicitly to add_marker once you have verified a reachable height.",
+    "",
+    "Work in this order: call rig() if needed, check target pixels with pixel_to_arm (adjusting height autonomously if inside_band is false), add the markers,",
+    "optionally call capture_view() to visually verify pins sit on the lower part of the object,",
     "plan with move_arm(false) and read the summary, then move with move_arm(true).",
     "If a plan or a move fails, read the error, change the marker or the height, and try once more.",
     "Never say the arm moved unless a tool result says executed: true.",
@@ -982,6 +1007,107 @@ function systemPrompt() {
   return lines.join("\n");
 }
 
+// Draw a light labeled pixel coordinate grid and any queued marker pins onto
+// the offscreen frame sent to the model, so it can read (u, v) accurately and
+// visually verify where its markers landed without altering the live preview.
+function drawFrameAnnotations(context, width, height) {
+  const step = Math.max(width, height) >= 1400 ? 200 : 160;
+  const fontPx = Math.max(14, Math.round(Math.min(width, height) / 55));
+  context.save();
+
+  // Translucent pixel grid lines.
+  context.lineWidth = 1;
+  context.strokeStyle = "rgba(255, 255, 255, 0.24)";
+  context.beginPath();
+  for (let u = step; u < width; u += step) {
+    context.moveTo(u + 0.5, 0);
+    context.lineTo(u + 0.5, height);
+  }
+  for (let v = step; v < height; v += step) {
+    context.moveTo(0, v + 0.5);
+    context.lineTo(width, v + 0.5);
+  }
+  context.stroke();
+
+  // Coordinate tick labels along the top (u) and left (v) borders.
+  context.font = "600 " + fontPx + "px ui-monospace, SFMono-Regular, Consolas, monospace";
+  context.textBaseline = "middle";
+  function labelPill(text, x, y, align) {
+    const padX = Math.round(fontPx * 0.35);
+    const boxH = Math.round(fontPx * 1.35);
+    const textW = context.measureText(text).width;
+    const boxW = textW + padX * 2;
+    const left = align === "center" ? Math.max(2, Math.min(width - boxW - 2, x - boxW / 2))
+      : Math.max(2, x);
+    const top = Math.max(2, Math.min(height - boxH - 2, y - boxH / 2));
+    context.fillStyle = "rgba(11, 13, 16, 0.72)";
+    context.fillRect(left, top, boxW, boxH);
+    context.fillStyle = "#e8eaed";
+    context.textAlign = "left";
+    context.fillText(text, left + padX, top + boxH / 2 + 0.5);
+  }
+  labelPill("u\u2192 v\u2193", 4, Math.round(fontPx * 0.8), "left");
+  for (let u = step; u < width - fontPx; u += step) {
+    labelPill(String(u), u, Math.round(fontPx * 0.8), "center");
+  }
+  for (let v = step; v < height - fontPx; v += step) {
+    labelPill(String(v), 4, v, "left");
+  }
+
+  // Queued marker pins + exact pixel crosshairs so capture_view() lets the
+  // model verify whether a marker landed on the lower part of the object.
+  const targets = markersOverlay && Array.isArray(markersOverlay.targets)
+    ? markersOverlay.targets : [];
+  const radius = Math.max(12, Math.round(fontPx * 0.95));
+  targets.forEach((target, index) => {
+    const projected = (reachOverlay && target && Array.isArray(target.tip))
+      ? reachOverlay.projectPoint(target.tip) : null;
+    const px = (projected && Number.isFinite(projected[0]) && Number.isFinite(projected[1]))
+      ? projected : (target && Array.isArray(target.pixel) ? target.pixel : null);
+    if (!px || !Number.isFinite(px[0]) || !Number.isFinite(px[1])) return;
+    const color = (index + 1) % 2 === 1 ? "#f0b429" : "#45c98a";
+    const cx = px[0], cy = px[1];
+    // Crosshair + center dot on the exact target pixel.
+    context.strokeStyle = "rgba(0, 0, 0, 0.85)";
+    context.lineWidth = 4;
+    context.beginPath();
+    context.moveTo(cx - radius - 5, cy); context.lineTo(cx + radius + 5, cy);
+    context.moveTo(cx, cy - radius - 5); context.lineTo(cx, cy + radius + 5);
+    context.stroke();
+    context.strokeStyle = color;
+    context.lineWidth = 2;
+    context.beginPath();
+    context.arc(cx, cy, radius, 0, Math.PI * 2);
+    context.moveTo(cx - radius - 4, cy); context.lineTo(cx + radius + 4, cy);
+    context.moveTo(cx, cy - radius - 4); context.lineTo(cx, cy + radius + 4);
+    context.stroke();
+    context.fillStyle = color;
+    context.beginPath();
+    context.arc(cx, cy, 3, 0, Math.PI * 2);
+    context.fill();
+    labelPill("#" + (index + 1), cx + radius + 4, cy - radius, "left");
+
+    // Any pass-through via points attached to this marker.
+    const vias = target && Array.isArray(target.via) ? target.via : [];
+    vias.forEach((viaTip, viaIndex) => {
+      const viaPx = reachOverlay ? reachOverlay.projectPoint(viaTip) : null;
+      if (!viaPx || !Number.isFinite(viaPx[0]) || !Number.isFinite(viaPx[1])) return;
+      context.save();
+      context.setLineDash([5, 4]);
+      context.strokeStyle = "#4ea1ff";
+      context.lineWidth = 2;
+      context.beginPath();
+      context.arc(viaPx[0], viaPx[1], Math.round(radius * 0.75), 0, Math.PI * 2);
+      context.stroke();
+      context.restore();
+      labelPill((index + 1) + String.fromCharCode(97 + viaIndex),
+        viaPx[0] + radius, viaPx[1] - radius * 0.7, "left");
+    });
+  });
+
+  context.restore();
+}
+
 function grabFrame() {
   const width = video.videoWidth;
   const height = video.videoHeight;
@@ -989,7 +1115,9 @@ function grabFrame() {
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
-  canvas.getContext("2d").drawImage(video, 0, 0, width, height);
+  const context = canvas.getContext("2d");
+  context.drawImage(video, 0, 0, width, height);
+  drawFrameAnnotations(context, width, height);
   return { url: canvas.toDataURL("image/jpeg", 0.82), width: width, height: height };
 }
 
@@ -1012,13 +1140,52 @@ function pruneFrames(limit) {
 
 function parseToolArgs(raw) {
   if (raw === undefined || raw === null || raw === "") return {};
-  if (typeof raw === "object") return raw;
-  try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch (error) {
-    throw new Error("arguments are not JSON: " + String(raw).slice(0, 120));
+  if (typeof raw === "object" && !Array.isArray(raw)) return raw;
+  const text = String(raw).trim();
+  if (!text) return {};
+  const candidates = [text, text.replace(/,\s*([}\]])/g, "$1")];
+  for (const candidate of candidates) {
+    try {
+      let parsed = JSON.parse(candidate);
+      if (typeof parsed === "string") {
+        const inner = parsed.trim();
+        parsed = JSON.parse(inner.replace(/,\s*([}\]])/g, "$1"));
+      }
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+      throw new Error("arguments must be a JSON object");
+    } catch (error) {
+      if (candidate === candidates[candidates.length - 1]) {
+        throw new Error("arguments are not JSON: " + text.slice(0, 120));
+      }
+    }
   }
+  return {};
+}
+
+function normalizeToolName(raw) {
+  let name = String(raw || "").trim();
+  if (name.startsWith("functions.")) name = name.slice("functions.".length);
+  return name;
+}
+
+const TOOL_ALLOWED_ARGS = {
+  rig: [],
+  pixel_to_arm: ["u", "v", "height_m"],
+  arm_to_pixel: ["x", "y", "z"],
+  add_marker: ["u", "v", "height_m"],
+  add_via: ["u", "v", "height_m"],
+  clear_markers: [],
+  move_arm: ["execute"],
+  capture_view: [],
+};
+
+function checkAllowedArgs(name, args) {
+  const allowed = TOOL_ALLOWED_ARGS[name];
+  if (!allowed || !args || typeof args !== "object") return "";
+  const extra = Object.keys(args).filter((k) => !allowed.includes(k));
+  if (!extra.length) return "";
+  return "unknown parameter(s) [" + extra.join(", ") + "] for " + name
+    + (allowed.length ? "; expected: " + allowed.join(", ") : "; takes no arguments");
 }
 
 function oneLine(value, limit) {
@@ -1039,18 +1206,29 @@ async function loadRigConfig() {
   return config;
 }
 
+const REACH_BAND_CACHE = new Map();
+
 function reachBandFor(config, height) {
+  const planeZ = Number(config.plane_z);
+  const h = Math.round(Number(height) * 1000) / 1000;
+  const tipM = Number(config.tip_m);
+  const key = planeZ.toFixed(4) + "|" + h.toFixed(4) + "|" + tipM.toFixed(4);
+  if (REACH_BAND_CACHE.has(key)) return REACH_BAND_CACHE.get(key);
+  let result = null;
   try {
-    const band = window.ReachArm.computeReachBand(Number(config.plane_z), Number(height),
-      Number(config.tip_m));
-    return {
-      inner_m: round3(band.inner),
-      outer_m: round3(band.outer),
-      sector_deg: Math.round(band.sector * 180 / Math.PI),
-    };
+    const band = window.ReachArm.computeReachBand(planeZ, h, tipM);
+    if (band) {
+      result = {
+        inner_m: round3(band.inner),
+        outer_m: round3(band.outer),
+        sector_deg: Math.round(band.sector * 180 / Math.PI),
+      };
+    }
   } catch (error) {
-    return null;
+    result = null;
   }
+  REACH_BAND_CACHE.set(key, result);
+  return result;
 }
 
 // The floor is min_z minus the worktop, exactly the badge's lower stop.
@@ -1061,29 +1239,174 @@ function heightFloor(config) {
   return Math.max(0, minZ - planeZ);
 }
 
-// An explicit height moves the badge, so what the model plans is what the page
-// shows; otherwise the badge's current height is the default.
+// Read-only height resolution for pixel_to_arm: snaps and clamps to the same
+// range as the badge without mutating the badge state, so probing a higher
+// height never silently raises subsequent add_marker calls.
+function probeHeight(config, args) {
+  const asked = Number(args && args.height_m);
+  if (!Number.isFinite(asked)) return heightControl.height;
+  const low = heightFloor(config);
+  const high = Math.max(low, window.HeightControl.MAX);
+  const step = window.HeightControl.STEP || 0.005;
+  const snapped = Math.round(asked / step) * step;
+  return Math.max(low, Math.min(high, snapped));
+}
+
+// An explicit height moves the badge when committing a marker or via, so what
+// the model plans is what the page shows; otherwise the badge's current height
+// is the default.
 function heightFrom(args) {
   const asked = Number(args && args.height_m);
   if (Number.isFinite(asked)) heightControl.setHeight(asked);
   return heightControl.height;
 }
 
+function pointReachStatus(tip, band, planeZ, floor) {
+  const x = Number(tip[0]);
+  const y = Number(tip[1]);
+  const z = Number(tip[2]);
+  const radius = Math.hypot(x, y);
+  const aboveFloor = z >= Number(planeZ) + floor - 1e-6;
+  if (!band) {
+    return {
+      radius: radius,
+      aboveFloor: aboveFloor,
+      insideBand: false,
+      reason: aboveFloor ? "no_band_at_height" : "below_floor",
+    };
+  }
+  const azDeg = Math.abs(Math.atan2(y, x) * 180 / Math.PI);
+  const inSector = !Number.isFinite(band.sector_deg) || azDeg <= band.sector_deg + 0.5;
+  const inRadius = radius >= band.inner_m - 1e-6 && radius <= band.outer_m + 1e-6;
+  const insideBand = inRadius && inSector;
+  let reason = null;
+  if (!aboveFloor) reason = "below_floor";
+  else if (!inSector) reason = "outside_sector";
+  else if (radius < band.inner_m - 1e-6) reason = "too_close";
+  else if (radius > band.outer_m + 1e-6) reason = "too_far";
+  return { radius: radius, aboveFloor: aboveFloor, insideBand: insideBand, reason: reason };
+}
+
+// When a pixel fails the reach check, find the lowest height_m that brings the
+// target into range. Pass 1 keeps (x, y) fixed above the worktop point and
+// projects the lifted point back to suggested_pixel (zero oblique parallax
+// drift); Pass 2 falls back to sweeping the camera ray along (u, v).
+async function findReachableHeight(config, tip, pixel, width, tall, turn) {
+  const floor = heightFloor(config);
+  const maxH = Math.min(window.HeightControl.MAX, 0.45);
+  const candidates = [];
+  for (let h = floor; h <= maxH + 1e-9; h = Math.round((h + 0.02) * 1000) / 1000) {
+    candidates.push(h);
+  }
+
+  // Pass 1: vertical lift directly above (tip[0], tip[1]).
+  const x0 = Number(tip[0]);
+  const y0 = Number(tip[1]);
+  const r0 = Math.hypot(x0, y0);
+  const az0 = Math.abs(Math.atan2(y0, x0) * 180 / Math.PI);
+  const verticalHits = [];
+  for (const h of candidates) {
+    const band = reachBandFor(config, h);
+    if (!band) continue;
+    const inSector = !Number.isFinite(band.sector_deg) || az0 <= band.sector_deg + 0.5;
+    if (inSector && r0 >= band.inner_m - 1e-6 && r0 <= band.outer_m + 1e-6) {
+      verticalHits.push(h);
+    }
+  }
+  if (verticalHits.length) {
+    let minH = verticalHits[0];
+    const fine = Math.round((minH - 0.01) * 1000) / 1000;
+    if (fine >= floor - 1e-9) {
+      const band = reachBandFor(config, fine);
+      if (band && (!Number.isFinite(band.sector_deg) || az0 <= band.sector_deg + 0.5)
+          && r0 >= band.inner_m - 1e-6 && r0 <= band.outer_m + 1e-6) {
+        minH = fine;
+      }
+    }
+    let proj = null;
+    try {
+      proj = await reachOverlay.projectPointLoaded([x0, y0, Number(config.plane_z) + minH]);
+    } catch (error) {
+      proj = null;
+    }
+    if (proj && Number.isFinite(proj[0]) && Number.isFinite(proj[1])
+        && proj[0] >= 0 && proj[0] <= width && proj[1] >= 0 && proj[1] <= tall) {
+      return {
+        reachable_heights_m: [round3(minH), round3(verticalHits[verticalHits.length - 1])],
+        suggested_height_m: round3(minH),
+        suggested_pixel: [round3(proj[0]), round3(proj[1])],
+      };
+    }
+  }
+
+  // Pass 2: sweep along the camera ray through (pixel.u, pixel.v).
+  if (pixel && Number.isFinite(pixel.u) && Number.isFinite(pixel.v)) {
+    const rayHits = [];
+    for (const h of candidates) {
+      const band = reachBandFor(config, h);
+      if (!band) continue;
+      try {
+        const probe = window.BrowserLocate.tipTarget(config.calibration, config.T_base_cam,
+          pixel.u, pixel.v, config.plane_z, h, width, tall, turn);
+        if (pointReachStatus(probe.tip, band, config.plane_z, floor).insideBand) {
+          rayHits.push(h);
+        }
+      } catch (error) {
+        // Ray missed the plane at this height.
+      }
+    }
+    if (rayHits.length) {
+      let minH = rayHits[0];
+      const fine = Math.round((minH - 0.01) * 1000) / 1000;
+      if (fine >= floor - 1e-9) {
+        const band = reachBandFor(config, fine);
+        if (band) {
+          try {
+            const probe = window.BrowserLocate.tipTarget(config.calibration, config.T_base_cam,
+              pixel.u, pixel.v, config.plane_z, fine, width, tall, turn);
+            if (pointReachStatus(probe.tip, band, config.plane_z, floor).insideBand) {
+              minH = fine;
+            }
+          } catch (error) { /* keep coarse minH */ }
+        }
+      }
+      return {
+        reachable_heights_m: [round3(minH), round3(rayHits[rayHits.length - 1])],
+        suggested_height_m: round3(minH),
+        suggested_pixel: [round3(pixel.u), round3(pixel.v)],
+      };
+    }
+  }
+
+  return { reachable_heights_m: null, suggested_height_m: null, suggested_pixel: null };
+}
+
 function tipReport(config, tip, height, pixel) {
-  const radius = Math.hypot(Number(tip[0]), Number(tip[1]));
   const band = reachBandFor(config, height);
   const floor = heightFloor(config);
   const z = Number(tip[2]);
-  return {
+  const reach = pointReachStatus(tip, band, config.plane_z, floor);
+  const report = {
     ok: true,
     tip_m: [round3(tip[0]), round3(tip[1]), round3(z)],
     height_m: round3(height),
     pixel: pixel ? [round3(pixel.u), round3(pixel.v)] : null,
-    radius_m: round3(radius),
+    radius_m: round3(reach.radius),
     reach_band_m: band,
-    inside_band: band ? radius >= band.inner_m - 1e-6 && radius <= band.outer_m + 1e-6 : null,
-    above_floor: z >= Number(config.plane_z) + floor - 1e-6,
+    inside_band: reach.insideBand,
+    above_floor: reach.aboveFloor,
   };
+  if (reach.reason) report.reason = reach.reason;
+  return report;
+}
+
+async function attachReachDiagnostics(report, config, tip, pixel, width, tall, turn) {
+  if (report.inside_band && report.above_floor) return report;
+  const suggestion = await findReachableHeight(config, tip, pixel, width, tall, turn);
+  report.reachable_heights_m = suggestion.reachable_heights_m;
+  report.suggested_height_m = suggestion.suggested_height_m;
+  report.suggested_pixel = suggestion.suggested_pixel;
+  return report;
 }
 
 async function toolRig() {
@@ -1113,12 +1436,14 @@ async function toolPixelToArm(args) {
   const u = Number(args.u);
   const v = Number(args.v);
   if (!Number.isFinite(u) || !Number.isFinite(v)) throw new Error("u and v must be image pixels");
-  const height = heightFrom(args);
+  const height = probeHeight(config, args);
   const width = video.videoWidth || config.calibration.image_size[0];
   const tall = video.videoHeight || config.calibration.image_size[1];
+  const turn = streamTurn();
   const tip = window.BrowserLocate.tipTarget(config.calibration, config.T_base_cam,
-    u, v, config.plane_z, height, width, tall, streamTurn());
-  return tipReport(config, tip.tip, height, { u: u, v: v });
+    u, v, config.plane_z, height, width, tall, turn);
+  const report = tipReport(config, tip.tip, height, { u: u, v: v });
+  return attachReachDiagnostics(report, config, tip.tip, { u: u, v: v }, width, tall, turn);
 }
 
 async function toolArmToPixel(args) {
@@ -1170,7 +1495,11 @@ async function toolAddMarker(args) {
     return { ok: false, error: (placed && placed.error) || "the marker was refused",
       count: markersOverlay.count };
   }
+  const width = video.videoWidth || config.calibration.image_size[0];
+  const tall = video.videoHeight || config.calibration.image_size[1];
   const report = tipReport(config, placed.marker.target.tip, height, { u: u, v: v });
+  await attachReachDiagnostics(report, config, placed.marker.target.tip,
+    { u: u, v: v }, width, tall, streamTurn());
   report.index = placed.index;
   report.count = markersOverlay.count;
   // Client-side geometry provenance: agent markers never touch the
@@ -1209,8 +1538,12 @@ async function toolAddVia(args) {
     return { ok: false, error: (placed && placed.error) || "the via was refused",
       count: markersOverlay.count };
   }
-  const report = tipReport(config, placed.marker.target.via[placed.via - 1], height,
-    { u: u, v: v });
+  const width = video.videoWidth || config.calibration.image_size[0];
+  const tall = video.videoHeight || config.calibration.image_size[1];
+  const viaTip = placed.marker.target.via[placed.via - 1];
+  const report = tipReport(config, viaTip, height, { u: u, v: v });
+  await attachReachDiagnostics(report, config, viaTip,
+    { u: u, v: v }, width, tall, streamTurn());
   report.index = placed.index;
   report.via = placed.via;
   report.count = markersOverlay.count;
@@ -1228,7 +1561,18 @@ async function toolAddVia(args) {
 }
 
 async function toolMoveArm(args) {
-  const execute = !(args && args.execute === false);
+  // Fail closed: quantized models occasionally pass "false" as a string or omit
+  // execute entirely. Never move the physical arm unless execute is strictly
+  // boolean true.
+  if (!args || typeof args.execute !== "boolean") {
+    return {
+      ok: false,
+      error: "execute must be a boolean (true or false), got "
+        + JSON.stringify(args ? args.execute : undefined),
+      markers: markersOverlay.count,
+    };
+  }
+  const execute = args.execute === true;
   const result = await runSequence(execute);
   if (!result.ok) {
     return { ok: false, error: result.error || "the plan failed", markers: result.markers };
@@ -1257,7 +1601,10 @@ async function runTool(name, args) {
   RebotTrace.trace("tool_call", { name: name, args: args });
   let result;
   try {
-    result = await runToolDispatch(name, args);
+    const argWarning = checkAllowedArgs(name, args);
+    result = argWarning
+      ? { ok: false, error: argWarning }
+      : await runToolDispatch(name, args);
   } catch (error) {
     RebotTrace.trace("tool_result", {
       name: name, args: args,
@@ -1311,30 +1658,55 @@ function summariseResult(result) {
   if (!result) return "no result";
   if (result.ok === false) return "error: " + oneLine(result.error || "failed", 160);
   if (result.executed === true) return "done, the arm moved";
-  if (Array.isArray(result.tip_m)) return "tip [" + result.tip_m.join(", ") + "] m"
-    + (result.inside_band === false ? ", outside the band" : "");
+  if (Array.isArray(result.tip_m)) {
+    let text = "tip [" + result.tip_m.join(", ") + "] m";
+    if (result.inside_band === false) {
+      text += ", outside band" + (result.reason ? " (" + result.reason + ")" : "");
+      if (Number.isFinite(result.suggested_height_m)) {
+        text += " · try h=" + result.suggested_height_m + " m";
+      }
+    }
+    return text;
+  }
   if (result.count !== undefined) return result.count + " queued";
   if (result.note) return oneLine(result.note, 100);
   return "ok";
 }
 
-async function postAgent(signal, onEvent) {
+function makeAgentError(message, meta) {
+  const err = new Error(message || "the model stream failed");
+  if (meta && typeof meta === "object") {
+    err.retryable = Boolean(meta.retryable);
+    err.reason = meta.reason || "";
+    err.finishReason = meta.finish_reason || "";
+  }
+  return err;
+}
+
+async function postAgent(signal, onEvent, options) {
+  const opts = options || {};
   prepareContext();
   const dropped = trimHistory(CHAT.maxMessages);
   if (dropped) pushChat("meta", "dropped " + dropped + " older messages to fit the context");
+  const systemText = opts.retryNote
+    ? systemPrompt() + "\n\n[Retry note: " + opts.retryNote + "]"
+    : systemPrompt();
+  const body = {
+    messages: [{ role: "system", content: systemText }].concat(CHAT.history),
+    tools: AGENT_TOOLS,
+    stream: true,
+  };
+  if (opts.disableThinking) body.disable_thinking = true;
+  if (opts.maxTokensBump) body.max_tokens_bump = true;
   const response = await api("/agent", {
     method: "POST",
     signal: signal,
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      messages: [{ role: "system", content: systemPrompt() }].concat(CHAT.history),
-      tools: AGENT_TOOLS,
-      stream: true,
-    }),
+    body: JSON.stringify(body),
   });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    throw new Error((data && data.error) || ("the agent failed: " + response.status));
+    throw makeAgentError((data && data.error) || ("the agent failed: " + response.status), data);
   }
 
   // A server that does not stream (or a proxy that buffered the response) is
@@ -1342,7 +1714,7 @@ async function postAgent(signal, onEvent) {
   const contentType = response.headers.get("Content-Type") || "";
   if (!contentType.includes("text/event-stream") || !response.body) {
     const data = await response.json().catch(() => ({}));
-    if (!data.ok) throw new Error(data.error || "the agent answered without JSON");
+    if (!data.ok) throw makeAgentError(data.error || "the agent answered without JSON", data);
     return {
       message: data.message || {},
       finish_reason: data.finish_reason || "",
@@ -1368,7 +1740,8 @@ async function postAgent(signal, onEvent) {
         } else if (event.event === "done" && event.data && event.data.message) {
           final = event.data;
         } else if (event.event === "error") {
-          throw new Error((event.data && event.data.error) || "the model stream failed");
+          throw makeAgentError((event.data && event.data.error) || "the model stream failed",
+            event.data);
         }
       }
     }
@@ -1377,7 +1750,10 @@ async function postAgent(signal, onEvent) {
       try { reader.releaseLock(); } catch (error) { /* already cancelled */ }
     }
   }
-  if (!final) throw new Error("the model stream ended without a final message");
+  if (!final) {
+    throw makeAgentError("the model stream ended without a final message",
+      { retryable: true, reason: "stream_incomplete" });
+  }
   return {
     message: final.message,
     finish_reason: final.finish_reason || "",
@@ -1401,53 +1777,188 @@ function stopAgent() {
   pushChat("meta", "stopping the agent…");
 }
 
+function retryPlanFor(reason) {
+  switch (reason) {
+    case "length_in_reasoning":
+    case "length_in_tool_call":
+    case "repetition_loop":
+      return {
+        disableThinking: true,
+        maxTokensBump: true,
+        label: reason === "repetition_loop" ? "reasoning loop detected" : "hit output token limit",
+        retryNote: "Your previous response was cut off before emitting a tool call or reply. "
+          + "Respond directly without long reasoning: either emit the next tool call now or "
+          + "give a concise 1-2 sentence reply.",
+      };
+    case "malformed_tool_call":
+      return {
+        disableThinking: true,
+        maxTokensBump: false,
+        label: "invalid tool call JSON",
+        retryNote: "Your previous tool call had invalid JSON arguments. Emit a single valid "
+          + "JSON object matching the tool schema.",
+      };
+    case "context_overflow":
+      return {
+        disableThinking: false,
+        maxTokensBump: false,
+        compact: true,
+        label: "context window exceeded",
+        retryNote: "Earlier turns were compacted to fit the context window. Continue from the "
+          + "latest frame and messages.",
+      };
+    default:
+      return {
+        disableThinking: true,
+        maxTokensBump: false,
+        label: reason === "stream_incomplete" ? "stream ended early" : "empty model turn",
+        retryNote: "Your previous turn produced no text or tool call. Either call the next tool "
+          + "now or reply concisely to the user.",
+      };
+  }
+}
+
+const READ_ONLY_TOOLS = new Set(["rig", "pixel_to_arm", "arm_to_pixel"]);
+
 async function runAgent() {
   CHAT.abort = new AbortController();
   const signal = CHAT.abort.signal;
   setChatBusy(true);
   let thinkingLine = null;
+  let totalRetries = 0;
+  let lastReadSig = "";
+  const MAX_STEP_RETRIES = 2;
+  const MAX_TASK_RETRIES = 3;
   try {
     for (let step = 0; step < CHAT.maxTurns; step += 1) {
       if (signal.aborted) break;
-      const draft = { reasoning: "", content: "", reasoningLine: null, contentLine: null };
-      // Until the first token arrives there is nothing else in the log: make
-      // the wait visible, and remove it the moment reasoning or content starts.
-      thinkingLine = pushChat("thinking", "Agent is thinking…");
-      const turn = await postAgent(signal, (kind, text) => {
+      let turn = null;
+      let draft = null;
+      let retryOpts = {};
+      for (let attempt = 0; attempt <= MAX_STEP_RETRIES; attempt += 1) {
+        if (signal.aborted) break;
+        draft = { reasoning: "", content: "", reasoningLine: null, contentLine: null };
+        // Until the first token arrives there is nothing else in the log: make
+        // the wait visible, and remove it the moment reasoning or content starts.
+        thinkingLine = pushChat("thinking",
+          attempt > 0 ? "Retrying turn (concise mode)…" : "Agent is thinking…");
+        try {
+          turn = await postAgent(signal, (kind, text) => {
+            if (thinkingLine) {
+              thinkingLine.remove();
+              thinkingLine = null;
+            }
+            if (kind === "reasoning") {
+              draft.reasoning += text;
+              if (!draft.reasoningLine) draft.reasoningLine = pushReasoning("", step + 1);
+              updateReasoning(draft.reasoningLine, draft.reasoning, step + 1);
+            } else if (kind === "content") {
+              draft.content += text;
+              // Do not render an empty/whitespace-only agent bubble while
+              // tokens after </think> are still just leading newlines.
+              if (draft.content.trim()) {
+                if (!draft.contentLine) draft.contentLine = pushChat("agent", "");
+                setChatText(draft.contentLine, draft.content.trim());
+              }
+            }
+          }, retryOpts);
+        } catch (error) {
+          if (thinkingLine) {
+            thinkingLine.remove();
+            thinkingLine = null;
+          }
+          if (isAbort(error)) throw error;
+          if (error && error.retryable && attempt < MAX_STEP_RETRIES
+              && totalRetries < MAX_TASK_RETRIES) {
+            // Drop orphaned reasoning / partial bubbles from the failed attempt
+            // so the chat never shows a dangling reasoning-only block.
+            if (draft.reasoningLine) draft.reasoningLine.remove();
+            if (draft.contentLine) draft.contentLine.remove();
+            totalRetries += 1;
+            const plan = retryPlanFor(error.reason);
+            RebotTrace.trace("turn_retry", {
+              step: step + 1, attempt: attempt + 1, reason: error.reason || "error",
+              disable_thinking: Boolean(plan.disableThinking),
+            });
+            if (plan.compact) {
+              const target = Math.max(1024, Math.floor((CHAT.promptTokens || 4096) * 0.5));
+              if (!compactHistory(target, "context_overflow")) throw error;
+            }
+            pushChat("meta", "retrying turn " + (step + 1) + " (" + plan.label + ")…");
+            retryOpts = plan;
+            continue;
+          }
+          // Even when retries are exhausted, drop an empty content bubble and
+          // surface the clear error below.
+          if (draft.contentLine && !draft.content.trim()) draft.contentLine.remove();
+          throw error;
+        }
         if (thinkingLine) {
           thinkingLine.remove();
           thinkingLine = null;
         }
-        if (kind === "reasoning") {
-          draft.reasoning += text;
-          if (!draft.reasoningLine) draft.reasoningLine = pushReasoning("", step + 1);
-          updateReasoning(draft.reasoningLine, draft.reasoning, step + 1);
-        } else if (kind === "content") {
-          draft.content += text;
-          if (!draft.contentLine) draft.contentLine = pushChat("agent", "");
-          setChatText(draft.contentLine, draft.content);
+        // Check for a client-side truncated or malformed tool call before
+        // accepting the turn; if retryable, loop cleanly without touching history.
+        const msg = turn.message || {};
+        const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+        let badCall = "";
+        for (const call of calls) {
+          try {
+            parseToolArgs(call.function && call.function.arguments);
+          } catch (error) {
+            badCall = error.message;
+            break;
+          }
         }
-      });
+        const trimmedContent = String(msg.content || draft.content || "").trim();
+        const clientRetryReason = badCall
+          ? (turn.finish_reason === "length" ? "length_in_tool_call" : "malformed_tool_call")
+          : (!trimmedContent && !calls.length)
+            ? (turn.finish_reason === "length" ? "length_in_reasoning" : "empty_turn")
+            : "";
+        if (clientRetryReason && attempt < MAX_STEP_RETRIES && totalRetries < MAX_TASK_RETRIES) {
+          if (draft.reasoningLine) draft.reasoningLine.remove();
+          if (draft.contentLine) draft.contentLine.remove();
+          totalRetries += 1;
+          const plan = retryPlanFor(clientRetryReason);
+          RebotTrace.trace("turn_retry", {
+            step: step + 1, attempt: attempt + 1, reason: clientRetryReason,
+            disable_thinking: Boolean(plan.disableThinking),
+          });
+          pushChat("meta", "retrying turn " + (step + 1) + " (" + plan.label + ")…");
+          retryOpts = plan;
+          turn = null;
+          continue;
+        }
+        if (badCall) {
+          if (draft.contentLine && !trimmedContent) draft.contentLine.remove();
+          pushChat("error", "the model's tool call was incomplete (" + badCall
+            + "); nothing was run. Retry, or raise REBOT_LLM_MAX_TOKENS.");
+          return;
+        }
+        break;
+      }
+      if (signal.aborted || !turn) break;
       const message = turn.message || {};
       if (turn.usage && Number.isFinite(Number(turn.usage.prompt_tokens))) {
         CHAT.promptTokens = Number(turn.usage.prompt_tokens);
       }
-      if (thinkingLine) {
-        // A non-streamed fallback, or a turn that only returned tool calls.
-        thinkingLine.remove();
-        thinkingLine = null;
-      }
       const finalReasoning = message.reasoning || "";
-      const finalContent = message.content || "";
+      const finalContent = String(message.content || "").trim();
       // A provider that sends everything only in `done`, or a non-streamed
       // fallback, still gets a block; a streamed turn already rendered it.
       if (finalReasoning && finalReasoning !== draft.reasoning) {
         if (!draft.reasoningLine) draft.reasoningLine = pushReasoning("", step + 1);
         updateReasoning(draft.reasoningLine, finalReasoning, step + 1);
       }
-      if (finalContent && finalContent !== draft.content) {
+      if (finalContent) {
         if (!draft.contentLine) draft.contentLine = pushChat("agent", "");
         setChatText(draft.contentLine, finalContent);
+      } else if (draft.contentLine) {
+        // Server stripped a recovered leaked tool call from content, or content
+        // was whitespace-only: drop the empty/stale bubble cleanly.
+        draft.contentLine.remove();
+        draft.contentLine = null;
       }
       if (turn.finish_reason === "length") {
         RebotTrace.trace("turn_truncated", { finish_reason: turn.finish_reason });
@@ -1461,20 +1972,7 @@ async function runAgent() {
           + "reply above may be incomplete.");
       }
       const rawCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-      // A truncated tool call must never reach CHAT.history: the model server
-      // rejects malformed assistant arguments on the next turn, which turns one
-      // bad call into a 500 loop. Server-side validation catches this too; this
-      // is the guard for an older server or a buffered/non-streamed reply.
-      for (const call of rawCalls) {
-        try {
-          parseToolArgs(call.function && call.function.arguments);
-        } catch (error) {
-          pushChat("error", "the model's tool call was incomplete (" + error.message
-            + "); nothing was run. Retry, or raise REBOT_LLM_MAX_TOKENS.");
-          return;
-        }
-      }
-      const contentText = finalContent || draft.content;
+      const contentText = finalContent || draft.content.trim();
       const assistant = { role: "assistant", content: contentText };
       if (rawCalls.length) {
         // Some backends (Ollama among them) omit the call id; a tool result
@@ -1485,7 +1983,7 @@ async function runAgent() {
             id: call.id || ("call_" + step + "_" + index),
             type: "function",
             function: {
-              name: String(fn.name || ""),
+              name: normalizeToolName(fn.name),
               arguments: typeof fn.arguments === "string"
                 ? fn.arguments : JSON.stringify(fn.arguments || {}),
             },
@@ -1503,6 +2001,7 @@ async function runAgent() {
       let wantsFrame = false;
       for (const call of assistant.tool_calls) {
         if (signal.aborted) break;
+        const toolName = normalizeToolName(call.function.name);
         let args = {};
         let argsError = "";
         try {
@@ -1510,20 +2009,33 @@ async function runAgent() {
         } catch (error) {
           argsError = error.message;
         }
-        const line = pushChat("tool", summariseCall(call.function.name, args) + " ...");
+        const sig = READ_ONLY_TOOLS.has(toolName)
+          ? toolName + "|" + JSON.stringify(args) : "";
+        const isDuplicate = Boolean(sig && sig === lastReadSig && !argsError);
+        if (!READ_ONLY_TOOLS.has(toolName)) lastReadSig = "";
+        else if (!argsError) lastReadSig = sig;
+        const line = pushChat("tool", summariseCall(toolName, args) + " ...");
         let result;
         try {
-          result = argsError
-            ? { ok: false, error: argsError }
-            : await runTool(call.function.name, args);
+          if (argsError) {
+            result = { ok: false, error: argsError };
+          } else if (isDuplicate) {
+            result = {
+              ok: false,
+              error: "duplicate call: you already called " + toolName
+                + " with these exact arguments; use the previous result or change u, v, or height_m",
+            };
+          } else {
+            result = await runTool(toolName, args);
+          }
         } catch (error) {
           result = { ok: false, error: (error && error.message) || String(error) };
         }
-        setChatText(line, summariseCall(call.function.name, args)
+        setChatText(line, summariseCall(toolName, args)
           + " → " + summariseResult(result));
         line.classList.toggle("bad", result.ok === false);
         CHAT.history.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
-        if (call.function.name === "capture_view" && result.ok) wantsFrame = true;
+        if (toolName === "capture_view" && result.ok) wantsFrame = true;
       }
       if (signal.aborted) break;
       if (wantsFrame) {

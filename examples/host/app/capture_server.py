@@ -1366,6 +1366,154 @@ def _agent_message(data):
     }, data.get("usage") or {}
 
 
+def _parse_json_lenient(raw):
+    """Parse a JSON object from a tool call, tolerating common quantized quirks.
+
+    Handles double-encoded JSON strings ('"{\\"u\\": 400}"') and trailing commas
+    before '}' or ']'. Returns (dict, canonical_json_str) or (None, None).
+    """
+    if raw is None or raw == "":
+        return {}, "{}"
+    if isinstance(raw, dict):
+        return raw, json.dumps(raw, ensure_ascii=False)
+    text = str(raw).strip()
+    if not text:
+        return {}, "{}"
+    for candidate in (text, re.sub(r",\s*([}\]])", r"\1", text)):
+        try:
+            value = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, str):
+            inner = value.strip()
+            for inner_cand in (inner, re.sub(r",\s*([}\]])", r"\1", inner)):
+                try:
+                    value = json.loads(inner_cand)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if isinstance(value, dict):
+            return value, json.dumps(value, ensure_ascii=False)
+    return None, None
+
+
+_LEAKED_TOOL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", re.DOTALL | re.IGNORECASE)
+_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_leaked_tool_calls(content, allowed_names):
+    """Recover tool calls dumped into plain content when llama.cpp fails to parse them.
+
+    Quantized models occasionally emit slightly malformed <tool_call>{...} tags
+    or fenced JSON blocks that bypass the server's parser. Only recovers objects
+    whose `name` matches an explicitly declared tool in this request.
+    """
+    if not content or not allowed_names:
+        return [], content
+    found = []
+    cleaned = content
+
+    def _try_parse_call(blob):
+        parsed, _ = _parse_json_lenient(blob)
+        if not isinstance(parsed, dict):
+            return None
+        name = str(parsed.get("name") or "").strip()
+        if name.startswith("functions."):
+            name = name[len("functions."):]
+        if name not in allowed_names:
+            return None
+        raw_args = parsed.get("arguments")
+        if raw_args is None:
+            raw_args = parsed.get("parameters") or {}
+        args_dict, canonical = _parse_json_lenient(raw_args)
+        if args_dict is None:
+            return None
+        return {
+            "id": "recovered_%d" % len(found),
+            "type": "function",
+            "function": {"name": name, "arguments": canonical},
+        }
+
+    # 1. Explicit <tool_call>...</tool_call> (or unclosed <tool_call>{...})
+    matches = list(_LEAKED_TOOL_TAG_RE.finditer(cleaned))
+    if matches:
+        kept = []
+        last = 0
+        for match in matches:
+            call = _try_parse_call(match.group(1))
+            if call is not None:
+                found.append(call)
+                kept.append(cleaned[last:match.start()])
+                last = match.end()
+        if found:
+            kept.append(cleaned[last:])
+            return found, "".join(kept).strip()
+
+    # 2. Markdown-fenced ```json {"name": ..., "arguments": ...} ```
+    fenced = list(_FENCED_JSON_RE.finditer(cleaned))
+    if fenced:
+        kept = []
+        last = 0
+        for match in fenced:
+            call = _try_parse_call(match.group(1))
+            if call is not None:
+                found.append(call)
+                kept.append(cleaned[last:match.start()])
+                last = match.end()
+        if found:
+            kept.append(cleaned[last:])
+            return found, "".join(kept).strip()
+
+    # 3. Bare JSON object as the entire content (common with Q4 drift)
+    stripped = cleaned.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        call = _try_parse_call(stripped)
+        if call is not None:
+            found.append(call)
+            return found, ""
+
+    return [], content
+
+
+def _detect_repetition_loop(text):
+    """Detect degenerate token/phrase repetition loops in streamed reasoning."""
+    if len(text) < 600:
+        return False
+    tail = text[-900:]
+    # Check 4+ consecutive repeats of a 20..160 char phrase at the tail.
+    for span in range(20, 161):
+        if len(tail) < span * 4:
+            break
+        unit = tail[-span:]
+        if not unit.strip():
+            continue
+        if tail.endswith(unit * 4):
+            return True
+    # Also check repeated identical non-empty lines in the last 10 lines.
+    lines = [line.strip() for line in tail.splitlines() if len(line.strip()) >= 16]
+    if len(lines) >= 6:
+        recent = lines[-10:]
+        last_line = recent[-1]
+        if recent.count(last_line) >= 5:
+            return True
+    return False
+
+
+def _is_context_overflow_error(status, text):
+    """Recognize llama.cpp / OpenAI context-window overflow responses."""
+    if status not in (400, 413, 422):
+        return False
+    low = str(text or "").lower()
+    return any(needle in low for needle in (
+        "exceeds the available context",
+        "context_length_exceeded",
+        "context size",
+        "maximum context length",
+        "n_ctx",
+        "prompt is too long",
+    ))
+
+
 def _agent_tool_error(message, finish_reason=""):
     """Why this turn's tool calls must not be executed, or '' when they are sane.
 
@@ -1381,18 +1529,24 @@ def _agent_tool_error(message, finish_reason=""):
         return ("the model's tool call was cut off by the token limit; nothing was run. "
                 "Raise REBOT_LLM_MAX_TOKENS or ask for one short tool call.")
     for call in calls:
-        arguments = (call.get("function") or {}).get("arguments")
+        fn = call.get("function") or {}
+        arguments = fn.get("arguments")
         if arguments is None or arguments == "":
             continue
-        try:
-            value = json.loads(arguments)
-        except (TypeError, ValueError):
-            return ("the model produced a tool call whose arguments are not valid JSON "
-                    "(%s); nothing was run. Retry, or raise REBOT_LLM_MAX_TOKENS."
-                    % str(arguments)[:80])
-        if not isinstance(value, dict):
-            return ("the model produced a tool call whose arguments are not a JSON object "
-                    "(%s); nothing was run." % str(arguments)[:80])
+        parsed, canonical = _parse_json_lenient(arguments)
+        if parsed is None:
+            # Distinguish invalid JSON vs valid non-object JSON.
+            try:
+                value = json.loads(arguments)
+            except (TypeError, ValueError):
+                return ("the model produced a tool call whose arguments are not valid JSON "
+                        "(%s); nothing was run. Retry, or raise REBOT_LLM_MAX_TOKENS."
+                        % str(arguments)[:80])
+            if not isinstance(value, dict):
+                return ("the model produced a tool call whose arguments are not a JSON object "
+                        "(%s); nothing was run." % str(arguments)[:80])
+        elif canonical != arguments:
+            fn["arguments"] = canonical
     return ""
 
 
@@ -1414,15 +1568,25 @@ def _merge_tool_delta(calls, parts):
     """Accumulate streamed tool-call fragments by index.
 
     OpenAI sends `function.arguments` in pieces; a tool must not run until the
-    stream has finished and those pieces form valid JSON.
+    stream has finished and those pieces form valid JSON. Handles servers that
+    omit `index` on subsequent tool calls by allocating a new slot on id change.
     """
     for part in parts or []:
         if not isinstance(part, dict):
             continue
-        try:
-            index = int(part.get("index", 0))
-        except (TypeError, ValueError):
-            index = 0
+        raw_index = part.get("index")
+        if raw_index is None:
+            part_id = str(part.get("id") or "")
+            if part_id and calls:
+                matched = next((idx for idx, s in calls.items() if s.get("id") == part_id), None)
+                index = matched if matched is not None else (max(calls) + 1)
+            else:
+                index = max(calls) if calls else 0
+        else:
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                index = 0
         slot = calls.setdefault(index, {
             "id": "", "type": "function",
             "function": {"name": "", "arguments": ""},
@@ -1453,7 +1617,7 @@ def _sse_payload(frame):
     return "\n".join(lines) if lines else None
 
 
-async def _relay_sse(request, upstream, on_turn=None):
+async def _relay_sse(request, upstream, on_turn=None, allowed_tools=None):
     """Relay one model turn as normalized SSE events.
 
     The browser sees `reasoning` and `content` deltas as they arrive, then one
@@ -1489,6 +1653,9 @@ async def _relay_sse(request, upstream, on_turn=None):
 
     content_parts = []
     reasoning_parts = []
+    reasoning_len = 0
+    next_rep_check = 600
+    loop_aborted = False
     tool_calls = {}
     finish_reason = ""
     usage = {}
@@ -1527,14 +1694,29 @@ async def _relay_sse(request, upstream, on_turn=None):
                     reasoning = _agent_reasoning(delta)
                     if reasoning:
                         reasoning_parts.append(reasoning)
+                        reasoning_len += len(reasoning)
                         await send("reasoning", {"text": reasoning})
+                        if reasoning_len >= next_rep_check:
+                            next_rep_check = reasoning_len + 200
+                            if _detect_repetition_loop("".join(reasoning_parts)):
+                                loop_aborted = True
+                                break
                     content = _agent_text(delta.get("content"))
                     if content:
                         content_parts.append(content)
                         await send("content", {"text": content})
                     _merge_tool_delta(tool_calls, delta.get("tool_calls"))
-            if finished:
+                if loop_aborted:
+                    break
+            if finished or loop_aborted:
                 break
+        if loop_aborted:
+            err = "the model entered a repetition loop while reasoning"
+            logging.warning("agent stream aborted: %s (%d reasoning chars)", err, reasoning_len)
+            await send("error", {"error": err, "retryable": True,
+                                 "reason": "repetition_loop", "finish_reason": finish_reason})
+            await note({"error": err})
+            return response
         # A stream that closes without its final blank line: parse what is left.
         if buffer.strip():
             payload = _sse_payload(buffer)
@@ -1568,14 +1750,31 @@ async def _relay_sse(request, upstream, on_turn=None):
             "reasoning": "".join(reasoning_parts),
             "tool_calls": [tool_calls[index] for index in sorted(tool_calls)],
         }
+        if not message["tool_calls"] and allowed_tools and finish_reason != "length":
+            recovered, stripped = _extract_leaked_tool_calls(message["content"], allowed_tools)
+            if recovered:
+                logging.info("agent stream: recovered %d leaked tool call(s) from content",
+                             len(recovered))
+                message["tool_calls"] = recovered
+                message["content"] = stripped
         tool_error = _agent_tool_error(message, finish_reason)
-        complete = bool(finished or finish_reason)
+        complete = bool((finished or finish_reason) and finish_reason != "length")
         if tool_error:
-            await send("error", {"error": tool_error})
+            reason = "length_in_tool_call" if finish_reason == "length" else "malformed_tool_call"
+            await send("error", {"error": tool_error, "retryable": True,
+                                 "reason": reason, "finish_reason": finish_reason})
             await note({"error": tool_error})
-        elif not message["content"] and not message["tool_calls"]:
-            await send("error", {"error": "the model returned neither text nor tool calls"})
-            await note({"error": "the model returned neither text nor tool calls"})
+        elif not message["content"].strip() and not message["tool_calls"]:
+            if finish_reason == "length":
+                err = ("the model hit its output token limit while reasoning before "
+                       "producing a reply or tool call")
+                reason = "length_in_reasoning"
+            else:
+                err = "the model returned neither text nor tool calls"
+                reason = "empty_turn"
+            await send("error", {"error": err, "retryable": True,
+                                 "reason": reason, "finish_reason": finish_reason})
+            await note({"error": err})
         else:
             logging.info("agent stream: %d chars, %d tool call(s), %d reasoning chars, "
                          "finish=%s complete=%s usage=%s",
@@ -1639,6 +1838,10 @@ async def handle_agent(request: web.Request) -> web.StreamResponse:
     tools = body.get("tools")
     if tools is not None and not isinstance(tools, list):
         raise web.HTTPBadRequest(text="'tools' must be a list of tool schemas")
+    allowed_tools = {
+        str((t.get("function") or {}).get("name") or "").strip()
+        for t in (tools or []) if isinstance(t, dict)
+    } - {""}
 
     # The sidebar names its session on every turn; without the header the turn
     # still runs, untraced. The full upstream messages array is stored per turn
@@ -1661,47 +1864,72 @@ async def handle_agent(request: web.Request) -> web.StreamResponse:
                           stream=bool(body.get("stream")),
                           config={"model": app["llm_model"],
                                   "temperature": app["llm_temperature"],
-                                  "max_tokens": app["llm_max_tokens"],
+                                  "max_tokens": effective_max_tokens,
                                   "tools_sha256": tools_sha})
 
     stream = bool(body.get("stream"))
+    effective_max_tokens = app["llm_max_tokens"]
+    if body.get("max_tokens_bump") and effective_max_tokens > 0:
+        bumped = min(max(effective_max_tokens * 2, 2048), 4096)
+        ctx_limit = int((app.get("llm_context") or {}).get("tokens") or 0)
+        if ctx_limit > 1024:
+            bumped = min(bumped, max(effective_max_tokens, ctx_limit // 4))
+        effective_max_tokens = bumped
     payload = {
         "model": app["llm_model"],
         "messages": messages,
         "stream": stream,
         "temperature": app["llm_temperature"],
     }
-    if app["llm_max_tokens"] > 0:
-        payload["max_tokens"] = app["llm_max_tokens"]
+    if effective_max_tokens > 0:
+        payload["max_tokens"] = effective_max_tokens
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
+    thinking_pref = app.get("llm_thinking")
+    if body.get("disable_thinking"):
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    elif thinking_pref is not None:
+        payload["chat_template_kwargs"] = {"enable_thinking": bool(thinking_pref)}
     headers = {"Content-Type": "application/json"}
     if stream:
         headers["Accept"] = "text/event-stream"
     if app["llm_token"]:
         headers["Authorization"] = "Bearer " + app["llm_token"]
 
+    # Brief server-side backoff on 503 (llama-server loading / unwinding an
+    # aborted slot right after the user presses Stop).
+    backoffs = (0.6, 1.2)
+    text = ""
     try:
-        async with app["client"].post(app["llm_url"], json=payload, headers=headers,
-                                      timeout=ClientTimeout(total=app["llm_timeout"])) as answer:
-            if answer.status != 200:
+        for attempt in range(len(backoffs) + 1):
+            async with app["client"].post(app["llm_url"], json=payload, headers=headers,
+                                          timeout=ClientTimeout(total=app["llm_timeout"])) as answer:
+                if answer.status == 503 and attempt < len(backoffs):
+                    logging.info("agent %s returned 503 (slot busy/loading); retrying in %.1f s",
+                                 app["llm_url"], backoffs[attempt])
+                    await asyncio.sleep(backoffs[attempt])
+                    continue
+                if answer.status != 200:
+                    text = await answer.text()
+                    logging.warning("agent %s answered %d: %s", app["llm_url"],
+                                    answer.status, text[:200])
+                    error = "the model refused (%d): %s" % (answer.status, text[:300])
+                    await trace_event(app, sid, "stream_error", error=error,
+                                      status=answer.status)
+                    err_body = {"ok": False, "error": error}
+                    if _is_context_overflow_error(answer.status, text):
+                        err_body["retryable"] = True
+                        err_body["reason"] = "context_overflow"
+                    return web.json_response(err_body, status=502)
+                content_type = answer.headers.get("Content-Type") or ""
+                if stream and "text/event-stream" in content_type:
+                    return await _relay_sse(request, answer, on_turn=on_turn,
+                                            allowed_tools=allowed_tools)
+                # A server that ignores `stream`, or the ordinary non-streamed
+                # request: read the one JSON body and answer in kind.
                 text = await answer.text()
-                logging.warning("agent %s answered %d: %s", app["llm_url"],
-                                answer.status, text[:200])
-                error = "the model refused (%d): %s" % (answer.status, text[:300])
-                await trace_event(app, sid, "stream_error", error=error,
-                                  status=answer.status)
-                return web.json_response({
-                    "ok": False,
-                    "error": error,
-                }, status=502)
-            content_type = answer.headers.get("Content-Type") or ""
-            if stream and "text/event-stream" in content_type:
-                return await _relay_sse(request, answer, on_turn=on_turn)
-            # A server that ignores `stream`, or the ordinary non-streamed
-            # request: read the one JSON body and answer in kind.
-            text = await answer.text()
+                break
     except Exception as exc:  # noqa: BLE001 - surfaced to the chat
         logging.warning("agent %s failed: %s", app["llm_url"], exc)
         await trace_event(app, sid, "stream_error", error=str(exc))
@@ -1722,16 +1950,33 @@ async def handle_agent(request: web.Request) -> web.StreamResponse:
 
     message, usage = _agent_message(data)
     finish_reason = (((data.get("choices") or [{}])[0] or {}).get("finish_reason") or "")
+    if not message["tool_calls"] and allowed_tools and finish_reason != "length":
+        recovered, stripped = _extract_leaked_tool_calls(message["content"], allowed_tools)
+        if recovered:
+            logging.info("agent: recovered %d leaked tool call(s) from content", len(recovered))
+            message["tool_calls"] = recovered
+            message["content"] = stripped
     tool_error = _agent_tool_error(message, finish_reason)
     if tool_error:
+        reason = "length_in_tool_call" if finish_reason == "length" else "malformed_tool_call"
         await trace_event(app, sid, "stream_error", error=tool_error)
-        return web.json_response({"ok": False, "error": tool_error}, status=502)
-    if not message["content"] and not message["tool_calls"]:
-        await trace_event(app, sid, "stream_error",
-                          error="the model returned neither text nor tool calls")
+        return web.json_response({"ok": False, "error": tool_error, "retryable": True,
+                                  "reason": reason, "finish_reason": finish_reason}, status=502)
+    if not message["content"].strip() and not message["tool_calls"]:
+        if finish_reason == "length":
+            err = ("the model hit its output token limit while reasoning before "
+                   "producing a reply or tool call")
+            reason = "length_in_reasoning"
+        else:
+            err = "the model returned neither text nor tool calls"
+            reason = "empty_turn"
+        await trace_event(app, sid, "stream_error", error=err)
         return web.json_response({
             "ok": False,
-            "error": "the model returned neither text nor tool calls",
+            "error": err,
+            "retryable": True,
+            "reason": reason,
+            "finish_reason": finish_reason,
         }, status=502)
     complete = finish_reason != "length"
     logging.info("agent: %d chars, %d tool call(s), %d reasoning chars, finish=%s "
@@ -3663,7 +3908,15 @@ def build_app(args) -> web.Application:
                                    else os.environ.get("REBOT_LLM_TEMPERATURE", "0.2"))
     max_tokens = getattr(args, "llm_max_tokens", None)
     app["llm_max_tokens"] = int(max_tokens if max_tokens is not None
-                                else os.environ.get("REBOT_LLM_MAX_TOKENS", "1024"))
+                                else os.environ.get("REBOT_LLM_MAX_TOKENS", "2048"))
+    thinking_raw = str(getattr(args, "llm_thinking", "")
+                       or os.environ.get("REBOT_LLM_THINKING", "")).strip().lower()
+    if thinking_raw in ("0", "false", "no", "off"):
+        app["llm_thinking"] = False
+    elif thinking_raw in ("1", "true", "yes", "on"):
+        app["llm_thinking"] = True
+    else:
+        app["llm_thinking"] = None
     context_tokens = int(getattr(args, "llm_context_tokens", 0)
                          or os.environ.get("REBOT_LLM_CONTEXT_TOKENS", "0") or 0)
     app["llm_context"] = {
@@ -3905,7 +4158,11 @@ def main(argv=None):
     parser.add_argument("--llm-temperature", type=float,
                         default=float(os.environ.get("REBOT_LLM_TEMPERATURE", "0.2")))
     parser.add_argument("--llm-max-tokens", type=int,
-                        default=int(os.environ.get("REBOT_LLM_MAX_TOKENS", "1024")))
+                        default=int(os.environ.get("REBOT_LLM_MAX_TOKENS", "2048")))
+    parser.add_argument("--llm-thinking",
+                        default=os.environ.get("REBOT_LLM_THINKING", ""),
+                        help="override endpoint thinking mode: '0'/'false' to disable, "
+                             "'1'/'true' to enable, empty to inherit endpoint default")
     parser.add_argument("--llm-context-tokens", type=int,
                         default=int(os.environ.get("REBOT_LLM_CONTEXT_TOKENS", "0") or 0),
                         help="context window override; 0 reads meta.n_ctx from /v1/models")

@@ -77,32 +77,37 @@ import base_marker  # noqa: E402
 import calib as calib_mod  # noqa: E402
 import extrinsics  # noqa: E402
 import locate_target  # noqa: E402
+import rebot_ik  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # The page's contract, repeated here
 # --------------------------------------------------------------------------- #
 # These names must match `live.html`'s AGENT_TOOLS; the runner checks that at
 # start-up so the two cannot drift apart silently.
-TOOL_NAMES = ("rig", "pixel_to_arm", "arm_to_pixel", "add_marker",
+TOOL_NAMES = ("rig", "pixel_to_arm", "arm_to_pixel", "add_marker", "add_via",
               "clear_markers", "move_arm", "capture_view")
 
 TOOLS = [
     {"type": "function", "function": {
         "name": "rig",
         "description": "The fitted camera and the arm's limits: image size, worktop plane z, "
-                       "tip offset, the height floor, and how many markers are queued. Call it "
-                       "once before converting anything.",
+                       "tip offset, the height floor, the reach band at the current height, and "
+                       "how many markers are queued. Call it once before converting anything.",
         "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
     {"type": "function", "function": {
         "name": "pixel_to_arm",
-        "description": "Convert an image pixel to the arm-base tool-tip point at an approach "
-                       "height. Reports whether the point is inside the reach band and above the "
-                       "height floor. Use it to check a target before adding a marker.",
+        "description": "Read-only check: convert an image pixel to the arm-base tool-tip point at "
+                       "an approach height without moving the page's height badge. Reports "
+                       "whether the point is inside the reach band and above the height floor; if "
+                       "out of range, also returns reason, reachable_heights_m, "
+                       "suggested_height_m (the lowest reachable height), and suggested_pixel. "
+                       "Use it to check a target before adding a marker.",
         "parameters": {"type": "object", "properties": {
-            "u": {"type": "number", "description": "image column in pixels"},
-            "v": {"type": "number", "description": "image row in pixels"},
-            "height_m": {"type": "number", "description": "approach height above the worktop, "
-                                                          "metres"}},
+            "u": {"type": "number", "description": "image column in pixels (read from the top grid axis)"},
+            "v": {"type": "number", "description": "image row in pixels (read from the left grid axis; larger v is lower on the object)"},
+            "height_m": {"type": "number", "description": "approach height above the worktop in metres; "
+                                                          "start low (default_height_m / height_floor_m) "
+                                                          "and omit to probe at the page's badge height"}},
             "required": ["u", "v"]}}},
     {"type": "function", "function": {
         "name": "arm_to_pixel",
@@ -116,13 +121,26 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "add_marker",
         "description": "Queue a numbered target at an image pixel; it appears on the screen. The "
-                       "arm visits queued markers in order, alternating the gripper. Returns the "
-                       "tip point and whether it is reachable.",
+                       "arm visits queued markers in order, alternating the gripper (odd = "
+                       "close/grasp, even = open/release). For grasping an object, aim at its "
+                       "lower third (larger v) at the lowest reachable height_m. Returns the tip "
+                       "point and whether it is reachable.",
+        "parameters": {"type": "object", "properties": {
+            "u": {"type": "number", "description": "image column in pixels"},
+            "v": {"type": "number", "description": "image row in pixels (for grasping, aim at the lower third of the object, near its base)"},
+            "height_m": {"type": "number", "description": "approach height above the worktop in metres; "
+                                                          "pass explicitly once verified with pixel_to_arm"}},
+            "required": ["u", "v"]}}},
+    {"type": "function", "function": {
+        "name": "add_via",
+        "description": "Attach a pass-through point to the last queued marker, at an image pixel. "
+                       "The arm travels through it without stopping on the way to that marker "
+                       "(from the previous marker, or the start pose for marker 1), gripper "
+                       "unchanged. Up to 5 per marker; needs a marker placed first.",
         "parameters": {"type": "object", "properties": {
             "u": {"type": "number", "description": "image column in pixels"},
             "v": {"type": "number", "description": "image row in pixels"},
-            "height_m": {"type": "number", "description": "approach height above the worktop, "
-                                                          "metres"}},
+            "height_m": {"type": "number", "description": "pass-through height above the worktop, metres"}},
             "required": ["u", "v"]}}},
     {"type": "function", "function": {
         "name": "clear_markers",
@@ -138,8 +156,10 @@ TOOLS = [
             "required": ["execute"]}}},
     {"type": "function", "function": {
         "name": "capture_view",
-        "description": "Ask for a fresh camera frame; it arrives as the next user message. Use it "
-                       "after the arm moves, or when the view may have changed.",
+        "description": "Ask for a fresh camera frame (with the pixel grid and any queued marker "
+                       "pins overlaid); it arrives as the next user message. Use it to visually "
+                       "verify marker placement on the object, after the arm moves, or when the "
+                       "view may have changed.",
         "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
 ]
 
@@ -149,18 +169,30 @@ SYSTEM_PROMPT = "\n".join([
     "You operate a B601 arm through a workstation page; the engineer watches the same view.",
     "You are shown a still from the fixed camera looking down at the workbench.",
     "Image coordinates are pixels: u grows right, v grows down, origin at the top-left.",
+    "A labeled pixel grid is overlaid on the image (u along the top, v along the left) — read coordinates directly from it.",
     "Arm coordinates are metres in the robot base frame: x and y on the worktop, z up.",
     "",
     "Tools:",
     "- rig(): camera matrix, worktop plane, height floor, reach band, queued markers.",
-    "- pixel_to_arm(u, v, height_m): the tool-tip point for a pixel, and whether it is reachable.",
+    "- pixel_to_arm(u, v, height_m): read-only check of the tool-tip point for a pixel, whether it is reachable, and if out of range, suggested_height_m / suggested_pixel.",
     "- arm_to_pixel(x, y, z): where an arm point lands in the image; use it to check yourself.",
-    "- add_marker(u, v, height_m): queue a numbered target; markers are visited in order.",
+    "- add_marker(u, v, height_m): queue a numbered target; odd markers close (grasp), even markers open (release).",
+    "- add_via(u, v, height_m): attach a pass-through point to the last marker; the arm",
+    "  crosses it without stopping on the way to that marker (max 5 per marker).",
     "- clear_markers(): drop the queued targets.",
     "- move_arm(execute): plan the markers; execute=false plans without moving.",
-    "- capture_view(): get a fresh frame, delivered in the next user message.",
+    "- capture_view(): get a fresh frame (showing the pixel grid and any queued marker pins), delivered in the next user message.",
     "",
-    "Work in this order: look at the image, check a pixel with pixel_to_arm, add the markers,",
+    "Grasping & height rules:",
+    "- The gripper slides in horizontally at the marker's height. To grasp an object, aim at the LOWER THIRD of the object (just above where it rests on the worktop — larger v), NOT its visual center or top.",
+    "- Start at the lowest practical height (default_height_m / height_floor_m) and keep height_m as low as reachable so the arm grabs the lower part of the object.",
+    "- If pixel_to_arm returns inside_band: false, do NOT stop or ask the user to adjust the height. Read reason, suggested_height_m, and suggested_pixel from the tool result:",
+    "  * When suggested_height_m is given, immediately re-check with pixel_to_arm at (suggested_pixel or the lower-body pixel, height_m=suggested_height_m) and use that lowest reachable height.",
+    "  * Only tell the user a target is unreachable when reachable_heights_m is null.",
+    "- Pass height_m explicitly to add_marker once you have verified a reachable height.",
+    "",
+    "Work in this order: call rig() if needed, check target pixels with pixel_to_arm (adjusting height autonomously if inside_band is false), add the markers,",
+    "optionally call capture_view() to visually verify pins sit on the lower part of the object,",
     "plan with move_arm(false) and read the summary, then move with move_arm(true).",
     "If a plan or a move fails, read the error, change the marker or the height, and try once more.",
     "Never say the arm moved unless a tool result says executed: true.",
@@ -376,16 +408,161 @@ def round3(value: float) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# Reach band & annotated stills (mirrors web/arm-model.js and web/live.html)
+# --------------------------------------------------------------------------- #
+
+_REACH_SEEDS = (
+    np.array([0.0, 2.02, 0.52, 1.5, 0.0, 0.0]),
+    np.array([0.0, 2.457, 1.246, 1.315, -0.376, 0.034]),
+    np.array([0.0, 1.2, 0.2, 1.5, 0.0, 0.0]),
+    np.zeros(6),
+)
+_REACH_ANCHORS = (0.60, 0.50, 0.65, 0.45, 0.70, 0.40, 0.30, 0.20)
+_MAX_REACH_M = 0.75
+_HEIGHT_MAX_M = 0.60
+_HEIGHT_STEP_M = 0.005
+_REACH_BAND_CACHE: dict[tuple[float, float, float], dict | None] = {}
+
+
+def _solve_reach_at(radius: float, flange_z: float, seed: np.ndarray):
+    target = rebot_ik.pose([radius, 0.0, flange_z], np.eye(3))
+    q, info = rebot_ik.ik(target, seed, tol_pos=1e-3, tol_rot=2e-3,
+                          max_iters=160, damping=0.02, max_step=0.15,
+                          rot_weight=0.5, margin=0.0)
+    if not info.get("ok") or not rebot_ik.within_limits(q, margin=0.0):
+        return None
+    actual = rebot_ik.forward(q)[:3, 3]
+    if math.hypot(actual[0] - radius, actual[1], actual[2] - flange_z) > 0.003:
+        return None
+    return q
+
+
+def compute_reach_band(plane_z: float, hover_m: float, tip_m: float) -> dict | None:
+    """Tool-down reach annulus at (plane_z, hover_m, tip_m), matching arm-model.js."""
+    key = (round(float(plane_z), 4), round(float(hover_m), 4), round(float(tip_m), 4))
+    if key in _REACH_BAND_CACHE:
+        return _REACH_BAND_CACHE[key]
+    flange_z = float(plane_z) + float(hover_m) + float(tip_m)
+    step = 0.01
+
+    def reachable(radius: float, seed: np.ndarray):
+        q = _solve_reach_at(radius, flange_z, seed)
+        if q is not None:
+            return q
+        for fallback in _REACH_SEEDS:
+            q = _solve_reach_at(radius, flange_z, fallback)
+            if q is not None:
+                return q
+        return None
+
+    anchor = None
+    seed = _REACH_SEEDS[0]
+    for candidate in _REACH_ANCHORS:
+        q = reachable(candidate, seed)
+        if q is not None:
+            anchor = candidate
+            seed = q
+            break
+    if anchor is None:
+        _REACH_BAND_CACHE[key] = None
+        return None
+
+    outer, outer_seed = anchor, seed
+    r = anchor + step
+    while r <= _MAX_REACH_M + 1e-9:
+        q = reachable(r, outer_seed)
+        if q is None:
+            break
+        outer, outer_seed = r, q
+        r += step
+
+    inner, inner_seed = anchor, seed
+    r = anchor - step
+    while r >= 0.02 - 1e-9:
+        q = reachable(r, inner_seed)
+        if q is None:
+            break
+        inner, inner_seed = r, q
+        r -= step
+
+    sector = min(abs(float(rebot_ik.LIMITS[0, 0])), abs(float(rebot_ik.LIMITS[0, 1])))
+    band = {
+        "inner_m": round3(max(0.0, inner)),
+        "outer_m": round3(min(outer, _MAX_REACH_M)),
+        "sector_deg": int(round(math.degrees(sector))),
+    }
+    _REACH_BAND_CACHE[key] = band
+    return band
+
+
+def annotate_frame(image: np.ndarray, markers: list | None = None,
+                   project_fn=None) -> np.ndarray:
+    """Overlay the labeled pixel grid and queued marker pins (mirrors live.html)."""
+    canvas = image.copy()
+    height, width = canvas.shape[:2]
+    step = 200 if max(width, height) >= 1400 else 160
+    font_scale = max(0.45, min(width, height) / 1400.0)
+    thickness = max(1, int(round(font_scale * 2)))
+
+    # Translucent pixel grid.
+    overlay = canvas.copy()
+    for u in range(step, width, step):
+        cv2.line(overlay, (u, 0), (u, height - 1), (255, 255, 255), 1)
+    for v in range(step, height, step):
+        cv2.line(overlay, (0, v), (width - 1, v), (255, 255, 255), 1)
+    cv2.addWeighted(overlay, 0.24, canvas, 0.76, 0.0, dst=canvas)
+
+    def label_pill(text: str, x: int, y: int, center_x: bool = False):
+        (tw, th), baseline = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        pad = max(3, int(round(th * 0.35)))
+        bw, bh = tw + pad * 2, th + pad * 2
+        left = (x - bw // 2) if center_x else x
+        left = max(2, min(width - bw - 2, left))
+        top = max(2, min(height - bh - 2, y - bh // 2))
+        cv2.rectangle(canvas, (left, top), (left + bw, top + bh), (16, 13, 11), -1)
+        cv2.putText(canvas, text, (left + pad, top + pad + th - baseline // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (237, 234, 232),
+                    thickness, cv2.LINE_AA)
+
+    top_y = max(14, int(round(20 * font_scale)))
+    label_pill("u> vV", 4, top_y, center_x=False)
+    for u in range(step, width - 20, step):
+        label_pill(str(u), u, top_y, center_x=True)
+    for v in range(step, height - 20, step):
+        label_pill(str(v), 4, v, center_x=False)
+
+    radius = max(12, int(round(18 * font_scale)))
+    for idx, marker in enumerate(markers or [], start=1):
+        px = None
+        if project_fn is not None and marker.get("tip") is not None:
+            px = project_fn(marker["tip"])
+        if px is None:
+            px = (marker["u"], marker["v"])
+        cx, cy = int(round(px[0])), int(round(px[1]))
+        color = (41, 180, 240) if idx % 2 == 1 else (138, 201, 69)  # BGR amber / green
+        cv2.line(canvas, (cx - radius - 5, cy), (cx + radius + 5, cy), (0, 0, 0), 4)
+        cv2.line(canvas, (cx, cy - radius - 5), (cx, cy + radius + 5), (0, 0, 0), 4)
+        cv2.circle(canvas, (cx, cy), radius, color, 2, cv2.LINE_AA)
+        cv2.line(canvas, (cx - radius - 4, cy), (cx + radius + 4, cy), color, 2)
+        cv2.line(canvas, (cx, cy - radius - 4), (cx, cy + radius + 4), color, 2)
+        cv2.circle(canvas, (cx, cy), 3, color, -1, cv2.LINE_AA)
+        label_pill("#%d" % idx, cx + radius + 4, cy - radius, center_x=False)
+    return canvas
+
+
+# --------------------------------------------------------------------------- #
 # One case, one run: the bench a session drives
 # --------------------------------------------------------------------------- #
 
 class Session:
     """Stands in for the page: the still, its pose, the marker list, the tools."""
 
-    def __init__(self, args, case: dict, still: Path):
+    def __init__(self, args, case: dict, still: Path, compute_reach: bool = True):
         self.args = args
         self.case = case
         self.still = still
+        self.compute_reach = bool(compute_reach)
         self.image = cv2.imread(str(still), cv2.IMREAD_COLOR)
         if self.image is None:
             raise EvalError("%s: cannot read %s" % (case["id"], still))
@@ -406,13 +583,22 @@ class Session:
         self.tip_m = float(case.get("tip_mm", args.tip_mm)) / 1000.0
         self.floor = max(0.0, float(case.get("min_z", args.min_z)) - self.plane_z)
         self.default_height = float(case.get("hover_m", args.hover_m))
-        self.markers = []           # {"u","v","tip","height"}
+        self.badge_height = self.default_height
+        self.markers = []           # {"u","v","tip","height","inside_band","via"?}
         self.tool_calls = []        # (name, args)
+        self.tool_results = []      # (name, args, result)
         self.plan_results = []      # move_arm results
         self.rig_tip_offset = np.zeros(3)   # the fitted offset, when a rig is used
         self.T = self._pose()
-        self.image_url = ("data:image/jpeg;base64,"
-                          + base64.b64encode(still.read_bytes()).decode())
+        self.image_url = self.frame_url()
+
+    def frame_url(self) -> str:
+        """Annotated JPEG data URL matching live.html's grabFrame()."""
+        annotated = annotate_frame(self.image, self.markers, project_fn=self.pixel_of)
+        ok, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not ok:
+            return "data:image/jpeg;base64," + base64.b64encode(self.still.read_bytes()).decode()
+        return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
 
     # -- geometry ---------------------------------------------------------- #
 
@@ -453,37 +639,186 @@ class Session:
                                       np.asarray(point, dtype=float), self.calibration.dist)
         return None if pixel is None else (float(pixel[0]), float(pixel[1]))
 
+    def _point_reach(self, tip, band):
+        x, y, z = float(tip[0]), float(tip[1]), float(tip[2])
+        radius = math.hypot(x, y)
+        above_floor = z >= self.plane_z + self.floor - 1e-6
+        if band is None:
+            return radius, above_floor, False, ("no_band_at_height" if above_floor else "below_floor")
+        az_deg = abs(math.degrees(math.atan2(y, x)))
+        in_sector = az_deg <= float(band["sector_deg"]) + 0.5
+        in_radius = band["inner_m"] - 1e-6 <= radius <= band["outer_m"] + 1e-6
+        inside = in_radius and in_sector
+        reason = None
+        if not above_floor:
+            reason = "below_floor"
+        elif not in_sector:
+            reason = "outside_sector"
+        elif radius < band["inner_m"] - 1e-6:
+            reason = "too_close"
+        elif radius > band["outer_m"] + 1e-6:
+            reason = "too_far"
+        return radius, above_floor, inside, reason
+
+    def _find_reachable_height(self, tip, pixel):
+        max_h = min(_HEIGHT_MAX_M, 0.45)
+        candidates = []
+        h = self.floor
+        while h <= max_h + 1e-9:
+            candidates.append(round(h, 3))
+            h += 0.02
+
+        # Pass 1: vertical lift directly above (tip[0], tip[1]).
+        x0, y0 = float(tip[0]), float(tip[1])
+        r0 = math.hypot(x0, y0)
+        az0 = abs(math.degrees(math.atan2(y0, x0)))
+        vhits = []
+        for cand in candidates:
+            band = compute_reach_band(self.plane_z, cand, self.tip_m)
+            if band is None:
+                continue
+            if az0 <= float(band["sector_deg"]) + 0.5 and band["inner_m"] - 1e-6 <= r0 <= band["outer_m"] + 1e-6:
+                vhits.append(cand)
+        if vhits:
+            min_h = vhits[0]
+            fine = round(min_h - 0.01, 3)
+            if fine >= self.floor - 1e-9:
+                band = compute_reach_band(self.plane_z, fine, self.tip_m)
+                if band and az0 <= float(band["sector_deg"]) + 0.5 and band["inner_m"] - 1e-6 <= r0 <= band["outer_m"] + 1e-6:
+                    min_h = fine
+            proj = self.pixel_of([x0, y0, self.plane_z + min_h])
+            if proj and 0 <= proj[0] <= self.width_px and 0 <= proj[1] <= self.height_px:
+                return {
+                    "reachable_heights_m": [round3(min_h), round3(vhits[-1])],
+                    "suggested_height_m": round3(min_h),
+                    "suggested_pixel": [round3(proj[0]), round3(proj[1])],
+                }
+
+        # Pass 2: sweep along the camera ray through pixel.
+        if pixel is not None:
+            rhits = []
+            for cand in candidates:
+                band = compute_reach_band(self.plane_z, cand, self.tip_m)
+                if band is None:
+                    continue
+                try:
+                    probe, _ = self.tip_at(pixel[0], pixel[1], cand)
+                except Exception:  # noqa: BLE001
+                    continue
+                if self._point_reach(probe, band)[2]:
+                    rhits.append(cand)
+            if rhits:
+                min_h = rhits[0]
+                fine = round(min_h - 0.01, 3)
+                if fine >= self.floor - 1e-9:
+                    band = compute_reach_band(self.plane_z, fine, self.tip_m)
+                    if band is not None:
+                        try:
+                            probe, _ = self.tip_at(pixel[0], pixel[1], fine)
+                            if self._point_reach(probe, band)[2]:
+                                min_h = fine
+                        except Exception:  # noqa: BLE001
+                            pass
+                return {
+                    "reachable_heights_m": [round3(min_h), round3(rhits[-1])],
+                    "suggested_height_m": round3(min_h),
+                    "suggested_pixel": [round3(pixel[0]), round3(pixel[1])],
+                }
+
+        return {"reachable_heights_m": None, "suggested_height_m": None, "suggested_pixel": None}
+
     def report(self, tip, height, pixel):
         radius = math.hypot(float(tip[0]), float(tip[1]))
-        return {
+        above_floor = float(tip[2]) >= self.plane_z + self.floor - 1e-6
+        if not self.compute_reach:
+            return {
+                "ok": True,
+                "tip_m": [round3(tip[0]), round3(tip[1]), round3(tip[2])],
+                "height_m": round3(height),
+                "pixel": [round3(pixel[0]), round3(pixel[1])] if pixel else None,
+                "radius_m": round3(radius),
+                "reach_band_m": None,
+                "inside_band": None,
+                "above_floor": above_floor,
+            }
+        band = compute_reach_band(self.plane_z, height, self.tip_m)
+        radius, above_floor, inside_band, reason = self._point_reach(tip, band)
+        out = {
             "ok": True,
             "tip_m": [round3(tip[0]), round3(tip[1]), round3(tip[2])],
             "height_m": round3(height),
             "pixel": [round3(pixel[0]), round3(pixel[1])] if pixel else None,
             "radius_m": round3(radius),
-            "reach_band_m": None,     # the page's arm model is not loaded here
-            "inside_band": None,
-            "above_floor": float(tip[2]) >= self.plane_z + self.floor - 1e-6,
+            "reach_band_m": band,
+            "inside_band": inside_band,
+            "above_floor": above_floor,
         }
+        if reason:
+            out["reason"] = reason
+        if not inside_band or not above_floor:
+            out.update(self._find_reachable_height(tip, pixel))
+        return out
 
     # -- tools ------------------------------------------------------------- #
 
-    def call(self, name: str, args: dict) -> dict:
-        self.tool_calls.append((name, dict(args or {})))
-        try:
-            handler = getattr(self, "_tool_" + name, None)
-            if handler is None:
-                return {"ok": False, "error": "no such tool: " + name}
-            return handler(args or {})
-        except Exception as exc:  # noqa: BLE001 - a tool error is a result, not a crash
-            return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    _ALLOWED_ARGS = {
+        "rig": (),
+        "pixel_to_arm": ("u", "v", "height_m"),
+        "arm_to_pixel": ("x", "y", "z"),
+        "add_marker": ("u", "v", "height_m"),
+        "add_via": ("u", "v", "height_m"),
+        "clear_markers": (),
+        "move_arm": ("execute",),
+        "capture_view": (),
+    }
 
-    def _height(self, args):
+    def call(self, name: str, args: dict) -> dict:
+        clean_name = str(name or "").strip()
+        if clean_name.startswith("functions."):
+            clean_name = clean_name[len("functions."):]
+        clean_args = dict(args or {})
+        self.tool_calls.append((clean_name, clean_args))
+        try:
+            handler = getattr(self, "_tool_" + clean_name, None)
+            if handler is None:
+                result = {"ok": False, "error": "no such tool: " + clean_name}
+            else:
+                allowed = self._ALLOWED_ARGS.get(clean_name)
+                extra = [k for k in clean_args if allowed is not None and k not in allowed]
+                if extra:
+                    result = {
+                        "ok": False,
+                        "error": "unknown parameter(s) [%s] for %s%s" % (
+                            ", ".join(extra), clean_name,
+                            ("; expected: " + ", ".join(allowed)) if allowed else "; takes no arguments"),
+                    }
+                else:
+                    result = handler(clean_args)
+        except Exception as exc:  # noqa: BLE001 - a tool error is a result, not a crash
+            result = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        self.tool_results.append((clean_name, clean_args, result))
+        return result
+
+    def _clamp_height(self, asked):
+        high = max(self.floor, _HEIGHT_MAX_M)
+        snapped = round(float(asked) / _HEIGHT_STEP_M) * _HEIGHT_STEP_M
+        return max(self.floor, min(high, snapped))
+
+    def _probe_height(self, args):
         asked = args.get("height_m")
-        height = self.default_height if asked is None else max(self.floor, float(asked))
-        return height
+        if asked is None:
+            return self.badge_height
+        return self._clamp_height(asked)
+
+    def _commit_height(self, args):
+        asked = args.get("height_m")
+        if asked is not None:
+            self.badge_height = self._clamp_height(asked)
+        return self.badge_height
 
     def _tool_rig(self, args):
+        band = (compute_reach_band(self.plane_z, self.badge_height, self.tip_m)
+                if self.compute_reach else None)
         return {
             "ok": True,
             "mode": "fixed" if self.extrinsics_path else "handheld",
@@ -494,14 +829,15 @@ class Session:
             "tip_offset_m": round3(self.tip_m),
             "default_height_m": round3(self.default_height),
             "height_floor_m": round3(self.floor),
-            "badge_height_m": round3(self.default_height),
-            "reach_band_m": None,
+            "badge_height_m": round3(self.badge_height),
+            "reach_band_m": band,
             "markers": len(self.markers),
+            "vias": sum(len(m.get("via") or []) for m in self.markers),
         }
 
     def _tool_pixel_to_arm(self, args):
         u, v = float(args["u"]), float(args["v"])
-        height = self._height(args)
+        height = self._probe_height(args)
         tip, _grazing = self.tip_at(u, v, height)
         return self.report(tip, height, (u, v))
 
@@ -517,12 +853,34 @@ class Session:
             return {"ok": False, "error": "that pixel is outside the image"}
         if len(self.markers) >= 10:
             return {"ok": False, "error": "at most 10 markers; clear them first"}
-        height = self._height(args)
+        height = self._commit_height(args)
         tip, _grazing = self.tip_at(u, v, height)
-        marker = {"u": round3(u), "v": round3(v), "tip": tip.tolist(), "height": height}
+        report = self.report(tip, height, (u, v))
+        marker = {"u": round3(u), "v": round3(v), "tip": tip.tolist(),
+                  "height": height, "inside_band": report.get("inside_band")}
         self.markers.append(marker)
+        report["index"] = len(self.markers)
+        report["count"] = len(self.markers)
+        return report
+
+    def _tool_add_via(self, args):
+        u, v = float(args["u"]), float(args["v"])
+        if not (0 <= u <= self.width_px and 0 <= v <= self.height_px):
+            return {"ok": False, "error": "that pixel is outside the image"}
+        if not self.markers:
+            return {"ok": False, "error": "place a marker first: vias attach to the last marker",
+                    "count": 0}
+        owner = self.markers[-1]
+        vias = owner.setdefault("via", [])
+        if len(vias) >= 5:
+            return {"ok": False, "error": "5 vias per marker is the limit",
+                    "count": len(self.markers)}
+        height = self._commit_height(args)
+        tip, _grazing = self.tip_at(u, v, height)
+        vias.append(tip.tolist())
         report = self.report(tip, height, (u, v))
         report["index"] = len(self.markers)
+        report["via"] = len(vias)
         report["count"] = len(self.markers)
         return report
 
@@ -532,15 +890,23 @@ class Session:
 
     def _tool_capture_view(self, args):
         # The page answers this with a fresh frame in the next user message; the
-        # loop below appends this case's still the same way.
+        # loop below appends an annotated still with the current marker pins.
         return {"ok": True, "note": "a fresh camera frame arrives in the next user message"}
 
     def _tool_move_arm(self, args):
-        execute = bool(args.get("execute"))
+        raw_execute = args.get("execute")
+        if not isinstance(raw_execute, bool):
+            return {"ok": False,
+                    "error": "execute must be a boolean (true or false), got %r" % (raw_execute,)}
+        execute = raw_execute is True
         if not self.markers:
             return {"ok": False, "error": "no markers yet: add at least one"}
-        targets = [{"tip": [round3(v) for v in m["tip"]],
-                    "pixel": [m["u"], m["v"]]} for m in self.markers]
+        targets = []
+        for m in self.markers:
+            entry = {"tip": [round3(v) for v in m["tip"]], "pixel": [m["u"], m["v"]]}
+            if m.get("via"):
+                entry["via"] = [[round3(v) for v in pt] for pt in m["via"]]
+            targets.append(entry)
         if not self.args.server:
             result = {"ok": True, "planned": False, "executed": False,
                       "note": "no host configured: geometry checked only"}
@@ -631,7 +997,24 @@ def _post_json(url: str, body: dict, headers: dict | None = None, timeout: float
         raise EvalError("cannot reach %s: %s" % (url, exc)) from exc
 
 
-def chat(args, messages) -> dict:
+def _parse_tool_args_lenient(raw):
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    for candidate in (text, re.sub(r",\s*([}\]])", r"\1", text)):
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, str):
+                inner = parsed.strip()
+                parsed = json.loads(re.sub(r",\s*([}\]])", r"\1", inner))
+            if isinstance(parsed, dict):
+                return parsed
+        except (TypeError, ValueError):
+            continue
+    return {}
+
+
+def chat(args, messages, disable_thinking: bool = False) -> dict:
     payload = {
         "model": args.model,
         "messages": messages,
@@ -641,7 +1024,7 @@ def chat(args, messages) -> dict:
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
     }
-    if not args.thinking:
+    if disable_thinking or not args.thinking:
         # Qwen's chat template spends its budget reasoning before it answers or
         # calls a tool; one flag turns that off, which is also what makes a run
         # replayable in seconds rather than half a minute.
@@ -653,7 +1036,8 @@ def chat(args, messages) -> dict:
     choices = body.get("choices") or []
     if not choices:
         raise EvalError("the model returned no choices: %s" % json.dumps(body)[:200])
-    message = choices[0].get("message") or {}
+    choice = choices[0] or {}
+    message = choice.get("message") or {}
     content = message.get("content")
     if isinstance(content, list):        # content parts, from some servers
         content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
@@ -670,6 +1054,7 @@ def chat(args, messages) -> dict:
             },
         })
     return {"content": content or "", "tool_calls": calls,
+            "finish_reason": str(choice.get("finish_reason") or ""),
             "reasoning": message.get("reasoning_content") or ""}
 
 
@@ -691,10 +1076,24 @@ def run_once(args, case: dict, still: Path) -> dict:
     trace = []
     started = time.time()
     for turn in range(args.max_turns):
-        message = chat(args, messages)
-        if message["content"]:
-            trace.append({"role": "agent", "text": message["content"]})
-        assistant = {"role": "assistant", "content": message["content"]}
+        message = None
+        for attempt in range(3):
+            req_messages = messages
+            if attempt > 0:
+                req_messages = [dict(messages[0], content=messages[0]["content"] + (
+                    "\n\n[Retry note: Your previous response returned no text or tool call "
+                    "or hit the token limit. Emit the next tool call or a brief answer directly.]"
+                ))] + messages[1:]
+            candidate = chat(args, req_messages, disable_thinking=(attempt > 0))
+            if (candidate["content"].strip() or candidate["tool_calls"]) \
+                    and not (candidate["finish_reason"] == "length" and candidate["tool_calls"]):
+                message = candidate
+                break
+        if message is None:
+            message = candidate
+        if message["content"].strip():
+            trace.append({"role": "agent", "text": message["content"].strip()})
+        assistant = {"role": "assistant", "content": message["content"].strip()}
         if message["tool_calls"]:
             assistant["tool_calls"] = message["tool_calls"]
         messages.append(assistant)
@@ -702,22 +1101,18 @@ def run_once(args, case: dict, still: Path) -> dict:
             break
         for call in message["tool_calls"]:
             name = call["function"]["name"]
-            try:
-                tool_args = json.loads(call["function"]["arguments"] or "{}")
-                if not isinstance(tool_args, dict):
-                    tool_args = {}
-            except json.JSONDecodeError:
-                tool_args = {}
+            tool_args = _parse_tool_args_lenient(call["function"]["arguments"])
             result = session.call(name, tool_args)
             trace.append({"role": "tool", "name": name, "args": tool_args,
                           "result": result})
             messages.append({"role": "tool", "tool_call_id": call["id"],
                              "content": json.dumps(result)})
             if name == "capture_view" and result.get("ok"):
-                # Same shape the page sends: a new user message with a frame.
+                # Same shape the page sends: a new user message with a fresh
+                # annotated frame showing the pixel grid and queued marker pins.
                 messages.append({"role": "user", "content": [
                     {"type": "text", "text": "A fresh camera frame, taken just now."},
-                    {"type": "image_url", "image_url": {"url": session.image_url}},
+                    {"type": "image_url", "image_url": {"url": session.frame_url()}},
                 ]})
             if name == "move_arm" and result.get("executed"):
                 # The page would show a new frame here; a replay cannot, and a
@@ -784,6 +1179,31 @@ def judge(args, case: dict, run: dict) -> list[str]:
         if box and any(in_box(m["u"], m["v"], box) for m in markers):
             problems.append("a marker landed on %s %s" % (name, box))
 
+    if expect.get("must_be_inside_band"):
+        out_of_band = [i + 1 for i, m in enumerate(markers)
+                       if m.get("inside_band") is False]
+        if out_of_band:
+            problems.append("marker(s) %s landed outside the reach band" % out_of_band)
+
+    if expect.get("max_height_m") is not None:
+        limit_h = float(expect["max_height_m"])
+        too_high = [(i + 1, round3(m["height"])) for i, m in enumerate(markers)
+                    if float(m.get("height", 0.0)) > limit_h + 1e-6]
+        if too_high:
+            problems.append("marker height(s) %s exceeded max_height_m %.3f"
+                            % (too_high, limit_h))
+
+    if expect.get("height_adjust_required"):
+        saw_out = any(name == "pixel_to_arm" and res.get("inside_band") is False
+                      for name, _a, res in session.tool_results)
+        placed_in = any(m.get("inside_band") is True
+                        and float(m.get("height", 0.0)) > session.default_height + 1e-4
+                        for m in markers)
+        if not saw_out:
+            problems.append("expected an out-of-band pixel_to_arm probe before adjusting height")
+        elif not placed_in:
+            problems.append("did not autonomously raise height_m to place a reachable marker")
+
     if expect.get("plan_first"):
         plans = [i for i, (name, args) in enumerate(session.tool_calls)
                  if name == "move_arm" and args.get("execute") is False]
@@ -831,9 +1251,13 @@ def judge(args, case: dict, run: dict) -> list[str]:
 # Prose differs by construction between the page and the harness; the numbers
 # are the contract. `error` text is prose too -- only the ok flag is compared.
 PROSE_FIELDS = {"note", "error"}
-# The reach band is computed in web/arm-model.js, which the harness does not
-# load; the harness answers None. These are listed as uncovered, never diffed.
-PAGE_ONLY_FIELDS = {"reach_band_m", "inside_band"}
+# Reach-band diagnostics are computed in web/arm-model.js and omitted during
+# deterministic trace replay so legacy bundles diff geometry only; they are
+# listed as uncovered, never diffed.
+PAGE_ONLY_FIELDS = {
+    "reach_band_m", "inside_band", "reason",
+    "reachable_heights_m", "suggested_height_m", "suggested_pixel",
+}
 
 
 def _float_diff(recorded, replayed) -> bool:
@@ -961,7 +1385,7 @@ def cmd_trace_replay(args, ctx) -> int:
     diffs, order, uncovered = [], [], []
     calls = 0
     try:
-        session = Session(rargs, case, ctx["still"])
+        session = Session(rargs, case, ctx["still"], compute_reach=False)
         results = [e for e in ctx["events"] if e.get("type") == "tool_result"]
         cursor = 0
         for event in ctx["events"]:
@@ -1315,9 +1739,13 @@ def cmd_dry(args, cases):
         for name, box in boxes.items():
             centre = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
             tip, grazing = session.tip_at(centre[0], centre[1], session.default_height)
-            print("   %-14s box %-22s centre tip [% .3f % .3f % .3f] m  radius %.3f  %.0f deg"
+            rep = session.report(tip, session.default_height, centre)
+            reach_note = "in-band" if rep.get("inside_band") else (
+                "%s (suggest h=%s)" % (rep.get("reason") or "out",
+                                       rep.get("suggested_height_m")))
+            print("   %-14s box %-22s centre tip [% .3f % .3f % .3f] m  r=%.3f  %.0f deg  %s"
                   % (name, str([round(v) for v in box]), tip[0], tip[1], tip[2],
-                     math.hypot(tip[0], tip[1]), grazing))
+                     math.hypot(tip[0], tip[1]), grazing, reach_note))
     return 0 if ok else 1
 
 
