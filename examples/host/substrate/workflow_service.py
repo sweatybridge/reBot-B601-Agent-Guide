@@ -204,15 +204,18 @@ def execute(exec_id: str) -> dict:
             # Ingest recording even on abort so the oracle has camera evidence for fault attribution!
             recording = _stop_and_ingest(exec_id, recorder, record_wall, play_wall, recording_error)
             recorder = None
+            has_recording = isinstance(recording, dict) and int(recording.get("segments") or 0) > 0
 
             if status != 200 or not payload.get("ok") or payload.get("executed") is not True:
                 return {"ok": False, "claimed": True, "executed": False,
                         "error": payload.get("error", "the gateway refused the play"),
                         "telemetry": payload.get("telemetry"),
-                        "recording": recording, "recording_error": recording_error}
+                        "recording": recording, "recording_error": recording_error,
+                        "no_recording": not has_recording}
             return {"ok": True, "claimed": True, "executed": True,
                     "exec_id": exec_id, "telemetry": payload.get("telemetry"),
-                    "recording": recording, "recording_error": recording_error}
+                    "recording": recording, "recording_error": recording_error,
+                    "no_recording": not has_recording}
         except Exception as exc:
             _json("SELECT execution_fail(%s, %s)", (exec_id, "%s: %s" % (type(exc).__name__, exc)))
             raise

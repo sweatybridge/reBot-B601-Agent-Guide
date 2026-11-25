@@ -178,6 +178,7 @@
   <div class="row">
     <button class="chip" id="camera">Camera: handheld tag</button>
     <button class="chip" id="reach">Reach: off</button>
+    <button class="chip" id="gripperMode">Gripper: horizontal</button>
     <button class="chip" id="calib">Calibration mode: off</button>
     <button class="chip" id="live">Live preview: off</button>
     <button class="chip" id="lock">Lock focus: -</button>
@@ -253,6 +254,7 @@ const lockButton = $("#lock");
 const clearButton = $("#clear");
 const viaButton = $("#via");
 const reachButton = $("#reach");
+const gripperModeButton = $("#gripperMode");
 const reachCanvas = $("#reachCanvas");
 const markersContainer = $("#markers");
 const heightBadge = $("#heightBadge");
@@ -264,6 +266,7 @@ const state = {
   whipUrl: null,
   wake: null,
   calib: false,
+  topDown: false,
   locked: false,
   busy: false,
   busyText: "",
@@ -871,6 +874,7 @@ const reachOverlay = window.ReachOverlay.create({
   // The Camera chip is the truth for this page: fixed uses the rig, handheld
   // solves the tag. A fitted rig does not force the band into fixed mode.
   mode: () => (window.TapPlanner ? TapPlanner.getMode() : "handheld"),
+  toolAxis: () => (state.topDown ? "x+" : "current"),
   // The frame is what the camera started at; if that is a quarter turn from the
   // calibration, every pixel drawn has to be mapped into it.
   turn: () => cameraTurn(),
@@ -945,7 +949,12 @@ async function startSequence() {
     const response = await api("/sequence", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ targets: markersOverlay.targets }),
+      body: JSON.stringify({
+        targets: markersOverlay.targets,
+        options: state.topDown
+          ? { tool_axis: "x+", entry: "vertical" }
+          : { tool_axis: "current", entry: "front" },
+      }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) {
@@ -1053,6 +1062,19 @@ reachButton.addEventListener("click", () => {
   reachButton.classList.toggle("on", on);
   log(on ? "reach overlay on: the shaded band is where a marker can be planned"
     : "reach overlay off", on ? "good" : "warn");
+});
+gripperModeButton.addEventListener("click", () => {
+  if (state.busy) {
+    log("wait for the sequence to finish", "warn");
+    return;
+  }
+  state.topDown = !state.topDown;
+  gripperModeButton.textContent = "Gripper: " + (state.topDown ? "top-down" : "horizontal");
+  gripperModeButton.classList.toggle("on", state.topDown);
+  reachOverlay.setToolAxis(state.topDown ? "x+" : "current");
+  log(state.topDown
+    ? "gripper: top-down orientation with vertical descend"
+    : "gripper: horizontal orientation with front slide-in", "warn");
 });
 liveButton.addEventListener("click", togglePublish);
 lockButton.addEventListener("click", toggleLock);

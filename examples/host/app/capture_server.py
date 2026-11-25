@@ -586,6 +586,7 @@ async def handle_reach(request: web.Request) -> web.Response:
     return web.json_response({
         "ok": True,
         "mode": effective_mode(app),
+        "tool_axis": app["tool_axis"],
         "plane_z": app["plane_z"],
         "hover_m": app["hover_m"],
         "tip_m": app["tip_m"],

@@ -200,7 +200,10 @@ BEGIN
 
   PERFORM execution_mark_played(p_exec_id, sha);
   UPDATE evidence.execution
-     SET record_deadline = now() + make_interval(secs => tout),
+     SET record_deadline = CASE
+           WHEN COALESCE((p_response->>'no_recording')::boolean, false) THEN now()
+           ELSE now() + make_interval(secs => tout)
+         END,
          error = CASE
            WHEN COALESCE((p_response->>'ok')::boolean, false)
                 AND COALESCE((p_response->>'executed')::boolean, false) THEN NULL
@@ -273,6 +276,14 @@ BEGIN
   -- Aborted plays with telemetry are ready to finalize immediately if no recording arrived
   -- (or if recording already arrived), so the oracle can attribute the execution fault.
   IF ex.error IS NOT NULL AND ex.status = 'played'
+     AND NOT EXISTS (SELECT 1 FROM evidence.media_fragment WHERE episode_id = ex.episode_id) THEN
+    RETURN true;
+  END IF;
+  -- If no recording arrived by record_deadline (e.g. phone Live preview is off and
+  -- /execute reported no_recording=true -> record_deadline=now()), degrade to
+  -- telemetry-only oracle verification instead of falsely failing a completed play.
+  IF ex.status = 'played'
+     AND ex.record_deadline IS NOT NULL AND now() >= ex.record_deadline
      AND NOT EXISTS (SELECT 1 FROM evidence.media_fragment WHERE episode_id = ex.episode_id) THEN
     RETURN true;
   END IF;

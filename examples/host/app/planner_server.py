@@ -98,6 +98,7 @@ class _GatewayOptions:
     hover_m: float = field(default_factory=lambda: sweep.DEFAULT_MIN_Z)
     tip_m: float = 0.0
     tool_axis: str = "current"
+    entry: str = "auto"
     yaw: float = 0.0
     payload: float = 0.0
     min_z: float = field(default_factory=lambda: sweep.DEFAULT_MIN_Z)
@@ -179,7 +180,7 @@ def _options_json(options):
         "unpark_j3": options.unpark_j3, "unpark_s": options.unpark_s,
         "ik_pos_tol": options.ik_pos_tol, "ik_angle_tol": options.ik_angle_tol,
         "min_z": options.min_z, "max_z": options.max_z, "max_reach": options.max_reach,
-        "tool_axis": options.tool_axis, "yaw": options.yaw, "kp_spec": options.kp_spec,
+        "tool_axis": options.tool_axis, "entry": options.entry, "yaw": options.yaw, "kp_spec": options.kp_spec,
         "grasp_q": options.grasp_q, "close_width_mm": options.close_width_mm,
     }
 

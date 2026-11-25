@@ -704,13 +704,41 @@ class Bench:
                                 % payload.get("error", status))
         return payload
 
+    def load_trajectory(self, plan):
+        """Read the planned trajectory JSON from Postgres (PG mode) or disk (file mode)."""
+        path_str = str(plan.get("path") or "")
+        if path_str and not path_str.startswith("pg:") and Path(path_str).is_file():
+            return json.loads(Path(path_str).read_text(encoding="utf-8"))
+        dsn = os.environ.get("REBOT_PG_DSN", "")
+        if dsn:
+            sub = str(HERE.parent / "substrate")
+            if sub not in sys.path:
+                sys.path.insert(0, sub)
+            from store import SubstrateStore
+            store = SubstrateStore(dsn)
+            try:
+                raw = store.read_plan_blob(plan["id"])
+            finally:
+                store.close()
+            if raw is not None:
+                return json.loads(raw)
+        raise IdentifyError("cannot read trajectory for plan %s (%s)" % (plan.get("id"), path_str))
+
     def execute_run(self, plan_id, workdir):
         """Record, log pose, execute, stop. Returns (segments, pose_log_path)."""
         workdir = Path(workdir)
         workdir.mkdir(parents=True, exist_ok=True)
         log_path = workdir / "poses.jsonl"
+        existing = {s.path for s in self.recorder.segments()}
         started = time.time()
         self.recorder.enable()
+        # Wait up to 2.5 s for MediaMTX to lock onto the first H.264 IDR keyframe
+        # and open segment 0 so hold 1 is not clipped.
+        deadline = started + 2.5
+        while time.time() < deadline:
+            if any(s.path not in existing for s in self.recorder.segments(since=started)):
+                break
+            time.sleep(0.1)
         log = sweep_video.PoseLog(self.arm, log_path)
         log.start()
         try:
@@ -919,7 +947,7 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
         print("\n=== round %d/%d ===" % (round_no, rounds))
         plan = bench.plan_run(tips, hold_s=hold_s)
         plan_id = plan["id"]
-        trajectory = json.loads(Path(plan["path"]).read_text(encoding="utf-8"))
+        trajectory = bench.load_trajectory(plan)
         print("plan %s: %d markers, %.1f s" % (plan_id, plan["summary"]["markers"],
                                                plan["summary"]["duration_s"]))
         workdir = session / ("round-%d" % round_no)
@@ -1031,7 +1059,7 @@ def run_session(bench, model, rounds=4, confirm=False, scale=0.5, hold_s=1.5,
     except Exception as exc:  # noqa: BLE001 - mirror never fails the climb
         print("  warning: session PG mirror failed: %s" % exc)
     print("\nsession: %s" % session)
-    print("final: %s" % json.dumps({k: trace["final"][k] for k in
+    print("final: %s" % json.dumps({k: trace["final"].get(k) for k in
                                     ("err_all_px", "tag_rms_px", "verify_ok", "candidate")}))
     return trace
 

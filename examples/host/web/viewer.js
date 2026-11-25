@@ -616,6 +616,10 @@
       // the badge expects the next tap to end there, not at the host's default.
       const hover = heightAt ? Number(heightAt()) : NaN;
       if (Number.isFinite(hover) && hover >= 0) body.hover_m = hover;
+      if (typeof options.planOptions === "function") {
+        const extra = options.planOptions();
+        if (extra && typeof extra === "object") body.options = extra;
+      }
       return body;
     }
 

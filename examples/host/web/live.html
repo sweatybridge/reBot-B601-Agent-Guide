@@ -152,6 +152,7 @@
     <span class="height-badge" id="heightBadge"
           title="Drag up or down in the preview to set the arm height">4 cm</span>
     <button class="chip" id="reach" type="button">Reach: off</button>
+    <button class="chip" id="gripperMode" type="button">Gripper: horizontal</button>
     <button class="chip" id="tapMode" type="button">Tap: plan</button>
     <button class="chip" id="viaMode" type="button" hidden>Via: off</button>
     <button class="chip" id="clear" type="button" disabled>Clear marker</button>
@@ -213,6 +214,7 @@ const connectButton = $("#connect");
 const disconnectButton = $("#disconnect");
 const moveButton = $("#move");
 const reachButton = $("#reach");
+const gripperModeButton = $("#gripperMode");
 const tapModeButton = $("#tapMode");
 const viaModeButton = $("#viaMode");
 const clearButton = $("#clear");
@@ -234,9 +236,18 @@ const state = {
   token: "",
   health: null,
   tapMode: "plan",          // "plan": one tap plans one point; "markers": taps queue up
+  topDown: false,           // false: horizontal + front entry; true: top-down (x+) + vertical descend
   busy: false,
   busyText: "",
 };
+function currentToolAxis() {
+  return state.topDown ? "x+" : "current";
+}
+function gripperPlanOptions() {
+  return state.topDown
+    ? { tool_axis: "x+", entry: "vertical" }
+    : { tool_axis: "current", entry: "front" };
+}
 let pc = null;
 let sessionUrl = null;
 
@@ -346,6 +357,7 @@ const reachOverlay = window.ReachOverlay.create({
   video: video,
   canvas: reachCanvas,
   token: () => state.token,
+  toolAxis: () => currentToolAxis(),
   onStatus: status,
   // Fixed rigs only: the band comes from `T_base_cam` in /reach.json, and there
   // is no detector here to invent a pose when one is missing.
@@ -367,6 +379,7 @@ const planner = TapPlanner.create({
   token: () => state.token,
   source: "live",
   height: () => heightControl.height,
+  planOptions: () => gripperPlanOptions(),
   // The stream's quarter turn, so the captured frame describes itself to the host.
   turn: () => streamTurn(),
   onStatus: status,
@@ -501,7 +514,10 @@ async function runSequence(execute) {
     const response = await api("/sequence", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ targets: markersOverlay.targets }),
+      body: JSON.stringify({
+        targets: markersOverlay.targets,
+        options: gripperPlanOptions(),
+      }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) {
@@ -1212,16 +1228,18 @@ function reachBandFor(config, height) {
   const planeZ = Number(config.plane_z);
   const h = Math.round(Number(height) * 1000) / 1000;
   const tipM = Number(config.tip_m);
-  const key = planeZ.toFixed(4) + "|" + h.toFixed(4) + "|" + tipM.toFixed(4);
+  const axis = currentToolAxis();
+  const key = planeZ.toFixed(4) + "|" + h.toFixed(4) + "|" + tipM.toFixed(4) + "|" + axis;
   if (REACH_BAND_CACHE.has(key)) return REACH_BAND_CACHE.get(key);
   let result = null;
   try {
-    const band = window.ReachArm.computeReachBand(planeZ, h, tipM);
+    const band = window.ReachArm.computeReachBand(planeZ, h, tipM, axis);
     if (band) {
       result = {
         inner_m: round3(band.inner),
         outer_m: round3(band.outer),
         sector_deg: Math.round(band.sector * 180 / Math.PI),
+        tool_axis: band.toolAxis,
       };
     }
   } catch (error) {
@@ -2293,6 +2311,19 @@ reachButton.addEventListener("click", () => {
     ? "reach band on: the shaded ring is where a point can be planned"
     : "reach band needs a fixed rig: press Rig, or run calibrate_extrinsics.py --auto",
     fixed ? "good" : "warn");
+});
+gripperModeButton.addEventListener("click", () => {
+  if (state.busy) {
+    status("wait for the sequence to finish", "warn");
+    return;
+  }
+  state.topDown = !state.topDown;
+  gripperModeButton.textContent = "Gripper: " + (state.topDown ? "top-down" : "horizontal");
+  gripperModeButton.classList.toggle("on", state.topDown);
+  reachOverlay.setToolAxis(currentToolAxis());
+  status(state.topDown
+    ? "gripper: top-down orientation with vertical descend"
+    : "gripper: horizontal orientation with front slide-in", "warn");
 });
 tapModeButton.addEventListener("click", () => {
   if (state.busy) {

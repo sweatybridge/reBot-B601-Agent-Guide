@@ -336,6 +336,31 @@ def run_rpcs_suite(dsn: str) -> list[tuple[str, bool, float, str]]:
                                    {"index": 2, "t_start": 22.0, "t_end": 24.0}])
             assert c.execute("SELECT wait_fragments('neg_off_ep', %s::jsonb, -0.6) AS v", (ws_uncov,)).fetchone()["v"] is False
 
+            # Completed play with no_recording=true (e.g. phone Live preview off) degrades
+            # immediately to telemetry-only oracle verification instead of timing out 60 s -> dead.
+            c.execute("INSERT INTO world.calibration(calib_fingerprint, K, dist, image_size) "
+                      "VALUES ('norec_cal', '[[600,0,320],[0,600,240],[0,0,1]]', '[0,0,0,0,0]', '[640,480]') "
+                      "ON CONFLICT DO NOTHING")
+            c.execute("INSERT INTO world.shared_rig(rig_fingerprint, workspace_id, calib_fingerprint, "
+                      "T_base_cam, image_size, tip_offset, method, provenance, status, rig_doc) "
+                      "VALUES ('norec_rig', 'default', 'norec_cal', "
+                      "'[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]', '[640,480]', '[0,0,-0.035]', "
+                      "'base-marker', '{}', 'active', '{\"fingerprint\":\"norec_rig\"}') "
+                      "ON CONFLICT DO NOTHING")
+            c.execute("SELECT execution_prepare('norec_exec', %s, 'b601', 'norec_ep', 'default', 60)", (pid,))
+            assert c.execute("SELECT execution_claim_play('norec_exec') AS v").fetchone()["v"] is True
+            resp_norec = json.dumps({
+                "ok": True, "claimed": True, "executed": True,
+                "no_recording": True, "telemetry": dry,
+            })
+            c.execute("SELECT execution_after_play('norec_exec', %s::jsonb)", (resp_norec,))
+            assert c.execute("SELECT execution_waiting('norec_exec') AS v").fetchone()["v"] is False
+            assert c.execute("SELECT execution_ready('norec_exec') AS v").fetchone()["v"] is True
+            fin = c.execute("SELECT execution_finalize('norec_exec', '{\"detections\":{}}'::jsonb) AS v").fetchone()["v"]
+            assert fin.get("verdict") is not None
+            rcpt = c.execute("SELECT execution_receipt('norec_exec') AS v").fetchone()["v"]
+            assert rcpt["ok"] is True and rcpt["executed"] is True and rcpt["ledger"]["status"] == "verified"
+
         return [("rpcs/p0_and_items_1_to_6", True, time.monotonic() - t0, "")]
     except Exception as exc:  # noqa: BLE001
         return [("rpcs/p0_and_items_1_to_6", False, time.monotonic() - t0, repr(exc))]
