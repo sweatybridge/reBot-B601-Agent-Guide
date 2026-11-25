@@ -20,6 +20,28 @@
   const MAX_MARKERS = 10;
   const MAX_VIAS = 5;
 
+  function reverseTargets(targets) {
+    if (!Array.isArray(targets) || !targets.length) return [];
+    const n = targets.length;
+    const out = [];
+    for (let i = 0; i < n; i += 1) {
+      const origIdx = n - 1 - i;
+      const src = targets[origIdx];
+      const copy = Object.assign({}, src);
+      delete copy.via;
+      if (i > 0) {
+        // Leg from original marker (origIdx + 1) back to origIdx traverses
+        // (origIdx + 1)'s incoming vias in reverse order.
+        const prevOrig = targets[origIdx + 1];
+        if (prevOrig && Array.isArray(prevOrig.via) && prevOrig.via.length) {
+          copy.via = prevOrig.via.slice().reverse();
+        }
+      }
+      out.push(copy);
+    }
+    return out;
+  }
+
   function create(options) {
     const video = options.video;
     const stage = options.stage;
@@ -278,9 +300,17 @@
       },
       get viaMode() { return viaMode; },
       get targets() { return markers.map((marker) => marker.target); },
+      get reversedTargets() { return reverseTargets(markers.map((marker) => marker.target)); },
       get busy() { return busy; },
     };
   }
 
-  window.MarkerSequence = { create: create, MAX_MARKERS: MAX_MARKERS, MAX_VIAS: MAX_VIAS };
+  const api = {
+    create: create,
+    reverseTargets: reverseTargets,
+    MAX_MARKERS: MAX_MARKERS,
+    MAX_VIAS: MAX_VIAS,
+  };
+  if (typeof window !== "undefined") window.MarkerSequence = api;
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
 })();
