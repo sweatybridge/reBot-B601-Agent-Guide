@@ -50,14 +50,23 @@
     [0, 0, 0, 0, 0, 0],
   ];
 
-  // Top-down orientation (`tool_axis = "x+"`): Ry(+90 deg), mapping gripper +x
-  // straight down to base -z. Matches `work_orientation(I, "x+", 0)`.
-  const TOP_DOWN_ROT = [
-    [0, 0, 1],
-    [0, 1, 0],
-    [-1, 0, 0],
-  ];
-  const TOP_DOWN_SEEDS = [
+  // Top-down / pitched orientations: Ry(pitchDeg), where 0 deg is flat horizontal
+  // (`tool_axis = "current"`) and 90 deg is straight down (`tool_axis = "x+"`).
+  function rotY(deg) {
+    const rad = deg * Math.PI / 180;
+    const c = Math.cos(rad);
+    const s = Math.sin(rad);
+    return [
+      [c, 0, s],
+      [0, 1, 0],
+      [-s, 0, c],
+    ];
+  }
+  const PITCHED_SEEDS = [
+    [0, 2.02, 0.52, 1.5, 0, 0],
+    [0, 2.457, 1.246, 1.315, -0.376, 0.034],
+    [0, 1.6, 0.6, 0.8, 0, 0],
+    [0, 1.8, 1.4, -0.4, 0, 0],
     [0, 1.5, 1.5, -1.5, 0, 0],
     [0, 1.1, 1.1, -1.5, 0, 0],
     [0, 2.0, 2.0, -1.5, 0, 0],
@@ -65,6 +74,8 @@
     [0, 0, 0.14, 0, 0, 0],
   ];
   const VERTICAL_APPROACH = 0.06;
+  const HORIZONTAL_EXT_PITCH_DEG = 30;
+  const TOP_DOWN_EXT_PITCH_DEG = 60;
 
   function forward(q, withFrames) {
     let rotation = identity();
@@ -241,12 +252,10 @@
    * tap, so a table point (x, y, plane_z) becomes a flange at
    * plane_z + hover_m + tip_m.
    */
-  function computeReachBand(planeZ, hoverM, tipM, toolAxis) {
-    const flangeZ = planeZ + hoverM + tipM;
+  function scanPitchBand(flangeZ, pitchDeg, requireVerticalStage) {
     const step = 0.01;
-    const topDown = toolAxis === "x+" || toolAxis === "top-down";
-    const targetRot = topDown ? TOP_DOWN_ROT : identity();
-    const seeds = topDown ? TOP_DOWN_SEEDS : SEEDS;
+    const targetRot = Math.abs(pitchDeg) < 1e-9 ? identity() : rotY(pitchDeg);
+    const seeds = Math.abs(pitchDeg) < 1e-9 ? SEEDS : PITCHED_SEEDS;
 
     function solveOne(radius, z, seed) {
       let q = solveAt(radius, z, seed, targetRot);
@@ -261,20 +270,17 @@
     function reachable(radius, seed) {
       const q = solveOne(radius, flangeZ, seed);
       if (!q) return null;
-      if (topDown) {
-        // Top-down uses vertical descend from `VERTICAL_APPROACH` above the target;
-        // only promise radii where both the target and its vertical stage solve.
+      if (requireVerticalStage) {
         if (!solveOne(radius, flangeZ + VERTICAL_APPROACH, q)) return null;
       }
       return q;
     }
 
-    // Find one point inside the band first, then walk outwards and inwards.
     let anchor = null;
     let seed = seeds[0];
-    const anchors = topDown
-      ? [0.25, 0.20, 0.30, 0.15, 0.35, 0.12, 0.38]
-      : [0.60, 0.50, 0.65, 0.45, 0.70, 0.40, 0.30, 0.20];
+    const anchors = pitchDeg >= 45
+      ? [0.25, 0.30, 0.20, 0.35, 0.40, 0.15, 0.45, 0.12, 0.50]
+      : [0.60, 0.50, 0.40, 0.65, 0.30, 0.70, 0.45, 0.20];
     for (let index = 0; index < anchors.length && !anchor; index += 1) {
       const q = reachable(anchors[index], seed);
       if (q) {
@@ -301,10 +307,44 @@
       inner = radius;
       innerSeed = q;
     }
+    return { inner: Math.max(0, inner), outer: Math.min(outer, MAX_REACH) };
+  }
+
+  function computeReachBand(planeZ, hoverM, tipM, toolAxis) {
+    const flangeZ = planeZ + hoverM + tipM;
+    const topDown = toolAxis === "x+" || toolAxis === "top-down";
+    const nominalPitch = topDown ? 90 : 0;
+    const extPitch = topDown ? TOP_DOWN_EXT_PITCH_DEG : HORIZONTAL_EXT_PITCH_DEG;
+    const nominal = scanPitchBand(flangeZ, nominalPitch, topDown);
+    const extended = scanPitchBand(flangeZ, extPitch, topDown);
+    if (!nominal && !extended) return null;
+
+    let inner = Infinity;
+    let outer = -Infinity;
+    if (nominal) {
+      inner = Math.min(inner, nominal.inner);
+      outer = Math.max(outer, nominal.outer);
+    }
+    if (extended) {
+      inner = Math.min(inner, extended.inner);
+      outer = Math.max(outer, extended.outer);
+    }
+    // Check an intermediate pitch when nominal & extended don't touch, just in case.
+    if (nominal && extended && (extended.outer < nominal.inner - 0.01 || nominal.outer < extended.inner - 0.01)) {
+      const mid = scanPitchBand(flangeZ, (nominalPitch + extPitch) / 2, topDown);
+      if (mid) {
+        inner = Math.min(inner, mid.inner);
+        outer = Math.max(outer, mid.outer);
+      }
+    }
 
     return {
       inner: Math.max(0, inner),
       outer: Math.min(outer, MAX_REACH),
+      nominal: nominal,
+      extended: { inner: Math.max(0, inner), outer: Math.min(outer, MAX_REACH), pitchDeg: extPitch },
+      nominalPitchDeg: nominalPitch,
+      extendedPitchDeg: extPitch,
       // The reachable azimuths are joint 1's range; the gap behind the base is
       // the part of the circle it cannot turn into.
       sector: Math.min(Math.abs(LIMITS[0][0]), Math.abs(LIMITS[0][1])),

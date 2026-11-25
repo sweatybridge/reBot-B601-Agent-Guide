@@ -237,6 +237,7 @@ const state = {
   health: null,
   tapMode: "plan",          // "plan": one tap plans one point; "markers": taps queue up
   topDown: false,           // false: horizontal + front entry; true: top-down (x+) + vertical descend
+  savedHeight: { horizontal: null, vertical: null },
   busy: false,
   busyText: "",
 };
@@ -304,12 +305,17 @@ async function healthLoop() {
     const agent = data.agent || {};
     CHAT.contextTokens = Number(agent.context_tokens) || 0;
     CHAT.maxTokens = Number(agent.max_tokens) || 0;
-    // point.z is the tip. The lowest accepted tip is min_z, so the lowest tap
-    // height is that minus the worktop only; the flange offset does not enter.
-    const minZ = Number(data.min_z ?? data.hover_m ?? 0.04);
+    // point.z is the tip. The lowest accepted tip is min_z (or vertical_min_z
+    // in top-down mode), so the lowest tap height is that minus the worktop.
     const planeZ = Number(data.plane_z ?? 0);
+    const minZ = state.topDown
+      ? Number(data.vertical_min_z ?? (planeZ + Number(data.vertical_hover_m ?? 0.0)))
+      : Number(data.min_z ?? data.hover_m ?? 0.04);
+    const defaultH = state.topDown
+      ? Number(data.vertical_hover_m ?? 0.0)
+      : Number(data.hover_m ?? 0.04);
     heightControl.setRange(Math.max(0, minZ - planeZ), window.HeightControl.MAX);
-    heightControl.adoptHeight(data.hover_m);
+    heightControl.adoptHeight(defaultH);
   } catch (error) {
     state.health = null;
   }
@@ -1253,7 +1259,9 @@ function reachBandFor(config, height) {
 function heightFloor(config) {
   const planeZ = Number(config.plane_z) || 0;
   const health = state.health || {};
-  const minZ = Number(health.min_z ?? (planeZ + Number(config.hover_m)));
+  const minZ = state.topDown
+    ? Number(health.vertical_min_z ?? config.vertical_min_z ?? (planeZ + Number(config.vertical_hover_m ?? 0.0)))
+    : Number(health.min_z ?? (planeZ + Number(config.hover_m)));
   return Math.max(0, minZ - planeZ);
 }
 
@@ -1438,7 +1446,9 @@ async function toolRig() {
     dist: config.calibration.dist,
     plane_z: round3(config.plane_z),
     tip_offset_m: round3(config.tip_m),
-    default_height_m: round3(config.hover_m),
+    default_height_m: round3(state.topDown
+      ? Number(config.vertical_hover_m ?? 0.0)
+      : Number(config.hover_m)),
     height_floor_m: round3(heightFloor(config)),
     badge_height_m: round3(height),
     reach_band_m: reachBandFor(config, height),
@@ -2317,13 +2327,27 @@ gripperModeButton.addEventListener("click", () => {
     status("wait for the sequence to finish", "warn");
     return;
   }
+  const prevKey = state.topDown ? "vertical" : "horizontal";
+  state.savedHeight[prevKey] = heightControl.height;
   state.topDown = !state.topDown;
+  const nextKey = state.topDown ? "vertical" : "horizontal";
+  const h = state.health || {};
+  const planeZ = Number(h.plane_z ?? 0);
+  const modeDefault = state.topDown
+    ? Number(h.vertical_hover_m ?? 0.0)
+    : Number(h.hover_m ?? 0.04);
+  const modeMinZ = state.topDown
+    ? Number(h.vertical_min_z ?? (planeZ + modeDefault))
+    : Number(h.min_z ?? (planeZ + modeDefault));
+  heightControl.setRange(Math.max(0, modeMinZ - planeZ), window.HeightControl.MAX);
+  heightControl.setHeight(state.savedHeight[nextKey] != null ? state.savedHeight[nextKey] : modeDefault);
   gripperModeButton.textContent = "Gripper: " + (state.topDown ? "top-down" : "horizontal");
   gripperModeButton.classList.toggle("on", state.topDown);
+  reachOverlay.setHeight(heightControl.height);
   reachOverlay.setToolAxis(currentToolAxis());
   status(state.topDown
-    ? "gripper: top-down orientation with vertical descend"
-    : "gripper: horizontal orientation with front slide-in", "warn");
+    ? "gripper: top-down orientation with vertical descend (height " + window.HeightControl.format(heightControl.height) + ")"
+    : "gripper: horizontal orientation with front slide-in (height " + window.HeightControl.format(heightControl.height) + ")", "warn");
 });
 tapModeButton.addEventListener("click", () => {
   if (state.busy) {

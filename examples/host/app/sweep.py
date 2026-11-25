@@ -381,12 +381,16 @@ def load_sag_map(calib_dir, rig_fingerprint, kp_key, zeros_key="none"):
     return map_doc
 
 
+SAG_ENVELOPE_TAPER_RAD = 0.25
+
+
 def sag_correction(q, sag_map, kp_key=None, rig_fingerprint=None, zeros_key="none"):
     """The additive term for aim(), or zeros when the map cannot be trusted.
 
-    Any key change (rig fingerprint, kp, zeros) or a pose outside the explored
-    envelope invalidates the map: it interpolates what was measured, and says
-    nothing about the rest of the workspace.
+    Any key change (rig fingerprint, kp, zeros) or a pose well outside the
+    explored envelope invalidates the map; crossing the envelope boundary tapers
+    smoothly (C1 cubic smoothstep over SAG_ENVELOPE_TAPER_RAD) so trajectories
+    entering/leaving the explored box never suffer a single-tick step shock.
     """
     zeros = np.zeros(6)
     if not sag_map:
@@ -401,11 +405,21 @@ def sag_correction(q, sag_map, kp_key=None, rig_fingerprint=None, zeros_key="non
     envelope = sag_map.get("envelope") or {}
     q_min = np.asarray(envelope.get("q_min", [-math.inf] * 6), dtype=float)
     q_max = np.asarray(envelope.get("q_max", [math.inf] * 6), dtype=float)
-    if np.any(q < q_min - 1e-9) or np.any(q > q_max + 1e-9):
-        return zeros
+    weight = 1.0
+    for j in range(6):
+        dist = 0.0
+        if q[j] < q_min[j]:
+            dist = max(dist, float(q_min[j] - q[j]))
+        if q[j] > q_max[j]:
+            dist = max(dist, float(q[j] - q_max[j]))
+        if dist >= SAG_ENVELOPE_TAPER_RAD:
+            return zeros
+        if dist > 0.0:
+            u = dist / SAG_ENVELOPE_TAPER_RAD
+            weight *= 1.0 - (3.0 * u * u - 2.0 * u * u * u)
     tau = rebot_ik.gravity_torques(q)
-    extra = np.asarray([sag_map["per_motor"][str(j + 1)]["a"] * tau[j]
-                        + sag_map["per_motor"][str(j + 1)]["b"] for j in range(6)])
+    extra = np.asarray([(sag_map["per_motor"][str(j + 1)]["a"] * tau[j]
+                         + sag_map["per_motor"][str(j + 1)]["b"]) * weight for j in range(6)])
     return np.clip(extra, -SAG_LIMIT_RAD, SAG_LIMIT_RAD)
 
 

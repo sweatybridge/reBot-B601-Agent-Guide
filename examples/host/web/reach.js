@@ -51,7 +51,8 @@
   const configStore = (typeof window !== "undefined" && window.RebotConfig) || null;
 
   /* ---------------------------------------------------------------- drawing */
-  const COLOR = "69, 201, 138";           // the page's --good, as rgba components
+  const COLOR = "69, 201, 138";           // the page's --good (nominal pitch)
+  const COLOR_EXT = "240, 180, 41";       // the page's --warn (wider pitch fallback)
 
   function create(options) {
     const video = options.video;
@@ -306,6 +307,45 @@
         [radius * Math.cos(angle), radius * Math.sin(angle), band.tipHeight]), box);
     }
 
+    function sampleRing(camera, pose, radius, sector, samples, box) {
+      const pts = [];
+      for (let index = 0; index <= samples; index += 1) {
+        const angle = -sector + (2 * sector * index) / samples;
+        const p = ringPoint(camera, pose, radius, angle, box);
+        if (p) pts.push(p);
+      }
+      return pts;
+    }
+
+    function fillAnnulus(outer, inner, colorRgb, alpha) {
+      if (outer.length <= 1 || inner.length <= 1) return;
+      context.beginPath();
+      context.moveTo(outer[0].u, outer[0].v);
+      for (let index = 1; index < outer.length; index += 1) {
+        context.lineTo(outer[index].u, outer[index].v);
+      }
+      for (let index = inner.length - 1; index >= 0; index -= 1) {
+        context.lineTo(inner[index].u, inner[index].v);
+      }
+      context.closePath();
+      context.fillStyle = "rgba(" + colorRgb + ", " + alpha + ")";
+      context.fill();
+    }
+
+    function strokeRing(ring, colorRgb) {
+      if (ring.length < 2) return;
+      context.setLineDash([7, 5]);
+      context.lineWidth = 2;
+      context.strokeStyle = "rgba(" + colorRgb + ", 0.95)";
+      context.beginPath();
+      context.moveTo(ring[0].u, ring[0].v);
+      for (let index = 1; index < ring.length; index += 1) {
+        context.lineTo(ring[index].u, ring[index].v);
+      }
+      context.stroke();
+      context.setLineDash([]);
+    }
+
     function drawBand(camera, pose, label) {
       const size = sizeCanvas();
       context.clearRect(0, 0, size.width, size.height);
@@ -318,68 +358,64 @@
 
       const samples = 128;
       const sector = band.sector;
-      const outer = [];
-      const inner = [];
-      for (let index = 0; index <= samples; index += 1) {
-        const angle = -sector + (2 * sector * index) / samples;
-        const far = ringPoint(camera, pose, band.outer, angle, box);
-        const near = ringPoint(camera, pose, band.inner, angle, box);
-        if (far) outer.push(far);
-        if (near) inner.push(near);
-      }
+      const nom = band.nominal;
+      const hasYellowInner = Boolean(nom && band.inner < nom.inner - 0.005);
+      const hasYellowOuter = Boolean(nom && band.outer > nom.outer + 0.005);
 
-      // The band itself: outer arc forwards, inner arc backwards, filled once.
-      if (outer.length > 1 && inner.length > 1) {
-        context.beginPath();
-        context.moveTo(outer[0].u, outer[0].v);
-        for (let index = 1; index < outer.length; index += 1) {
-          context.lineTo(outer[index].u, outer[index].v);
+      if (nom) {
+        const nomOuter = sampleRing(camera, pose, nom.outer, sector, samples, box);
+        const nomInner = sampleRing(camera, pose, nom.inner, sector, samples, box);
+        if (hasYellowInner) {
+          const extInner = sampleRing(camera, pose, band.inner, sector, samples, box);
+          fillAnnulus(nomInner, extInner, COLOR_EXT, 0.14);
+          strokeRing(extInner, COLOR_EXT);
         }
-        for (let index = inner.length - 1; index >= 0; index -= 1) {
-          context.lineTo(inner[index].u, inner[index].v);
+        if (hasYellowOuter) {
+          const extOuter = sampleRing(camera, pose, band.outer, sector, samples, box);
+          fillAnnulus(extOuter, nomOuter, COLOR_EXT, 0.14);
+          strokeRing(extOuter, COLOR_EXT);
         }
-        context.closePath();
-        context.fillStyle = "rgba(" + COLOR + ", 0.14)";
-        context.fill();
+        fillAnnulus(nomOuter, nomInner, COLOR, 0.15);
+        strokeRing(nomOuter, COLOR);
+        strokeRing(nomInner, COLOR);
+      } else {
+        // Only the pitched (yellow) band is reachable at this height.
+        const extOuter = sampleRing(camera, pose, band.outer, sector, samples, box);
+        const extInner = sampleRing(camera, pose, band.inner, sector, samples, box);
+        fillAnnulus(extOuter, extInner, COLOR_EXT, 0.15);
+        strokeRing(extOuter, COLOR_EXT);
+        strokeRing(extInner, COLOR_EXT);
       }
-
-      context.setLineDash([7, 5]);
-      context.lineWidth = 2;
-      context.strokeStyle = "rgba(" + COLOR + ", 0.95)";
-      for (const ring of [outer, inner]) {
-        if (ring.length < 2) continue;
-        context.beginPath();
-        context.moveTo(ring[0].u, ring[0].v);
-        for (let index = 1; index < ring.length; index += 1) {
-          context.lineTo(ring[index].u, ring[index].v);
-        }
-        context.stroke();
-      }
-      context.setLineDash([]);
 
       // The base, so the band has an obvious centre even when it is off-screen.
       const base = toCanvas(projectToFrame(camera, pose, [0, 0, band.tipHeight]), box);
       if (base) {
         context.beginPath();
         context.arc(base.u, base.v, 4, 0, Math.PI * 2);
-        context.fillStyle = "rgba(" + COLOR + ", 0.95)";
+        context.fillStyle = "rgba(" + (nom ? COLOR : COLOR_EXT) + ", 0.95)";
         context.fill();
       }
 
       // A two-line legend in the top-left of the *video*, not of the letterbox.
       // Two lines because a phone held in landscape letterboxes the preview to
       // a narrow strip, and one long line would be cut off by the clip.
+      const isTopDown = band.toolAxis === "x+";
+      const pitchHint = !nom
+        ? "pitched " + (band.extendedPitchDeg || (isTopDown ? 60 : 30)) + "°"
+        : ((hasYellowInner || hasYellowOuter)
+          ? (isTopDown ? "90° / yellow 60°" : "0° / yellow ≤30°")
+          : "");
       const first = "arm reach · " + band.inner.toFixed(2) + "–" + band.outer.toFixed(2) + " m"
-        + (band.toolAxis === "x+" ? " · top-down" : "");
+        + (isTopDown ? " · top-down" : "");
       const second = "tip " + Math.round((band.tipHeight - Number(config.plane_z)) * 1000)
-        + " mm up" + (label ? " · " + label : "");
+        + " mm up" + (pitchHint ? " · " + pitchHint : "") + (label ? " · " + label : "");
       context.font = "500 12.5px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
       const textWidth = Math.max(context.measureText(first).width,
         context.measureText(second).width);
       const x = box.left + 12;
       const y = box.top + 12;
       context.fillStyle = "rgba(16, 20, 26, 0.86)";
-      context.strokeStyle = "rgba(" + COLOR + ", 0.5)";
+      context.strokeStyle = "rgba(" + (nom ? COLOR : COLOR_EXT) + ", 0.5)";
       context.lineWidth = 1;
       if (context.roundRect) {
         context.beginPath();
@@ -389,9 +425,9 @@
       } else {
         context.fillRect(x, y, textWidth + 22, 46);
       }
-      context.fillStyle = "#cfe9dd";
+      context.fillStyle = nom ? "#cfe9dd" : "#f7dc9c";
       context.fillText(first, x + 11, y + 18);
-      context.fillStyle = "#95c9b0";
+      context.fillStyle = nom ? "#95c9b0" : "#e3be68";
       context.fillText(second, x + 11, y + 36);
       context.restore();
     }

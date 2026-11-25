@@ -169,6 +169,26 @@ def rotz(deg):
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
+def roty(deg):
+    c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
+def pitch_deltas(axis):
+    """Automatic pitch-delta candidates (degrees around tool +y) tried in order:
+    nominal first (0 deg), then progressively wider pitch up to 30 deg downward
+    for horizontal ('z-') or down to 60 deg for top-down ('x+')."""
+    if axis == "z-":
+        return (0.0, 10.0, 20.0, 30.0)
+    if axis == "x+":
+        return (0.0, -10.0, -20.0, -30.0)
+    return (0.0,)
+
+
+def nominal_pitch_deg(axis):
+    return 90.0 if axis == "x+" else 0.0
+
+
 def rotation_between(a, b):
     """Smallest rotation taking unit vector `a` onto unit vector `b`."""
     a = np.asarray(a, dtype=float)
@@ -512,22 +532,43 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
                          or (hover_axis == "x+" and abs(float(options.yaw)) < 1e-9))
                      else options.yaw)
         effective_entry = resolve_entry(options.entry, hover_axis)
-        R_hover = work_orientation(R0, hover_axis, hover_yaw)
-        report_axis, report_yaw, report_entry = hover_axis, hover_yaw, effective_entry
+        R_hover_nom = work_orientation(R0, hover_axis, hover_yaw)
         start_seed = seed.copy()
-        try:
-            target_q = ik_to(hover_point, R_hover, seed, "hover")
-        except PlanError:
-            target_q = ik_to(hover_point, R_hover, start_seed, "hover")
-        current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
-        stage_q = None
+        stage_place_opt = None
         if effective_entry == "vertical" and float(options.approach) > 1e-6:
             stage_point = stage_above(tip_point, options.approach, options.max_z)
-            stage_place = stage_point + np.array([0.0, 0.0, tip_offset_m])
+            stage_place_opt = stage_point + np.array([0.0, 0.0, tip_offset_m])
+
+        def _try_ik_pair(place, rot, primary_seed, fallback_seed, label):
             try:
-                stage_q = ik_to(stage_place, R_hover, target_q, "above")
+                return ik_to(place, rot, primary_seed, label)
             except PlanError:
-                stage_q = ik_to(stage_place, R_hover, start_seed, "above")
+                return ik_to(place, rot, fallback_seed, label)
+
+        target_q = stage_q = None
+        chosen_pitch = nominal_pitch_deg(hover_axis)
+        first_err = None
+        for delta in pitch_deltas(hover_axis):
+            R_try = R_hover_nom if abs(delta) < 1e-9 else (R_hover_nom @ roty(delta))
+            prev_worst = dict(worst)
+            try:
+                tq = _try_ik_pair(hover_point, R_try, seed, start_seed, "hover")
+                sq = (_try_ik_pair(stage_place_opt, R_try, tq, start_seed, "above")
+                      if stage_place_opt is not None else None)
+                target_q, stage_q = tq, sq
+                chosen_pitch = nominal_pitch_deg(hover_axis) + delta
+                break
+            except PlanError as error:
+                worst.clear()
+                worst.update(prev_worst)
+                if first_err is None:
+                    first_err = error
+        if target_q is None:
+            raise first_err
+        report_axis, report_yaw, report_entry, report_pitch = (
+            hover_axis, hover_yaw, effective_entry, chosen_pitch)
+        current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+        if stage_q is not None:
             if not sweep.path_safe(current_q, stage_q[:n_arm]):
                 raise PlanError("the leg above the tap dips within a link radius of the "
                                 "worktop; tap a point further out or move the arm clear")
@@ -568,7 +609,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
                       {j: start_seed[j] - q_last[j] for j in range(n_arm)},
                       sweep.seconds_for(q_last, start_seed[:n_arm]), "return")
     else:
-        report_axis, report_yaw, report_entry = options.tool_axis, options.yaw, "front"
+        report_axis, report_yaw, report_entry, report_pitch = options.tool_axis, options.yaw, "front", 0.0
         # Both legs now run at the target's height, so both get the same
         # worktop capsule gate the hover branch uses -- a low horizontal slide
         # is a new way to dip a link into the table.
@@ -647,6 +688,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
             "capture": provenance,
             "tool_axis": report_axis,
             "entry": report_entry,
+            "pitch_deg": report_pitch,
             "yaw_deg": report_yaw,
             "dynamics": {
                 "source": "reBotArm_control_py.compute_generalized_gravity (Pinocchio RNEA)",
@@ -670,6 +712,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         "point_frame": target.get("point_frame"),
         "tool_axis": report_axis,
         "entry": report_entry,
+        "pitch_deg": report_pitch,
         "yaw_deg": report_yaw,
         "waypoints": stats["waypoints"],
         "duration_s": stats["duration_s"],
@@ -937,6 +980,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     start_seed = seed.copy()
 
     yaw_degrees = []
+    pitch_degrees = []
     # Each marker's RAW IK solution, before the emission pass compensates sag.
     # The oracle compares FK(q_ik) against the requested flange point to measure
     # the solver's own residual, separately from the arm's hold error (§7.4).
@@ -948,64 +992,71 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     # confuse a marker near the park pose with the start hold.
     marker_holds = []
     odd_close = close_angle(options, options.grasp_q)
+
+    def _try_ik_pair(place_p, rot_m, primary_s, fallback_s, lbl):
+        try:
+            return ik_to(place_p, rot_m, primary_s, lbl)
+        except PlanError:
+            return ik_to(place_p, rot_m, fallback_s, lbl)
+
     for index, point in enumerate(points, start=1):
         place = flange_points[index - 1]
         yaw_deg = math.degrees(math.atan2(float(point[1]), float(point[0])))
         yaw_degrees.append(round(yaw_deg, 3))
-        R_marker = work_orientation(R0, sequence_axis, yaw_deg)
-        # Every marker, the first included, is approached endpoint-first: solve
-        # the marker pose, then interpolate joint space. The incremental
-        # Cartesian IK the first approach used bulged j1 forward-then-back and
-        # slipped IK branches near the orientation blend's end -- the jolt after
-        # the peel. A straight Cartesian line can also leave the annulus the arm
-        # can reach with the tool down; the capsule check still guards the table.
-        try:
-            target = ik_to(place, R_marker, seed, "marker %d" % index)
-        except PlanError:
-            target = ik_to(place, R_marker, start_seed, "marker %d" % index)
-        marker_q_ik.append([float(v) for v in target[:n_arm]])
-        current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+        R_marker_nom = work_orientation(R0, sequence_axis, yaw_deg)
         needs_stage = vertical_entry or (index % 2 == 1)
+        stage_place_opt = None
+        stage_label = ""
         if vertical_entry:
             try:
                 stage_point = stage_above(point, options.approach, options.max_z)
             except PlanError as error:
                 raise PlanError("marker %d: %s" % (index, error)) from error
-            stage_place = stage_point + np.array([0.0, 0.0, tip_offsets[index - 1]])
-            try:
-                stage_q = ik_to(stage_place, R_marker, target, "above %d" % index)
-            except PlanError:
-                stage_q = ik_to(stage_place, R_marker, start_seed, "above %d" % index)
-            arrival_q = stage_q
+            stage_place_opt = stage_point + np.array([0.0, 0.0, tip_offsets[index - 1]])
+            stage_label = "above %d" % index
         elif index % 2 == 1:
-            # Odd markers are grasped: stage `approach` m in front and slide
-            # forward into the marker, the same geometry as the single-tap
-            # pick. A via chain delivers the arm to the staging point; the
-            # slide-in itself is unchanged.
             try:
                 stage_point = stage_in_front(point, options.approach)
             except PlanError as error:
                 raise PlanError("marker %d: %s" % (index, error)) from error
-            stage_place = stage_point + np.array([0.0, 0.0, tip_offsets[index - 1]])
-            try:
-                stage_q = ik_to(stage_place, R_marker, seed, "stage %d" % index)
-            except PlanError:
-                stage_q = ik_to(stage_place, R_marker, start_seed, "stage %d" % index)
-            arrival_q = stage_q
-        else:
-            arrival_q = target
-        # This marker's vias: the approach to it, solved endpoint-first like
-        # every pose, in its own work orientation. A failure here aborts the
-        # whole plan before any motion, exactly like a marker IK failure.
+            stage_place_opt = stage_point + np.array([0.0, 0.0, tip_offsets[index - 1]])
+            stage_label = "stage %d" % index
+
+        target = stage_q = arrival_q = None
         via_qs = []
-        for via_index, via_place in enumerate(via_flange_points[index - 1], start=1):
-            label = "via %d.%d" % (index, via_index)
+        chosen_pitch = nominal_pitch_deg(sequence_axis)
+        first_err = None
+        for delta in pitch_deltas(sequence_axis):
+            R_try = R_marker_nom if abs(delta) < 1e-9 else (R_marker_nom @ roty(delta))
+            prev_worst = dict(worst)
             try:
-                via_q = ik_to(via_place, R_marker, seed, label)
-            except PlanError:
-                via_q = ik_to(via_place, R_marker, start_seed, label)
-            via_qs.append(np.array(via_q[:n_arm], dtype=float))
-            via_q_ik[index - 1].append([float(v) for v in via_q[:n_arm]])
+                tq = _try_ik_pair(place, R_try, seed, start_seed, "marker %d" % index)
+                if stage_place_opt is not None:
+                    sseed = tq if vertical_entry else seed
+                    sq = _try_ik_pair(stage_place_opt, R_try, sseed, start_seed, stage_label)
+                    aq = sq
+                else:
+                    sq = None
+                    aq = tq
+                vqs = []
+                for via_index, via_place in enumerate(via_flange_points[index - 1], start=1):
+                    vlabel = "via %d.%d" % (index, via_index)
+                    vq = _try_ik_pair(via_place, R_try, seed, start_seed, vlabel)
+                    vqs.append(np.array(vq[:n_arm], dtype=float))
+                target, stage_q, arrival_q, via_qs = tq, sq, aq, vqs
+                chosen_pitch = nominal_pitch_deg(sequence_axis) + delta
+                break
+            except PlanError as error:
+                worst.clear()
+                worst.update(prev_worst)
+                if first_err is None:
+                    first_err = error
+        if target is None:
+            raise first_err
+        pitch_degrees.append(chosen_pitch)
+        marker_q_ik.append([float(v) for v in target[:n_arm]])
+        via_q_ik[index - 1] = [[float(v) for v in vq] for vq in via_qs]
+        current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
         # The leg in, policy-paced exactly as on /move: the speed policy (peak
         # cap plus a cruise floor above stiction breakaway) sets the leg time.
         # approach_s belongs to the single-tap Cartesian approach; as a floor
@@ -1130,6 +1181,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         "entry": effective_entry,
         "yaw_deg": options.yaw,
         "marker_yaw_deg": yaw_degrees,
+        "marker_pitch_deg": pitch_degrees,
         "gripper": {"open": MOTOR7_OPEN, "half": MOTOR7_HALF,
                     "closed": MOTOR7_CLOSED, "odd_close": odd_close},
     }
@@ -1146,6 +1198,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             "entry": effective_entry,
             "yaw_deg": options.yaw,
             "marker_yaw_deg": yaw_degrees,
+            "marker_pitch_deg": pitch_degrees,
             "dynamics": {
                 "source": "reBotArm_control_py.compute_generalized_gravity (Pinocchio RNEA)",
                 "tau": "gravity torque of the planned pose, per waypoint",

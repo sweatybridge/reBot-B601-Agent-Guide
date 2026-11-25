@@ -503,8 +503,10 @@ async def handle_health(request: web.Request) -> web.Response:
                  "yaw_deg": math.degrees(app["marker"]["yaw"])}),
         "plane_z": app["plane_z"],
         "hover_m": app["hover_m"],
+        "vertical_hover_m": app["vertical_hover_m"],
         "tip_m": app["tip_m"],
         "min_z": app["min_z"],
+        "vertical_min_z": app["vertical_min_z"],
         "stream_orientation": app["stream_orientation"],
         "stream_turn": ({"turns": int(app["measured_turn"]["turns"]),
                          "source": "measured", "error_px":
@@ -589,6 +591,9 @@ async def handle_reach(request: web.Request) -> web.Response:
         "tool_axis": app["tool_axis"],
         "plane_z": app["plane_z"],
         "hover_m": app["hover_m"],
+        "vertical_hover_m": app["vertical_hover_m"],
+        "min_z": app["min_z"],
+        "vertical_min_z": app["vertical_min_z"],
         "tip_m": app["tip_m"],
         # The browser locates the tag itself; it needs the tag's size, its
         # placement in the base frame, and its heading. Dictionary 4x4_50/id 0
@@ -1087,6 +1092,14 @@ async def planner_call(app, path, body, timeout=120, method="POST", sid=None):
     return status, payload
 
 
+def _is_vertical_request(app, body) -> bool:
+    opts = body.get("options") if isinstance(body, dict) else None
+    opts = opts if isinstance(opts, dict) else {}
+    axis = str(opts.get("tool_axis") or app["tool_axis"])
+    entry = str(opts.get("entry") or ("vertical" if axis == "x+" else "front"))
+    return axis == "x+" or entry == "vertical"
+
+
 async def handle_sequence(request: web.Request) -> web.Response:
     """Plan one pass through the compact tip targets the phone collected.
 
@@ -1108,14 +1121,15 @@ async def handle_sequence(request: web.Request) -> web.Response:
     if body.get("hover_m") is not None:
         raise web.HTTPBadRequest(text="hover_m is deprecated; send tip points")
 
+    min_z = app["vertical_min_z"] if _is_vertical_request(app, body) else app["min_z"]
     tips = [target_tip(target, index) for index, target in enumerate(targets, start=1)]
     tap_heights = [tip[2] - float(app["plane_z"]) for tip in tips]
     for index, tip in enumerate(tips, start=1):
-        if tip[2] < app["min_z"] - 1e-9:
+        if tip[2] < min_z - 1e-9:
             return web.json_response({
                 "ok": False, "stage": "target",
                 "error": "marker %d: tip z %.3f m is below the minimum %.3f m"
-                         % (index, tip[2], app["min_z"]),
+                         % (index, tip[2], min_z),
             }, status=422)
     # Via points: the same tip-space contract and the same height floor as the
     # markers they belong to. The planner re-checks reach and IK before motion.
@@ -1140,20 +1154,20 @@ async def handle_sequence(request: web.Request) -> web.Response:
             if not all(math.isfinite(value) for value in point):
                 raise web.HTTPBadRequest(
                     text="marker %d via %d has a non-finite tip" % (index, via_index))
-            if point[2] < app["min_z"] - 1e-9:
+            if point[2] < min_z - 1e-9:
                 return web.json_response({
                     "ok": False, "stage": "target",
                     "error": "marker %d via %d: tip z %.3f m is below the minimum %.3f m"
-                             % (index, via_index, point[2], app["min_z"]),
+                             % (index, via_index, point[2], min_z),
                 }, status=422)
 
     plan_options = {
         "tool_axis": app["tool_axis"],
         "yaw": float(body.get("yaw", app["yaw"])),
-        "min_z": app["min_z"],
+        "min_z": min_z,
     }
     plan_options.update(body.get("options") or {})
-    plan_options["min_z"] = app["min_z"]
+    plan_options["min_z"] = min_z
     planner_targets = [compact_target(tip, target)
                        for tip, target in zip(tips, targets)]
 
@@ -1259,7 +1273,10 @@ async def handle_plan(request: web.Request) -> web.Response:
     calibration = calib_mod.load(calibration_path,
                                  image_size=tuple(target.get("image_size") or (0, 0)))
 
-    tap_height = float(body.get("hover_m", app["hover_m"]))
+    is_vertical = _is_vertical_request(app, body)
+    default_hover = app["vertical_hover_m"] if is_vertical else app["hover_m"]
+    min_z = app["vertical_min_z"] if is_vertical else app["min_z"]
+    tap_height = float(body.get("hover_m", default_hover))
     if tap_height < 0:
         raise web.HTTPBadRequest(text="hover_m must be >= 0")
     tap = target.get("tap") or {}
@@ -1274,21 +1291,21 @@ async def handle_plan(request: web.Request) -> web.Response:
             "target": target,
         }, status=422)
     tip = [float(value) for value in tip]
-    if tip[2] < app["min_z"] - 1e-9:
+    if tip[2] < min_z - 1e-9:
         return web.json_response({
             "ok": False, "stage": "target", "capture": capture_id,
             "error": "tip z %.3f m is below the minimum %.3f m"
-                     % (tip[2], app["min_z"]),
+                     % (tip[2], min_z),
             "target": target,
         }, status=422)
 
     plan_options = {
         "tool_axis": app["tool_axis"],
         "yaw": float(body.get("yaw", app["yaw"])),
-        "min_z": app["min_z"],
+        "min_z": min_z,
     }
     plan_options.update(body.get("options") or {})
-    plan_options["min_z"] = app["min_z"]
+    plan_options["min_z"] = min_z
 
     status, payload = await planner_call(app, "/plan", {
         "targets": [compact_target(tip, {"pixel": target.get("pixel"),
@@ -4042,11 +4059,15 @@ def build_app(args) -> web.Application:
     hover_arg = getattr(args, "hover_m", None)
     app["hover_m"] = float(hover_arg if hover_arg not in (None, 0, 0.0)
                            else os.environ.get("REBOT_HOVER_M", str(sweep.DEFAULT_MIN_Z)))
+    vh_arg = getattr(args, "vertical_hover_m", None)
+    app["vertical_hover_m"] = float(vh_arg if vh_arg is not None
+                                    else os.environ.get("REBOT_VERTICAL_HOVER_M", "0.0"))
     # The lowest tip z the planner will accept: the worktop plane plus the
     # hover height above it -- the same sum the page's fallback and
     # .env.example use -- so a tap can never plan closer to the table than the
     # hover height, whatever plane the worktop sits at.
     app["min_z"] = float(args.plane_z) + app["hover_m"]
+    app["vertical_min_z"] = float(args.plane_z) + app["vertical_hover_m"]
     # Scratch dirs for cv2 materializations and file-mode artifacts (§8 flatten):
     # in PG mode the authoritative records are in the substrate, these are cache.
     # Deriving from --captures keeps a test workdir entirely self-contained.
@@ -4127,6 +4148,8 @@ def main(argv=None):
     parser.add_argument("--hover-m", type=float, default=None,
                         help="height of the tap plane above the worktop, in metres; "
                              "also the lowest tip z the planner accepts")
+    parser.add_argument("--vertical-hover-m", type=float, default=None,
+                        help="default tap height and floor in top-down/vertical mode, in metres (default 0.0)")
     parser.add_argument("--extrinsics", default="",
                         help="a fitted rig JSON; default is "
                              "<calib-dir>/extrinsics-fixed.json when it exists")

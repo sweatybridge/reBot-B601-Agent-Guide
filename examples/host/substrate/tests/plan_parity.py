@@ -210,6 +210,79 @@ print("top-down vertical markers", len(td_targets), "wp", len(rw_td),
       "dur ref %.3f rust %.3f" % (ref_td_sum["duration_s"], rust_td["summary"]["duration_s"]),
       "maxdq %.2e dtau %.2e dv %.2e" % (dq_td, dtau_td, dv_td))
 
+# ── automatic wider-pitch fallback parity (yellow band: <=30 deg horiz, 60 deg vert) ── #
+for p_label, p_axis, p_entry, p_targets, expect_range in [
+    ("horiz_yellow_30", "current", "front",
+     [{"format": "rebot-target", "point": [0.42, 0.05, 0.04], "point_frame": "tip", "tip_offset_m": 0.035}],
+     (10.0, 30.0)),
+    ("vert_yellow_60", "x+", "vertical",
+     [{"format": "rebot-target", "point": [0.48, -0.05, 0.04], "point_frame": "tip", "tip_offset_m": 0.035},
+      {"format": "rebot-target", "point": [0.30,  0.05, 0.08], "point_frame": "tip", "tip_offset_m": 0.035}],
+     (60.0, 80.0)),
+]:
+    p_opts = seq_opts()
+    p_opts.tool_axis = p_axis
+    p_opts.entry = p_entry
+    p_opts_json = seq_opts_json()
+    p_opts_json["tool_axis"] = p_axis
+    p_opts_json["entry"] = p_entry
+    ref_p, ref_p_sum = ptt.plan_sequence(td_dump, p_targets, p_opts, log=lambda *a: None)
+    rust_p = conn.execute("SELECT rebot_plan_sequence(%s, %s, %s, %s, %s, %s::jsonb)",
+                          (URDF, json.dumps(td_dump), json.dumps(p_targets),
+                           json.dumps(p_opts_json), json.dumps({}), CFG)).fetchone()[0]
+    rw_p, fw_p = rust_p["payload"]["waypoints"], ref_p["waypoints"]
+    assert len(rw_p) == len(fw_p), "%s WAYPOINT COUNT differs: rust %d ref %d" % (p_label, len(rw_p), len(fw_p))
+    assert rust_p["payload"]["marker_pitch_deg"] == ref_p["marker_pitch_deg"], (
+        "%s pitch differs: rust %s ref %s" % (p_label, rust_p["payload"]["marker_pitch_deg"], ref_p["marker_pitch_deg"]))
+    for deg in rust_p["payload"]["marker_pitch_deg"]:
+        assert expect_range[0] <= deg <= expect_range[1], "%s unexpected pitch %s" % (p_label, deg)
+    dq_p, dtau_p, dv_p, _ = compare(rw_p, fw_p)
+    assert dq_p < 1e-4, "%s parity gap %.3e rad" % (p_label, dq_p)
+    worst_q = max(worst_q, dq_p); worst_tau = max(worst_tau, dtau_p); worst_v = max(worst_v, dv_p)
+    print(p_label, "pitches", rust_p["payload"]["marker_pitch_deg"], "wp", len(rw_p),
+          "maxdq %.2e dtau %.2e" % (dq_p, dtau_p))
+
+# ── smooth sag-map envelope boundary (no peel-off / return step shock) ──── #
+import numpy as np
+sag_snap = {
+    "rig_fingerprint": "test_rig",
+    "zeros_key": "none",
+    "sag_map": {
+        "rig_fingerprint": "test_rig",
+        "kp_key": "50,2:150,3:150",
+        "zeros_key": "none",
+        "envelope": {
+            "q_min": [-0.7, 0.0, 0.0, -0.057, -0.08, -0.09],
+            "q_max": [0.9, 2.77, 1.89, 1.57, 0.13, 0.08],
+        },
+        "per_motor": {
+            "1": {"a": 0.0, "b": 0.0},
+            "2": {"a": -0.004, "b": -0.006},
+            "3": {"a": -0.0035, "b": -0.002},
+            "4": {"a": -0.015, "b": 0.0},
+            "5": {"a": 0.0, "b": 0.0},
+            "6": {"a": 0.0, "b": 0.0},
+        },
+    },
+}
+sm_tgts = [{"format": "rebot-target", "point": [0.22, 0.0, 0.02], "point_frame": "tip", "tip_offset_m": 0.035}]
+sm_opts_json = seq_opts_json()
+sm_opts_json["tool_axis"] = "x+"
+sm_opts_json["entry"] = "vertical"
+sm_opts_json["min_z"] = 0.02
+rust_sm = conn.execute("SELECT rebot_plan_sequence(%s, %s, %s, %s, %s, %s::jsonb)",
+                       (URDF, json.dumps(td_dump), json.dumps(sm_tgts),
+                        json.dumps(sm_opts_json), json.dumps(sag_snap), CFG)).fetchone()[0]
+q_sm = np.array([w["q"][:6] for w in rust_sm["payload"]["waypoints"]])
+t_sm = np.array([w["t"] for w in rust_sm["payload"]["waypoints"]])
+dt_sm = np.maximum(np.diff(t_sm), 1e-6)
+vel_sm = np.diff(q_sm, axis=0) / dt_sm[:, None]
+acc_sm = np.abs(np.diff(vel_sm, axis=0) / dt_sm[1:, None])
+max_acc_sm = float(acc_sm.max())
+assert max_acc_sm < 10.0, "sag envelope boundary shock remains: max_acc=%.2f rad/s2" % max_acc_sm
+print("smooth sag boundary 2cm top-down: wp=%d max_vel=%.3f max_acc=%.2f rad/s2" % (
+    len(q_sm), float(np.abs(vel_sm).max()), max_acc_sm))
+
 print("TOTAL WORST dq %.3e dtau %.3e dv %.3e" % (worst_q, worst_tau, worst_v))
 ok = cases > 0 and seq_cases > 0 and via_cases > 0 and worst_q < 1e-2 and worst_tau < 1e-2
 print("PARITY", "OK" if ok else "CHECK")

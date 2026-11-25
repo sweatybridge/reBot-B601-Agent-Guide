@@ -267,6 +267,7 @@ const state = {
   wake: null,
   calib: false,
   topDown: false,
+  savedHeight: { horizontal: null, vertical: null },
   locked: false,
   busy: false,
   busyText: "",
@@ -375,13 +376,18 @@ async function healthLoop() {
       if (reachOverlay && reachOverlay.visible) reachOverlay.refresh();
     }
     if (heightControl) {
-      // point.z is the tip. The lowest accepted tip is min_z, so the lowest tap
-      // height is that minus the worktop only; the flange offset does not enter.
-      const minZ = Number(data.min_z ?? data.hover_m ?? 0.04);
+      // point.z is the tip. The lowest accepted tip is min_z (or vertical_min_z
+      // in top-down mode), so the lowest tap height is that minus the worktop.
       const planeZ = Number(data.plane_z ?? 0);
+      const minZ = state.topDown
+        ? Number(data.vertical_min_z ?? (planeZ + Number(data.vertical_hover_m ?? 0.0)))
+        : Number(data.min_z ?? data.hover_m ?? 0.04);
+      const defaultH = state.topDown
+        ? Number(data.vertical_hover_m ?? 0.0)
+        : Number(data.hover_m ?? 0.04);
       heightControl.setRange(Math.max(0, minZ - planeZ),
                              window.HeightControl.MAX);
-      heightControl.adoptHeight(data.hover_m);
+      heightControl.adoptHeight(defaultH);
     }
     $("#serverDot").className = "dot ok";
     $("#serverText").textContent = "host ok" + (data.latest ? " / " + data.latest.slice(-6) : "");
@@ -1068,13 +1074,27 @@ gripperModeButton.addEventListener("click", () => {
     log("wait for the sequence to finish", "warn");
     return;
   }
+  const prevKey = state.topDown ? "vertical" : "horizontal";
+  state.savedHeight[prevKey] = heightControl.height;
   state.topDown = !state.topDown;
+  const nextKey = state.topDown ? "vertical" : "horizontal";
+  const h = state.health || {};
+  const planeZ = Number(h.plane_z ?? 0);
+  const modeDefault = state.topDown
+    ? Number(h.vertical_hover_m ?? 0.0)
+    : Number(h.hover_m ?? 0.04);
+  const modeMinZ = state.topDown
+    ? Number(h.vertical_min_z ?? (planeZ + modeDefault))
+    : Number(h.min_z ?? (planeZ + modeDefault));
+  heightControl.setRange(Math.max(0, modeMinZ - planeZ), window.HeightControl.MAX);
+  heightControl.setHeight(state.savedHeight[nextKey] != null ? state.savedHeight[nextKey] : modeDefault);
   gripperModeButton.textContent = "Gripper: " + (state.topDown ? "top-down" : "horizontal");
   gripperModeButton.classList.toggle("on", state.topDown);
+  reachOverlay.setHeight(heightControl.height);
   reachOverlay.setToolAxis(state.topDown ? "x+" : "current");
   log(state.topDown
-    ? "gripper: top-down orientation with vertical descend"
-    : "gripper: horizontal orientation with front slide-in", "warn");
+    ? "gripper: top-down orientation with vertical descend (height " + window.HeightControl.format(heightControl.height) + ")"
+    : "gripper: horizontal orientation with front slide-in (height " + window.HeightControl.format(heightControl.height) + ")", "warn");
 });
 liveButton.addEventListener("click", togglePublish);
 lockButton.addEventListener("click", toggleLock);

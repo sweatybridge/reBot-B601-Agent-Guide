@@ -59,6 +59,29 @@ fn rotz(deg: f64) -> M3 {
     M3::new(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0)
 }
 
+fn roty(deg: f64) -> M3 {
+    let (c, s) = (deg.to_radians().cos(), deg.to_radians().sin());
+    M3::new(c, 0.0, s, 0.0, 1.0, 0.0, -s, 0.0, c)
+}
+
+/// Automatic pitch-delta candidates (degrees around tool +y) tried in order:
+/// nominal first (0 deg delta), then progressively wider pitch up to 30 deg
+/// downward for horizontal (`z-`) or down to 60 deg for top-down (`x+`).
+fn pitch_deltas(axis: &str) -> &'static [f64] {
+    match axis {
+        "z-" => &[0.0, 10.0, 20.0, 30.0],
+        "x+" => &[0.0, -10.0, -20.0, -30.0],
+        _ => &[0.0],
+    }
+}
+
+fn nominal_pitch_deg(axis: &str) -> f64 {
+    match axis {
+        "x+" => 90.0,
+        _ => 0.0,
+    }
+}
+
 fn rotation_between(a: &V3, b: &V3) -> M3 {
     let a = a.normalize();
     let b = b.normalize();
@@ -397,6 +420,8 @@ fn gravity_sag(tau: &[f64], kp: &[f64; 6], cfg: &Config) -> [f64; 6] {
     s
 }
 
+const SAG_ENVELOPE_TAPER_RAD: f64 = 0.25;
+
 fn sag_correction(q: &[f64], tau: &[f64], snap: &Value, kp_key: &str, cfg: &Config) -> [f64; 6] {
     let mut extra = [0.0; 6];
     let map = match snap.get("sag_map") {
@@ -433,16 +458,28 @@ fn sag_correction(q: &[f64], tau: &[f64], snap: &Value, kp_key: &str, cfg: &Conf
     let env = map.get("envelope").cloned().unwrap_or(json!({}));
     let q_min = env.get("q_min").and_then(|v| v.as_array());
     let q_max = env.get("q_max").and_then(|v| v.as_array());
+    // C1 smoothstep taper outside [q_min, q_max] over SAG_ENVELOPE_TAPER_RAD so
+    // crossing the envelope boundary (e.g. peel-off / return to rest in top-down
+    // mode) ramps smoothly instead of jumping by 20-30 mrad in a single tick.
+    let mut weight = 1.0_f64;
     for j in 0..6 {
+        let mut dist = 0.0_f64;
         if let Some(mn) = q_min.and_then(|a| a.get(j)).and_then(|v| v.as_f64()) {
-            if q[j] < mn - 1e-9 {
-                return extra;
+            if q[j] < mn {
+                dist = dist.max(mn - q[j]);
             }
         }
         if let Some(mx) = q_max.and_then(|a| a.get(j)).and_then(|v| v.as_f64()) {
-            if q[j] > mx + 1e-9 {
-                return extra;
+            if q[j] > mx {
+                dist = dist.max(q[j] - mx);
             }
+        }
+        if dist >= SAG_ENVELOPE_TAPER_RAD {
+            return extra;
+        }
+        if dist > 0.0 {
+            let u = dist / SAG_ENVELOPE_TAPER_RAD;
+            weight *= 1.0 - (3.0 * u * u - 2.0 * u * u * u);
         }
     }
     let per = match map.get("per_motor") {
@@ -456,7 +493,7 @@ fn sag_correction(q: &[f64], tau: &[f64], snap: &Value, kp_key: &str, cfg: &Conf
         };
         let a = m.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let b = m.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        extra[j] = (a * tau[j] + b).clamp(-cfg.sag_limit_rad, cfg.sag_limit_rad);
+        extra[j] = ((a * tau[j] + b) * weight).clamp(-cfg.sag_limit_rad, cfg.sag_limit_rad);
     }
     extra
 }
@@ -1067,6 +1104,25 @@ impl<'a> Planner<'a> {
         Ok(res.q)
     }
 
+    fn try_ik_with_fallback(
+        &mut self,
+        place: &V3,
+        rotation: &M3,
+        seed: &[f64],
+        fallback_seed: &[f64],
+        label: &str,
+    ) -> Result<[f64; 6], String> {
+        match self.try_ik_to(place, rotation, seed, label) {
+            Ok(q) => Ok(q),
+            Err(first_err) => {
+                if max_diff(seed, fallback_seed) <= 1e-12 {
+                    return Err(first_err);
+                }
+                self.try_ik_to(place, rotation, fallback_seed, label)
+            }
+        }
+    }
+
     fn ik_with_fallback(
         &mut self,
         place: &V3,
@@ -1075,16 +1131,8 @@ impl<'a> Planner<'a> {
         fallback_seed: &[f64],
         label: &str,
     ) -> [f64; 6] {
-        match self.try_ik_to(place, rotation, seed, label) {
-            Ok(q) => q,
-            Err(first_err) => {
-                if max_diff(seed, fallback_seed) <= 1e-12 {
-                    panic!("{first_err}");
-                }
-                self.try_ik_to(place, rotation, fallback_seed, label)
-                    .unwrap_or_else(|e| panic!("{e}"))
-            }
-        }
+        self.try_ik_with_fallback(place, rotation, seed, fallback_seed, label)
+            .unwrap_or_else(|e| panic!("{e}"))
     }
 
     fn joint_leg(&mut self, base: &[f64], delta: &[f64], seconds: f64, gripper: f64) -> [f64; 6] {
@@ -1336,7 +1384,7 @@ fn rebot_plan(
         r0 = *ee.rotation.to_rotation_matrix().matrix();
     }
 
-    let (report_axis, report_yaw, report_entry, hold_start, hold_end) = if hover {
+    let (report_axis, report_yaw, report_entry, report_pitch, hold_start, hold_end) = if hover {
         let hover_axis = if tool_axis == "current" {
             "z-".to_string()
         } else {
@@ -1348,16 +1396,56 @@ fn rebot_plan(
             yaw
         };
         let effective_entry = resolve_entry(&entry_opt, &hover_axis);
-        let r_hover = work_orientation(&r0, &hover_axis, hover_yaw);
-        let target_q = pl.ik_with_fallback(&flange_point, &r_hover, &seed, &q_start, "hover");
-        let current_q = pl.last_q6();
-        let stage_q = if effective_entry == "vertical" && approach > 1e-6 {
+        let r_hover_nom = work_orientation(&r0, &hover_axis, hover_yaw);
+        let stage_place_opt = if effective_entry == "vertical" && approach > 1e-6 {
             let stage_point = stage_above(&tip_point, approach, max_z);
-            let stage_place = stage_point + V3::new(0.0, 0.0, tip_offset_m);
-            Some(pl.ik_with_fallback(&stage_place, &r_hover, &target_q, &seed, "above"))
+            Some(stage_point + V3::new(0.0, 0.0, tip_offset_m))
         } else {
             None
         };
+        let mut solved: Option<([f64; 6], Option<[f64; 6]>, f64)> = None;
+        let mut first_err: Option<String> = None;
+        for &delta in pitch_deltas(&hover_axis) {
+            let r_try = if delta.abs() < 1e-9 {
+                r_hover_nom
+            } else {
+                r_hover_nom * roty(delta)
+            };
+            let prev_worst = pl.worst_residual;
+            let prev_where = pl.worst_where.clone();
+            match pl.try_ik_with_fallback(&flange_point, &r_try, &seed, &q_start, "hover") {
+                Ok(tq) => {
+                    if let Some(sp) = stage_place_opt {
+                        match pl.try_ik_with_fallback(&sp, &r_try, &tq, &seed, "above") {
+                            Ok(sq) => {
+                                solved = Some((tq, Some(sq), nominal_pitch_deg(&hover_axis) + delta));
+                                break;
+                            }
+                            Err(e) => {
+                                pl.worst_residual = prev_worst;
+                                pl.worst_where = prev_where;
+                                if first_err.is_none() {
+                                    first_err = Some(e);
+                                }
+                            }
+                        }
+                    } else {
+                        solved = Some((tq, None, nominal_pitch_deg(&hover_axis) + delta));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    pl.worst_residual = prev_worst;
+                    pl.worst_where = prev_where;
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        let (target_q, stage_q, chosen_pitch) =
+            solved.unwrap_or_else(|| panic!("{}", first_err.unwrap_or_else(|| "IK failed".to_string())));
+        let current_q = pl.last_q6();
         if let Some(sq) = stage_q {
             if !ctx.path_safe(&current_q, &sq) {
                 panic!(
@@ -1430,7 +1518,7 @@ fn rebot_plan(
                 gripper_start,
             );
         }
-        (hover_axis, hover_yaw, effective_entry, hs, he)
+        (hover_axis, hover_yaw, effective_entry, chosen_pitch, hs, he)
     } else {
         panic!("rebot_plan currently implements the hover branch (the gateway tap path)");
     };
@@ -1477,6 +1565,7 @@ fn rebot_plan(
         "capture": provenance,
         "tool_axis": report_axis,
         "entry": report_entry,
+        "pitch_deg": report_pitch,
         "yaw_deg": report_yaw,
         "dynamics": {
             "source": "rebot_plan (Rust CLIK + gravity port of reBotArm_control_py)",
@@ -1515,6 +1604,7 @@ fn rebot_plan(
         "point_frame": target.get("point_frame").cloned().unwrap_or(Value::Null),
         "tool_axis": report_axis,
         "entry": report_entry,
+        "pitch_deg": report_pitch,
         "yaw_deg": report_yaw,
         "waypoints": stats["waypoints"],
         "duration_s": stats["duration_s"],
@@ -1713,24 +1803,19 @@ fn rebot_plan_sequence(
     let mut via_q_ik: Vec<Vec<[f64; 6]>> = vec![Vec::new(); points.len()];
     let mut marker_holds: Vec<(f64, f64)> = Vec::with_capacity(points.len());
     let mut yaw_degrees: Vec<f64> = Vec::with_capacity(points.len());
+    let mut pitch_degrees: Vec<f64> = Vec::with_capacity(points.len());
 
     for (i, point) in points.iter().enumerate() {
         let index = i + 1;
         let place = flange_points[i];
         let yaw_deg = point.y.atan2(point.x).to_degrees();
         yaw_degrees.push((yaw_deg * 1000.0).round_ties_even() / 1000.0);
-        let r_marker = work_orientation(&r0, &sequence_axis, yaw_deg);
+        let r_marker_nom = work_orientation(&r0, &sequence_axis, yaw_deg);
         let label = format!("marker {index}");
-        let target_q = pl.ik_with_fallback(&place, &r_marker, &seed, &start_seed, &label);
-        marker_q_ik.push(target_q);
-        let current_q = pl.last_q6();
-
         let needs_stage = vertical_entry || index % 2 == 1;
-        let arrival_q = if vertical_entry {
+        let stage_place_opt = if vertical_entry {
             let stage_point = stage_above(point, approach, max_z);
-            let stage_place = stage_point + V3::new(0.0, 0.0, tip_offsets[i]);
-            let slabel = format!("above {index}");
-            pl.ik_with_fallback(&stage_place, &r_marker, &target_q, &start_seed, &slabel)
+            Some((stage_point + V3::new(0.0, 0.0, tip_offsets[i]), format!("above {index}")))
         } else if index % 2 == 1 {
             let radius = (point.x * point.x + point.y * point.y).sqrt();
             if radius <= approach {
@@ -1740,20 +1825,60 @@ fn rebot_plan_sequence(
                 );
             }
             let stage_point = stage_in_front(point, approach);
-            let stage_place = stage_point + V3::new(0.0, 0.0, tip_offsets[i]);
-            let slabel = format!("stage {index}");
-            pl.ik_with_fallback(&stage_place, &r_marker, &seed, &start_seed, &slabel)
+            Some((stage_point + V3::new(0.0, 0.0, tip_offsets[i]), format!("stage {index}")))
         } else {
-            target_q
+            None
         };
 
-        let mut via_qs: Vec<[f64; 6]> = Vec::with_capacity(via_flange_points[i].len());
-        for (vi, via_place) in via_flange_points[i].iter().enumerate() {
-            let vlabel = format!("via {index}.{}", vi + 1);
-            let via_q = pl.ik_with_fallback(via_place, &r_marker, &seed, &start_seed, &vlabel);
-            via_qs.push(via_q);
-            via_q_ik[i].push(via_q);
+        // Try nominal pitch first (0 deg delta); if target/stage/vias don't all
+        // solve, automatically widen pitch (up to 30 deg for horizontal, down to
+        // 60 deg for top-down) keeping the same orientation across the marker.
+        let mut solved: Option<([f64; 6], [f64; 6], Vec<[f64; 6]>, f64)> = None;
+        let mut first_err: Option<String> = None;
+        for &delta in pitch_deltas(&sequence_axis) {
+            let r_try = if delta.abs() < 1e-9 {
+                r_marker_nom
+            } else {
+                r_marker_nom * roty(delta)
+            };
+            let prev_worst = pl.worst_residual;
+            let prev_where = pl.worst_where.clone();
+            let attempt = (|| -> Result<([f64; 6], [f64; 6], Vec<[f64; 6]>), String> {
+                let tq = pl.try_ik_with_fallback(&place, &r_try, &seed, &start_seed, &label)?;
+                let aq = if let Some((ref sp, ref slabel)) = stage_place_opt {
+                    let sseed = if vertical_entry { &tq } else { &seed };
+                    pl.try_ik_with_fallback(sp, &r_try, sseed, &start_seed, slabel)?
+                } else {
+                    tq
+                };
+                let mut vqs: Vec<[f64; 6]> = Vec::with_capacity(via_flange_points[i].len());
+                for (vi, via_place) in via_flange_points[i].iter().enumerate() {
+                    let vlabel = format!("via {index}.{}", vi + 1);
+                    let vq = pl.try_ik_with_fallback(via_place, &r_try, &seed, &start_seed, &vlabel)?;
+                    vqs.push(vq);
+                }
+                Ok((tq, aq, vqs))
+            })();
+            match attempt {
+                Ok((tq, aq, vqs)) => {
+                    solved = Some((tq, aq, vqs, nominal_pitch_deg(&sequence_axis) + delta));
+                    break;
+                }
+                Err(e) => {
+                    pl.worst_residual = prev_worst;
+                    pl.worst_where = prev_where;
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
         }
+        let (target_q, arrival_q, via_qs, chosen_pitch) =
+            solved.unwrap_or_else(|| panic!("{}", first_err.unwrap_or_else(|| "IK failed".to_string())));
+        pitch_degrees.push(chosen_pitch);
+        marker_q_ik.push(target_q);
+        via_q_ik[i] = via_qs.clone();
+        let current_q = pl.last_q6();
 
         if !via_qs.is_empty() {
             let mut knots: Vec<[f64; 6]> = vec![current_q];
@@ -1913,6 +2038,7 @@ fn rebot_plan_sequence(
         "entry": effective_entry,
         "yaw_deg": yaw,
         "marker_yaw_deg": yaw_degrees,
+        "marker_pitch_deg": pitch_degrees,
         "gripper": {
             "open": cfg.motor7_open,
             "half": cfg.motor7_half(),
@@ -1929,6 +2055,7 @@ fn rebot_plan_sequence(
         "entry": effective_entry,
         "yaw_deg": yaw,
         "marker_yaw_deg": yaw_degrees,
+        "marker_pitch_deg": pitch_degrees,
         "dynamics": {
             "source": "rebot_plan_sequence (Rust CLIK + gravity port of reBotArm_control_py)",
             "tau": "gravity torque of the planned pose, per waypoint",
