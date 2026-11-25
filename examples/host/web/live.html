@@ -175,6 +175,7 @@
   <button class="primary" id="connect" type="button">Connect</button>
   <button id="disconnect" type="button" disabled>Disconnect</button>
   <button id="move" type="button" hidden>Move arm</button>
+  <button id="undo" type="button" hidden>Undo</button>
 </footer>
 </div>
 <aside id="chat" aria-label="Agent chat">
@@ -213,6 +214,7 @@ const tapStatus = $("#tapStatus");
 const connectButton = $("#connect");
 const disconnectButton = $("#disconnect");
 const moveButton = $("#move");
+const undoButton = $("#undo");
 const reachButton = $("#reach");
 const gripperModeButton = $("#gripperMode");
 const tapModeButton = $("#tapMode");
@@ -240,6 +242,7 @@ const state = {
   savedHeight: { horizontal: null, vertical: null },
   busy: false,
   busyText: "",
+  busyAction: "",
 };
 function currentToolAxis() {
   return state.topDown ? "x+" : "current";
@@ -476,10 +479,16 @@ async function locateHere(tap, height) {
 
 function renderAction() {
   const markers = state.tapMode === "markers";
+  const cantRun = state.busy || markersOverlay.busy || markersOverlay.count === 0;
   moveButton.hidden = !markers;
+  undoButton.hidden = !markers;
   viaModeButton.hidden = !markers;
-  moveButton.textContent = state.busy ? (state.busyText || "Planning...") : "Move arm";
-  moveButton.disabled = state.busy || markersOverlay.busy || markersOverlay.count === 0;
+  moveButton.textContent = (state.busy && state.busyAction !== "undo")
+    ? (state.busyText || "Planning...") : "Move arm";
+  moveButton.disabled = cantRun;
+  undoButton.textContent = (state.busy && state.busyAction === "undo")
+    ? (state.busyText || "Planning...") : "Undo";
+  undoButton.disabled = cantRun;
   clearButton.disabled = state.busy || markersOverlay.count === 0;
   tapModeButton.disabled = state.busy;
   viaModeButton.disabled = state.busy;
@@ -504,14 +513,18 @@ function applyTapMode() {
 // `execute: false` plans and reports without moving anything: that is how the
 // agent checks its own trajectory before committing to it. Returns a result
 // object rather than only logging, so both the button and the chat can read it.
-async function runSequence(execute) {
+async function runSequence(execute, options) {
   const willExecute = execute !== false;
-  const result = { ok: false, markers: markersOverlay.count };
+  const reverse = Boolean(options && options.reverse);
+  const prefix = reverse ? "undo: " : "";
+  const targets = reverse ? markersOverlay.reversedTargets : markersOverlay.targets;
+  const result = { ok: false, markers: markersOverlay.count, reversed: reverse };
   if (state.busy) return { ok: false, error: "the arm is busy", markers: markersOverlay.count };
   if (markersOverlay.count === 0) {
     return { ok: false, error: "no markers yet: add at least one", markers: 0 };
   }
   state.busy = true;
+  state.busyAction = reverse ? "undo" : "move";
   state.busyText = "Planning...";
   markersOverlay.setEnabled(false);
   heightControl.setEnabled(false);
@@ -521,7 +534,7 @@ async function runSequence(execute) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        targets: markersOverlay.targets,
+        targets: targets,
         options: gripperPlanOptions(),
       }),
     });
@@ -534,7 +547,8 @@ async function runSequence(execute) {
     result.plan = plan;
     result.planId = plan.id;
     result.summary = summary;
-    status("planned " + (summary.markers || markersOverlay.count) + " markers · "
+    status(prefix + "planned " + (summary.markers || markersOverlay.count)
+      + (reverse ? " markers in reverse · " : " markers · ")
       + (summary.waypoints || 0) + " waypoints · "
       + Number(summary.duration_s || 0).toFixed(1) + " s", "good");
     if (!willExecute) {
@@ -552,7 +566,7 @@ async function runSequence(execute) {
     }
     state.busyText = "Moving...";
     renderAction();
-    status("starting " + plan.id + " on the arm", "warn");
+    status(prefix + "starting " + plan.id + " on the arm", "warn");
     const answer = await api("/execute", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -562,12 +576,12 @@ async function runSequence(execute) {
     if (!answer.ok || body.ok === false) {
       throw new Error(body.error || ("execute failed: " + answer.status));
     }
-    status("arm finished: " + plan.id, "good");
+    status((reverse ? "undo finished: " : "arm finished: ") + plan.id, "good");
     result.ok = true;
     result.executed = true;
     return result;
   } catch (error) {
-    status("sequence failed: " + error.message, "bad");
+    status((reverse ? "undo failed: " : "sequence failed: ") + error.message, "bad");
     result.error = error.message;
     return result;
   } finally {
@@ -575,12 +589,14 @@ async function runSequence(execute) {
     // links the same plan_id, so either side alone can seed a replay.
     RebotTrace.trace("sequence_result", {
       plan_id: result.planId || null,
-      targets: markersOverlay.targets,
+      targets: targets,
+      reversed: reverse,
       summary: result.summary || null,
       executed: Boolean(result.executed),
       error: result.error || null,
     });
     state.busy = false;
+    state.busyAction = "";
     state.busyText = "";
     markersOverlay.setEnabled(state.tapMode === "markers");
     heightControl.setEnabled(true);
@@ -2308,6 +2324,7 @@ async function disconnect() {
 connectButton.addEventListener("click", connect);
 disconnectButton.addEventListener("click", disconnect);
 moveButton.addEventListener("click", () => { runSequence(true); });
+undoButton.addEventListener("click", () => { runSequence(true, { reverse: true }); });
 reachButton.addEventListener("click", () => {
   const on = reachOverlay.toggle();
   reachButton.textContent = "Reach: " + (on ? "on" : "off");

@@ -174,6 +174,7 @@
   <div class="row">
     <button class="action primary" id="start">Start camera</button>
     <button class="action" id="shot" disabled>Move arm</button>
+    <button class="action small" id="undo" style="flex: 0 0 auto; min-width: 82px;" disabled>Undo</button>
   </div>
   <div class="row">
     <button class="chip" id="camera">Camera: handheld tag</button>
@@ -247,6 +248,7 @@ const hint = $("#hint");
 const logBox = $("#log");
 const startButton = $("#start");
 const shotButton = $("#shot");
+const undoButton = $("#undo");
 const cameraButton = $("#camera");
 const calibButton = $("#calib");
 const liveButton = $("#live");
@@ -271,6 +273,7 @@ const state = {
   locked: false,
   busy: false,
   busyText: "",
+  busyAction: "",
   calibCount: 0,
   token: "",
   health: null,
@@ -936,16 +939,27 @@ function updateStartButton() {
   if (state.calib) {
     shotButton.textContent = state.busy ? "Sending..." : "Capture";
     shotButton.disabled = state.busy || !state.track;
+    undoButton.hidden = true;
+    undoButton.disabled = true;
     return;
   }
-  shotButton.textContent = state.busy ? (state.busyText || "Planning...") : "Move arm";
-  shotButton.disabled = state.busy || !state.track || markersOverlay.busy
-    || markersOverlay.count === 0;
+  const cantRun = state.busy || !state.track || markersOverlay.busy || markersOverlay.count === 0;
+  shotButton.textContent = (state.busy && state.busyAction !== "undo")
+    ? (state.busyText || "Planning...") : "Move arm";
+  shotButton.disabled = cantRun;
+  undoButton.hidden = false;
+  undoButton.textContent = (state.busy && state.busyAction === "undo")
+    ? (state.busyText || "Planning...") : "Undo";
+  undoButton.disabled = cantRun;
 }
 
-async function startSequence() {
+async function startSequence(options) {
   if (state.busy || !state.track || markersOverlay.count === 0) return;
+  const reverse = Boolean(options && options.reverse);
+  const targets = reverse ? markersOverlay.reversedTargets : markersOverlay.targets;
+  const prefix = reverse ? "undo: " : "";
   state.busy = true;
+  state.busyAction = reverse ? "undo" : "move";
   state.busyText = "Planning...";
   clearButton.disabled = true;
   markersOverlay.setEnabled(false);
@@ -956,7 +970,7 @@ async function startSequence() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        targets: markersOverlay.targets,
+        targets: targets,
         options: state.topDown
           ? { tool_axis: "x+", entry: "vertical" }
           : { tool_axis: "current", entry: "front" },
@@ -968,7 +982,8 @@ async function startSequence() {
     }
     const plan = data.plan || {};
     const summary = plan.summary || {};
-    log("planned " + (summary.markers || markersOverlay.count) + " markers · "
+    log(prefix + "planned " + (summary.markers || markersOverlay.count)
+      + (reverse ? " markers in reverse · " : " markers · ")
       + (summary.waypoints || 0) + " waypoints · "
       + Number(summary.duration_s || 0).toFixed(1) + " s", "good");
     if (!data.execute) {
@@ -977,7 +992,7 @@ async function startSequence() {
     }
     state.busyText = "Moving...";
     updateStartButton();
-    log("starting " + plan.id + " on the arm", "warn");
+    log(prefix + "starting " + plan.id + " on the arm", "warn");
     const answer = await api("/execute", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -987,11 +1002,12 @@ async function startSequence() {
     if (!answer.ok || result.ok === false) {
       throw new Error(result.error || ("execute failed: " + answer.status));
     }
-    log("arm finished: " + plan.id, "good");
+    log((reverse ? "undo finished: " : "arm finished: ") + plan.id, "good");
   } catch (error) {
-    log("sequence failed: " + escapeHtml(error.message), "bad");
+    log((reverse ? "undo failed: " : "sequence failed: ") + escapeHtml(error.message), "bad");
   } finally {
     state.busy = false;
+    state.busyAction = "";
     state.busyText = "";
     markersOverlay.setEnabled(true);
     heightControl.setEnabled(true);
@@ -1010,6 +1026,9 @@ startButton.addEventListener("click", () => {
 shotButton.addEventListener("click", () => {
   if (state.calib) capture();
   else startSequence();
+});
+undoButton.addEventListener("click", () => {
+  if (!state.calib) startSequence({ reverse: true });
 });
 clearButton.addEventListener("click", () => {
   const removed = markersOverlay.clearLast();
