@@ -120,6 +120,7 @@ class Options:
     # this from the rig; handheld has only a typed number.
     tip_m: float = 0.0
     tool_axis: str = "current"
+    entry: str = "auto"
     yaw: float = 0.0
     payload: float = 0.0
     # The lowest z the planner accepts for a target point. The default is the
@@ -231,6 +232,25 @@ def stage_in_front(point, approach):
                         "standoff: no room to stage in front of it"
                         % (radius, approach * 1000))
     return point - np.array([point[0], point[1], 0.0]) * (approach / radius)
+
+
+def resolve_entry(entry, axis):
+    """Resolve 'auto'/'front'/'vertical': top-down ('x+') defaults to vertical descend."""
+    value = str(entry or "auto")
+    if value == "auto":
+        return "vertical" if axis == "x+" else "front"
+    if value in ("front", "vertical"):
+        return value
+    raise PlanError("entry must be 'auto', 'front', or 'vertical', got %r" % (value,))
+
+
+def stage_above(point, approach, max_z):
+    """The staging point `approach` metres directly above a target for vertical descend."""
+    staged = point + np.array([0.0, 0.0, float(approach)])
+    if float(staged[2]) > float(max_z) + 1e-9:
+        raise PlanError("vertical staging z %.3f m is above --max-z %.3f"
+                        % (float(staged[2]), float(max_z)))
+    return staged
 
 
 def close_angle(options, default):
@@ -488,24 +508,57 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         hover_point = flange_point
         hover_axis = "z-" if options.tool_axis == "current" else options.tool_axis
         hover_yaw = (math.degrees(math.atan2(float(point[1]), float(point[0])))
-                     if options.tool_axis == "current" else options.yaw)
+                     if (options.tool_axis == "current"
+                         or (hover_axis == "x+" and abs(float(options.yaw)) < 1e-9))
+                     else options.yaw)
+        effective_entry = resolve_entry(options.entry, hover_axis)
         R_hover = work_orientation(R0, hover_axis, hover_yaw)
-        report_axis, report_yaw = hover_axis, hover_yaw
+        report_axis, report_yaw, report_entry = hover_axis, hover_yaw, effective_entry
         start_seed = seed.copy()
         try:
             target_q = ik_to(hover_point, R_hover, seed, "hover")
         except PlanError:
             target_q = ik_to(hover_point, R_hover, start_seed, "hover")
         current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
-        if not sweep.path_safe(current_q, target_q[:n_arm]):
-            raise PlanError("the leg to the tap dips within a link radius of the "
-                            "worktop; tap a point further out or move the arm clear")
-        seed = joint_leg(current_q,
-                         {j: target_q[j] - current_q[j] for j in range(n_arm)},
-                         sweep.seconds_for(current_q, target_q[:n_arm]), "hover")
+        stage_q = None
+        if effective_entry == "vertical" and float(options.approach) > 1e-6:
+            stage_point = stage_above(tip_point, options.approach, options.max_z)
+            stage_place = stage_point + np.array([0.0, 0.0, tip_offset_m])
+            try:
+                stage_q = ik_to(stage_place, R_hover, target_q, "above")
+            except PlanError:
+                stage_q = ik_to(stage_place, R_hover, start_seed, "above")
+            if not sweep.path_safe(current_q, stage_q[:n_arm]):
+                raise PlanError("the leg above the tap dips within a link radius of the "
+                                "worktop; tap a point further out or move the arm clear")
+            seed = joint_leg(current_q,
+                             {j: stage_q[j] - current_q[j] for j in range(n_arm)},
+                             sweep.seconds_for(current_q, stage_q[:n_arm]), "above")
+            q_above = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+            if not sweep.path_safe(q_above, target_q[:n_arm]):
+                raise PlanError("the vertical descent to the tap dips within a link radius "
+                                "of the worktop; raise the target or move the arm clear")
+            seed = joint_leg(q_above,
+                             {j: target_q[j] - q_above[j] for j in range(n_arm)},
+                             sweep.seconds_for(q_above, target_q[:n_arm]), "descend")
+        else:
+            if not sweep.path_safe(current_q, target_q[:n_arm]):
+                raise PlanError("the leg to the tap dips within a link radius of the "
+                                "worktop; tap a point further out or move the arm clear")
+            seed = joint_leg(current_q,
+                             {j: target_q[j] - current_q[j] for j in range(n_arm)},
+                             sweep.seconds_for(current_q, target_q[:n_arm]), "hover")
         hold_start = state["t"]
         hold(options.hold_s)
         hold_end = state["t"]
+        if stage_q is not None:
+            q_at = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+            if not sweep.path_safe(q_at, stage_q[:n_arm]):
+                raise PlanError("the vertical retract from the tap dips within a link radius "
+                                "of the worktop; move the arm clear and retry")
+            seed = joint_leg(q_at,
+                             {j: stage_q[j] - q_at[j] for j in range(n_arm)},
+                             sweep.seconds_for(q_at, stage_q[:n_arm]), "retract")
         if not options.no_return:
             q_last = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
             if not sweep.path_safe(q_last, start_seed[:n_arm]):
@@ -515,7 +568,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
                       {j: start_seed[j] - q_last[j] for j in range(n_arm)},
                       sweep.seconds_for(q_last, start_seed[:n_arm]), "return")
     else:
-        report_axis, report_yaw = options.tool_axis, options.yaw
+        report_axis, report_yaw, report_entry = options.tool_axis, options.yaw, "front"
         # Both legs now run at the target's height, so both get the same
         # worktop capsule gate the hover branch uses -- a low horizontal slide
         # is a new way to dip a link into the table.
@@ -593,6 +646,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         extra={
             "capture": provenance,
             "tool_axis": report_axis,
+            "entry": report_entry,
             "yaw_deg": report_yaw,
             "dynamics": {
                 "source": "reBotArm_control_py.compute_generalized_gravity (Pinocchio RNEA)",
@@ -615,6 +669,7 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
         "tap_height_m": target.get("tap_height_m"),
         "point_frame": target.get("point_frame"),
         "tool_axis": report_axis,
+        "entry": report_entry,
         "yaw_deg": report_yaw,
         "waypoints": stats["waypoints"],
         "duration_s": stats["duration_s"],
@@ -758,6 +813,8 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     # free-yaw envelope the reach overlay draws. `z-` is the reference arm's
     # down axis at the parked pose; an explicit axis is used as given.
     sequence_axis = "z-" if options.tool_axis == "current" else options.tool_axis
+    effective_entry = resolve_entry(options.entry, sequence_axis)
+    vertical_entry = effective_entry == "vertical"
     ik_params = IKParams(max_iter=300, tolerance=1e-6, damping=1e-8, step_size=1.0)
     worst = {"residual": 0.0, "where": ""}
 
@@ -908,7 +965,19 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             target = ik_to(place, R_marker, start_seed, "marker %d" % index)
         marker_q_ik.append([float(v) for v in target[:n_arm]])
         current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
-        if index % 2 == 1:
+        needs_stage = vertical_entry or (index % 2 == 1)
+        if vertical_entry:
+            try:
+                stage_point = stage_above(point, options.approach, options.max_z)
+            except PlanError as error:
+                raise PlanError("marker %d: %s" % (index, error)) from error
+            stage_place = stage_point + np.array([0.0, 0.0, tip_offsets[index - 1]])
+            try:
+                stage_q = ik_to(stage_place, R_marker, target, "above %d" % index)
+            except PlanError:
+                stage_q = ik_to(stage_place, R_marker, start_seed, "above %d" % index)
+            arrival_q = stage_q
+        elif index % 2 == 1:
             # Odd markers are grasped: stage `approach` m in front and slide
             # forward into the marker, the same geometry as the single-tap
             # pick. A via chain delivers the arm to the staging point; the
@@ -947,7 +1016,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         if via_qs:
             seed = chain_leg([current_q] + via_qs + [arrival_q[:n_arm]],
                              index, gripper)
-        elif index % 2 == 1:
+        elif needs_stage:
             if not sweep.path_safe(current_q, stage_q[:n_arm]):
                 raise PlanError(
                     "the leg to the staging point for marker %d dips within a link "
@@ -957,7 +1026,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                 current_q,
                 {joint: stage_q[joint] - current_q[joint] for joint in range(n_arm)},
                 sweep.seconds_for(current_q, stage_q[:n_arm]),
-                "stage %d" % index, gripper)
+                ("above %d" if vertical_entry else "stage %d") % index, gripper)
         else:
             if not sweep.path_safe(current_q, target[:n_arm]):
                 raise PlanError(
@@ -968,17 +1037,18 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                 {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
                 sweep.seconds_for(current_q, target[:n_arm]),
                 "marker %d" % index, gripper)
-        if index % 2 == 1:
+        if needs_stage:
             current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
             if not sweep.path_safe(current_q, target[:n_arm]):
                 raise PlanError(
-                    "the slide-in to marker %d dips within a link radius of the "
-                    "worktop; raise the marker or move the arm clear" % index)
+                    "the %s to marker %d dips within a link radius of the "
+                    "worktop; raise the marker or move the arm clear"
+                    % ("vertical descent" if vertical_entry else "slide-in", index))
             seed = joint_leg(
                 current_q,
                 {joint: target[joint] - current_q[joint] for joint in range(n_arm)},
                 sweep.seconds_for(current_q, target[:n_arm]),
-                "slide %d" % index, gripper)
+                ("descend %d" if vertical_entry else "slide %d") % index, gripper)
         hold_t0 = state["t"]
         hold(0.25, gripper)
         next_gripper = odd_close if index % 2 == 1 else MOTOR7_OPEN
@@ -987,6 +1057,17 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         gripper = next_gripper
         hold(0.25, gripper)
         marker_holds.append((hold_t0, state["t"]))
+        if vertical_entry:
+            current_q = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
+            if not sweep.path_safe(current_q, stage_q[:n_arm]):
+                raise PlanError(
+                    "the vertical retract from marker %d dips within a link radius of "
+                    "the worktop; raise the marker or move the arm clear" % index)
+            seed = joint_leg(
+                current_q,
+                {joint: stage_q[joint] - current_q[joint] for joint in range(n_arm)},
+                sweep.seconds_for(current_q, stage_q[:n_arm]),
+                "retract %d" % index, gripper)
 
     # Return in joint space. A Cartesian return to the parked pose is the one
     # leg where IK can fail on the last millimetres (the parked pose sits on
@@ -1004,9 +1085,14 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
     close_text = ("close to %.2f rad" % odd_close if options.close_width_mm is None
                   else "close to %.1f mm" % options.close_width_mm)
     total_vias = sum(len(marker_vias) for marker_vias in vias)
-    steps = ("%d markers: stage %.0f mm in front and slide in on odd, direct on even; "
-             "gripper open, %s on odd, open on even; return"
-             % (len(points), options.approach * 1000, close_text))
+    if vertical_entry:
+        steps = ("%d markers: stage %.0f mm above, descend vertically, retract vertically; "
+                 "gripper open, %s on odd, open on even; return"
+                 % (len(points), options.approach * 1000, close_text))
+    else:
+        steps = ("%d markers: stage %.0f mm in front and slide in on odd, direct on even; "
+                 "gripper open, %s on odd, open on even; return"
+                 % (len(points), options.approach * 1000, close_text))
     if total_vias:
         steps += "; %d via points passed through without stopping" % total_vias
     provenance = {
@@ -1041,6 +1127,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             for index, point in enumerate(points)
         ],
         "tool_axis": sequence_axis,
+        "entry": effective_entry,
         "yaw_deg": options.yaw,
         "marker_yaw_deg": yaw_degrees,
         "gripper": {"open": MOTOR7_OPEN, "half": MOTOR7_HALF,
@@ -1056,6 +1143,7 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         extra={
             "capture": provenance,
             "tool_axis": sequence_axis,
+            "entry": effective_entry,
             "yaw_deg": options.yaw,
             "marker_yaw_deg": yaw_degrees,
             "dynamics": {

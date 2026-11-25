@@ -181,6 +181,35 @@ print("via markers", len(via_targets), "wp", len(rw),
       "dur ref %.3f rust %.3f" % (ref_sum["duration_s"], rust["summary"]["duration_s"]),
       "maxdq %.2e dtau %.2e dv %.2e" % (dq, dtau, dv))
 print("VIA CASES", via_cases)
+
+# ── top-down (tool_axis='x+') + vertical descend/retract parity ──────────── #
+td_targets = [
+    {"format": "rebot-target", "point": [0.22, -0.08, 0.04], "point_frame": "tip", "tip_offset_m": 0.035},
+    {"format": "rebot-target", "point": [0.22,  0.08, 0.04], "point_frame": "tip", "tip_offset_m": 0.035},
+]
+td_dump = {"ids": [1, 2, 3, 4, 5, 6, 7], "q": [0.0, 0.0, 0.02, 0.0, 0.0, 0.0, 0.0]}
+td_opts = seq_opts()
+td_opts.tool_axis = "x+"
+td_opts.entry = "vertical"
+td_opts_json = seq_opts_json()
+td_opts_json["tool_axis"] = "x+"
+td_opts_json["entry"] = "vertical"
+ref_td, ref_td_sum = ptt.plan_sequence(td_dump, td_targets, td_opts, log=lambda *a: None)
+row_td = conn.execute("SELECT rebot_plan_sequence(%s, %s, %s, %s, %s, %s::jsonb)",
+                      (URDF, json.dumps(td_dump), json.dumps(td_targets),
+                       json.dumps(td_opts_json), json.dumps({}), CFG)).fetchone()
+rust_td = row_td[0]
+rw_td, fw_td = rust_td["payload"]["waypoints"], ref_td["waypoints"]
+assert len(rw_td) == len(fw_td), "top-down WAYPOINT COUNT differs: rust %d ref %d" % (len(rw_td), len(fw_td))
+assert rust_td["payload"]["entry"] == "vertical" and ref_td["entry"] == "vertical"
+assert rust_td["payload"]["tool_axis"] == "x+" and ref_td["tool_axis"] == "x+"
+dq_td, dtau_td, dv_td, dt_td = compare(rw_td, fw_td)
+assert dq_td < 1e-4, "top-down vertical parity gap %.3e rad" % dq_td
+worst_q = max(worst_q, dq_td); worst_tau = max(worst_tau, dtau_td); worst_v = max(worst_v, dv_td)
+print("top-down vertical markers", len(td_targets), "wp", len(rw_td),
+      "dur ref %.3f rust %.3f" % (ref_td_sum["duration_s"], rust_td["summary"]["duration_s"]),
+      "maxdq %.2e dtau %.2e dv %.2e" % (dq_td, dtau_td, dv_td))
+
 print("TOTAL WORST dq %.3e dtau %.3e dv %.3e" % (worst_q, worst_tau, worst_v))
 ok = cases > 0 and seq_cases > 0 and via_cases > 0 and worst_q < 1e-2 and worst_tau < 1e-2
 print("PARITY", "OK" if ok else "CHECK")

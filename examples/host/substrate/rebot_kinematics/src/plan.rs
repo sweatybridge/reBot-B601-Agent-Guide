@@ -121,6 +121,32 @@ fn stage_in_front(point: &V3, approach: f64) -> V3 {
     point - V3::new(point.x, point.y, 0.0) * (approach / radius)
 }
 
+fn resolve_entry(entry: &str, axis: &str) -> &'static str {
+    match entry {
+        "" | "auto" => {
+            if axis == "x+" {
+                "vertical"
+            } else {
+                "front"
+            }
+        }
+        "front" => "front",
+        "vertical" => "vertical",
+        other => panic!("entry must be 'auto', 'front', or 'vertical', got '{other}'"),
+    }
+}
+
+fn stage_above(point: &V3, approach: f64, max_z: f64) -> V3 {
+    let staged = point + V3::new(0.0, 0.0, approach);
+    if staged.z > max_z + 1e-9 {
+        panic!(
+            "vertical staging z {:.3} m is above --max-z {max_z:.3}",
+            staged.z
+        );
+    }
+    staged
+}
+
 fn close_angle(cfg: &Config, close_width_mm: Option<f64>, default: f64) -> f64 {
     match close_width_mm {
         None => default,
@@ -1281,6 +1307,8 @@ fn rebot_plan(
     }
 
     let tool_axis = opt_s(&options, "tool_axis", "current").to_string();
+    let entry_opt = opt_s(&options, "entry", "auto").to_string();
+    let approach = opt_nonneg_f(&options, "approach", 0.06);
     let yaw = opt_f(&options, "yaw", 0.0);
     let hz = validate_hz(opt_f(&options, "hz", cfg.default_hz));
     let hold_s = validate_duration(opt_f(&options, "hold_s", 0.6), "hold_s");
@@ -1308,38 +1336,82 @@ fn rebot_plan(
         r0 = *ee.rotation.to_rotation_matrix().matrix();
     }
 
-    let (report_axis, report_yaw, hold_start, hold_end) = if hover {
+    let (report_axis, report_yaw, report_entry, hold_start, hold_end) = if hover {
         let hover_axis = if tool_axis == "current" {
             "z-".to_string()
         } else {
             tool_axis.clone()
         };
-        let hover_yaw = if tool_axis == "current" {
+        let hover_yaw = if tool_axis == "current" || (hover_axis == "x+" && yaw.abs() < 1e-9) {
             point.y.atan2(point.x).to_degrees()
         } else {
             yaw
         };
+        let effective_entry = resolve_entry(&entry_opt, &hover_axis);
         let r_hover = work_orientation(&r0, &hover_axis, hover_yaw);
         let target_q = pl.ik_with_fallback(&flange_point, &r_hover, &seed, &q_start, "hover");
         let current_q = pl.last_q6();
-        if !ctx.path_safe(&current_q, &target_q) {
-            panic!(
-                "the leg to the tap dips within a link radius of the worktop; tap a point further out or move the arm clear"
+        let stage_q = if effective_entry == "vertical" && approach > 1e-6 {
+            let stage_point = stage_above(&tip_point, approach, max_z);
+            let stage_place = stage_point + V3::new(0.0, 0.0, tip_offset_m);
+            Some(pl.ik_with_fallback(&stage_place, &r_hover, &target_q, &seed, "above"))
+        } else {
+            None
+        };
+        if let Some(sq) = stage_q {
+            if !ctx.path_safe(&current_q, &sq) {
+                panic!(
+                    "the leg above the tap dips within a link radius of the worktop; tap a point further out or move the arm clear"
+                );
+            }
+            let mut d = [0.0; 6];
+            for j in 0..6 {
+                d[j] = sq[j] - current_q[j];
+            }
+            pl.joint_leg(&current_q, &d, seconds_for(&current_q, &sq, &cfg), gripper_start);
+            let q_above = pl.last_q6();
+            if !ctx.path_safe(&q_above, &target_q) {
+                panic!(
+                    "the vertical descent to the tap dips within a link radius of the worktop; raise the target or move the arm clear"
+                );
+            }
+            for j in 0..6 {
+                d[j] = target_q[j] - q_above[j];
+            }
+            pl.joint_leg(&q_above, &d, seconds_for(&q_above, &target_q, &cfg), gripper_start);
+        } else {
+            if !ctx.path_safe(&current_q, &target_q) {
+                panic!(
+                    "the leg to the tap dips within a link radius of the worktop; tap a point further out or move the arm clear"
+                );
+            }
+            let mut delta = [0.0; 6];
+            for j in 0..6 {
+                delta[j] = target_q[j] - current_q[j];
+            }
+            pl.joint_leg(
+                &current_q,
+                &delta,
+                seconds_for(&current_q, &target_q, &cfg),
+                gripper_start,
             );
         }
-        let mut delta = [0.0; 6];
-        for j in 0..6 {
-            delta[j] = target_q[j] - current_q[j];
-        }
-        pl.joint_leg(
-            &current_q,
-            &delta,
-            seconds_for(&current_q, &target_q, &cfg),
-            gripper_start,
-        );
         let hs = pl.t;
         pl.hold(hold_s);
         let he = pl.t;
+        if let Some(sq) = stage_q {
+            let q_at = pl.last_q6();
+            if !ctx.path_safe(&q_at, &sq) {
+                panic!(
+                    "the vertical retract from the tap dips within a link radius of the worktop; move the arm clear and retry"
+                );
+            }
+            let mut d = [0.0; 6];
+            for j in 0..6 {
+                d[j] = sq[j] - q_at[j];
+            }
+            pl.joint_leg(&q_at, &d, seconds_for(&q_at, &sq, &cfg), gripper_start);
+        }
         if !no_return {
             let q_last = pl.last_q6();
             if !ctx.path_safe(&q_last, &seed) {
@@ -1358,7 +1430,7 @@ fn rebot_plan(
                 gripper_start,
             );
         }
-        (hover_axis, hover_yaw, hs, he)
+        (hover_axis, hover_yaw, effective_entry, hs, he)
     } else {
         panic!("rebot_plan currently implements the hover branch (the gateway tap path)");
     };
@@ -1404,6 +1476,7 @@ fn rebot_plan(
     let extra = json!({
         "capture": provenance,
         "tool_axis": report_axis,
+        "entry": report_entry,
         "yaw_deg": report_yaw,
         "dynamics": {
             "source": "rebot_plan (Rust CLIK + gravity port of reBotArm_control_py)",
@@ -1441,6 +1514,7 @@ fn rebot_plan(
         "tap_height_m": target.get("tap_height_m").cloned().unwrap_or(Value::Null),
         "point_frame": target.get("point_frame").cloned().unwrap_or(Value::Null),
         "tool_axis": report_axis,
+        "entry": report_entry,
         "yaw_deg": report_yaw,
         "waypoints": stats["waypoints"],
         "duration_s": stats["duration_s"],
@@ -1486,6 +1560,7 @@ fn rebot_plan_sequence(
     let mut r0 = *ee_start.rotation.to_rotation_matrix().matrix();
 
     let tool_axis = opt_s(&options, "tool_axis", "current").to_string();
+    let entry_opt = opt_s(&options, "entry", "auto").to_string();
     let yaw = opt_f(&options, "yaw", 0.0);
     let approach = opt_nonneg_f(&options, "approach", 0.06);
     let hz = validate_hz(opt_f(&options, "hz", cfg.default_hz));
@@ -1507,6 +1582,8 @@ fn rebot_plan_sequence(
     } else {
         tool_axis.clone()
     };
+    let effective_entry = resolve_entry(&entry_opt, &sequence_axis);
+    let vertical_entry = effective_entry == "vertical";
 
     let mut points: Vec<V3> = Vec::with_capacity(tarr.len());
     let mut hovers: Vec<f64> = Vec::with_capacity(tarr.len());
@@ -1648,7 +1725,13 @@ fn rebot_plan_sequence(
         marker_q_ik.push(target_q);
         let current_q = pl.last_q6();
 
-        let arrival_q = if index % 2 == 1 {
+        let needs_stage = vertical_entry || index % 2 == 1;
+        let arrival_q = if vertical_entry {
+            let stage_point = stage_above(point, approach, max_z);
+            let stage_place = stage_point + V3::new(0.0, 0.0, tip_offsets[i]);
+            let slabel = format!("above {index}");
+            pl.ik_with_fallback(&stage_place, &r_marker, &target_q, &start_seed, &slabel)
+        } else if index % 2 == 1 {
             let radius = (point.x * point.x + point.y * point.y).sqrt();
             if radius <= approach {
                 panic!(
@@ -1677,7 +1760,7 @@ fn rebot_plan_sequence(
             knots.extend(via_qs.iter().copied());
             knots.push(arrival_q);
             seed = pl.chain_leg(&knots, index, gripper);
-        } else if index % 2 == 1 {
+        } else if needs_stage {
             if !ctx.path_safe(&current_q, &arrival_q) {
                 panic!(
                     "the leg to the staging point for marker {index} dips within a link radius of the worktop; space the markers further apart or move the arm clear"
@@ -1710,11 +1793,12 @@ fn rebot_plan_sequence(
                 gripper,
             );
         }
-        if index % 2 == 1 {
+        if needs_stage {
             let current_q = pl.last_q6();
             if !ctx.path_safe(&current_q, &target_q) {
                 panic!(
-                    "the slide-in to marker {index} dips within a link radius of the worktop; raise the marker or move the arm clear"
+                    "the {} to marker {index} dips within a link radius of the worktop; raise the marker or move the arm clear",
+                    if vertical_entry { "vertical descent" } else { "slide-in" }
                 );
             }
             let mut d = [0.0; 6];
@@ -1741,6 +1825,24 @@ fn rebot_plan_sequence(
         gripper = next_gripper;
         pl.hold_g(0.25, gripper);
         marker_holds.push((hold_t0, pl.t));
+        if vertical_entry {
+            let current_q = pl.last_q6();
+            if !ctx.path_safe(&current_q, &arrival_q) {
+                panic!(
+                    "the vertical retract from marker {index} dips within a link radius of the worktop; raise the marker or move the arm clear"
+                );
+            }
+            let mut d = [0.0; 6];
+            for j in 0..6 {
+                d[j] = arrival_q[j] - current_q[j];
+            }
+            seed = pl.joint_leg(
+                &current_q,
+                &d,
+                seconds_for(&current_q, &arrival_q, &cfg),
+                gripper,
+            );
+        }
     }
 
     let q_last = pl.last_q6();
@@ -1762,11 +1864,19 @@ fn rebot_plan_sequence(
         Some(w) => format!("close to {w:.1} mm"),
     };
     let total_vias: usize = vias.iter().map(|v| v.len()).sum();
-    let mut steps = format!(
-        "{} markers: stage {:.0} mm in front and slide in on odd, direct on even; gripper open, {close_text} on odd, open on even; return",
-        points.len(),
-        approach * 1000.0
-    );
+    let mut steps = if vertical_entry {
+        format!(
+            "{} markers: stage {:.0} mm above, descend vertically, retract vertically; gripper open, {close_text} on odd, open on even; return",
+            points.len(),
+            approach * 1000.0
+        )
+    } else {
+        format!(
+            "{} markers: stage {:.0} mm in front and slide in on odd, direct on even; gripper open, {close_text} on odd, open on even; return",
+            points.len(),
+            approach * 1000.0
+        )
+    };
     if total_vias > 0 {
         steps += &format!("; {total_vias} via points passed through without stopping");
     }
@@ -1800,6 +1910,7 @@ fn rebot_plan_sequence(
         "tip_m": opt_tip,
         "targets": targets_prov,
         "tool_axis": sequence_axis,
+        "entry": effective_entry,
         "yaw_deg": yaw,
         "marker_yaw_deg": yaw_degrees,
         "gripper": {
@@ -1815,6 +1926,7 @@ fn rebot_plan_sequence(
     let extra = json!({
         "capture": provenance,
         "tool_axis": sequence_axis,
+        "entry": effective_entry,
         "yaw_deg": yaw,
         "marker_yaw_deg": yaw_degrees,
         "dynamics": {

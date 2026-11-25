@@ -50,6 +50,22 @@
     [0, 0, 0, 0, 0, 0],
   ];
 
+  // Top-down orientation (`tool_axis = "x+"`): Ry(+90 deg), mapping gripper +x
+  // straight down to base -z. Matches `work_orientation(I, "x+", 0)`.
+  const TOP_DOWN_ROT = [
+    [0, 0, 1],
+    [0, 1, 0],
+    [-1, 0, 0],
+  ];
+  const TOP_DOWN_SEEDS = [
+    [0, 1.5, 1.5, -1.5, 0, 0],
+    [0, 1.1, 1.1, -1.5, 0, 0],
+    [0, 2.0, 2.0, -1.5, 0, 0],
+    [0, 0.8, 0.8, -1.5, 0, 0],
+    [0, 0, 0.14, 0, 0, 0],
+  ];
+  const VERTICAL_APPROACH = 0.06;
+
   function forward(q, withFrames) {
     let rotation = identity();
     let position = [0, 0, 0];
@@ -200,11 +216,11 @@
     return { q: q, info: last };
   }
 
-  function solveAt(radius, flangeZ, seed) {
+  function solveAt(radius, flangeZ, seed, targetRotation) {
     const target = [radius, 0, flangeZ];
-    // Tool pointing straight down: the parked arm's orientation, and the one
-    // `plan_to_target.work_orientation` settles on for a table target.
-    const attempt = inverseKinematics(target, identity(), seed);
+    // Default (`identity()`): parked horizontal orientation (`tool_axis="current"`).
+    // Top-down (`TOP_DOWN_ROT`): gripper +x pointing straight down (`tool_axis="x+"`).
+    const attempt = inverseKinematics(target, targetRotation || identity(), seed);
     if (!attempt.info.ok || !withinLimits(attempt.q)) return null;
     const actual = forward(attempt.q);
     if (Math.hypot(actual.position[0] - radius, actual.position[1], actual.position[2] - flangeZ) > 0.003) {
@@ -225,25 +241,40 @@
    * tap, so a table point (x, y, plane_z) becomes a flange at
    * plane_z + hover_m + tip_m.
    */
-  function computeReachBand(planeZ, hoverM, tipM) {
+  function computeReachBand(planeZ, hoverM, tipM, toolAxis) {
     const flangeZ = planeZ + hoverM + tipM;
     const step = 0.01;
+    const topDown = toolAxis === "x+" || toolAxis === "top-down";
+    const targetRot = topDown ? TOP_DOWN_ROT : identity();
+    const seeds = topDown ? TOP_DOWN_SEEDS : SEEDS;
 
-    function reachable(radius, seed) {
-      let q = solveAt(radius, flangeZ, seed);
+    function solveOne(radius, z, seed) {
+      let q = solveAt(radius, z, seed, targetRot);
       if (q) return q;
-      for (let index = 0; index < SEEDS.length; index += 1) {
-        q = solveAt(radius, flangeZ, SEEDS[index]);
+      for (let index = 0; index < seeds.length; index += 1) {
+        q = solveAt(radius, z, seeds[index], targetRot);
         if (q) return q;
       }
       return null;
     }
 
-    // Find one point inside the band first: 0.60 m is a normal working radius
-    // on this arm, and the scan then walks outwards and inwards from there.
+    function reachable(radius, seed) {
+      const q = solveOne(radius, flangeZ, seed);
+      if (!q) return null;
+      if (topDown) {
+        // Top-down uses vertical descend from `VERTICAL_APPROACH` above the target;
+        // only promise radii where both the target and its vertical stage solve.
+        if (!solveOne(radius, flangeZ + VERTICAL_APPROACH, q)) return null;
+      }
+      return q;
+    }
+
+    // Find one point inside the band first, then walk outwards and inwards.
     let anchor = null;
-    let seed = SEEDS[0];
-    const anchors = [0.60, 0.50, 0.65, 0.45, 0.70, 0.40, 0.30, 0.20];
+    let seed = seeds[0];
+    const anchors = topDown
+      ? [0.25, 0.20, 0.30, 0.15, 0.35, 0.12, 0.38]
+      : [0.60, 0.50, 0.65, 0.45, 0.70, 0.40, 0.30, 0.20];
     for (let index = 0; index < anchors.length && !anchor; index += 1) {
       const q = reachable(anchors[index], seed);
       if (q) {
@@ -279,6 +310,7 @@
       sector: Math.min(Math.abs(LIMITS[0][0]), Math.abs(LIMITS[0][1])),
       tipHeight: planeZ + hoverM,
       flangeZ: flangeZ,
+      toolAxis: topDown ? "x+" : "current",
     };
   }
 

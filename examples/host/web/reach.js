@@ -73,9 +73,10 @@
     let visible = false;
     let loading = false;
     let config = null;              // /reach.json
-    let band = null;                // computed annulus, cached by flange height
+    let band = null;                // computed annulus, cached by flange height + orientation
     let bandKey = "";
     let heightM = null;             // page override of hover_m, metres above the worktop
+    let toolAxis = null;            // page override of tool_axis ("current" | "x+")
     let heightTimer = 0;            // coalesces band recomputes during a height drag
     let lastPose = null;            // T_base_cam from the last plan (handheld)
     let lastPoseLabel = "";
@@ -107,14 +108,24 @@
       return Number(config && config.hover_m);
     }
 
+    function effectiveToolAxis() {
+      if (toolAxis !== null) return toolAxis;
+      if (typeof options.toolAxis === "function") {
+        const value = options.toolAxis();
+        if (value) return String(value);
+      }
+      return String((config && config.tool_axis) || "current");
+    }
+
     function recomputeBand() {
       if (!config) return false;
       const planeZ = Number(config.plane_z);
       const hoverM = effectiveHeight();
       const tipM = Number(config.tip_m);
-      const key = [planeZ, hoverM, tipM].join("|");
+      const axis = effectiveToolAxis();
+      const key = [planeZ, hoverM, tipM, axis].join("|");
       if (bandKey !== key || !band) {
-        band = computeReachBand(planeZ, hoverM, tipM);
+        band = computeReachBand(planeZ, hoverM, tipM, axis);
         bandKey = key;
       }
       return Boolean(band);
@@ -157,6 +168,15 @@
       // ~110 ms; the final value always gets drawn because the timer is trailing.
       if (heightTimer) return;
       heightTimer = window.setTimeout(applyHeight, 110);
+    }
+
+    function setToolAxis(value) {
+      const next = value ? String(value) : "current";
+      if (toolAxis === next) return;
+      toolAxis = next;
+      if (!visible || !config) return;
+      clearHeightTimer();
+      applyHeight();
     }
 
     function sizeCanvas() {
@@ -349,7 +369,8 @@
       // A two-line legend in the top-left of the *video*, not of the letterbox.
       // Two lines because a phone held in landscape letterboxes the preview to
       // a narrow strip, and one long line would be cut off by the clip.
-      const first = "arm reach · " + band.inner.toFixed(2) + "–" + band.outer.toFixed(2) + " m";
+      const first = "arm reach · " + band.inner.toFixed(2) + "–" + band.outer.toFixed(2) + " m"
+        + (band.toolAxis === "x+" ? " · top-down" : "");
       const second = "tip " + Math.round((band.tipHeight - Number(config.plane_z)) * 1000)
         + " mm up" + (label ? " · " + label : "");
       context.font = "500 12.5px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
@@ -862,7 +883,9 @@
       projectPoint: projectPoint,
       projectPointLoaded: projectPointLoaded,
       setHeight: setHeight,
+      setToolAxis: setToolAxis,
       get height() { return heightM; },
+      get toolAxis() { return effectiveToolAxis(); },
       get visible() { return visible; },
     };
   }
