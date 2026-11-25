@@ -115,8 +115,9 @@ services:
       REBOT_MARKER_AT: ${REBOT_MARKER_AT:-}
       REBOT_MARKER_SIZE: ${REBOT_MARKER_SIZE:-0.04}
       # Height of the tap plane above the worktop: the tip is planned at the
-      # tapped x/y, at plane_z + hover_m.
+      # tapped x/y, at plane_z + hover_m (or vertical_hover_m in top-down mode).
       REBOT_HOVER_M: ${REBOT_HOVER_M:-0.04}
+      REBOT_VERTICAL_HOVER_M: ${REBOT_VERTICAL_HOVER_M:-0.0}
       REBOT_TIP_MM: ${REBOT_TIP_MM:-35}
       REBOT_PLANNER_TOKEN: ${REBOT_PLANNER_TOKEN:-}
       REBOT_EXECUTE: ${REBOT_EXECUTE:-0}
