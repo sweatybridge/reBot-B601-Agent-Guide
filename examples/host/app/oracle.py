@@ -160,14 +160,55 @@ def _max_abs(values):
     return max((abs(float(v)) for v in values or []), default=0.0)
 
 
+def _effective_joint_error(hold):
+    """Per-joint residual for attribution: `q_meas - q_ik` on sag-compensated
+    planned holds, falling back to `hold_error_rad` (`q_meas - q_cmd`) on
+    uncompensated sweeps and synthetic test holds without `q_ik`."""
+    q_ik = hold.get("q_ik")
+    q_meas = hold.get("q_meas")
+    if (isinstance(q_ik, (list, tuple)) and len(q_ik) >= 6
+            and isinstance(q_meas, (list, tuple)) and len(q_meas) >= 6
+            and all(v is not None for v in q_ik[:6])
+            and all(v is not None for v in q_meas[:6])):
+        return [float(q_meas[j]) - float(q_ik[j]) for j in range(6)]
+    return [float(v) for v in (hold.get("hold_error_rad") or []) if v is not None]
+
+
+def _effective_tip_error_mm(hold):
+    """Effective tip tracking error (mm) for attribution: `||tip_fk_meas - tip_fk_ik||`
+    on sag-compensated planned holds (or `placement_mm` if only that is present),
+    falling back to `tip_error_mm` (`||tip_fk_meas - tip_fk_cmd||`) on uncompensated
+    holds. Prevents sag pre-compensation from inverting `sag` / `tip-error` verdicts."""
+    tip_ik = hold.get("tip_fk_ik")
+    tip_meas = hold.get("tip_fk_meas")
+    if (isinstance(tip_ik, (list, tuple)) and len(tip_ik) >= 3
+            and isinstance(tip_meas, (list, tuple)) and len(tip_meas) >= 3
+            and all(v is not None for v in tip_ik[:3])
+            and all(v is not None for v in tip_meas[:3])):
+        dx = float(tip_meas[0]) - float(tip_ik[0])
+        dy = float(tip_meas[1]) - float(tip_ik[1])
+        dz = float(tip_meas[2]) - float(tip_ik[2])
+        return 1000.0 * math.sqrt(dx * dx + dy * dy + dz * dz)
+    if hold.get("placement_mm") is not None:
+        return float(hold["placement_mm"])
+    if hold.get("tip_error_mm") is not None:
+        return float(hold["tip_error_mm"])
+    return None
+
+
+def _is_planned_target_hold(hold):
+    q_ik = hold.get("q_ik")
+    return (isinstance(q_ik, (list, tuple)) and len(q_ik) >= 6) or (hold.get("placement_mm") is not None)
+
+
 def _sag_correlation(hold):
-    """|cos| between the per-joint hold error and the model's tau_g/kp sag.
+    """|cos| between the effective per-joint error and the model's tau_g/kp sag.
 
     The controller has no integral term, so a load-dependent error lines up
-    with the gravity prediction (held = command - sag: the sign is negative,
-    hence the absolute cosine).
+    with the gravity prediction (under-compensation aligns with `-sag_rad`,
+    over-compensation aligns with `+sag_rad`; hence the absolute cosine).
     """
-    error = [float(v) for v in (hold.get("hold_error_rad") or [])][:6]
+    error = _effective_joint_error(hold)[:6]
     sag = [float(v) for v in (hold.get("sag_rad") or [])][:6]
     if len(error) != 6 or len(sag) != 6:
         return 0.0
@@ -180,7 +221,7 @@ def _sag_correlation(hold):
 
 def _constant_bias(holds):
     """A per-joint bias that is pose- and load-independent: joint zeros."""
-    errors = [[float(v) for v in (hold.get("hold_error_rad") or [])] for hold in holds]
+    errors = [_effective_joint_error(hold) for hold in holds]
     width = min(len(row) for row in errors)
     if width == 0:
         return False
@@ -249,8 +290,8 @@ def attribute(oracle_doc):
                      / len(vectors)) if len(vectors) >= 2 else 1.0
         # Row 1: the arm held what it was told, the camera disagrees coherently.
         if coherence >= TIP_VECTOR_COHERENCE and all(
-                hold.get("tip_error_mm") is not None
-                and float(hold["tip_error_mm"]) <= TIP_ERROR_MM for hold in pixel_bad):
+                _effective_tip_error_mm(hold) is not None
+                and _effective_tip_error_mm(hold) <= TIP_ERROR_MM for hold in pixel_bad):
             problems.append(_problem("rig-mismatch", "camera-arm",
                                      "%d hold(s) with pixel error > %.0f mm while the tip "
                                      "held within %.0f mm: rig / K / turns"
@@ -270,9 +311,16 @@ def attribute(oracle_doc):
                                      "pixel error with stream_turn source %r%s"
                                      % (source, " in landscape" if doc.get("landscape") else "")))
 
+    # When a planned sequence has target holds (`q_ik` / `placement_mm`), gate
+    # motor/sag accuracy on those target holds so an un-targeted parked start
+    # hold resting on the physical J2/J3 stops with sag pre-comp applied cannot
+    # produce false `tip-error` / `sag` blames. Uncompensated sweeps evaluate all holds.
+    target_holds = [hold for hold in holds if _is_planned_target_hold(hold)]
+    accuracy_holds = target_holds if target_holds else holds
+
     # Rows 4 and 5: per-joint hold error, load-dependent vs constant.
-    biased = [hold for hold in holds
-              if _max_abs(hold.get("hold_error_rad")) > HOLD_ERROR_RAD]
+    biased = [hold for hold in accuracy_holds
+              if _max_abs(_effective_joint_error(hold)) > HOLD_ERROR_RAD]
     if biased:
         if any(_sag_correlation(hold) >= SAG_CORRELATION for hold in biased):
             problems.append(_problem("sag", "arm-motor",
@@ -286,9 +334,9 @@ def attribute(oracle_doc):
                                      % (len(biased), 1000.0 * HOLD_ERROR_RAD)))
 
     # Row 6: tip error near the reach boundary with IK refusals in the tape.
-    tip_bad = [hold for hold in holds
-               if hold.get("tip_error_mm") is not None
-               and float(hold["tip_error_mm"]) > TIP_ERROR_MM]
+    tip_bad = [hold for hold in accuracy_holds
+               if _effective_tip_error_mm(hold) is not None
+               and _effective_tip_error_mm(hold) > TIP_ERROR_MM]
     if tip_bad:
         radius = doc.get("max_radius_m")
         reach = doc.get("max_reach_m")
@@ -311,8 +359,8 @@ def attribute(oracle_doc):
     ik_bad = [hold for hold in holds
               if hold.get("ik_residual_mm") is not None
               and float(hold["ik_residual_mm"]) > IK_RESIDUAL_MM]
-    if ik_bad and all(hold.get("tip_error_mm") is not None
-                      and float(hold["tip_error_mm"]) <= TIP_ERROR_MM for hold in ik_bad):
+    if ik_bad and all(_effective_tip_error_mm(hold) is not None
+                      and _effective_tip_error_mm(hold) <= TIP_ERROR_MM for hold in ik_bad):
         problems.append(_problem("ik-residual", "ik",
                                  "%d hold(s) where the IK solution misses its target by "
                                  "> %.0f mm while the arm held within %.0f mm: solver / model"

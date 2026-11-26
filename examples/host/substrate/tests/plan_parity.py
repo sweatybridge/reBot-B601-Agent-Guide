@@ -283,6 +283,62 @@ assert max_acc_sm < 10.0, "sag envelope boundary shock remains: max_acc=%.2f rad
 print("smooth sag boundary 2cm top-down: wp=%d max_vel=%.3f max_acc=%.2f rad/s2" % (
     len(q_sm), float(np.abs(vel_sm).max()), max_acc_sm))
 
+# ── Issue #13: elevated 2-via arc (f95aff) jerk + Python/Rust parity ────── #
+f9_tgts = [
+    {"format": "rebot-target", "point": [0.462, -0.033, 0.04], "point_frame": "tip", "tip_offset_m": 0.0},
+    {"format": "rebot-target", "point": [0.430,  0.250, 0.04], "point_frame": "tip", "tip_offset_m": 0.0,
+     "via": [[0.462, -0.033, 0.16], [0.430, 0.250, 0.16]]},
+]
+f9_dump = {"ids": [1, 2, 3, 4, 5, 6, 7], "q": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.9]}
+f9_opts = seq_opts(); f9_opts.hz = 50.0; f9_opts.tool_axis = "z-"; f9_opts.entry = "front"
+f9_opts_json = seq_opts_json(); f9_opts_json["hz"] = 50.0; f9_opts_json["tool_axis"] = "z-"; f9_opts_json["entry"] = "front"
+ref_f9, _ = ptt.plan_sequence(f9_dump, f9_tgts, f9_opts, log=lambda *a: None)
+rust_f9 = conn.execute("SELECT rebot_plan_sequence(%s, %s, %s, %s, %s, %s::jsonb)",
+                       (URDF, json.dumps(f9_dump), json.dumps(f9_tgts),
+                        json.dumps(f9_opts_json), json.dumps({}), CFG)).fetchone()[0]
+rw_f9, fw_f9 = rust_f9["payload"]["waypoints"], ref_f9["waypoints"]
+assert len(rw_f9) == len(fw_f9), "f95aff WAYPOINT COUNT differs: rust %d ref %d" % (len(rw_f9), len(fw_f9))
+dq_f9, dtau_f9, dv_f9, _ = compare(rw_f9, fw_f9)
+assert dq_f9 < 1e-4, "f95aff parity gap %.3e rad" % dq_f9
+q_f9 = np.array([w["q"][:6] for w in rw_f9])
+t_f9 = np.array([w["t"] for w in rw_f9])
+dt_f9 = np.maximum(np.diff(t_f9), 1e-6)
+v_f9 = np.diff(q_f9, axis=0) / dt_f9[:, None]
+a_f9 = np.diff(v_f9, axis=0) / dt_f9[1:, None]
+j_f9 = np.abs(np.diff(a_f9, axis=0) / dt_f9[2:, None])
+max_jerk_f9 = float(j_f9.max())
+assert max_jerk_f9 < 120.0, "f95aff V-corner jerk spike remains: %.1f rad/s3" % max_jerk_f9
+print("f95aff 2-via arc: wp=%d maxdq=%.2e max_jerk=%.1f rad/s3" % (len(rw_f9), dq_f9, max_jerk_f9))
+
+# ── Issue #13: close-in horizontal folded J4 bind guard (b602e4) ────────── #
+b6_tgts = [
+    {"format": "rebot-target", "point": [0.32, 0.10, 0.045], "point_frame": "tip", "tip_offset_m": 0.0},
+    {"format": "rebot-target", "point": [0.35, -0.10, 0.055], "point_frame": "tip", "tip_offset_m": 0.0},
+]
+b6_opts = seq_opts(); b6_opts.hz = 50.0; b6_opts.tool_axis = "z-"; b6_opts.entry = "front"
+b6_opts_json = seq_opts_json(); b6_opts_json["hz"] = 50.0; b6_opts_json["tool_axis"] = "z-"; b6_opts_json["entry"] = "front"
+b6_ref_ok = False
+try:
+    ref_b6, _ = ptt.plan_sequence(f9_dump, b6_tgts, b6_opts, log=lambda *a: None)
+    b6_ref_ok = True
+except ptt.PlanError:
+    ref_b6 = None
+b6_rust_ok = False
+try:
+    rust_b6 = conn.execute("SELECT rebot_plan_sequence(%s, %s, %s, %s, %s, %s::jsonb)",
+                           (URDF, json.dumps(f9_dump), json.dumps(b6_tgts),
+                            json.dumps(b6_opts_json), json.dumps({}), CFG)).fetchone()[0]
+    b6_rust_ok = True
+except Exception:
+    conn.rollback()
+    rust_b6 = None
+assert b6_ref_ok == b6_rust_ok, "b602e4 accept/refuse mismatch: ref=%s rust=%s" % (b6_ref_ok, b6_rust_ok)
+if b6_rust_ok:
+    for wp in rust_b6["payload"]["waypoints"]:
+        q_b6 = wp["q"][:6]
+        assert not (q_b6[2] < np.radians(8.0) - 1e-4 and q_b6[3] < -0.10), "b602e4 folded J4 bind present: %s" % q_b6
+print("b602e4 folded-wrist guard: accepted=%s (bind-free)" % b6_rust_ok)
+
 print("TOTAL WORST dq %.3e dtau %.3e dv %.3e" % (worst_q, worst_tau, worst_v))
 ok = cases > 0 and seq_cases > 0 and via_cases > 0 and worst_q < 1e-2 and worst_tau < 1e-2
 print("PARITY", "OK" if ok else "CHECK")

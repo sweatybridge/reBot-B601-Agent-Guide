@@ -204,6 +204,63 @@ BEGIN
 END $$ LANGUAGE plpgsql IMMUTABLE;
 
 -- ---------------------------------------------------------------------------
+-- Effective error helpers for oracle_attribute: on sag-compensated planned
+-- holds (`q_ik` / `tip_fk_ik` / `placement_mm` present), gate against the
+-- desired IK pose rather than `q_cmd` so intentional sag pre-compensation
+-- never inverts `sag` / `tip-error` / `rig-mismatch` verdicts. Uncompensated
+-- sweeps and synthetic test holds without `q_ik` fall back to `hold_error_rad`
+-- and `tip_error_mm`.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION _oracle_eff_joint_error(h jsonb) RETURNS float8[] AS $$
+DECLARE
+  out float8[] := ARRAY[]::float8[];
+  j int;
+BEGIN
+  IF jsonb_typeof(h->'q_ik') = 'array' AND jsonb_array_length(h->'q_ik') >= 6
+     AND jsonb_typeof(h->'q_meas') = 'array' AND jsonb_array_length(h->'q_meas') >= 6 THEN
+    FOR j IN 0..5 LOOP
+      IF (h->'q_ik'->>j) IS NULL OR (h->'q_meas'->>j) IS NULL THEN
+        out := ARRAY[]::float8[];
+        EXIT;
+      END IF;
+      out := array_append(out, (h->'q_meas'->>j)::float8 - (h->'q_ik'->>j)::float8);
+    END LOOP;
+    IF array_length(out, 1) = 6 THEN RETURN out; END IF;
+  END IF;
+  IF jsonb_typeof(h->'hold_error_rad') = 'array' THEN
+    SELECT COALESCE(array_agg(x::float8), ARRAY[]::float8[]) INTO out
+      FROM jsonb_array_elements_text(h->'hold_error_rad') x WHERE x IS NOT NULL;
+  END IF;
+  RETURN out;
+END $$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION _oracle_eff_tip_error_mm(h jsonb) RETURNS float8 AS $$
+BEGIN
+  IF jsonb_typeof(h->'tip_fk_ik') = 'array' AND jsonb_array_length(h->'tip_fk_ik') >= 3
+     AND jsonb_typeof(h->'tip_fk_meas') = 'array' AND jsonb_array_length(h->'tip_fk_meas') >= 3
+     AND (h->'tip_fk_ik'->>0) IS NOT NULL AND (h->'tip_fk_ik'->>1) IS NOT NULL AND (h->'tip_fk_ik'->>2) IS NOT NULL
+     AND (h->'tip_fk_meas'->>0) IS NOT NULL AND (h->'tip_fk_meas'->>1) IS NOT NULL AND (h->'tip_fk_meas'->>2) IS NOT NULL THEN
+    RETURN 1000.0 * sqrt(
+      power((h->'tip_fk_meas'->>0)::float8 - (h->'tip_fk_ik'->>0)::float8, 2)
+      + power((h->'tip_fk_meas'->>1)::float8 - (h->'tip_fk_ik'->>1)::float8, 2)
+      + power((h->'tip_fk_meas'->>2)::float8 - (h->'tip_fk_ik'->>2)::float8, 2));
+  END IF;
+  IF h ? 'placement_mm' AND jsonb_typeof(h->'placement_mm') <> 'null' THEN
+    RETURN (h->>'placement_mm')::float8;
+  END IF;
+  IF h ? 'tip_error_mm' AND jsonb_typeof(h->'tip_error_mm') <> 'null' THEN
+    RETURN (h->>'tip_error_mm')::float8;
+  END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION _oracle_is_planned_target_hold(h jsonb) RETURNS boolean AS $$
+BEGIN
+  RETURN (jsonb_typeof(h->'q_ik') = 'array' AND jsonb_array_length(h->'q_ik') >= 6)
+      OR (h ? 'placement_mm' AND jsonb_typeof(h->'placement_mm') <> 'null');
+END $$ LANGUAGE plpgsql IMMUTABLE;
+
+-- ---------------------------------------------------------------------------
 -- oracle_attribute(doc, config): residual shape -> {layer, problems[], confidence}
 -- Validates config keys & non-null numeric values BEFORE unpacking.
 -- ---------------------------------------------------------------------------
@@ -211,6 +268,8 @@ DROP FUNCTION IF EXISTS oracle_attribute(jsonb);
 CREATE OR REPLACE FUNCTION oracle_attribute(doc jsonb, config jsonb) RETURNS jsonb AS $$
 DECLARE
   holds jsonb;
+  target_holds jsonb := '[]'::jsonb;
+  accuracy_holds jsonb;
   telemetry jsonb;
   witness jsonb;
   problems jsonb := '[]'::jsonb;
@@ -236,8 +295,8 @@ DECLARE
   coherence float8;
   vx float8; vy float8; nv float8;
   sx float8 := 0; sy float8 := 0; cnt int := 0;
-  err jsonb; sag jsonb; ne float8; ns float8; dot float8;
-  max_abs float8;
+  err_arr float8[]; sag jsonb; ne float8; ns float8; dot float8;
+  max_abs float8; eff_tip float8;
   has_sag boolean := false;
   constant_bias boolean := false;
   width int; j int; mean_j float8; spread_j float8; max_spread float8; max_mean float8;
@@ -305,18 +364,25 @@ BEGIN
       'detail', format('the camera moved since the rig was fitted (drift %s px, scale %s)', drift, scale)));
   END IF;
 
-  -- classify holds
+  -- classify holds (scope sag/tip accuracy to planned target holds when present)
   FOR h IN SELECT jsonb_array_elements(holds) LOOP
     IF jsonb_typeof(h) <> 'object' THEN CONTINUE; END IF;
     IF (h->>'pixel_error_mm')::float8 > PIXEL_ERROR_MM THEN pixel_bad := pixel_bad || jsonb_build_array(h); END IF;
-    max_abs := 0;
-    IF h ? 'hold_error_rad' AND jsonb_typeof(h->'hold_error_rad') = 'array' THEN
-      SELECT max(abs(x::float8)) INTO max_abs FROM jsonb_array_elements_text(h->'hold_error_rad') x WHERE x IS NOT NULL;
-    END IF;
-    IF coalesce(max_abs, 0) > HOLD_ERROR_RAD THEN biased := biased || jsonb_build_array(h); END IF;
-    IF (h->>'tip_error_mm')::float8 > TIP_ERROR_MM THEN tip_bad := tip_bad || jsonb_build_array(h); END IF;
     IF (h->>'ik_residual_mm')::float8 > IK_RESIDUAL_MM THEN ik_bad := ik_bad || jsonb_build_array(h); END IF;
     IF h ? 'pixel_error_mm' AND jsonb_typeof(h->'pixel_error_mm') <> 'null' THEN measured_cnt := measured_cnt + 1; END IF;
+    IF _oracle_is_planned_target_hold(h) THEN target_holds := target_holds || jsonb_build_array(h); END IF;
+  END LOOP;
+  accuracy_holds := CASE WHEN jsonb_array_length(target_holds) > 0 THEN target_holds ELSE holds END;
+  FOR h IN SELECT jsonb_array_elements(accuracy_holds) LOOP
+    IF jsonb_typeof(h) <> 'object' THEN CONTINUE; END IF;
+    err_arr := _oracle_eff_joint_error(h);
+    max_abs := 0;
+    IF coalesce(array_length(err_arr, 1), 0) > 0 THEN
+      SELECT max(abs(x)) INTO max_abs FROM unnest(err_arr) x;
+    END IF;
+    IF coalesce(max_abs, 0) > HOLD_ERROR_RAD THEN biased := biased || jsonb_build_array(h); END IF;
+    eff_tip := _oracle_eff_tip_error_mm(h);
+    IF eff_tip IS NOT NULL AND eff_tip > TIP_ERROR_MM THEN tip_bad := tip_bad || jsonb_build_array(h); END IF;
   END LOOP;
 
   -- pixel layer: coherence of error directions
@@ -332,7 +398,7 @@ BEGIN
     coherence := CASE WHEN cnt >= 2 THEN sqrt(sx*sx + sy*sy)/cnt ELSE 1.0 END;
     IF coherence >= TIP_VECTOR_COHERENCE AND NOT EXISTS (
          SELECT 1 FROM jsonb_array_elements(pixel_bad) p
-         WHERE (p->>'tip_error_mm')::float8 IS NULL OR (p->>'tip_error_mm')::float8 > TIP_ERROR_MM) THEN
+         WHERE _oracle_eff_tip_error_mm(p) IS NULL OR _oracle_eff_tip_error_mm(p) > TIP_ERROR_MM) THEN
       problems := problems || jsonb_build_array(jsonb_build_object(
         'kind','rig-mismatch','layer','camera-arm',
         'detail', format('%s hold(s) with pixel error > %s mm while the tip held within %s mm: rig / K / turns',
@@ -356,14 +422,14 @@ BEGIN
   -- per-joint hold error: sag vs zeros vs generic
   IF jsonb_array_length(biased) > 0 THEN
     FOR h IN SELECT jsonb_array_elements(biased) LOOP
-      err := h->'hold_error_rad'; sag := h->'sag_rad';
-      IF jsonb_typeof(err) = 'array' AND jsonb_typeof(sag) = 'array'
-         AND jsonb_array_length(err) >= 6 AND jsonb_array_length(sag) >= 6 THEN
+      err_arr := _oracle_eff_joint_error(h); sag := h->'sag_rad';
+      IF coalesce(array_length(err_arr, 1), 0) >= 6 AND jsonb_typeof(sag) = 'array'
+         AND jsonb_array_length(sag) >= 6 THEN
         ne := 0; ns := 0; dot := 0;
         FOR j IN 0..5 LOOP
-          ne := ne + power((err->>j)::float8, 2);
+          ne := ne + power(err_arr[j + 1], 2);
           ns := ns + power((sag->>j)::float8, 2);
-          dot := dot + (err->>j)::float8 * (sag->>j)::float8;
+          dot := dot + err_arr[j + 1] * (sag->>j)::float8;
         END LOOP;
         ne := sqrt(ne); ns := sqrt(ns);
         IF ne >= 1e-9 AND ns >= 1e-9 AND abs(dot/(ne*ns)) >= SAG_CORRELATION THEN
@@ -372,15 +438,19 @@ BEGIN
       END IF;
     END LOOP;
     IF jsonb_array_length(biased) >= 2 THEN
-      width := 6; max_spread := 0; max_mean := 0; constant_bias := true;
-      FOR j IN 0..width-1 LOOP
-        SELECT avg((e->'hold_error_rad'->>j)::float8),
-               max((e->'hold_error_rad'->>j)::float8) - min((e->'hold_error_rad'->>j)::float8)
-          INTO mean_j, spread_j FROM jsonb_array_elements(biased) e;
-        max_mean := greatest(max_mean, abs(coalesce(mean_j, 0)));
-        max_spread := greatest(max_spread, coalesce(spread_j, 0));
-      END LOOP;
-      constant_bias := (max_mean > HOLD_ERROR_RAD AND max_spread <= ZERO_BIAS_SPREAD_RAD);
+      SELECT min(coalesce(array_length(_oracle_eff_joint_error(e), 1), 0)) INTO width
+        FROM jsonb_array_elements(biased) e;
+      IF coalesce(width, 0) > 0 THEN
+        max_spread := 0; max_mean := 0;
+        FOR j IN 1..width LOOP
+          SELECT avg((_oracle_eff_joint_error(e))[j]),
+                 max((_oracle_eff_joint_error(e))[j]) - min((_oracle_eff_joint_error(e))[j])
+            INTO mean_j, spread_j FROM jsonb_array_elements(biased) e;
+          max_mean := greatest(max_mean, abs(coalesce(mean_j, 0)));
+          max_spread := greatest(max_spread, coalesce(spread_j, 0));
+        END LOOP;
+        constant_bias := (max_mean > HOLD_ERROR_RAD AND max_spread <= ZERO_BIAS_SPREAD_RAD);
+      END IF;
     END IF;
     IF has_sag THEN
       problems := problems || jsonb_build_array(jsonb_build_object(
@@ -417,7 +487,7 @@ BEGIN
   -- IK residual bridge
   IF jsonb_array_length(ik_bad) > 0 AND NOT EXISTS (
        SELECT 1 FROM jsonb_array_elements(ik_bad) p
-       WHERE (p->>'tip_error_mm')::float8 IS NULL OR (p->>'tip_error_mm')::float8 > TIP_ERROR_MM) THEN
+       WHERE _oracle_eff_tip_error_mm(p) IS NULL OR _oracle_eff_tip_error_mm(p) > TIP_ERROR_MM) THEN
     problems := problems || jsonb_build_array(jsonb_build_object(
       'kind','ik-residual','layer','ik',
       'detail', format('%s hold(s) where the IK solution misses its target by > %s mm while the arm held within %s mm: solver / model',
@@ -481,7 +551,7 @@ DECLARE
   tip_cmd float8[]; tip_meas float8[]; tip_ik float8[];
   tip_err float8; ik_res float8; placement float8;
   tip_point float8[]; predicted float8[]; detected jsonb;
-  px_err float8; mm_per_px float8; focal float8; dist_cam float8;
+  px_err float8; mm_per_px float8; focal float8; dist_cam float8; gscale float8;
   cam_origin float8[];
   hold jsonb;
   max_radius float8 := 0.0;
@@ -539,7 +609,8 @@ BEGIN
           hold := hold || jsonb_build_object(
             'q_ik', target->'q_ik', 'tip_fk_ik', to_jsonb(tip_ik),
             'ik_residual_mm', round(ik_res::numeric, 3),
-            'placement_mm', round(placement::numeric, 3));
+            'placement_mm', round(placement::numeric, 3),
+            'z_error_mm', round((1000.0 * (tip_meas[3] - tip_ik[3]))::numeric, 3));
         END IF;
       END IF;
 
@@ -547,6 +618,11 @@ BEGIN
       IF det IS NOT NULL AND jsonb_typeof(det) = 'object' AND jsonb_typeof(det->'uv') = 'array' THEN
         tip_point := rebot_tip_point(p_urdf, q_meas, p_tip_offset);
         predicted := rebot_project_dist(p_k, p_t_base_cam, tip_point, p_dist);
+        gscale := COALESCE((det->>'grid_scale')::float8, 1.0);
+        IF gscale <= 0 THEN gscale := 1.0; END IF;
+        IF predicted IS NOT NULL AND abs(gscale - 1.0) > 1e-6 THEN
+          predicted := ARRAY[predicted[1] * gscale, predicted[2] * gscale];
+        END IF;
         detected := det->'uv';
         hold := hold || jsonb_build_object(
           'image_size', det->'image_size', 'grid_scale', det->'grid_scale',
@@ -557,7 +633,7 @@ BEGIN
                        + ((detected->>1)::float8 - predicted[2])^2);
           dist_cam := sqrt((cam_origin[1]-tip_point[1])^2 + (cam_origin[2]-tip_point[2])^2
                          + (cam_origin[3]-tip_point[3])^2);
-          mm_per_px := CASE WHEN focal > 0 THEN 1000.0 * dist_cam / focal ELSE NULL END;
+          mm_per_px := CASE WHEN focal * gscale > 0 THEN 1000.0 * dist_cam / (focal * gscale) ELSE NULL END;
           hold := hold || jsonb_build_object(
             'pixel_error_px', round(px_err::numeric, 2),
             'pixel_error_mm', CASE WHEN mm_per_px IS NOT NULL THEN round((px_err * mm_per_px)::numeric, 2) ELSE NULL END);

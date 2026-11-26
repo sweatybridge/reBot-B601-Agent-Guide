@@ -45,6 +45,16 @@ BEGIN
   IF res->>'confidence' <> 'high' THEN RAISE EXCEPTION 'tip_detector confidence: % vs high', res->>'confidence'; END IF;
   SELECT coalesce(jsonb_agg(jsonb_build_array(p->>'kind', p->>'layer') ORDER BY ord), '[]'::jsonb) INTO ak FROM jsonb_array_elements(res->'problems') WITH ORDINALITY t(p, ord);
   IF ak <> $k$[["tip-detector", "perception"]]$k$::jsonb THEN RAISE EXCEPTION 'tip_detector kinds: % vs [["tip-detector", "perception"]]', ak; END IF;
+  -- sag_compensated_ok (Issue #13: dead-on placement with +22 mm sag pre-comp must not blame sag/tip-error)
+  res := oracle_attribute($doc${"holds": [{"pixel_error_mm": 2.0, "tip_error_mm": 8.7, "hold_error_rad": [0, -0.02, -0.01, 0, 0, 0]}, {"pixel_error_mm": 2.0, "tip_error_mm": 23.4, "placement_mm": 1.4, "q_ik": [0.1, 1.5, 0.4, 1.2, 0, 0], "q_meas": [0.101, 1.503, 0.402, 1.201, 0, 0], "tip_fk_ik": [0.35, 0.05, 0.04], "tip_fk_meas": [0.351, 0.05, 0.041], "hold_error_rad": [0, -0.04, -0.03, -0.01, 0, 0], "sag_rad": [0, 0.04, 0.03, 0.01, 0, 0]}]}$doc$::jsonb, (SELECT config_doc->'oracle' FROM world.arm_config WHERE arm_id='b601'));
+  IF res->>'layer' <> 'none' THEN RAISE EXCEPTION 'sag_compensated_ok layer: % vs none', res->>'layer'; END IF;
+  SELECT coalesce(jsonb_agg(jsonb_build_array(p->>'kind', p->>'layer') ORDER BY ord), '[]'::jsonb) INTO ak FROM jsonb_array_elements(res->'problems') WITH ORDINALITY t(p, ord);
+  IF ak <> $k$[]$k$::jsonb THEN RAISE EXCEPTION 'sag_compensated_ok kinds: % vs []', ak; END IF;
+  -- sag_overcomp (Issue #13: meas == cmd +22 mm above ik must flag sag + tip-error)
+  res := oracle_attribute($doc${"holds": [{"pixel_error_mm": 2.0, "tip_error_mm": 6.1, "placement_mm": 22.1, "q_ik": [0.1, 1.5, 0.4, 1.2, 0, 0], "q_meas": [0.1, 1.535, 0.425, 1.21, 0, 0], "tip_fk_ik": [0.35, 0.05, 0.04], "tip_fk_meas": [0.352, 0.051, 0.062], "hold_error_rad": [0, -0.002, -0.002, 0, 0, 0], "sag_rad": [0, 0.035, 0.025, 0.01, 0, 0]}]}$doc$::jsonb, (SELECT config_doc->'oracle' FROM world.arm_config WHERE arm_id='b601'));
+  IF res->>'layer' <> 'arm-motor' THEN RAISE EXCEPTION 'sag_overcomp layer: % vs arm-motor', res->>'layer'; END IF;
+  SELECT coalesce(jsonb_agg(jsonb_build_array(p->>'kind', p->>'layer') ORDER BY ord), '[]'::jsonb) INTO ak FROM jsonb_array_elements(res->'problems') WITH ORDINALITY t(p, ord);
+  IF ak <> $k$[["sag", "arm-motor"], ["tip-error", "arm-motor"]]$k$::jsonb THEN RAISE EXCEPTION 'sag_overcomp kinds: %', ak; END IF;
   RAISE NOTICE 'ORACLE_ATTRIBUTE MATCHES REFERENCE OK';
 END $$;
 

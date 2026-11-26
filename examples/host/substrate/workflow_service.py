@@ -206,13 +206,18 @@ def _plan_grasp_check_spec(plan_id: str, workspace: str) -> dict | None:
     if not row:
         return None
     q0 = [0.0] * 6
+    q_check = None
     wps = plan.get("waypoints") or []
     if wps and isinstance(wps[0].get("q"), list) and len(wps[0]["q"]) >= 6:
         q0 = [float(v) for v in wps[0]["q"][:6]]
+        best_wp = min(wps, key=lambda w: abs(float(w.get("t", 0.0)) - t_check))
+        if isinstance(best_wp.get("q"), list) and len(best_wp["q"]) >= 6:
+            q_check = [float(v) for v in best_wp["q"][:6]]
     return {
         "t_check": t_check,
         "point": [float(v) for v in point[:3]],
         "q0": q0,
+        "q_check": q_check,
         "K": np.asarray(row["k"], dtype=float),
         "dist": np.asarray(row["dist"], dtype=float).reshape(-1),
         "T_base_cam": np.asarray(row["t_base_cam"], dtype=float),
@@ -245,7 +250,9 @@ def _start_grasp_guard(spec: dict | None, pre_frame: np.ndarray | None,
                 spec["K"], (int(spec["image_size"][0]), int(spec["image_size"][1])),
                 (int(pre_up.shape[1]), int(pre_up.shape[0])))
             pick_uv = oracle_vision._project_point(spec["point"], K_up, spec["dist"], spec["T_base_cam"])
-            verdict = oracle_vision.verify_grasp(pre_up, post_up, pick_uv, scale=scale)
+            verdict = oracle_vision.verify_grasp(
+                pre_up, post_up, pick_uv, scale=scale,
+                post_q6=spec.get("q_check"), K=K_up, dist=spec["dist"], T_base_cam=spec["T_base_cam"])
             result_out.update(verdict)
             if verdict.get("grasped") is False and verdict.get("confidence") == "high" and not done_event.is_set():
                 try:
@@ -476,6 +483,7 @@ def detect(exec_id: str) -> dict:
         calib_size = req.get("image_size")
     detections = {}
     upright_by_index: dict[int, tuple[np.ndarray, float]] = {}
+    q6_by_index: dict[int, np.ndarray] = {}
     cached_turn: int | None = None
     for hold in req.get("holds") or []:
         sha = hold.get("frame")
@@ -500,6 +508,7 @@ def detect(exec_id: str) -> dict:
             if turn in (1, 3):
                 cached_turn = turn
             upright_by_index[int(hold["index"])] = (frame, scale)
+            q6_by_index[int(hold["index"])] = q6
             K_use = K
             if calib_size and len(calib_size) >= 2 and (
                 int(frame.shape[1]) != int(calib_size[0]) or int(frame.shape[0]) != int(calib_size[1])
@@ -539,7 +548,8 @@ def detect(exec_id: str) -> dict:
             pick_uv = oracle_vision._project_point(pick_pt, K_use, dist, T)
             if pick_uv is not None:
                 grasp_verification = oracle_vision.verify_grasp(
-                    pre_img, post_img, pick_uv, scale=pre_scale)
+                    pre_img, post_img, pick_uv, scale=pre_scale,
+                    post_q6=q6_by_index.get(3), K=K_use, dist=dist, T_base_cam=T)
 
     out = {"detections": detections}
     if grasp_verification is not None:

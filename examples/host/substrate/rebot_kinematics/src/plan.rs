@@ -493,6 +493,8 @@ fn smoothstep_taper(value: f64, lo: f64, hi: f64, taper: f64) -> f64 {
     1.0 - (3.0 * u * u - 2.0 * u * u * u)
 }
 
+const SOFT_CLAMP_MARGIN_RAD: f64 = 0.12;
+
 fn soft_clamp_sag(q: &[f64], cmd: &[f64; 6], limits: &[[f64; 2]; 6]) -> [f64; 6] {
     let mut out = [0.0; 6];
     for j in 0..6 {
@@ -500,27 +502,25 @@ fn soft_clamp_sag(q: &[f64], cmd: &[f64; 6], limits: &[[f64; 2]; 6]) -> [f64; 6]
         let hi = limits[j][1];
         let qj = q[j].clamp(lo, hi);
         let delta = cmd[j] - qj;
-        let delta_eff = if delta > 0.0 {
-            let half = 0.5 * (hi - qj).max(0.0);
-            if half <= 1e-12 {
-                0.0
-            } else if delta <= half {
-                delta
-            } else {
-                half + half * ((delta - half) / half).tanh()
-            }
-        } else if delta < 0.0 {
-            let half = 0.5 * (qj - lo).max(0.0);
-            let ad = -delta;
-            if half <= 1e-12 {
-                0.0
-            } else if ad <= half {
-                delta
-            } else {
-                -(half + half * ((ad - half) / half).tanh())
-            }
-        } else {
+        let ad = delta.abs();
+        let delta_eff = if ad <= 1e-12 {
             0.0
+        } else {
+            let headroom = if delta > 0.0 {
+                (hi - qj).max(0.0)
+            } else {
+                (qj - lo).max(0.0)
+            };
+            let margin = SOFT_CLAMP_MARGIN_RAD.max(3.0 * ad);
+            if headroom >= margin {
+                delta
+            } else if headroom <= 0.0 {
+                0.0
+            } else {
+                let t = headroom / margin;
+                let omt = 1.0 - t;
+                delta * (1.0 - omt * omt * omt)
+            }
         };
         out[j] = (qj + delta_eff).clamp(lo, hi);
     }
@@ -1336,16 +1336,45 @@ impl<'a> Planner<'a> {
         if unique.len() < 2 {
             return self.last_q6();
         }
-        let (samples, arc) = chain_path(&unique, self.ctx.cfg.corner_radius_rad, &self.ctx.cfg);
-        if !self.ctx.samples_safe(&samples) {
-            panic!(
-                "the via chain into marker {into_marker} dips within a link radius of the worktop; raise the via points or move the arm clear"
-            );
+        // Split at sharp interior V-corners (cos < 0.25, turn > ~75.5 deg) so
+        // the arm decelerates smoothly to rest via C2 quintic S-ramps instead
+        // of forcing a 6-axis velocity reversal through a 0.05 rad fillet.
+        let mut sub_chains: Vec<Vec<[f64; 6]>> = Vec::new();
+        let mut current: Vec<[f64; 6]> = vec![unique[0]];
+        for idx_k in 1..unique.len() - 1 {
+            let mut dot = 0.0_f64;
+            let mut n_in2 = 0.0_f64;
+            let mut n_out2 = 0.0_f64;
+            for j in 0..6 {
+                let vin = unique[idx_k][j] - unique[idx_k - 1][j];
+                let vout = unique[idx_k + 1][j] - unique[idx_k][j];
+                dot += vin * vout;
+                n_in2 += vin * vin;
+                n_out2 += vout * vout;
+            }
+            let n_in = n_in2.sqrt();
+            let n_out = n_out2.sqrt();
+            current.push(unique[idx_k]);
+            if n_in > 1e-12 && n_out > 1e-12 && (dot / (n_in * n_out)) < 0.25 {
+                sub_chains.push(current);
+                current = vec![unique[idx_k]];
+            }
         }
-        let seconds = seconds_for_travel(chain_travel(&samples), &self.ctx.cfg);
-        for q in chain_series(&samples, &arc, seconds, self.hz, &self.ctx.cfg) {
-            self.t += self.period;
-            self.append(&q, gripper);
+        current.push(*unique.last().unwrap());
+        sub_chains.push(current);
+
+        for sub in &sub_chains {
+            let (samples, arc) = chain_path(sub, self.ctx.cfg.corner_radius_rad, &self.ctx.cfg);
+            if !self.ctx.samples_safe(&samples) {
+                panic!(
+                    "the via chain into marker {into_marker} dips within a link radius of the worktop or folds j4 into the j2 casing; raise the via points or move the arm clear"
+                );
+            }
+            let seconds = seconds_for_travel(chain_travel(&samples), &self.ctx.cfg);
+            for q in chain_series(&samples, &arc, seconds, self.hz, &self.ctx.cfg) {
+                self.t += self.period;
+                self.append(&q, gripper);
+            }
         }
         self.last_q6()
     }
@@ -1967,17 +1996,43 @@ fn rebot_plan_sequence(
             let prev_where = pl.worst_where.clone();
             let attempt = (|| -> Result<([f64; 6], [f64; 6], Vec<[f64; 6]>), String> {
                 let tq = pl.try_ik_with_fallback(&place, &r_try, &seed, &start_seed, &label)?;
+                if !ctx.arm.pose_safe(&tq, &ctx.cfg) {
+                    return Err(format!(
+                        "marker {index} pose violates worktop clearance or folds j4 into the j2 casing (j3 < 8 deg with negative j4); use vertical top-down entry or adjust target"
+                    ));
+                }
                 let aq = if let Some((ref sp, ref slabel)) = stage_place_opt {
                     let sseed = if vertical_entry { &tq } else { &seed };
-                    pl.try_ik_with_fallback(sp, &r_try, sseed, &start_seed, slabel)?
+                    let sq = pl.try_ik_with_fallback(sp, &r_try, sseed, &start_seed, slabel)?;
+                    if !ctx.arm.pose_safe(&sq, &ctx.cfg) {
+                        return Err(format!(
+                            "{slabel} pose violates worktop clearance or folds j4 into the j2 casing (j3 < 8 deg with negative j4); use vertical top-down entry or adjust target"
+                        ));
+                    }
+                    sq
                 } else {
                     tq
                 };
                 let mut vqs: Vec<[f64; 6]> = Vec::with_capacity(via_flange_points[i].len());
+                let mut vseed = seed;
                 for (vi, via_place) in via_flange_points[i].iter().enumerate() {
                     let vlabel = format!("via {index}.{}", vi + 1);
-                    let vq = pl.try_ik_with_fallback(via_place, &r_try, &seed, &start_seed, &vlabel)?;
+                    let via_tip = vias[i][vi];
+                    let via_yaw = via_tip.y.atan2(via_tip.x).to_degrees();
+                    let r_via_nom = work_orientation(&r0, &sequence_axis, via_yaw);
+                    let r_via = if delta.abs() < 1e-9 {
+                        r_via_nom
+                    } else {
+                        r_via_nom * roty(delta)
+                    };
+                    let vq = pl.try_ik_with_fallback(via_place, &r_via, &vseed, &start_seed, &vlabel)?;
+                    if !ctx.arm.pose_safe(&vq, &ctx.cfg) {
+                        return Err(format!(
+                            "{vlabel} pose violates worktop clearance or folds j4 into the j2 casing; raise the via point"
+                        ));
+                    }
                     vqs.push(vq);
+                    vseed = vq;
                 }
                 Ok((tq, aq, vqs))
             })();

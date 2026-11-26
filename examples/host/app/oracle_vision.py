@@ -254,15 +254,17 @@ def detect_tip(frame, q6, K, dist, T_base_cam, t_tip, scale=1.0):
     return {"detector": "green", "uv": [found.u, found.v], "score": found.score}
 
 
-def verify_grasp(pre_frame, post_frame, pick_uv, radius_px=65.0, scale=1.0):
+def verify_grasp(pre_frame, post_frame, pick_uv, radius_px=65.0, scale=1.0,
+                 post_q6=None, K=None, dist=None, T_base_cam=None):
     """Verify whether the target object left the pick zone after grasp + retract.
 
-    Uses translation-invariant template matching (`TM_CCOEFF_NORMED` over a
-    local ±55 px search window) plus aligned Lab color difference and HSV
-    histogram correlation around `pick_uv`. Tolerates a missed grasp nudging
-    the object a few centimetres on the table while cleanly detecting object
-    removal across arbitrary object colors (including soft plushes where motor
-    7 encoder telemetry cannot distinguish hit from empty-air miss).
+    Uses projected arm-skeleton occlusion gating (when `post_q6`, `K`, `dist`,
+    `T_base_cam` are supplied) plus translation-invariant template matching
+    (`TM_CCOEFF_NORMED` over a local ±55 px search window), aligned Lab color
+    difference, and HSV histogram correlation around `pick_uv`. Tolerates a
+    missed grasp nudging the object a few centimetres or casting an overhead
+    arm shadow on the table while cleanly detecting object removal across
+    arbitrary object colors.
     """
     import cv2
 
@@ -280,6 +282,30 @@ def verify_grasp(pre_frame, post_frame, pick_uv, radius_px=65.0, scale=1.0):
     if (x1 - x0) < 20 or (y1 - y0) < 20:
         return {"grasped": None, "confidence": "low", "reason": "pick_uv_out_of_frame",
                 "pick_uv": [round(cx, 1), round(cy, 1)]}
+
+    # Geometric arm-skeleton occlusion guard: black motor/wrist housings are
+    # invisible to `green_mask`, so project links j2..ee in the post frame and
+    # abstain whenever the arm itself sits directly over `pick_uv`.
+    if post_q6 is not None and K is not None and dist is not None and T_base_cam is not None:
+        try:
+            joints_uv, _collar_uv, ee_uv = _arm_joint_pixels(post_q6, K, dist, T_base_cam)
+            chain = [p for p in joints_uv[1:] + [ee_uv] if p is not None]
+            if len(chain) >= 2:
+                p_arr = np.asarray([[cx, cy]], dtype=float)
+                min_arm_d = min(
+                    float(_point_to_seg_dist(p_arr, a, b)[0])
+                    for a, b in zip(chain[:-1], chain[1:])
+                )
+                occlude_gate = max(75.0, float(radius_px) + 15.0) * float(scale)
+                if min_arm_d < occlude_gate:
+                    return {
+                        "grasped": None, "confidence": "low",
+                        "reason": "arm_occludes_pick_zone",
+                        "arm_dist_px": round(min_arm_d, 1),
+                        "pick_uv": [round(cx, 1), round(cy, 1)],
+                    }
+        except Exception:  # noqa: BLE001 - fall back to pixel checks if FK/proj fails
+            pass
 
     tpl = pre_frame[y0:y1, x0:x1]
     sx0, sx1 = max(0, x0 - shift_r), min(w, x1 + shift_r)
@@ -322,8 +348,15 @@ def verify_grasp(pre_frame, post_frame, pick_uv, radius_px=65.0, scale=1.0):
     hist_corr = float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
 
     grasped = bool(tm_max < 0.72 and changed_frac >= 0.20 and mean_de >= 18.0)
+    # Shadow-tolerant high-confidence miss bar: overhead arm shadows during
+    # live post-retract checks raise Lab `changed_frac` to 0.19-0.36 while
+    # gain-invariant `tm_max` (>= 0.75) and HSV `hist_corr` (>= 0.72) still
+    # confirm the target object never left the pick zone.
     if (grasped and tm_max < 0.62 and changed_frac >= 0.25) or (
-        (not grasped) and tm_max >= 0.80 and changed_frac <= 0.18
+        (not grasped) and (
+            (tm_max >= 0.80 and changed_frac <= 0.18)
+            or (tm_max >= 0.75 and hist_corr >= 0.72)
+        )
     ):
         confidence = "high"
     else:

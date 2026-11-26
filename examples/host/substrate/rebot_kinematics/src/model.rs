@@ -253,8 +253,17 @@ impl ArmModel {
         jac
     }
 
-    /// Worktop capsule clearance + reach cylinder gate for a single pose `q6`.
+    /// Worktop capsule clearance + reach cylinder + folded-wrist bind gate for a single pose `q6`.
     pub fn pose_safe(&self, q6: &[f64], cfg: &Config) -> bool {
+        if q6.len() < 6 || !q6[..6].iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        // Folded-elbow wrist-bind guard: below ~8 deg (UNPARK_J3_DEG) the j4
+        // hinge seats onto the j2 casing; driving j4 negative jams the wrist
+        // into link 2 (b602e4: j3=0.057, j4=-0.55 -> 0.22 rad stall & slam).
+        if q6[2] < 8.0_f64.to_radians() - 1e-6 && q6[3] < -0.10 {
+            return false;
+        }
         let points = self.joint_points(q6);
         for index in 1..points.len() {
             let start = points[index - 1];

@@ -131,23 +131,44 @@ def pose_ok(q):
             and math.hypot(tip[0], tip[1]) < RADIUS_MAX)
 
 
+# Folded-elbow wrist-bind guard: below UNPARK_J3_DEG (~8 deg) the j4 hinge
+# seats onto the j2 casing; driving j4 negative jams the wrist into link 2
+# (observed in b602e4: j3=0.057, j4=-0.55 -> 0.22 rad stall and 104 rad/s^2
+# release slam). Positive j4 lifts the wrist away from link 2.
+FOLDED_J3_RAD = math.radians(UNPARK_J3_DEG) - 1e-6
+FOLDED_J4_MIN_RAD = -0.10
+
+
+def pose_safe(q):
+    """Single-pose safety gate: table clearance, reach cylinder, and folded-wrist bind."""
+    q6 = np.asarray(q, dtype=float).reshape(6)
+    if not np.all(np.isfinite(q6)):
+        return False
+    if float(q6[2]) < FOLDED_J3_RAD and float(q6[3]) < FOLDED_J4_MIN_RAD:
+        return False
+    points = joint_points(q6)
+    for index in range(1, len(points)):
+        start, end = points[index - 1], points[index]
+        radius = RADII[min(index, len(RADII) - 1)]
+        for fraction in (0.0, 0.5):
+            centre = start + (end - start) * fraction
+            if centre[2] - radius < CLEARANCE:
+                return False
+        if math.hypot(end[0], end[1]) > LINK_RADIUS_MAX:
+            return False
+    return True
+
+
 def samples_safe(samples):
     """The capsule test on a dense joint-space sample series: no link centre
-    passes within its own radius of the worktop, and none leaves the cell's
-    radial bound. `path_safe` is this test on a straight-line linspace; a
-    curved leg (a via chain) must be gated on its own curve, not its chords.
+    passes within its own radius of the worktop, none leaves the cell's
+    radial bound, and no pose folds j4 negative against the j2 casing.
+    `path_safe` is this test on a straight-line linspace; a curved leg
+    (a via chain) must be gated on its own curve, not its chords.
     """
     for q in samples:
-        points = joint_points(np.asarray(q, dtype=float).reshape(6))
-        for index in range(1, len(points)):
-            start, end = points[index - 1], points[index]
-            radius = RADII[min(index, len(RADII) - 1)]
-            for fraction in (0.0, 0.5):
-                centre = start + (end - start) * fraction
-                if centre[2] - radius < CLEARANCE:
-                    return False
-            if math.hypot(end[0], end[1]) > LINK_RADIUS_MAX:
-                return False
+        if not pose_safe(q):
+            return False
     return True
 
 
@@ -371,13 +392,18 @@ def gravity_sag(q, kp, limit=None):
     return np.clip(sag, -limit, limit)
 
 
-def soft_clamp_sag(q, cmd, lower, upper):
-    """C2-smoothly saturate additive sag compensation inside joint limits.
+SOFT_CLAMP_MARGIN_RAD = 0.12
 
-    When `q` is well inside `[lower, upper]` (available headroom >= 2*|delta|),
-    returns `cmd` unchanged. As `q + delta` approaches a joint limit, saturates
-    the excess offset with `tanh` into the remaining headroom so the command
-    never forms a C0 hard-clamp corner (eliminating limit-peel jerk spikes).
+
+def soft_clamp_sag(q, cmd, lower, upper):
+    """C2-smoothly taper additive sag compensation inside joint limits.
+
+    When `q` has headroom >= max(0.12, 3*|delta|) from the approached limit,
+    returns `cmd` unchanged. Closer to the limit, scales `delta` by the C2
+    cubic blend `1 - (1 - h / m)^3`, which stays strictly <= h (never clips),
+    meets `delta` with zero first and second derivatives at `h = m`, and has
+    bounded curvature right down to `h = 0` (eliminating limit-peel jerk spikes
+    when an IK hold sits directly on a joint stop).
     """
     q = np.asarray(q, dtype=float).reshape(-1)
     cmd = np.asarray(cmd, dtype=float).reshape(-1)
@@ -387,27 +413,19 @@ def soft_clamp_sag(q, cmd, lower, upper):
     for j in range(len(q)):
         qj = float(np.clip(q[j], lo[j], hi[j]))
         delta = float(cmd[j] - qj)
-        if delta > 0.0:
-            headroom = max(0.0, float(hi[j] - qj))
-            half = 0.5 * headroom
-            if half <= 1e-12:
-                delta_eff = 0.0
-            elif delta <= half:
-                delta_eff = delta
-            else:
-                delta_eff = half + half * math.tanh((delta - half) / half)
-        elif delta < 0.0:
-            headroom = max(0.0, float(qj - lo[j]))
-            half = 0.5 * headroom
-            ad = -delta
-            if half <= 1e-12:
-                delta_eff = 0.0
-            elif ad <= half:
-                delta_eff = delta
-            else:
-                delta_eff = -(half + half * math.tanh((ad - half) / half))
-        else:
+        ad = abs(delta)
+        if ad <= 1e-12:
             delta_eff = 0.0
+        else:
+            headroom = max(0.0, float(hi[j] - qj)) if delta > 0.0 else max(0.0, float(qj - lo[j]))
+            margin = max(SOFT_CLAMP_MARGIN_RAD, 3.0 * ad)
+            if headroom >= margin:
+                delta_eff = delta
+            elif headroom <= 0.0:
+                delta_eff = 0.0
+            else:
+                t = headroom / margin
+                delta_eff = delta * (1.0 - (1.0 - t) ** 3)
         out[j] = float(np.clip(qj + delta_eff, lo[j], hi[j]))
     return out
 

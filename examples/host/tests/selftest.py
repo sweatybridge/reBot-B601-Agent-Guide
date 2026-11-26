@@ -1518,6 +1518,40 @@ def test_oracle_rules():
     check("attribute: no evidence is low confidence, not a pass",
           oracle.attribute({})["confidence"] == "low"
           and oracle.attribute({})["layer"] == "none")
+    # Sag-compensated planned holds (Issue #13): gate on `q_meas - q_ik` and
+    # `||tip_fk_meas - tip_fk_ik||` rather than `q_meas - q_cmd`, so accurate
+    # placement (1.3-2.0 mm) with intentional +22 mm sag pre-comp does NOT
+    # trigger false `sag` or `tip-error`, while +22 mm sag over-compensation
+    # (`meas == cmd` far above `ik`) DOES trigger `sag` + `tip-error`.
+    sag_ok = {"holds": [
+        hold(tip_error_mm=8.7, pixel_error_mm=2.0),  # parked Hold 1 (no q_ik)
+        hold(q_ik=[0.1, 1.5, 0.4, 1.2, 0.0, 0.0],
+             q_meas=[0.101, 1.503, 0.402, 1.201, 0.0, 0.0],
+             hold_error_rad=[0.0, -0.04, -0.03, -0.01, 0.0, 0.0],
+             sag_rad=[0.0, 0.04, 0.03, 0.01, 0.0, 0.0],
+             tip_fk_ik=[0.35, 0.05, 0.04], tip_fk_meas=[0.351, 0.050, 0.041],
+             placement_mm=1.4, tip_error_mm=23.4, pixel_error_mm=2.0),
+        hold(q_ik=[-0.1, 1.6, 0.5, 1.1, 0.0, 0.0],
+             q_meas=[-0.101, 1.602, 0.501, 1.101, 0.0, 0.0],
+             hold_error_rad=[0.0, -0.038, -0.028, -0.01, 0.0, 0.0],
+             sag_rad=[0.0, 0.038, 0.028, 0.01, 0.0, 0.0],
+             tip_fk_ik=[0.35, -0.05, 0.05], tip_fk_meas=[0.350, -0.051, 0.050],
+             placement_mm=1.0, tip_error_mm=21.8, pixel_error_mm=2.0),
+    ]}
+    sag_ok_kinds = [p["kind"] for p in oracle.attribute(sag_ok)["problems"]]
+    check("attribute: sag-compensated dead-on placement is not blamed on sag/tip-error",
+          sag_ok_kinds == [], str(sag_ok_kinds))
+    sag_over = {"holds": [
+        hold(q_ik=[0.1, 1.5, 0.4, 1.2, 0.0, 0.0],
+             q_meas=[0.1, 1.535, 0.425, 1.21, 0.0, 0.0],
+             hold_error_rad=[0.0, -0.002, -0.002, 0.0, 0.0, 0.0],
+             sag_rad=[0.0, 0.035, 0.025, 0.01, 0.0, 0.0],
+             tip_fk_ik=[0.35, 0.05, 0.04], tip_fk_meas=[0.352, 0.051, 0.062],
+             placement_mm=22.1, tip_error_mm=6.1, pixel_error_mm=2.0),
+    ]}
+    sag_over_kinds = [p["kind"] for p in oracle.attribute(sag_over)["problems"]]
+    check("attribute: sag over-compensation (meas==cmd above ik) flags sag + tip-error",
+          "sag" in sag_over_kinds and "tip-error" in sag_over_kinds, str(sag_over_kinds))
     check("attribute: an aborted run is medium confidence",
           oracle.attribute(rows[-1][1])["confidence"] == "medium")
 
@@ -4736,8 +4770,8 @@ def test_identify_gate(workdir: Path):
     check("coverage picks poses for the unvalidated cells", 0 < len(chosen) <= 6,
           "%d poses" % len(chosen))
     check("every coverage pose is a legal pose", all(sweep.pose_ok(e["q"]) for e in chosen))
-    chain = [np.zeros(6)] + [entry["q"] for entry in chosen]
-    check("the coverage chain is path-safe from the current pose",
+    chain = [sweep.unpark_pose(np.zeros(6))] + [entry["q"] for entry in chosen]
+    check("the coverage chain is path-safe from the unparked pose",
           all(sweep.path_safe(a, b) for a, b in zip(chain, chain[1:])))
     peaks = [float(np.max(np.abs(b - a))) / (sweep.seconds_for(a, b) - traj.RAMP_S)
              for a, b in zip(chain, chain[1:])]
@@ -5974,6 +6008,19 @@ def test_oracle_detect(workdir: Path):
           v_nudge["grasped"] is False, str(v_nudge))
     check("verify_grasp flags removed object as grasped=True",
           v_hit["grasped"] is True and v_hit["confidence"] == "high", str(v_hit))
+    # Shadowed miss (darkened overhead shadow raises Lab changed_frac > 0.18
+    # while object stays put): must still report grasped=False, confidence=high
+    # so the live guard fires POST /stop (Issue #13).
+    shadowed = np.clip(pre_g.astype(np.float32) * 0.72, 0, 255).astype(np.uint8)
+    v_shadow = ov.verify_grasp(pre_g, shadowed, (320, 240))
+    check("verify_grasp flags shadowed miss as high-confidence False",
+          v_shadow["grasped"] is False and v_shadow["confidence"] == "high", str(v_shadow))
+    # Arm-skeleton occlusion guard: when post_q6 places the wrist/forearm over
+    # pick_uv, abstain as arm_occludes_pick_zone instead of false-positive True.
+    v_occ = ov.verify_grasp(pre_g, table, ee_uv, post_q6=q, K=K, dist=dist, T_base_cam=T)
+    check("verify_grasp abstains when post_q6 arm skeleton occludes pick_uv",
+          v_occ["grasped"] is None and v_occ.get("reason") == "arm_occludes_pick_zone",
+          str(v_occ))
 
 
 def test_uniform_rescale(workdir: Path, geometry):
@@ -6270,6 +6317,29 @@ def test_via_chain(workdir: Path):
           wire["via"] == [[0.32, 0.12, 0.15]] and wire["pixel"] == [100, 200])
     check("compact_target without vias is unchanged",
           "via" not in cs.compact_target(tip, {"pixel": [1, 2]}))
+
+    # Issue #13 regressions: folded-wrist bind guard (b602e4) and C2 cubic
+    # soft_clamp_sag peel-off from a joint limit (6b95f7).
+    check("pose_safe refuses folded j3<8deg with negative j4 (b602e4 bind)",
+          not sweep.pose_safe([-0.283, 0.0, 0.057, -0.55, 0.025, 0.014]))
+    check("pose_safe permits unparked j3=8deg and positive j4",
+          sweep.pose_safe([0.0, 0.0, math.radians(8.0), -0.55, 0.0, 0.0])
+          and sweep.pose_safe([0.0, 0.8, 0.08, +0.90, 0.0, 0.0]))
+    lo, hi = rebot_ik.LIMITS[:, 0], rebot_ik.LIMITS[:, 1]
+    q_lim = np.array([0.39, 1.98, 0.56, float(hi[3]), 0.0, 0.0])
+    q_ret = np.array([0.0, 0.0, math.radians(8.0), 0.0, 0.0, 0.0])
+    n_ret = int(round(sweep.seconds_for(q_lim, q_ret) * 50.0))
+    clamped = []
+    for k in range(15):
+        clamped.append(sweep.soft_clamp_sag(q_lim, q_lim + np.array([0, 0, 0, 0.025, 0, 0]), lo, hi))
+    for k in range(1, n_ret + 1):
+        qk = q_lim + (q_ret - q_lim) * traj.ease_fraction(k / n_ret, n_ret / 50.0)
+        clamped.append(sweep.soft_clamp_sag(qk, qk + np.array([0, 0, 0, 0.025, 0, 0]), lo, hi))
+    arr_c = np.asarray(clamped)
+    jerk_c = np.max(np.abs(np.diff(arr_c[:, 3], n=3))) * (50.0 ** 3)
+    check("soft_clamp_sag exits a joint-limit hold without a peel-off jerk spike",
+          jerk_c < 60.0 and np.all(arr_c[:, 3] <= hi[3] + 1e-12),
+          "max_j4_jerk=%.1f rad/s3" % jerk_c)
 
 
 def main(argv=None):

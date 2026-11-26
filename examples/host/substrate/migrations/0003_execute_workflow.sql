@@ -1011,9 +1011,9 @@ BEGIN
       COALESCE(doc->'verdict'->'problems', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
         'kind', 'empty-grasp',
         'layer', 'grasp',
-        'detail', format('visual post-grasp check saw object still at pick spot (changed=%.0f%%, tm=%.2f)',
-                         COALESCE((p_detections->'grasp_verification'->>'changed_frac')::float8, 0.0) * 100.0,
-                         COALESCE((p_detections->'grasp_verification'->>'tm_max')::float8, 1.0)))));
+        'detail', format('visual post-grasp check saw object still at pick spot (changed=%s%%, tm=%s)',
+                         round((COALESCE((p_detections->'grasp_verification'->>'changed_frac')::float8, 0.0) * 100.0)::numeric, 0),
+                         round(COALESCE((p_detections->'grasp_verification'->>'tm_max')::float8, 1.0)::numeric, 2)))));
   END IF;
   PERFORM oracle_learn(p_exec_id, ex.arm_id, rig.rig_fingerprint, doc, NULL);
   RETURN jsonb_build_object('doc', doc, 'verdict', doc->'verdict');

@@ -935,11 +935,11 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         return pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float), n_arm)
 
     def chain_leg(knots, into_marker, gripper):
-        """One continuous pass through the knots: straight joint-space segments
-        with tangent fillets at the vias (traj.chain_series), under one S-ramp
-        trapezoid time law so the arm does not stop at the vias. The capsule
-        gate sees the filleted path itself -- a rounded corner leaves the chord
-        near the knot -- and the speed policy budgets the whole path."""
+        """Pass through the knots using filleted continuous chains across gentle
+        bends, splitting to a smooth C2 rest-to-rest ramp at sharp V-corners
+        (dot(u_in, u_out) < 0.25, i.e., turn > ~75.5 deg) so a tight 0.05 rad
+        fillet never blasts a 6-axis reversal through 40 ms. Every sub-chain
+        still runs the capsule gate on its filleted curve."""
         unique = [np.asarray(knots[0], dtype=float)]
         for knot in knots[1:]:
             knot = np.asarray(knot, dtype=float)
@@ -948,16 +948,34 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
         if len(unique) < 2:
             return pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float),
                                    n_arm)
-        if not sweep.samples_safe(traj.chain_samples(unique)):
-            raise PlanError(
-                "the via chain into marker %d dips within a link radius of the "
-                "worktop; raise the via points or move the arm clear" % into_marker)
-        seconds = sweep.seconds_for_travel(traj.chain_travel(unique))
+        sub_chains = []
+        current = [unique[0]]
+        for idx_k in range(1, len(unique) - 1):
+            v_in = unique[idx_k] - unique[idx_k - 1]
+            v_out = unique[idx_k + 1] - unique[idx_k]
+            n_in = float(np.linalg.norm(v_in))
+            n_out = float(np.linalg.norm(v_out))
+            current.append(unique[idx_k])
+            if n_in > 1e-12 and n_out > 1e-12:
+                cos_turn = float(np.dot(v_in, v_out) / (n_in * n_out))
+                if cos_turn < 0.25:
+                    sub_chains.append(current)
+                    current = [unique[idx_k]]
+        current.append(unique[-1])
+        sub_chains.append(current)
+
         count = 0
-        for q_chain in traj.chain_series(unique, seconds, options.hz):
-            state["t"] += period
-            append(pad_q_for_model(model, q_chain, n_arm), gripper)
-            count += 1
+        for sub in sub_chains:
+            if not sweep.samples_safe(traj.chain_samples(sub)):
+                raise PlanError(
+                    "the via chain into marker %d dips within a link radius of the "
+                    "worktop or folds j4 into the j2 casing; raise the via points or "
+                    "move the arm clear" % into_marker)
+            seconds = sweep.seconds_for_travel(traj.chain_travel(sub))
+            for q_chain in traj.chain_series(sub, seconds, options.hz):
+                state["t"] += period
+                append(pad_q_for_model(model, q_chain, n_arm), gripper)
+                count += 1
         if not options.quiet:
             log("  %-11s: %d waypoints" % ("via %d" % into_marker, count))
         return pad_q_for_model(model, np.array(waypoints[-1]["q"][:n_arm], dtype=float), n_arm)
@@ -1031,18 +1049,38 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
             prev_worst = dict(worst)
             try:
                 tq = _try_ik_pair(place, R_try, seed, start_seed, "marker %d" % index)
+                if not sweep.pose_safe(tq[:n_arm]):
+                    raise PlanError(
+                        "marker %d pose violates worktop clearance or folds j4 into the j2 casing "
+                        "(j3 < 8 deg with negative j4); use vertical top-down entry or adjust target"
+                        % index)
                 if stage_place_opt is not None:
                     sseed = tq if vertical_entry else seed
                     sq = _try_ik_pair(stage_place_opt, R_try, sseed, start_seed, stage_label)
+                    if not sweep.pose_safe(sq[:n_arm]):
+                        raise PlanError(
+                            "%s pose violates worktop clearance or folds j4 into the j2 casing "
+                            "(j3 < 8 deg with negative j4); use vertical top-down entry or adjust target"
+                            % stage_label)
                     aq = sq
                 else:
                     sq = None
                     aq = tq
                 vqs = []
+                vseed = seed
                 for via_index, via_place in enumerate(via_flange_points[index - 1], start=1):
                     vlabel = "via %d.%d" % (index, via_index)
-                    vq = _try_ik_pair(via_place, R_try, seed, start_seed, vlabel)
+                    via_tip = vias[index - 1][via_index - 1]
+                    via_yaw = math.degrees(math.atan2(float(via_tip[1]), float(via_tip[0])))
+                    R_via_nom = work_orientation(R0, sequence_axis, via_yaw)
+                    R_via = R_via_nom if abs(delta) < 1e-9 else (R_via_nom @ roty(delta))
+                    vq = _try_ik_pair(via_place, R_via, vseed, start_seed, vlabel)
+                    if not sweep.pose_safe(vq[:n_arm]):
+                        raise PlanError(
+                            "%s pose violates worktop clearance or folds j4 into the j2 casing; "
+                            "raise the via point" % vlabel)
                     vqs.append(np.array(vq[:n_arm], dtype=float))
+                    vseed = vq
                 target, stage_q, arrival_q, via_qs = tq, sq, aq, vqs
                 chosen_pitch = nominal_pitch_deg(sequence_axis) + delta
                 break

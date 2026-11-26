@@ -2398,6 +2398,8 @@ async def oracle_finish(app, prep, sid):
                         if tip_meas and flange_point:
                             hold["placement_mm"] = round(1000.0 * float(np.linalg.norm(
                                 np.asarray(tip_meas) - np.asarray(flange_point))), 3)
+                        if tip_meas and tip_ik:
+                            hold["z_error_mm"] = round(1000.0 * (float(tip_meas[2]) - float(tip_ik[2])), 3)
             shot = prep["holds"].get(window["index"])
             if shot and rig is not None and tip_meas:
                 frame = cv2.imread(shot["path"])
