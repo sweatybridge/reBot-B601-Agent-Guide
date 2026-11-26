@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +29,99 @@ def default_json(obj):
     if isinstance(obj, (bytes, bytearray)):
         return f"<bytes:{len(obj)}>"
     return str(obj)
+
+
+def analyze_motion(tel_doc: dict | None, t_offset: float = 0.0) -> dict:
+    """Compute 50 Hz smoothness, tracking error, and worst command/measured spike metrics."""
+    if not isinstance(tel_doc, dict):
+        return {}
+    samples = tel_doc.get("samples") or []
+    out: dict = {
+        "sample_count": len(samples),
+        "abort": tel_doc.get("abort"),
+        "gripper_stall": tel_doc.get("gripper_stall"),
+    }
+    if len(samples) < 5:
+        return out
+
+    t = np.array([float(s["t"]) for s in samples], dtype=float)
+    dt = np.diff(t)
+    dt_valid = dt[dt > 1e-4]
+    if len(dt_valid):
+        out["dt_mean_ms"] = round(float(np.mean(dt_valid) * 1000.0), 3)
+        out["dt_p95_ms"] = round(float(np.percentile(dt_valid, 95) * 1000.0), 3)
+        out["dt_max_ms"] = round(float(np.max(dt_valid) * 1000.0), 3)
+
+    def _mat(key: str) -> np.ndarray | None:
+        rows = []
+        for s in samples:
+            v = s.get(key)
+            if not isinstance(v, list) or len(v) < 6:
+                return None
+            rows.append([float(x) if x is not None else np.nan for x in v])
+        return np.array(rows, dtype=float)
+
+    q_cmd = _mat("cmd")
+    q_meas = _mat("meas")
+    if q_cmd is None or q_meas is None or q_cmd.shape != q_meas.shape:
+        return out
+
+    n_arm = min(6, q_cmd.shape[1])
+    err = np.abs(q_cmd[:, :n_arm] - q_meas[:, :n_arm])
+    out["track_err_rms_rad"] = round(float(np.sqrt(np.nanmean(err ** 2))), 4)
+    out["track_err_p95_rad"] = round(float(np.nanpercentile(err, 95)), 4)
+    out["track_err_max_rad"] = round(float(np.nanmax(err)), 4)
+    out["track_err_per_joint_max_rad"] = [round(float(np.nanmax(err[:, j])), 4) for j in range(n_arm)]
+
+    dt_col = np.where(dt > 1e-4, dt, np.nan)[:, None]
+    v_meas = np.diff(q_meas[:, :n_arm], axis=0) / dt_col
+    v_cmd = np.diff(q_cmd[:, :n_arm], axis=0) / dt_col
+    a_meas = np.diff(v_meas, axis=0) / dt_col[1:]
+    a_cmd = np.diff(v_cmd, axis=0) / dt_col[1:]
+    j_meas = np.diff(a_meas, axis=0) / dt_col[2:]
+    j_cmd = np.diff(a_cmd, axis=0) / dt_col[2:]
+
+    v_meas_norm = np.linalg.norm(v_meas, axis=1)
+    v_cmd_norm = np.linalg.norm(v_cmd, axis=1)
+    a_meas_norm = np.linalg.norm(a_meas, axis=1)
+    j_meas_norm = np.linalg.norm(j_meas, axis=1)
+    j_cmd_norm = np.linalg.norm(j_cmd, axis=1)
+
+    i_am = int(np.nanargmax(a_meas_norm))
+    i_jm = int(np.nanargmax(j_meas_norm))
+    i_jc = int(np.nanargmax(j_cmd_norm))
+
+    out.update({
+        "vel_cmd_max_rads": round(float(np.nanmax(v_cmd_norm)), 3),
+        "vel_meas_max_rads": round(float(np.nanmax(v_meas_norm)), 3),
+        "acc_meas_p95_rads2": round(float(np.nanpercentile(a_meas_norm, 95)), 2),
+        "acc_meas_max_rads2": round(float(a_meas_norm[i_am]), 2),
+        "acc_meas_max_t": round(float(t[i_am + 1]), 2),
+        "acc_meas_max_vid_t": round(float(t[i_am + 1] + t_offset), 2),
+        "acc_meas_max_per_joint": [round(float(v), 1) for v in a_meas[i_am]],
+        "jerk_cmd_rms_rads3": round(float(np.sqrt(np.nanmean(j_cmd_norm ** 2))), 1),
+        "jerk_cmd_max_rads3": round(float(j_cmd_norm[i_jc]), 1),
+        "jerk_cmd_max_t": round(float(t[i_jc + 2]), 2),
+        "jerk_cmd_max_vid_t": round(float(t[i_jc + 2] + t_offset), 2),
+        "jerk_cmd_max_per_joint": [round(float(v), 0) for v in j_cmd[i_jc]],
+        "jerk_meas_rms_rads3": round(float(np.sqrt(np.nanmean(j_meas_norm ** 2))), 1),
+        "jerk_meas_p95_rads3": round(float(np.nanpercentile(j_meas_norm, 95)), 1),
+        "jerk_meas_max_rads3": round(float(j_meas_norm[i_jm]), 1),
+        "jerk_meas_max_t": round(float(t[i_jm + 2]), 2),
+        "jerk_meas_max_vid_t": round(float(t[i_jm + 2] + t_offset), 2),
+        "jerk_meas_max_per_joint": [round(float(v), 0) for v in j_meas[i_jm]],
+    })
+
+    if q_cmd.shape[1] >= 7:
+        g_cmd = q_cmd[:, 6]
+        g_meas = q_meas[:, 6]
+        g_diff = np.abs(g_cmd - g_meas)
+        out["gripper_cmd_minmax"] = [round(float(np.nanmin(g_cmd)), 3), round(float(np.nanmax(g_cmd)), 3)]
+        out["gripper_meas_minmax"] = [round(float(np.nanmin(g_meas)), 3), round(float(np.nanmax(g_meas)), 3)]
+        out["gripper_err_p95"] = round(float(np.nanpercentile(g_diff, 95)), 3)
+        out["gripper_err_max"] = round(float(np.nanmax(g_diff)), 3)
+
+    return out
 
 
 def decode_frame_sequential(frags_paths: list[tuple[float, float, str]], vt: float) -> np.ndarray | None:
@@ -94,10 +186,11 @@ def main() -> int:
             "WHERE r.status = 'active' ORDER BY r.fitted DESC NULLS LAST LIMIT 1"
         ).fetchone()
         arm_cfg = c.execute("SELECT * FROM world.arm_config WHERE arm_id='b601'").fetchone()
-        try:
-            sag_maps = c.execute("SELECT * FROM learning.sag_model ORDER BY id DESC LIMIT 10").fetchall()
-        except Exception:
-            sag_maps = []
+    with store.conn() as c:
+        sag_maps = c.execute(
+            "SELECT * FROM learning.sag_map WHERE arm_id='b601' ORDER BY map_id DESC LIMIT 10"
+        ).fetchall()
+    print(f"Loaded env: rig={rig_row['rig_fingerprint'] if rig_row else None}, sag_maps={len(sag_maps)}")
 
     holds_rows_img = []
     run_payloads = []
@@ -115,7 +208,16 @@ def main() -> int:
                 "FROM evidence.plan WHERE plan_id=%s",
                 (eid,),
             ).fetchone()
-            verdict_row = c.execute("SELECT * FROM evidence.oracle_verdict WHERE exec_id=%s", (eid,)).fetchone()
+            if ex_row and ex_row.get("verdict_id") is not None:
+                verdict_row = c.execute(
+                    "SELECT * FROM evidence.oracle_verdict WHERE id=%s",
+                    (ex_row["verdict_id"],),
+                ).fetchone()
+            else:
+                verdict_row = c.execute(
+                    "SELECT * FROM evidence.oracle_verdict WHERE exec_id=%s ORDER BY id DESC LIMIT 1",
+                    (eid,),
+                ).fetchone()
             stills = c.execute(
                 "SELECT id, purpose, arm_id, t, width, height, sha256, created_at "
                 "FROM evidence.still WHERE episode_id=%s ORDER BY id",
@@ -140,6 +242,7 @@ def main() -> int:
         tel_doc = store.read_telemetry_doc(eid)
         verdict_doc = (verdict_row or {}).get("doc") or {}
         t_off = float((ex_row or {}).get("t_offset") or 0.0)
+        motion = analyze_motion(tel_doc, t_off)
         wps = plan_doc.get("waypoints") or []
         dur = float(wps[-1]["t"]) if wps else 0.0
         targets = ((plan_doc.get("capture") or {}).get("targets")) or []
@@ -204,6 +307,14 @@ def main() -> int:
             print(f"  axis={plan_doc.get('tool_axis')} entry={plan_doc.get('entry')} pitch={plan_doc.get('marker_pitch_deg')} dur={dur:.2f}s t_off={t_off:.2f}s")
             print(f"  frags: {', '.join(res_summary)}")
             print(f"  verdict={verdict_doc.get('verdict')} grasp={verdict_doc.get('grasp_verification')}")
+            if motion.get("jerk_cmd_max_rads3") is not None:
+                print(
+                    f"  motion: track_rms={motion['track_err_rms_rad']} max={motion['track_err_max_rad']}rad "
+                    f"vel_cmd/meas={motion['vel_cmd_max_rads']}/{motion['vel_meas_max_rads']}rad/s "
+                    f"acc_max={motion['acc_meas_max_rads2']}rad/s2@{motion['acc_meas_max_t']}s "
+                    f"jerk_cmd_max={motion['jerk_cmd_max_rads3']}@{motion['jerk_cmd_max_t']}s "
+                    f"jerk_meas_max={motion['jerk_meas_max_rads3']}@{motion['jerk_meas_max_t']}s"
+                )
             for h in verdict_doc.get("holds") or []:
                 print(
                     f"    H{h['index']}: scale={h.get('grid_scale')} tip_err={h.get('tip_error_mm')}mm "
@@ -234,18 +345,22 @@ def main() -> int:
         holds_rows_img.append(np.hstack(h_panels[:3]))
 
         run_payloads.append(
-            (run, slug, ex_row, plan_row, plan_doc, tel_doc, verdict_doc, stills, frags_meta, detect_req, storyboard_path)
+            (run, slug, ex_row, plan_row, plan_doc, tel_doc, verdict_doc, stills, frags_meta, detect_req, storyboard_path, motion)
         )
 
     holds_sheet_path = out_dir / "oracle_holds_all.jpg"
     if holds_rows_img:
         cv2.imwrite(str(holds_sheet_path), np.vstack(holds_rows_img), [cv2.IMWRITE_JPEG_QUALITY, 90])
 
-    # Package enriched repro zip
+    # Package enriched repro zip (DEFLATED for JSON, STORED for already-compressed JPEGs)
     zip_path = out_dir / bundle_name
-    summary_index = {"generated_at": datetime.now(timezone.utc).isoformat(), "runs": []}
+    summary_index = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "git_commit": manifest.get("git_commit") or os.environ.get("REBOT_GIT_COMMIT") or None,
+        "runs": [],
+    }
 
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         if rig_row:
             zf.writestr("env/rig_and_calibration.json", json.dumps(rig_row, indent=2, default=default_json) + "\n")
         if arm_cfg:
@@ -253,9 +368,9 @@ def main() -> int:
         if sag_maps:
             zf.writestr("env/sag_maps.json", json.dumps(sag_maps, indent=2, default=default_json) + "\n")
         if holds_sheet_path.is_file():
-            zf.write(holds_sheet_path, "oracle_holds_all.jpg")
+            zf.write(holds_sheet_path, "oracle_holds_all.jpg", compress_type=zipfile.ZIP_STORED)
 
-        for run, slug, ex_row, plan_row, plan_doc, tel_doc, verdict_doc, stills, frags_meta, detect_req, sb_path in run_payloads:
+        for run, slug, ex_row, plan_row, plan_doc, tel_doc, verdict_doc, stills, frags_meta, detect_req, sb_path, motion in run_payloads:
             eid = run["exec_id"]
             prefix = f"runs/{eid}/"
             sha_to_local = {}
@@ -263,7 +378,9 @@ def main() -> int:
                 local_rel = f"stills/still_{st['purpose']}_{idx}.jpg"
                 sha_to_local[st["sha256"]] = local_rel
                 try:
-                    zf.writestr(prefix + local_rel, store.get_blob(st["sha256"]))
+                    zi = zipfile.ZipInfo(prefix + local_rel)
+                    zi.compress_type = zipfile.ZIP_STORED
+                    zf.writestr(zi, store.get_blob(st["sha256"]))
                 except Exception:
                     pass
             if isinstance(detect_req, dict):
@@ -288,6 +405,7 @@ def main() -> int:
                 "plan_metadata": plan_meta,
                 "execution": ex_row,
                 "telemetry_summary": tel_summary,
+                "motion_metrics": motion,
                 "stills": stills,
                 "recording_fragments": frags_meta,
             }
@@ -302,6 +420,7 @@ def main() -> int:
                 "marker_pitch_deg": plan_doc.get("marker_pitch_deg"),
                 "duration_s": plan_meta["duration_s"],
                 "waypoint_count": plan_meta["waypoint_count"],
+                "motion_metrics": motion,
                 "verdict": verdict_doc.get("verdict"),
                 "grasp_verification": verdict_doc.get("grasp_verification"),
             })
@@ -313,10 +432,10 @@ def main() -> int:
             zf.writestr(prefix + "verdict.json", json.dumps(verdict_doc, indent=2, default=default_json) + "\n")
             zf.writestr(prefix + "detect_request.json", json.dumps(detect_req, indent=2, default=default_json) + "\n")
             if sb_path.is_file():
-                zf.write(sb_path, prefix + "storyboard.jpg")
+                zf.write(sb_path, prefix + "storyboard.jpg", compress_type=zipfile.ZIP_STORED)
             after_img = Path(run["after_image"]) if run.get("after_image") else None
             if after_img and after_img.is_file():
-                zf.write(after_img, prefix + "after.jpg")
+                zf.write(after_img, prefix + "after.jpg", compress_type=zipfile.ZIP_STORED)
 
         zf.writestr("summary.json", json.dumps(summary_index, indent=2, default=default_json) + "\n")
 

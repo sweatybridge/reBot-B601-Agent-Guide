@@ -7,7 +7,7 @@ description: >-
   publish a GitHub issue with the zip and individual video attachments via Chrome remote debugging.
   Use when the user asks for batch validation, multi-run physical pick-and-place evaluation,
   grading from recordings, or filing a bench evaluation GitHub issue with repro bundles and videos.
-version: 1.0.0
+version: 1.1.0
 ---
 
 # Batch Validation (B601-RS Physical Pick-and-Place)
@@ -15,7 +15,12 @@ version: 1.0.0
 End-to-end procedure for executing a batch of distinct physical pick-and-place runs on the
 B601-RS bench, grading each run visually from its recorded video + telemetry + oracle verdict,
 packaging trajectory metadata into one `.zip`, stitching individual `.mp4` recordings, and
-filing a GitHub issue with native attachments (modeled on Issues `#10` and `#12`).
+filing a GitHub issue with native attachments (modeled on Issues `#10`, `#12`, and `#13`).
+
+> **Review-only mode (already-executed DB runs):** If the user asks to grade runs that are
+> already in Postgres, skip Steps 1–2, query `evidence.execution` for the target `exec_id`s
+> (verifying each has rows in `evidence.media_fragment`), omit `after_image` in
+> `batch_manifest.json`, and jump straight to Step 3.
 
 ## Environment & Known Host Quirks
 
@@ -80,6 +85,7 @@ For **each** run:
    ```json
    {
      "bundle_name": "repro-20261126-batch-validation.zip",
+     "git_commit": "<git rev-parse HEAD>",
      "out_dir": "/app/work/export_batch",
      "runs": [
        {
@@ -97,15 +103,16 @@ For **each** run:
 2. Copy or run [`scripts/extract_and_bundle.py`](./scripts/extract_and_bundle.py) inside
    `rebot-capture-capture-1`:
    ```powershell
-   docker exec -i rebot-capture-capture-1 python - /app/work/batch_manifest.json < skills\batch-validation\scripts\extract_and_bundle.py
+   Get-Content -Raw skills\batch-validation\scripts\extract_and_bundle.py | docker exec -i rebot-capture-capture-1 python - /app/work/batch_manifest.json
    ```
    This produces in `examples/host/work/export_batch/`:
    - `storyboard_<key>.jpg` (12-panel phase-aligned recording contact sheet per run, sequentially
      decoded to avoid H.264 keyframe seek drift)
    - `oracle_holds_all.jpg` (all oracle-extracted hold stills side-by-side)
-   - `<bundle_name>` (single `.zip` containing `summary.json`, `env/{rig_and_calibration,arm_config,sag_maps}.json`,
+   - `<bundle_name>` (single `.zip` containing `summary.json` with `git_commit` and per-run
+     `motion_metrics`, `env/{rig_and_calibration,arm_config,sag_maps}.json`,
      `oracle_holds_all.jpg`, and per-run `runs/<exec_id>/{metadata,execution,plan,telemetry,verdict,detect_request}.json`,
-     extracted hold stills, storyboard, and post-exec still)
+     extracted hold stills, storyboard, and optional post-exec still)
    - `raw_frags/<key>/seg_*.mp4` (raw MediaMTX fragments ready for stitching)
 3. Visually inspect `storyboard_<key>.jpg`, `oracle_holds_all.jpg`, and `after_<key>.jpg` with
    `read_file` to grade every run honestly:
@@ -115,7 +122,15 @@ For **each** run:
    - Check `grid_scale` on every hold: mid-stream WebRTC ramps (`1356x762` -> `1920x1080`) can
      trigger false ~250 mm pixel errors if `oracle_compute` does not rescale `detected_tip_px`.
    - Separate servo tracking error (`tip_error_mm` = meas vs cmd) from net placement error
-     (`placement_mm` = meas vs requested `flange_point`) to diagnose sag over-/under-compensation.
+     (`placement_mm` = meas vs requested `flange_point`) to diagnose sag over-/under-compensation
+     and catch inverted oracle verdicts (e.g., `placement_mm < 5 mm` falsely blamed as `sag`, or
+     `placement_mm > 15 mm` missed because `tip_error_mm < 8 mm`).
+   - **Check 50 Hz smoothness & tracking spikes (`motion_metrics`)**: inspect `jerk_cmd_max_rads3`,
+     `acc_meas_max_rads2`, `jerk_meas_max_rads3`, and `track_err_per_joint_max_rad` printed by
+     `extract_and_bundle.py`. Flag commanded jerk spikes (`> 150 rad/s³`, e.g., unblended V-corners
+     or joint-limit clamps) and measured acceleration/tracking spikes (`acc_meas_max > 25 rad/s²`
+     or `track_err_max > 0.10 rad`, e.g., mechanical binds or release slams) — a visually clean
+     pick can still hide a severe mid-carry jerk spike (`f95aff` in `#13`).
    - Check motor-7 (`q[6]`) hold compliance (`meas - cmd` at grasp end) and edge tick jitter.
 4. Update `grade` / `summary_label` in `batch_manifest.json` after visual inspection and re-run
    `extract_and_bundle.py --zip-only` if grades changed.
@@ -124,10 +139,11 @@ For **each** run:
 
 ## Step 4: Stitch Individual Recordings (<10 MB MP4s)
 
-Run [`scripts/stitch_recordings.ps1`](./scripts/stitch_recordings.ps1) on the Windows host:
+Run [`scripts/stitch_recordings.ps1`](./scripts/stitch_recordings.ps1) on the Windows host
+(use `powershell -File` on Windows PowerShell 5.1, or `pwsh -File` if PowerShell 7 is installed):
 
 ```powershell
-pwsh -File skills\batch-validation\scripts\stitch_recordings.ps1 `
+powershell -File skills\batch-validation\scripts\stitch_recordings.ps1 `
   -ExportDir "d:\work\reBot-B601-Agent-Guide\examples\host\work\export_batch" `
   -Manifest "d:\work\reBot-B601-Agent-Guide\examples\host\work\batch_manifest.json"
 ```
