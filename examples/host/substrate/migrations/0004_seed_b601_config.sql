@@ -21,8 +21,8 @@ WITH seed(doc) AS (
     "gripper": {"motor7_open":4.90,"motor7_closed":-0.015,"rad_per_mm":0.0412},
     "collision": {"clearance":0.012,"link_radius_max":0.85},
     "motion": {
-      "default_min_z":0.04,"sag_limit_rad":0.15,"limit_tol":0.002,"max_joint_step":0.5,
-      "ramp_s":0.15,"min_cruise_speed":0.25,"min_seconds":0.3,"max_seconds":25.0,
+      "default_min_z":0.04,"sag_limit_rad":0.15,"tau_sag_scale":0.45,"limit_tol":0.002,"max_joint_step":0.5,
+      "ramp_s":0.25,"min_cruise_speed":0.25,"min_seconds":0.3,"max_seconds":25.0,
       "peak_speed":0.5,"gripper_peak_speed":3.0,
       "default_hz":50.0,"corner_radius_rad":0.05,"chain_line_samples":40.0,"chain_fillet_samples":16.0
     },

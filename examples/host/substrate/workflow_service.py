@@ -52,6 +52,7 @@ RECORDINGS = Path(os.environ.get("REBOT_RECORDINGS", str(ROOT / "work" / "record
 CAMERA = os.environ.get("REBOT_CAMERA", "rtsp://mediamtx:8554/phone")
 DRY = os.environ.get("REBOT_WORKFLOW_DRY", "0") == "1"
 EXECUTE = os.environ.get("REBOT_EXECUTE", "0") == "1"
+GRASP_VERIFY = os.environ.get("REBOT_GRASP_VERIFY", "1") == "1"
 KP = os.environ.get("REBOT_KP", "50,2:150,3:150")
 KD = os.environ.get("REBOT_KD", "3,2:10,3:10,4:5,5:4,6:4,7:4")
 PLAY_TIMEOUT = int(float(os.environ.get("REBOT_PLAY_TIMEOUT", "900")))
@@ -149,6 +150,117 @@ def _stop_and_ingest(exec_id: str, recorder, record_wall: float | None, play_wal
         return {"error": str(exc)}
 
 
+def _grab_camera_frame(camera_url: str) -> np.ndarray | None:
+    """Grab one live BGR frame from CAMERA without disrupting recording."""
+    if not camera_url:
+        return None
+    cap = cv2.VideoCapture(camera_url)
+    try:
+        if not cap.isOpened():
+            return None
+        ok, frame = cap.read()
+        return frame if ok and frame is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        cap.release()
+
+
+def _plan_grasp_check_spec(plan_id: str, workspace: str) -> dict | None:
+    """Inspect a pick-and-place plan + active rig to schedule a post-retract grasp check."""
+    if STORE is None or not GRASP_VERIFY or not CAMERA:
+        return None
+    try:
+        raw = STORE.read_plan_blob(plan_id)
+        if not raw:
+            return None
+        plan = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return None
+    cap = plan.get("capture") if isinstance(plan.get("capture"), dict) else {}
+    is_seq = bool(cap.get("sequence") or plan.get("sequence"))
+    targets = cap.get("targets") or plan.get("targets") or []
+    if not is_seq or len(targets) < 2:
+        return None
+    pick = targets[0]
+    place = targets[1]
+    t_pick_end = pick.get("hold_t_end")
+    t_place_start = place.get("hold_t_start")
+    point = pick.get("point")
+    if t_pick_end is None or t_place_start is None or not point or len(point) < 3:
+        return None
+    span = float(t_place_start) - float(t_pick_end)
+    if span < 1.5:
+        return None
+    # Check right after vertical retract finishes (~45% into transit, capped at +2.5 s)
+    # so the gripper has lifted clear of the pick spot with >5 s of transit left to save.
+    t_check = float(t_pick_end) + min(2.5, max(1.2, 0.45 * span))
+    with STORE.conn() as c:
+        row = c.execute(
+            "SELECT r.T_base_cam, c.K, c.dist, c.image_size "
+            "FROM world.shared_rig r JOIN world.calibration c ON c.calib_fingerprint = r.calib_fingerprint "
+            "WHERE r.workspace_id = %s AND r.status = 'active' "
+            "ORDER BY r.fitted DESC NULLS LAST LIMIT 1",
+            (workspace,),
+        ).fetchone()
+    if not row:
+        return None
+    q0 = [0.0] * 6
+    wps = plan.get("waypoints") or []
+    if wps and isinstance(wps[0].get("q"), list) and len(wps[0]["q"]) >= 6:
+        q0 = [float(v) for v in wps[0]["q"][:6]]
+    return {
+        "t_check": t_check,
+        "point": [float(v) for v in point[:3]],
+        "q0": q0,
+        "K": np.asarray(row["k"], dtype=float),
+        "dist": np.asarray(row["dist"], dtype=float).reshape(-1),
+        "T_base_cam": np.asarray(row["t_base_cam"], dtype=float),
+        "image_size": list(row["image_size"]),
+    }
+
+
+def _start_grasp_guard(spec: dict | None, pre_frame: np.ndarray | None,
+                       play_wall: float, done_event: threading.Event,
+                       result_out: dict) -> threading.Thread | None:
+    """Background post-retract visual grasp check: calls POST /stop on clear miss."""
+    if spec is None or pre_frame is None:
+        return None
+
+    def _watch():
+        wait_s = max(0.0, (play_wall + spec["t_check"]) - time.time())
+        if done_event.wait(wait_s):
+            return
+        post_frame = _grab_camera_frame(CAMERA)
+        if post_frame is None or done_event.is_set():
+            return
+        try:
+            pre_up, turn, scale = oracle_vision.orient_frame(
+                pre_frame, spec["q0"], spec["K"], spec["dist"], spec["T_base_cam"], spec["image_size"])
+            post_up, _t2, _s2 = oracle_vision.orient_frame(
+                post_frame, spec["q0"], spec["K"], spec["dist"], spec["T_base_cam"],
+                spec["image_size"], hint_turn=turn if turn else None)
+            import calib as calib_mod
+            K_up = calib_mod.scale_K(
+                spec["K"], (int(spec["image_size"][0]), int(spec["image_size"][1])),
+                (int(pre_up.shape[1]), int(pre_up.shape[0])))
+            pick_uv = oracle_vision._project_point(spec["point"], K_up, spec["dist"], spec["T_base_cam"])
+            verdict = oracle_vision.verify_grasp(pre_up, post_up, pick_uv, scale=scale)
+            result_out.update(verdict)
+            if verdict.get("grasped") is False and verdict.get("confidence") == "high" and not done_event.is_set():
+                try:
+                    _http_json(PLANNER + "/stop", {}, timeout=10, token=PLANNER_TOKEN)
+                    result_out["aborted_transit"] = True
+                except Exception as exc:  # noqa: BLE001
+                    result_out["stop_error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            result_out["error"] = str(exc)
+
+    th = threading.Thread(target=_watch, daemon=True)
+    th.start()
+    return th
+
+
 def execute(exec_id: str) -> dict:
     if not _json("SELECT execution_claim_play(%s)", (exec_id,)):
         ex = _json("SELECT execution_get(%s)", (exec_id,))
@@ -174,7 +286,12 @@ def execute(exec_id: str) -> dict:
         recorder = None
         record_wall = None
         recording_error = None
+        guard_done = threading.Event()
+        guard_result: dict = {}
+        guard_thread = None
         try:
+            grasp_spec = _plan_grasp_check_spec(plan_id, WORKSPACE)
+            pre_frame = _grab_camera_frame(CAMERA) if grasp_spec is not None else None
             path_name = mediamtx.path_from_camera(CAMERA) or "phone"
             try:
                 recorder = mediamtx.Recorder(MEDIAMTX_API, path=path_name, recordings=RECORDINGS)
@@ -194,6 +311,7 @@ def execute(exec_id: str) -> dict:
                 recording_error = str(exc)
 
             play_wall = time.time()
+            guard_thread = _start_grasp_guard(grasp_spec, pre_frame, play_wall, guard_done, guard_result)
             # Leave 30 s headroom inside df.http's PLAY_TIMEOUT for recorder teardown + ingest.
             gateway_timeout = max(30, PLAY_TIMEOUT - 30)
             status, payload = _http_json(
@@ -201,6 +319,9 @@ def execute(exec_id: str) -> dict:
                 {"id": plan_id, "kp": KP, "kd": KD},
                 timeout=gateway_timeout, token=PLANNER_TOKEN,
             )
+            guard_done.set()
+            if guard_thread is not None:
+                guard_thread.join(timeout=2.0)
             # Ingest recording even on abort so the oracle has camera evidence for fault attribution!
             recording = _stop_and_ingest(exec_id, recorder, record_wall, play_wall, recording_error)
             recorder = None
@@ -210,16 +331,19 @@ def execute(exec_id: str) -> dict:
                 return {"ok": False, "claimed": True, "executed": False,
                         "error": payload.get("error", "the gateway refused the play"),
                         "telemetry": payload.get("telemetry"),
+                        "grasp_check": guard_result or None,
                         "recording": recording, "recording_error": recording_error,
                         "no_recording": not has_recording}
             return {"ok": True, "claimed": True, "executed": True,
                     "exec_id": exec_id, "telemetry": payload.get("telemetry"),
+                    "grasp_check": guard_result or None,
                     "recording": recording, "recording_error": recording_error,
                     "no_recording": not has_recording}
         except Exception as exc:
             _json("SELECT execution_fail(%s, %s)", (exec_id, "%s: %s" % (type(exc).__name__, exc)))
             raise
         finally:
+            guard_done.set()
             if recorder is not None:
                 try:
                     recorder.disable()
@@ -343,13 +467,16 @@ def detect(exec_id: str) -> dict:
         raise
     if not req or req.get("error"):
         return {"detections": {}, "error": (req or {}).get("error", "no detect request")}
-    K = dist = T = tip = None
+    K = dist = T = tip = calib_size = None
     if not DRY:
         K = np.asarray(req["K"], dtype=float)
         dist = np.asarray(req["dist"], dtype=float).reshape(-1)
         T = np.asarray(req["T_base_cam"], dtype=float)
         tip = np.asarray(req["tip_offset"], dtype=float).reshape(-1)
+        calib_size = req.get("image_size")
     detections = {}
+    upright_by_index: dict[int, tuple[np.ndarray, float]] = {}
+    cached_turn: int | None = None
     for hold in req.get("holds") or []:
         sha = hold.get("frame")
         raw = by_sha.get(sha) if sha else None
@@ -360,6 +487,7 @@ def detect(exec_id: str) -> dict:
         frame = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             continue
+        scale = float(hold.get("grid_scale") or 1.0)
         if DRY:
             found = oracle_vision.green_centroid(frame)
         else:
@@ -367,18 +495,56 @@ def detect(exec_id: str) -> dict:
             q6 = np.asarray([0.0 if v is None else float(v) for v in q_raw[:6]], dtype=float)
             if not np.all(np.isfinite(q6)):
                 continue
+            frame, turn, scale = oracle_vision.orient_frame(
+                frame, q6, K, dist, T, calib_size, hint_turn=cached_turn)
+            if turn in (1, 3):
+                cached_turn = turn
+            upright_by_index[int(hold["index"])] = (frame, scale)
+            K_use = K
+            if calib_size and len(calib_size) >= 2 and (
+                int(frame.shape[1]) != int(calib_size[0]) or int(frame.shape[0]) != int(calib_size[1])
+            ):
+                import calib as calib_mod
+                K_use = calib_mod.scale_K(K, (int(calib_size[0]), int(calib_size[1])),
+                                          (int(frame.shape[1]), int(frame.shape[0])))
             found = oracle_vision.detect_tip(
-                frame, q6, K, dist, T, tip, scale=float(hold.get("grid_scale") or 1.0))
+                frame, q6, K_use, dist, T, tip, scale=scale)
         if found:
             detections[str(hold["index"])] = {
                 "uv": [float(found["uv"][0]), float(found["uv"][1])],
                 "score": float(found["score"]),
                 "detector": found["detector"],
                 "image_size": [int(frame.shape[1]), int(frame.shape[0])],
-                "grid_scale": round(float(hold.get("grid_scale") or 1.0), 4),
+                "grid_scale": round(float(scale), 4),
                 "frame": sha,
             }
-    return {"detections": detections}
+
+    # Offline post-grasp verification on pick-and-place sequences: compare the
+    # unobstructed pre-pick still (Hold 1) against the post-transit still (Hold 3)
+    # around the first pick target pixel.
+    grasp_verification = None
+    targets = req.get("targets") or []
+    if not DRY and req.get("sequence") and len(targets) >= 2 and 1 in upright_by_index and 3 in upright_by_index:
+        pick_pt = targets[0].get("point")
+        if pick_pt and len(pick_pt) >= 3:
+            pre_img, pre_scale = upright_by_index[1]
+            post_img, _post_scale = upright_by_index[3]
+            K_use = K
+            if calib_size and len(calib_size) >= 2 and (
+                int(pre_img.shape[1]) != int(calib_size[0]) or int(pre_img.shape[0]) != int(calib_size[1])
+            ):
+                import calib as calib_mod
+                K_use = calib_mod.scale_K(K, (int(calib_size[0]), int(calib_size[1])),
+                                          (int(pre_img.shape[1]), int(pre_img.shape[0])))
+            pick_uv = oracle_vision._project_point(pick_pt, K_use, dist, T)
+            if pick_uv is not None:
+                grasp_verification = oracle_vision.verify_grasp(
+                    pre_img, post_img, pick_uv, scale=pre_scale)
+
+    out = {"detections": detections}
+    if grasp_verification is not None:
+        out["grasp_verification"] = grasp_verification
+    return out
 
 
 def embed_frame(body: dict) -> dict:

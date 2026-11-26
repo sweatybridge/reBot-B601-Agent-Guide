@@ -350,10 +350,16 @@ fn rebot_fit_sag_map(
     let dof = hs.iter().map(|h| h.q.len()).min().unwrap_or(6);
     let mut q_min = vec![f64::INFINITY; dof];
     let mut q_max = vec![f64::NEG_INFINITY; dof];
+    let mut tau_min = vec![f64::INFINITY; 6];
+    let mut tau_max = vec![f64::NEG_INFINITY; 6];
     for h in &hs {
         for j in 0..dof {
             q_min[j] = q_min[j].min(h.q[j]);
             q_max[j] = q_max[j].max(h.q[j]);
+        }
+        for j in 0..6 {
+            tau_min[j] = tau_min[j].min(h.tau[j]);
+            tau_max[j] = tau_max[j].max(h.tau[j]);
         }
     }
     let mean_q6: Vec<f64> = (0..6)
@@ -395,7 +401,7 @@ fn rebot_fit_sag_map(
             "samples": hs.len(),
             "rms_mrad": (test_rms * 1000.0).round_ties_even() / 1000.0,
             "validated_mm": (validated_mm * 100.0).round_ties_even() / 100.0,
-            "envelope": {"q_min": q_min, "q_max": q_max, "radius_m": [rmin, rmax], "height_m": [hmin, hmax]}
+            "envelope": {"q_min": q_min, "q_max": q_max, "tau_min": tau_min, "tau_max": tau_max, "radius_m": [rmin, rmax], "height_m": [hmin, hmax]}
         }
     }))
 }

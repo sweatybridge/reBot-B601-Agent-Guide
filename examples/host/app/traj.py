@@ -61,24 +61,24 @@ def _ramp_ratio(duration, ramp):
 
 
 def ease_fraction(u, duration, ramp=None):
-    """Fraction of a leg's travel at normalized time u, S-ramp trapezoid.
+    """Fraction of a leg's travel at normalized time u, C2 quintic S-ramp trapezoid.
 
-    Velocity rises as a smoothstep (3x^2 - 2x^3) over the ramp: acceleration
-    is zero at rest and at cruise, continuous in between. The smoothstep's
-    area is 1/2, the linear ramp's, so ramp distance and cruise timing are
-    unchanged. Legs shorter than 2*ramp degenerate to a smooth bell (no
-    cruise); every shape starts and ends at rest. `duration` is the leg's
-    scheduled time in seconds.
+    Velocity rises as a quintic smootherstep (10x^3 - 15x^4 + 6x^5) over the
+    ramp: both acceleration and jerk are zero at rest and at cruise, so no
+    jerk step excites joint elasticity on ramp entry/exit. The smootherstep's
+    area is 1/2, the same as a linear ramp, so ramp distance and cruise timing
+    are unchanged. Legs shorter than 2*ramp degenerate to a smooth bell (no
+    cruise); every shape starts and ends at rest.
     """
     r = _ramp_ratio(duration, RAMP_S if ramp is None else ramp)
     vc = 1.0 / (1.0 - r)
     u = max(0.0, min(1.0, float(u)))
     if u <= r:
         x = u / r
-        return vc * r * (x ** 3 - 0.5 * x ** 4)
+        return vc * r * (2.5 * x ** 4 - 3.0 * x ** 5 + x ** 6)
     if u >= 1.0 - r:
         y = (1.0 - u) / r
-        return 1.0 - vc * r * (y ** 3 - 0.5 * y ** 4)
+        return 1.0 - vc * r * (2.5 * y ** 4 - 3.0 * y ** 5 + y ** 6)
     return vc * (u - 0.5 * r)
 
 
@@ -90,10 +90,10 @@ def ease_velocity(u, duration, ramp=None):
     duration = max(float(duration), 1e-9)
     if u <= r:
         x = u / r
-        return vc * (3.0 * x * x - 2.0 * x ** 3) / duration
+        return vc * (10.0 * x ** 3 - 15.0 * x ** 4 + 6.0 * x ** 5) / duration
     if u >= 1.0 - r:
         y = (1.0 - u) / r
-        return vc * (3.0 * y * y - 2.0 * y ** 3) / duration
+        return vc * (10.0 * y ** 3 - 15.0 * y ** 4 + 6.0 * y ** 5) / duration
     return vc / duration
 
 

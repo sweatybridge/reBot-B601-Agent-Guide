@@ -197,10 +197,10 @@ fn ease_fraction(u: f64, duration: f64, cfg: &Config) -> f64 {
     let u = u.clamp(0.0, 1.0);
     if u <= r {
         let x = u / r;
-        vc * r * (x.powi(3) - 0.5 * x.powi(4))
+        vc * r * (2.5 * x.powi(4) - 3.0 * x.powi(5) + x.powi(6))
     } else if u >= 1.0 - r {
         let y = (1.0 - u) / r;
-        1.0 - vc * r * (y.powi(3) - 0.5 * y.powi(4))
+        1.0 - vc * r * (2.5 * y.powi(4) - 3.0 * y.powi(5) + y.powi(6))
     } else {
         vc * (u - 0.5 * r)
     }
@@ -421,31 +421,132 @@ fn gravity_sag(tau: &[f64], kp: &[f64; 6], cfg: &Config) -> [f64; 6] {
 }
 
 const SAG_ENVELOPE_TAPER_RAD: f64 = 0.25;
+const SAG_TAU_TAPER_NM: f64 = 1.0;
 
-fn sag_correction(q: &[f64], tau: &[f64], snap: &Value, kp_key: &str, cfg: &Config) -> [f64; 6] {
+fn try_kp_vector(spec: &str) -> Option<[f64; 6]> {
+    let trimmed = spec.trim();
+    let effective = if trimmed.is_empty() || trimmed == "default" {
+        KP_DEFAULT
+    } else {
+        trimmed
+    };
+    let mut base = 50.0;
+    let mut overrides = [None::<f64>; 6];
+    for part in effective.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = part.split_once(':') {
+            let idx = k.trim().parse::<usize>().ok()?;
+            let val = v.trim().parse::<f64>().ok()?;
+            if !val.is_finite() || val <= 0.0 {
+                return None;
+            }
+            if (1..=6).contains(&idx) {
+                overrides[idx - 1] = Some(val);
+            }
+        } else {
+            let b = part.parse::<f64>().ok()?;
+            if !b.is_finite() || b <= 0.0 {
+                return None;
+            }
+            base = b;
+        }
+    }
+    let mut out = [base; 6];
+    for i in 0..6 {
+        if let Some(v) = overrides[i] {
+            out[i] = v;
+        }
+    }
+    Some(out)
+}
+
+fn kp_keys_match(a: &str, b: &str) -> bool {
+    let sa = a.trim();
+    let sb = b.trim();
+    if sa == sb {
+        return true;
+    }
+    match (try_kp_vector(sa), try_kp_vector(sb)) {
+        (Some(va), Some(vb)) => (0..6).all(|j| (va[j] - vb[j]).abs() <= 1e-6),
+        _ => false,
+    }
+}
+
+fn smoothstep_taper(value: f64, lo: f64, hi: f64, taper: f64) -> f64 {
+    let dist = if value < lo {
+        lo - value
+    } else if value > hi {
+        value - hi
+    } else {
+        0.0
+    };
+    if dist <= 0.0 {
+        return 1.0;
+    }
+    if dist >= taper || taper <= 0.0 {
+        return 0.0;
+    }
+    let u = dist / taper;
+    1.0 - (3.0 * u * u - 2.0 * u * u * u)
+}
+
+fn soft_clamp_sag(q: &[f64], cmd: &[f64; 6], limits: &[[f64; 2]; 6]) -> [f64; 6] {
+    let mut out = [0.0; 6];
+    for j in 0..6 {
+        let lo = limits[j][0];
+        let hi = limits[j][1];
+        let qj = q[j].clamp(lo, hi);
+        let delta = cmd[j] - qj;
+        let delta_eff = if delta > 0.0 {
+            let half = 0.5 * (hi - qj).max(0.0);
+            if half <= 1e-12 {
+                0.0
+            } else if delta <= half {
+                delta
+            } else {
+                half + half * ((delta - half) / half).tanh()
+            }
+        } else if delta < 0.0 {
+            let half = 0.5 * (qj - lo).max(0.0);
+            let ad = -delta;
+            if half <= 1e-12 {
+                0.0
+            } else if ad <= half {
+                delta
+            } else {
+                -(half + half * ((ad - half) / half).tanh())
+            }
+        } else {
+            0.0
+        };
+        out[j] = (qj + delta_eff).clamp(lo, hi);
+    }
+    out
+}
+
+fn sag_correction_weights(
+    q: &[f64],
+    tau: &[f64],
+    snap: &Value,
+    kp_key: &str,
+    cfg: &Config,
+) -> ([f64; 6], [f64; 6]) {
     let mut extra = [0.0; 6];
+    let mut weights = [0.0; 6];
     let map = match snap.get("sag_map") {
         Some(m) if m.is_object() => m,
-        _ => return extra,
+        _ => return (extra, weights),
     };
-    let fp = snap
-        .get("rig_fingerprint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
     let zk = snap
         .get("zeros_key")
         .and_then(|v| v.as_str())
         .unwrap_or("none");
-    if map.get("kp_key").and_then(|v| v.as_str()).unwrap_or("") != kp_key {
-        return extra;
-    }
-    if map
-        .get("rig_fingerprint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        != fp
-    {
-        return extra;
+    let map_kp = map.get("kp_key").and_then(|v| v.as_str()).unwrap_or("");
+    if !kp_keys_match(map_kp, kp_key) {
+        return (extra, weights);
     }
     if map
         .get("zeros_key")
@@ -453,49 +554,57 @@ fn sag_correction(q: &[f64], tau: &[f64], snap: &Value, kp_key: &str, cfg: &Conf
         .unwrap_or("none")
         != zk
     {
-        return extra;
+        return (extra, weights);
     }
     let env = map.get("envelope").cloned().unwrap_or(json!({}));
+    let tau_min = env.get("tau_min").and_then(|v| v.as_array());
+    let tau_max = env.get("tau_max").and_then(|v| v.as_array());
+    let use_tau = tau_min.map(|a| a.len() >= 6).unwrap_or(false)
+        && tau_max.map(|a| a.len() >= 6).unwrap_or(false);
     let q_min = env.get("q_min").and_then(|v| v.as_array());
     let q_max = env.get("q_max").and_then(|v| v.as_array());
-    // C1 smoothstep taper outside [q_min, q_max] over SAG_ENVELOPE_TAPER_RAD so
-    // crossing the envelope boundary (e.g. peel-off / return to rest in top-down
-    // mode) ramps smoothly instead of jumping by 20-30 mrad in a single tick.
-    let mut weight = 1.0_f64;
-    for j in 0..6 {
-        let mut dist = 0.0_f64;
-        if let Some(mn) = q_min.and_then(|a| a.get(j)).and_then(|v| v.as_f64()) {
-            if q[j] < mn {
-                dist = dist.max(mn - q[j]);
-            }
-        }
-        if let Some(mx) = q_max.and_then(|a| a.get(j)).and_then(|v| v.as_f64()) {
-            if q[j] > mx {
-                dist = dist.max(q[j] - mx);
-            }
-        }
-        if dist >= SAG_ENVELOPE_TAPER_RAD {
-            return extra;
-        }
-        if dist > 0.0 {
-            let u = dist / SAG_ENVELOPE_TAPER_RAD;
-            weight *= 1.0 - (3.0 * u * u - 2.0 * u * u * u);
-        }
-    }
     let per = match map.get("per_motor") {
         Some(p) => p,
-        None => return extra,
+        None => return (extra, weights),
     };
     for j in 0..6 {
-        let m = match per.get(&(j + 1).to_string()) {
-            Some(m) => m,
-            None => return extra,
+        let w = if use_tau {
+            let lo = tau_min
+                .and_then(|a| a.get(j))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::NEG_INFINITY);
+            let hi = tau_max
+                .and_then(|a| a.get(j))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::INFINITY);
+            let taper = SAG_TAU_TAPER_NM.max(0.25 * (hi - lo).max(0.0));
+            smoothstep_taper(tau[j], lo, hi, taper)
+        } else {
+            let lo = q_min
+                .and_then(|a| a.get(j))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::NEG_INFINITY);
+            let hi = q_max
+                .and_then(|a| a.get(j))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::INFINITY);
+            smoothstep_taper(q[j], lo, hi, SAG_ENVELOPE_TAPER_RAD)
         };
-        let a = m.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let b = m.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        extra[j] = ((a * tau[j] + b) * weight).clamp(-cfg.sag_limit_rad, cfg.sag_limit_rad);
+        weights[j] = w;
+        if w > 0.0 {
+            if let Some(m) = per.get(&(j + 1).to_string()) {
+                let a = m.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let b = m.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                extra[j] =
+                    ((a * tau[j] + b) * w).clamp(-cfg.sag_limit_rad, cfg.sag_limit_rad);
+            }
+        }
     }
-    extra
+    (extra, weights)
+}
+
+fn sag_correction(q: &[f64], tau: &[f64], snap: &Value, kp_key: &str, cfg: &Config) -> [f64; 6] {
+    sag_correction_weights(q, tau, snap, kp_key, cfg).0
 }
 
 fn unpark_pose_impl(q: &[f64; 6], cfg: &Config) -> [f64; 6] {
@@ -1244,13 +1353,27 @@ impl<'a> Planner<'a> {
 
 // ── sag compensation ─────────────────────────────────────────────────────── //
 
-fn aim_with_ctx(ctx: &PlanCtx, target: &[f64], kp: &[f64; 6], extra: &[f64; 6]) -> [f64; 6] {
+fn aim_with_ctx(
+    ctx: &PlanCtx,
+    target: &[f64],
+    kp: &[f64; 6],
+    extra: &[f64; 6],
+    base_scale: f64,
+    blend_weights: Option<&[f64; 6]>,
+) -> [f64; 6] {
     let sag_at = |q: &[f64]| -> [f64; 6] {
         let tau = ctx.gravity(q);
         let g = gravity_sag(&tau, kp, &ctx.cfg);
         let mut t = [0.0; 6];
         for j in 0..6 {
-            t[j] = (g[j] + extra[j]).clamp(-ctx.cfg.sag_limit_rad, ctx.cfg.sag_limit_rad);
+            let eff_scale = match blend_weights {
+                Some(ws) => {
+                    let w = ws[j].clamp(0.0, 1.0);
+                    (1.0 - w) * base_scale + w
+                }
+                None => base_scale,
+            };
+            t[j] = (eff_scale * g[j] + extra[j]).clamp(-ctx.cfg.sag_limit_rad, ctx.cfg.sag_limit_rad);
         }
         t
     };
@@ -1279,12 +1402,11 @@ fn compensate(
     for wp in waypoints {
         let q6 = &wp.q[..6];
         let tau = ctx.gravity(q6);
-        let extra = sag_correction(q6, &tau, snap, kp_spec, &ctx.cfg);
-        let cmd = aim_with_ctx(ctx, q6, kp, &extra);
+        let (extra, weights) = sag_correction_weights(q6, &tau, snap, kp_spec, &ctx.cfg);
+        let cmd = aim_with_ctx(ctx, q6, kp, &extra, ctx.cfg.tau_sag_scale, Some(&weights));
+        let clamped = soft_clamp_sag(q6, &cmd, &ctx.cfg.limits);
         let mut q = [0.0; 7];
-        for j in 0..6 {
-            q[j] = cmd[j].clamp(ctx.cfg.limits[j][0], ctx.cfg.limits[j][1]);
-        }
+        q[..6].copy_from_slice(&clamped);
         q[6] = wp.q[6];
         let g = ctx.gravity_urdf(&q[..6]);
         let mut tau7 = [0.0; 7];
@@ -1971,17 +2093,32 @@ fn rebot_plan_sequence(
     }
 
     let q_last = pl.last_q6();
-    if !ctx.path_safe(&q_last, &q_start) {
-        panic!(
-            "the return from marker {} to the start pose dips within a link radius of the worktop; move the arm clear and retry",
-            points.len()
-        );
+    let unpark_span = (0..6)
+        .map(|j| (start_seed[j] - q_start[j]).abs())
+        .fold(0.0_f64, f64::max);
+    if unparked && unpark_span > 1e-4 && ctx.path_safe(&q_last, &start_seed) {
+        let mut d1 = [0.0; 6];
+        let mut d2 = [0.0; 6];
+        for j in 0..6 {
+            d1[j] = start_seed[j] - q_last[j];
+            d2[j] = q_start[j] - start_seed[j];
+        }
+        pl.joint_leg(&q_last, &d1, seconds_for(&q_last, &start_seed, &cfg), gripper);
+        let park_s = 1.0_f64.max(seconds_for(&start_seed, &q_start, &cfg));
+        pl.joint_leg(&start_seed, &d2, park_s, gripper);
+    } else {
+        if !ctx.path_safe(&q_last, &q_start) {
+            panic!(
+                "the return from marker {} to the start pose dips within a link radius of the worktop; move the arm clear and retry",
+                points.len()
+            );
+        }
+        let mut d = [0.0; 6];
+        for j in 0..6 {
+            d[j] = q_start[j] - q_last[j];
+        }
+        pl.joint_leg(&q_last, &d, seconds_for(&q_last, &q_start, &cfg), gripper);
     }
-    let mut d = [0.0; 6];
-    for j in 0..6 {
-        d[j] = q_start[j] - q_last[j];
-    }
-    pl.joint_leg(&q_last, &d, seconds_for(&q_last, &q_start, &cfg), gripper);
 
     let compensated = compensate(&ctx, &pl.waypoints, &snap, &kp_spec, &kp);
     let close_text = match close_width_mm {
@@ -2431,7 +2568,7 @@ fn rebot_move_build(
     for target in &targets6 {
         let tau = ctx.gravity(target);
         let extra = sag_correction(target, &tau, &snap, &kp_spec, &cfg);
-        let cmd = aim_with_ctx(&ctx, target, &kp, &extra);
+        let cmd = aim_with_ctx(&ctx, target, &kp, &extra, 1.0, None);
         let mut clipped = [0.0; 6];
         for j in 0..6 {
             clipped[j] = cmd[j].clamp(cfg.limits[j][0], cfg.limits[j][1]);

@@ -925,25 +925,26 @@ BEGIN
    ORDER BY fitted DESC NULLS LAST LIMIT 1;
 
   snap := jsonb_build_object('rig_fingerprint', coalesce(rig_fp, ''), 'zeros_key', 'none', 'sag_map', null);
-  IF rig_fp IS NOT NULL THEN
+  -- Gravity sag is an arm/motor property (independent of camera rig refits):
+  -- prefer the active map matching rig_fp + kp_spec if present, else the most
+  -- recent active map for this arm so camera refits never drop learned sag.
+  SELECT jsonb_build_object('rig_fingerprint', rig_fingerprint, 'kp_key', kp_key,
+                            'zeros_key', zeros_key, 'per_motor', per_motor, 'envelope', envelope)
+    INTO sag
+    FROM learning.sag_map
+   WHERE arm_id = p_arm_id AND status = 'active'
+     AND (p_kp_spec IS NULL OR kp_key = p_kp_spec)
+   ORDER BY (rig_fingerprint = coalesce(rig_fp, '')) DESC, created_at DESC LIMIT 1;
+  IF sag IS NULL AND p_kp_spec IS NOT NULL THEN
     SELECT jsonb_build_object('rig_fingerprint', rig_fingerprint, 'kp_key', kp_key,
                               'zeros_key', zeros_key, 'per_motor', per_motor, 'envelope', envelope)
       INTO sag
       FROM learning.sag_map
-     WHERE arm_id = p_arm_id AND rig_fingerprint = rig_fp AND status = 'active'
-       AND (p_kp_spec IS NULL OR kp_key = p_kp_spec)
-     ORDER BY created_at DESC LIMIT 1;
-    IF sag IS NULL AND p_kp_spec IS NOT NULL THEN
-      SELECT jsonb_build_object('rig_fingerprint', rig_fingerprint, 'kp_key', kp_key,
-                                'zeros_key', zeros_key, 'per_motor', per_motor, 'envelope', envelope)
-        INTO sag
-        FROM learning.sag_map
-       WHERE arm_id = p_arm_id AND rig_fingerprint = rig_fp AND status = 'active'
-       ORDER BY created_at DESC LIMIT 1;
-    END IF;
-    IF sag IS NOT NULL THEN
-      snap := jsonb_build_object('rig_fingerprint', rig_fp, 'zeros_key', sag->>'zeros_key', 'sag_map', sag);
-    END IF;
+     WHERE arm_id = p_arm_id AND status = 'active'
+     ORDER BY (rig_fingerprint = coalesce(rig_fp, '')) DESC, created_at DESC LIMIT 1;
+  END IF;
+  IF sag IS NOT NULL THEN
+    snap := jsonb_build_object('rig_fingerprint', coalesce(rig_fp, ''), 'zeros_key', sag->>'zeros_key', 'sag_map', sag);
   END IF;
 END $$ LANGUAGE plpgsql STABLE;
 
@@ -1364,8 +1365,7 @@ BEGIN
     INTO sag
     FROM learning.sag_map
    WHERE arm_id = p_arm_id AND status = 'active'
-     AND (rig.rig_fingerprint IS NULL OR rig_fingerprint = rig.rig_fingerprint)
-   ORDER BY created_at DESC LIMIT 1;
+   ORDER BY (rig_fingerprint = coalesce(rig.rig_fingerprint, '')) DESC, created_at DESC LIMIT 1;
 
   SELECT ewma_pixel_error_mm, ewma_tag_rms_px, last_doc INTO mon
     FROM learning.monitor_state WHERE arm_id = p_arm_id;
