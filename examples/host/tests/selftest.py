@@ -4844,20 +4844,42 @@ def test_sag_map(workdir: Path):
               float(np.max(np.abs(extra))) > 0.0)
         q_out = q_in.copy()
         q_out[1] = map_doc["envelope"]["q_max"][1] + 0.5
+        # Per-joint torque/angle envelope: leaving one joint's envelope zeros
+        # THAT joint without zeroing unrelated joints (e.g. J4 top-down must not
+        # zero J2/J3 learned sag!). Moving all joints outside zeros all 6.
+        tau_out = dict(map_doc)
+        tau_out["envelope"] = dict(map_doc["envelope"],
+                                   tau_min=[0.0] * 6, tau_max=[0.0] * 6)
+        check("per-joint envelope: J4 outside q_min does not zero J2/J3",
+              abs(float(identify.sag_correction(
+                  np.array([q_in[0], q_in[1], q_in[2],
+                            map_doc["envelope"]["q_min"][3] - 0.8, q_in[4], q_in[5]]),
+                  map_doc, **keys)[2])) > 0.0)
+        q_all_out = np.asarray(map_doc["envelope"]["q_max"], float) + 1.0
+        legacy_map = dict(map_doc, envelope={
+            "q_min": map_doc["envelope"]["q_min"],
+            "q_max": map_doc["envelope"]["q_max"],
+        })
         check("no correction outside the explored envelope",
-              np.all(identify.sag_correction(q_out, map_doc, **keys) == 0.0))
+              np.all(identify.sag_correction(q_all_out, legacy_map, **keys) == 0.0))
         check("a kp change invalidates the map",
               np.all(identify.sag_correction(q_in, map_doc, kp_key="50",
                                              rig_fingerprint="abc123def456") == 0.0))
-        check("a rig change invalidates the map",
-              np.all(identify.sag_correction(q_in, map_doc, kp_key=sweep.KP_DEFAULT,
-                                             rig_fingerprint="other") == 0.0))
+        check("canonical kp specs match across dict/full/compact forms",
+              np.allclose(identify.sag_correction(
+                  q_in, map_doc, kp_key="1:50,2:150,3:150,4:50,5:50,6:50",
+                  rig_fingerprint="abc123def456"), extra, atol=1e-12))
+        check("a camera rig refit preserves the arm sag map",
+              np.allclose(identify.sag_correction(q_in, map_doc, kp_key=sweep.KP_DEFAULT,
+                                                  rig_fingerprint="other"), extra, atol=1e-12))
         check("a zero change invalidates the map",
               np.all(identify.sag_correction(q_in, map_doc, zeros_key="changed",
                                              **keys) == 0.0))
         identify.save_sag_map(workdir, map_doc)
         loaded = identify.load_sag_map(workdir, "abc123def456", kp_key=sweep.KP_DEFAULT)
         check("the map round-trips keyed by rig fingerprint", loaded is not None)
+        check("the map survives a rig refit via sag-arm.json fallback",
+              identify.load_sag_map(workdir, "refitted-rig", kp_key=sweep.KP_DEFAULT) is not None)
         check("loading refuses a kp change",
               identify.load_sag_map(workdir, "abc123def456", kp_key="50") is None)
         check("loading refuses a zero change",
@@ -4883,11 +4905,15 @@ def test_sag_map(workdir: Path):
         check("the plan compensator applies model sag plus the keyed map",
               np.allclose(compensate(q_in), sweep.aim(q_in, kp, extra_sag=extra),
                           atol=1e-12))
-        check("the plan compensator is model-only outside the envelope",
-              np.allclose(compensate(q_out), sweep.aim(q_out, kp), atol=1e-12))
         check("the plan compensator is model-only with no calib dir",
               np.allclose(sweep.sag_compensator(sweep.KP_DEFAULT, "")(q_in),
                           sweep.aim(q_in, kp), atol=1e-12))
+        check("the plan compensator with_tau uses cold-start TAU_SAG_SCALE",
+              np.allclose(sweep.sag_compensator(sweep.KP_DEFAULT, "", with_tau=True)(q_in),
+                          sweep.aim(q_in, kp, base_scale=sweep.TAU_SAG_SCALE), atol=1e-12))
+        check("soft_clamp_sag stays inside limits smoothly without distorting interior",
+              abs(float(sweep.soft_clamp_sag([0.5], [0.53], [-1.57], [1.57])[0]) - 0.53) < 1e-12
+              and float(sweep.soft_clamp_sag([1.54], [1.573], [-1.57], [1.57])[0]) < 1.57)
         rig_file.write_text("{torn", encoding="utf-8")
         check("a torn rig file means no map, never an exception",
               np.all(sweep.active_sag_extra(q_in, sweep.KP_DEFAULT, live_dir) == 0.0))
@@ -5909,6 +5935,45 @@ def test_oracle_detect(workdir: Path):
     blank = np.full((480, 640, 3), 200, np.uint8)
     check("oracle detect: background-only frame is None, never a guess",
           cs._oracle_detect(blank, q, K, dist, T, t_tip) is None)
+
+    # Base-marker rig (t_tip = 0): green collar along j6->ee is detected while
+    # a far-off green link decal is rejected; verify_grasp catches both hits
+    # and nudged empty-air misses.
+    import oracle_vision as ov
+    zero_tip = np.zeros(3)
+    joints_uv, collar_uv, ee_uv = ov._arm_joint_pixels(q, K, dist, T)
+    cframe = np.full((480, 640, 3), 200, np.uint8)
+    cu, cv_i = int(round(collar_uv[0])), int(round(collar_uv[1]))
+    cframe[cv_i - 30:cv_i + 30, cu - 30:cu + 30] = (0, 200, 0)
+    cfound = ov.detect_tip(cframe, q, K, dist, T, zero_tip)
+    check("oracle detect: base-marker green collar projects accurately to ee",
+          cfound is not None and cfound["detector"] == "green-collar"
+          and np.hypot(cfound["uv"][0] - ee_uv[0], cfound["uv"][1] - ee_uv[1]) < 6.0,
+          str(cfound))
+    # Landscape frame rotated 90 deg CCW relative to portrait calib K: orient_frame fixes it.
+    rot_ccw = cv2.rotate(cframe, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    up, turn, sc = ov.orient_frame(rot_ccw, q, K, dist, T, size)
+    check("orient_frame detects 90 deg rotation and recovers upright scale",
+          turn == 1 and abs(sc - 1.0) < 1e-6 and up.shape[:2] == cframe.shape[:2],
+          "turn=%s scale=%.2f shape=%s" % (turn, sc, up.shape[:2]))
+    # Post-grasp verification: synthetic table + red plush at (320, 240).
+    table = np.full((480, 640, 3), (140, 150, 155), np.uint8)
+    pre_g = table.copy()
+    cv2.circle(pre_g, (320, 240), 38, (30, 30, 220), -1)
+    cv2.circle(pre_g, (310, 232), 9, (250, 250, 250), -1)
+    # Miss (untouched) & miss (nudged 25 px): must both return grasped=False.
+    nudged = table.copy()
+    cv2.circle(nudged, (320, 215), 38, (30, 30, 220), -1)
+    cv2.circle(nudged, (310, 207), 9, (250, 250, 250), -1)
+    v_miss = ov.verify_grasp(pre_g, pre_g.copy(), (320, 240))
+    v_nudge = ov.verify_grasp(pre_g, nudged, (320, 240))
+    v_hit = ov.verify_grasp(pre_g, table, (320, 240))
+    check("verify_grasp flags untouched miss as grasped=False",
+          v_miss["grasped"] is False and v_miss["confidence"] == "high", str(v_miss))
+    check("verify_grasp flags nudged miss as grasped=False",
+          v_nudge["grasped"] is False, str(v_nudge))
+    check("verify_grasp flags removed object as grasped=True",
+          v_hit["grasped"] is True and v_hit["confidence"] == "high", str(v_hit))
 
 
 def test_uniform_rescale(workdir: Path, geometry):

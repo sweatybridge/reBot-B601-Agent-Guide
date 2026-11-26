@@ -75,7 +75,7 @@ const SHUTDOWN_PEAK_SPEED: f64 = 3.0 * RETURN_PEAK_SPEED;
 // Velocity ramp at each end of an internally generated leg, seconds. Mirrors
 // traj.py's RAMP_S: trapezoid velocity (short ramps, constant cruise) so slow
 // legs do not linger below the drive's stiction breakaway speed (~0.2 rad/s).
-const MOVE_RAMP_S: f64 = 0.15;
+const MOVE_RAMP_S: f64 = 0.25;
 
 // RobStride communication types (see robstride_dynamics/protocol.py).
 const COMM_OPERATION_CONTROL: u32 = 1;
@@ -1714,18 +1714,20 @@ impl<T: Transport> Arm<T> {
     }
 }
 
-/// Trapezoid velocity profile: fraction of travel at normalized time u, with
-/// linear velocity ramps of `ramp` seconds at each end (mirrors traj.py's
-/// ease_fraction). Legs shorter than 2*ramp degenerate to a triangle; both
-/// shapes start and end at rest.
+/// C2 quintic S-ramp trapezoid velocity profile: fraction of travel at
+/// normalized time u, with smootherstep velocity ramps (10x^3 - 15x^4 + 6x^5)
+/// of `ramp` seconds at each end (mirrors traj.py's ease_fraction). Both
+/// acceleration and jerk are zero at rest and at cruise.
 fn ease_fraction(u: f64, duration: f64, ramp: f64) -> f64 {
     let r = (ramp / duration.max(1e-9)).clamp(1e-9, 0.5);
     let vc = 1.0 / (1.0 - r);
     let u = u.clamp(0.0, 1.0);
     if u <= r {
-        vc * u * u / (2.0 * r)
+        let x = u / r;
+        vc * r * (2.5 * x.powi(4) - 3.0 * x.powi(5) + x.powi(6))
     } else if u >= 1.0 - r {
-        1.0 - vc * (1.0 - u) * (1.0 - u) / (2.0 * r)
+        let y = (1.0 - u) / r;
+        1.0 - vc * r * (2.5 * y.powi(4) - 3.0 * y.powi(5) + y.powi(6))
     } else {
         vc * (u - 0.5 * r)
     }
@@ -1738,9 +1740,11 @@ fn ease_velocity(u: f64, duration: f64, ramp: f64) -> f64 {
     let vc = 1.0 / (1.0 - r);
     let u = u.clamp(0.0, 1.0);
     if u <= r {
-        vc * u / (r * duration)
+        let x = u / r;
+        vc * (10.0 * x.powi(3) - 15.0 * x.powi(4) + 6.0 * x.powi(5)) / duration
     } else if u >= 1.0 - r {
-        vc * (1.0 - u) / (r * duration)
+        let y = (1.0 - u) / r;
+        vc * (10.0 * y.powi(3) - 15.0 * y.powi(4) + 6.0 * y.powi(5)) / duration
     } else {
         vc / duration
     }
@@ -4790,14 +4794,19 @@ mod tests {
             "cruise velocity {} should be {cruise}",
             joint2[50].velocity
         );
-        // The cruise is flat, and the ramp at u=0.05 is a third of the cruise
-        // (ramp ratio 0.15).
+        // The cruise is flat, and ramp samples follow the quintic smootherstep velocity.
         assert!((joint2[40].velocity - joint2[60].velocity).abs() < 2e-3);
+        let expect_ramp = 0.4 * ease_velocity(0.05, 1.0, MOVE_RAMP_S);
         assert!(
-            (joint2[5].velocity - cruise / 3.0).abs() < 2e-3,
+            (joint2[5].velocity - expect_ramp).abs() < 2e-3,
             "ramp sample {} should be {}",
             joint2[5].velocity,
-            cruise / 3.0
+            expect_ramp
+        );
+        let expect_mid = 0.4 * ease_velocity(0.5 * MOVE_RAMP_S, 1.0, MOVE_RAMP_S);
+        assert!(
+            (joint2[(50.0 * MOVE_RAMP_S).round() as usize].velocity - expect_mid).abs() < 3e-2,
+            "mid-ramp sample should track quintic smootherstep"
         );
         assert!(joint2.iter().all(|frame| frame.velocity > -2e-3));
     }

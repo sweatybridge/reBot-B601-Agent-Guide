@@ -565,21 +565,20 @@ RETURNS bigint AS $$
   SELECT count(*) FROM gone;
 $$ LANGUAGE sql;
 
--- Scoped rig invalidation: only touches clearance_cells in p_rig's workspace
--- and logs only the sag_map rows newly transitioned from active -> superseded.
+-- Scoped rig invalidation: camera extrinsics changes unvalidate accuracy_cell
+-- and clearance_cell (workspace-scoped) but preserve learning.sag_map because
+-- gravity sag is measured purely from arm motor encoders (rig-independent).
 CREATE OR REPLACE FUNCTION world.invalidate_rig(p_rig text) RETURNS void AS $$
 DECLARE ws text;
 BEGIN
   SELECT workspace_id INTO ws FROM world.shared_rig WHERE rig_fingerprint = p_rig;
   WITH gone AS (
-    UPDATE learning.sag_map SET status = 'superseded'
-     WHERE rig_fingerprint = p_rig AND status = 'active'
-     RETURNING map_id
+    UPDATE learning.accuracy_cell SET validated_at = NULL, n_good = 0
+     WHERE rig_fingerprint = p_rig
+     RETURNING cell_id
   )
   INSERT INTO world.invalidation(source_kind, source_id, target_kind, target_id)
-    SELECT 'rig', p_rig, 'sag_map', map_id FROM gone;
-  UPDATE learning.accuracy_cell SET validated_at = NULL, n_good = 0
-   WHERE rig_fingerprint = p_rig;
+    SELECT 'rig', p_rig, 'accuracy_cell', cell_id FROM gone;
   IF ws IS NOT NULL THEN
     UPDATE learning.clearance_cell SET validated_at = NULL
      WHERE workspace_id = ws;

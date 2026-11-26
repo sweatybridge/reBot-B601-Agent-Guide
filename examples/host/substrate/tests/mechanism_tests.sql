@@ -44,7 +44,7 @@ INSERT INTO learning.clearance_cell(arm_a,arm_b,workspace_id,cell_key,n,validate
   VALUES ('arm1','arm2','ws1','c0',3,now());
 SELECT world.invalidate_rig('rig1');
 DO $$ BEGIN
-  IF (SELECT status FROM learning.sag_map WHERE arm_id='arm1')<>'superseded' THEN RAISE EXCEPTION 'sag not superseded'; END IF;
+  IF (SELECT status FROM learning.sag_map WHERE arm_id='arm1')<>'active' THEN RAISE EXCEPTION 'camera rig refit must not supersede arm sag_map'; END IF;
   IF (SELECT validated_at FROM learning.accuracy_cell WHERE arm_id='arm1') IS NOT NULL THEN RAISE EXCEPTION 'accuracy cell not unvalidated'; END IF;
   IF (SELECT validated_at FROM learning.clearance_cell WHERE workspace_id='ws1' AND cell_key='c0') IS NOT NULL THEN RAISE EXCEPTION 'clearance not unvalidated'; END IF;
   IF (SELECT count(*) FROM world.invalidation WHERE source_id='rig1')<1 THEN RAISE EXCEPTION 'no invalidation rows'; END IF;

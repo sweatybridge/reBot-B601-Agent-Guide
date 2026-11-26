@@ -146,17 +146,17 @@ class Options:
 def compensate_waypoints(waypoints, options, model, n_arm, lower, upper):
     """The emission pass: command the sag offset on every waypoint (§7.3b).
 
-    The controller has no integral term, so a loaded joint rests tau_g/kp below
-    its command; the learned residual applies where a keyed map exists for these
-    gains. Kinematic state stays uncompensated -- compensating at emission keeps
-    holds and gripper legs consistent without double-compensating the poses that
-    feed back into later legs. tau is recomputed at the command, and the command
-    is clipped to the joint limits the edge will re-check.
+    The controller has no integral term, so a loaded joint rests below its
+    command; with gravity torque feedforward `tau` active, cold-start position
+    compensation uses `TAU_SAG_SCALE` and blends smoothly into any learned
+    residual map. Additive sag is C2-soft-clamped inside joint limits so
+    approaching a limit never introduces a velocity corner / jerk spike.
     """
-    compensate = sweep.sag_compensator(options.kp_spec, options.calib_dir)
+    compensate = sweep.sag_compensator(options.kp_spec, options.calib_dir, with_tau=True)
     out = []
     for wp in waypoints:
-        cmd = np.clip(compensate(wp["q"][:n_arm]), lower[:n_arm], upper[:n_arm])
+        raw_q = np.asarray(wp["q"][:n_arm], dtype=float)
+        cmd = sweep.soft_clamp_sag(raw_q, compensate(raw_q), lower[:n_arm], upper[:n_arm])
         gravity = compute_generalized_gravity(model=model,
                                               q=pad_q_for_model(model, cmd, n_arm))
         out.append(traj.waypoint(wp["t"], list(cmd) + [float(wp["q"][n_arm])],
@@ -1120,18 +1120,26 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                 sweep.seconds_for(current_q, stage_q[:n_arm]),
                 "retract %d" % index, gripper)
 
-    # Return in joint space. A Cartesian return to the parked pose is the one
-    # leg where IK can fail on the last millimetres (the parked pose sits on
-    # two stops), and a return is not a precision move. The capsule check still
-    # refuses a leg that would cross the worktop, exactly like /move does.
+    # Return in joint space. When the sequence started parked (unparked=True),
+    # return via the unparked staging pose (`start_seed`) before gently lowering
+    # onto the physical J2/J3 zero stops so we never slam into the end-stops at
+    # full cruise speed.
     q_last = np.array(waypoints[-1]["q"][:n_arm], dtype=float)
     q_home = np.array(q_start[:n_arm], dtype=float)
-    if not sweep.path_safe(q_last, q_home):
-        raise PlanError("the return from marker %d to the start pose dips within a "
-                        "link radius of the worktop; move the arm clear and retry"
-                        % len(points))
-    joint_leg(q_last, {index: q_home[index] - q_last[index] for index in range(n_arm)},
-              sweep.seconds_for(q_last, q_home), "return", gripper)
+    q_unpark = np.array(start_seed[:n_arm], dtype=float)
+    if unparked and float(np.max(np.abs(q_unpark - q_home))) > 1e-4 and sweep.path_safe(q_last, q_unpark):
+        joint_leg(q_last, {index: q_unpark[index] - q_last[index] for index in range(n_arm)},
+                  sweep.seconds_for(q_last, q_unpark), "return", gripper)
+        park_s = max(1.0, sweep.seconds_for(q_unpark, q_home))
+        joint_leg(q_unpark, {index: q_home[index] - q_unpark[index] for index in range(n_arm)},
+                  park_s, "park", gripper)
+    else:
+        if not sweep.path_safe(q_last, q_home):
+            raise PlanError("the return from marker %d to the start pose dips within a "
+                            "link radius of the worktop; move the arm clear and retry"
+                            % len(points))
+        joint_leg(q_last, {index: q_home[index] - q_last[index] for index in range(n_arm)},
+                  sweep.seconds_for(q_last, q_home), "return", gripper)
 
     close_text = ("close to %.2f rad" % odd_close if options.close_width_mm is None
                   else "close to %.1f mm" % options.close_width_mm)

@@ -278,6 +278,7 @@ HOLD_SECONDS = 1.5
 # except motors 2 and 3 at 150 -- the two that carry the arm.
 KP_DEFAULT = "50,2:150,3:150"
 SAG_LIMIT_RAD = rebot_ik.MOTION["sag_limit_rad"]
+TAU_SAG_SCALE = rebot_ik.MOTION["tau_sag_scale"]
 
 # The tool is a gripper: its tip is a few centimetres from the flange. A fit that
 # puts it hundreds of millimetres away has locked onto something else -- a shadow,
@@ -286,10 +287,16 @@ TIP_LIMIT_M = 0.15
 
 
 def kp_vector(spec=None):
-    """Per-joint kp for motors 1..6, from the player's spec string."""
+    """Per-joint kp for motors 1..6, from the player's spec string or dict."""
+    if isinstance(spec, dict):
+        return np.asarray([float(spec.get(str(m), spec.get(m, 50.0))) for m in range(1, 7)],
+                          dtype=float)
+    text = str(spec or "").strip()
+    if not text or text == "default":
+        text = KP_DEFAULT
     base = 50.0
     overrides = {}
-    for part in str(spec or KP_DEFAULT).split(","):
+    for part in text.split(","):
         part = part.strip()
         if not part:
             continue
@@ -299,6 +306,52 @@ def kp_vector(spec=None):
         else:
             base = float(part)
     return np.asarray([overrides.get(motor, base) for motor in range(1, 7)], dtype=float)
+
+
+def _fmt_kp_num(v: float) -> str:
+    v = float(v)
+    return str(int(round(v))) if abs(v - round(v)) < 1e-9 else ("%g" % v)
+
+
+def format_kp_spec(kp_or_spec) -> str:
+    """Canonical kp_key string from a telemetry kp dict or spec string."""
+    if kp_or_spec is None:
+        return KP_DEFAULT
+    if isinstance(kp_or_spec, dict):
+        if not kp_or_spec:
+            return KP_DEFAULT
+        vec = kp_vector(kp_or_spec)
+    else:
+        text = str(kp_or_spec).strip()
+        if not text or text == "default":
+            return KP_DEFAULT
+        try:
+            vec = kp_vector(text)
+        except (ValueError, TypeError):
+            return text
+    # Compact form matching KP_DEFAULT ("50,2:150,3:150") using the mode as base.
+    vals = [round(float(v), 6) for v in vec]
+    base = max(set(vals), key=vals.count)
+    parts = [_fmt_kp_num(base)]
+    for idx, val in enumerate(vals, start=1):
+        if abs(val - base) > 1e-6:
+            parts.append("%d:%s" % (idx, _fmt_kp_num(val)))
+    return ",".join(parts)
+
+
+def kp_keys_match(a, b) -> bool:
+    """Compare two kp_key values by their 6-joint gain vector (fallback to text)."""
+    if a is None or b is None:
+        return True
+    sa, sb = str(a).strip(), str(b).strip()
+    if sa == sb:
+        return True
+    try:
+        va = kp_vector(a)
+        vb = kp_vector(b)
+    except (ValueError, TypeError):
+        return False
+    return bool(np.allclose(va, vb, atol=1e-6, rtol=0.0))
 
 
 def gravity_sag(q, kp, limit=None):
@@ -318,30 +371,81 @@ def gravity_sag(q, kp, limit=None):
     return np.clip(sag, -limit, limit)
 
 
-def aim(q, kp, iterations=3, extra_sag=None):
+def soft_clamp_sag(q, cmd, lower, upper):
+    """C2-smoothly saturate additive sag compensation inside joint limits.
+
+    When `q` is well inside `[lower, upper]` (available headroom >= 2*|delta|),
+    returns `cmd` unchanged. As `q + delta` approaches a joint limit, saturates
+    the excess offset with `tanh` into the remaining headroom so the command
+    never forms a C0 hard-clamp corner (eliminating limit-peel jerk spikes).
+    """
+    q = np.asarray(q, dtype=float).reshape(-1)
+    cmd = np.asarray(cmd, dtype=float).reshape(-1)
+    lo = np.asarray(lower, dtype=float).reshape(-1)
+    hi = np.asarray(upper, dtype=float).reshape(-1)
+    out = np.empty_like(cmd)
+    for j in range(len(q)):
+        qj = float(np.clip(q[j], lo[j], hi[j]))
+        delta = float(cmd[j] - qj)
+        if delta > 0.0:
+            headroom = max(0.0, float(hi[j] - qj))
+            half = 0.5 * headroom
+            if half <= 1e-12:
+                delta_eff = 0.0
+            elif delta <= half:
+                delta_eff = delta
+            else:
+                delta_eff = half + half * math.tanh((delta - half) / half)
+        elif delta < 0.0:
+            headroom = max(0.0, float(qj - lo[j]))
+            half = 0.5 * headroom
+            ad = -delta
+            if half <= 1e-12:
+                delta_eff = 0.0
+            elif ad <= half:
+                delta_eff = delta
+            else:
+                delta_eff = -(half + half * math.tanh((ad - half) / half))
+        else:
+            delta_eff = 0.0
+        out[j] = float(np.clip(qj + delta_eff, lo[j], hi[j]))
+    return out
+
+
+def aim(q, kp, iterations=3, extra_sag=None, base_scale=1.0, blend_weights=None):
     """The command that makes the arm *hold* `q` instead of settling off it.
 
-    This arm settles as `held = command - sag`, where `sag = tau_g / kp` -- the
-    sign is not the intuitive one (j2's axis means gravity shows up negative), and
-    it was measured rather than assumed: commanding `target - sag` moved every
-    pose by another |sag| (pose 2 went from 92 mrad off to 179), which is only
-    consistent with `held = command - sag`. So holding `q` means asking for
-    `q + sag`: a fixed point, solved by substitution, since the sag depends only
-    weakly on the pose.
+    This arm settles as `held = command - sag`, where `sag = tau_g / kp` when
+    no torque feedforward is active (`/move`, `base_scale = 1.0`). When MIT
+    gravity torque feedforward `tau_ff` IS active (`/plan`, `base_scale =
+    TAU_SAG_SCALE`), cold-start compensation scales the model sag to avoid
+    double-compensating gravity while smoothly blending into the learned
+    residual map (`tau_g/kp + extra_sag`) across `blend_weights`.
 
-    `extra_sag` is the learned residual-map term (§7.3b, identify.sag_correction):
-    what the gravity model did not explain, per joint. The *total* compensation
-    stays clipped by SAG_LIMIT_RAD, so a bad or stale map can never command a
-    large excursion -- the model term alone already saturates that bound.
+    The *total* compensation stays clipped by SAG_LIMIT_RAD, so a bad or stale
+    map can never command a large excursion.
     """
     target = np.asarray(q, dtype=float).reshape(6)
     extra = (np.zeros(6) if extra_sag is None else
              np.clip(np.asarray(extra_sag, dtype=float).reshape(6),
                      -SAG_LIMIT_RAD, SAG_LIMIT_RAD))
-    command = target + np.clip(gravity_sag(target, kp) + extra, -SAG_LIMIT_RAD, SAG_LIMIT_RAD)
+    weights = None if blend_weights is None else np.clip(
+        np.asarray(blend_weights, dtype=float).reshape(6), 0.0, 1.0)
+    scale = float(base_scale)
+
+    def _offset(pose):
+        model_sag = gravity_sag(pose, kp)
+        if weights is None:
+            raw = scale * model_sag + extra
+        else:
+            # extra already carries per-joint weight w_j * (a_j * tau_j + b_j):
+            # blend model term from scale*model_sag (w=0) to 1.0*model_sag (w=1).
+            raw = ((1.0 - weights) * scale + weights) * model_sag + extra
+        return np.clip(raw, -SAG_LIMIT_RAD, SAG_LIMIT_RAD)
+
+    command = target + _offset(target)
     for _ in range(max(0, int(iterations) - 1)):
-        command = target + np.clip(gravity_sag(command, kp) + extra,
-                                   -SAG_LIMIT_RAD, SAG_LIMIT_RAD)
+        command = target + _offset(command)
     return command
 
 
@@ -366,61 +470,106 @@ def sag_map_path(calib_dir, rig_fingerprint):
     return Path(calib_dir) / ("sag-%s.json" % rig_fingerprint)
 
 
+def _sag_map_matches(map_doc, kp_key, zeros_key="none") -> bool:
+    if not isinstance(map_doc, dict):
+        return False
+    if not kp_keys_match(map_doc.get("kp_key"), kp_key):
+        return False
+    if str(map_doc.get("zeros_key", "none")) != str(zeros_key):
+        return False
+    return True
+
+
 def load_sag_map(calib_dir, rig_fingerprint, kp_key, zeros_key="none"):
-    """Load the map for this rig, or None when any key changed (§7.3b)."""
-    path = sag_map_path(calib_dir, rig_fingerprint)
-    if not path.is_file():
-        return None
-    try:
-        map_doc = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    if str(map_doc.get("kp_key")) != str(kp_key) or \
-            str(map_doc.get("zeros_key", "none")) != str(zeros_key):
-        return None
-    return map_doc
+    """Load the sag map for this arm's kp and zeros (camera-rig independent)."""
+    calib_dir = Path(calib_dir)
+    candidates = [sag_map_path(calib_dir, rig_fingerprint), calib_dir / "sag-arm.json"]
+    if calib_dir.is_dir():
+        others = sorted(
+            (p for p in calib_dir.glob("sag-*.json") if p not in candidates),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        candidates.extend(others)
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            map_doc = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if _sag_map_matches(map_doc, kp_key, zeros_key=zeros_key):
+            return map_doc
+    return None
 
 
 SAG_ENVELOPE_TAPER_RAD = 0.25
+SAG_TAU_TAPER_NM = 1.0
 
 
-def sag_correction(q, sag_map, kp_key=None, rig_fingerprint=None, zeros_key="none"):
-    """The additive term for aim(), or zeros when the map cannot be trusted.
+def _smoothstep_taper(value: float, lo: float, hi: float, taper: float) -> float:
+    dist = 0.0
+    if value < lo:
+        dist = lo - value
+    elif value > hi:
+        dist = value - hi
+    if dist <= 0.0:
+        return 1.0
+    if dist >= taper or taper <= 0.0:
+        return 0.0
+    u = dist / taper
+    return 1.0 - (3.0 * u * u - 2.0 * u * u * u)
 
-    Any key change (rig fingerprint, kp, zeros) or a pose well outside the
-    explored envelope invalidates the map; crossing the envelope boundary tapers
-    smoothly (C1 cubic smoothstep over SAG_ENVELOPE_TAPER_RAD) so trajectories
-    entering/leaving the explored box never suffer a single-tick step shock.
+
+def sag_correction_weights(q, sag_map, kp_key=None, rig_fingerprint=None, zeros_key="none"):
+    """Per-joint learned residual and C1 envelope weights `(extra, weights)`.
+
+    Gravity sag is an arm/motor property (independent of camera `rig_fingerprint`),
+    keyed by canonical `kp` and `zeros_key`. Each joint is gated independently on
+    its own torque envelope `[tau_min[j], tau_max[j]]` (or angle envelope on
+    legacy maps), so changing J4 from horizontal to top-down never zeroes the
+    learned corrections on J2/J3.
     """
     zeros = np.zeros(6)
     if not sag_map:
-        return zeros
-    if kp_key is not None and str(sag_map.get("kp_key")) != str(kp_key):
-        return zeros
-    if rig_fingerprint is not None and str(sag_map.get("rig_fingerprint")) != str(rig_fingerprint):
-        return zeros
+        return zeros, zeros
+    if kp_key is not None and not kp_keys_match(sag_map.get("kp_key"), kp_key):
+        return zeros, zeros
     if str(sag_map.get("zeros_key", "none")) != str(zeros_key):
-        return zeros
+        return zeros, zeros
     q = np.asarray(q, dtype=float).reshape(6)
+    tau = rebot_ik.gravity_torques(q)
     envelope = sag_map.get("envelope") or {}
+    tau_min = envelope.get("tau_min")
+    tau_max = envelope.get("tau_max")
+    use_tau = (isinstance(tau_min, (list, tuple)) and len(tau_min) >= 6
+               and isinstance(tau_max, (list, tuple)) and len(tau_max) >= 6)
     q_min = np.asarray(envelope.get("q_min", [-math.inf] * 6), dtype=float)
     q_max = np.asarray(envelope.get("q_max", [math.inf] * 6), dtype=float)
-    weight = 1.0
+    weights = np.zeros(6)
+    extra = np.zeros(6)
+    per_motor = sag_map.get("per_motor") or {}
     for j in range(6):
-        dist = 0.0
-        if q[j] < q_min[j]:
-            dist = max(dist, float(q_min[j] - q[j]))
-        if q[j] > q_max[j]:
-            dist = max(dist, float(q[j] - q_max[j]))
-        if dist >= SAG_ENVELOPE_TAPER_RAD:
-            return zeros
-        if dist > 0.0:
-            u = dist / SAG_ENVELOPE_TAPER_RAD
-            weight *= 1.0 - (3.0 * u * u - 2.0 * u * u * u)
-    tau = rebot_ik.gravity_torques(q)
-    extra = np.asarray([(sag_map["per_motor"][str(j + 1)]["a"] * tau[j]
-                         + sag_map["per_motor"][str(j + 1)]["b"]) * weight for j in range(6)])
-    return np.clip(extra, -SAG_LIMIT_RAD, SAG_LIMIT_RAD)
+        if use_tau:
+            lo, hi = float(tau_min[j]), float(tau_max[j])
+            taper = max(SAG_TAU_TAPER_NM, 0.25 * max(0.0, hi - lo))
+            w = _smoothstep_taper(float(tau[j]), lo, hi, taper)
+        else:
+            w = _smoothstep_taper(float(q[j]), float(q_min[j]), float(q_max[j]),
+                                  SAG_ENVELOPE_TAPER_RAD)
+        weights[j] = w
+        motor = per_motor.get(str(j + 1))
+        if motor and w > 0.0:
+            raw = (float(motor["a"]) * float(tau[j]) + float(motor["b"])) * w
+            extra[j] = float(np.clip(raw, -SAG_LIMIT_RAD, SAG_LIMIT_RAD))
+    return extra, weights
+
+
+def sag_correction(q, sag_map, kp_key=None, rig_fingerprint=None, zeros_key="none"):
+    """The per-joint additive sag term for aim(), or zeros when untrusted."""
+    extra, _weights = sag_correction_weights(
+        q, sag_map, kp_key=kp_key, rig_fingerprint=rig_fingerprint, zeros_key=zeros_key)
+    return extra
 
 
 def active_sag_extra(q, kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
@@ -443,13 +592,13 @@ def active_sag_extra(q, kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
                           zeros_key=key)
 
 
-def sag_compensator(kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
+def sag_compensator(kp_spec, calib_dir, rig_name="extrinsics-fixed.json", with_tau=False):
     """A per-pose command compensator for a whole plan (§7.3b): model sag plus
     the learned residual where a keyed map exists.
 
-    The rig and map are read once, not per waypoint; a missing or torn file
-    means model-only compensation, never an exception into the plan. The total
-    stays clipped inside aim(); the caller clips to the joint limits.
+    When `with_tau=True` (the trajectory also carries MIT gravity torque
+    feedforward `tau`), cold-start compensation uses `TAU_SAG_SCALE` and blends
+    smoothly into the learned residual map across each joint's envelope weight.
     """
     kp = kp_vector(kp_spec)
     rig_doc = {}
@@ -462,12 +611,14 @@ def sag_compensator(kp_spec, calib_dir, rig_name="extrinsics-fixed.json"):
     key = zeros_key(rig_doc.get("joint_zeros"))
     map_doc = (load_sag_map(calib_dir, fingerprint, kp_key=kp_spec, zeros_key=key)
                if calib_dir and fingerprint else None)
+    base_scale = TAU_SAG_SCALE if with_tau else 1.0
 
     def compensate(q):
         q = np.asarray(q, dtype=float).reshape(6)
-        extra = sag_correction(q, map_doc, kp_key=kp_spec, rig_fingerprint=fingerprint,
-                               zeros_key=key)
-        return aim(q, kp, extra_sag=extra)
+        extra, weights = sag_correction_weights(
+            q, map_doc, kp_key=kp_spec, rig_fingerprint=fingerprint, zeros_key=key)
+        return aim(q, kp, extra_sag=extra, base_scale=base_scale,
+                   blend_weights=weights if with_tau else None)
 
     return compensate
 

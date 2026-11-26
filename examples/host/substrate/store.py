@@ -657,19 +657,12 @@ class SubstrateStore:
 
     def read_sag_map_doc(self, arm_id: str, rig_fingerprint: str | None = None):
         with self.conn() as c:
-            if rig_fingerprint:
-                row = c.execute(
-                    "SELECT rig_fingerprint, kp_key, zeros_key, per_motor, samples, "
-                    "rms_mrad, validated_mm, envelope FROM learning.sag_map "
-                    "WHERE arm_id=%s AND rig_fingerprint=%s AND status='active' "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (arm_id, rig_fingerprint)).fetchone()
-            else:
-                row = c.execute(
-                    "SELECT rig_fingerprint, kp_key, zeros_key, per_motor, samples, "
-                    "rms_mrad, validated_mm, envelope FROM learning.sag_map "
-                    "WHERE arm_id=%s AND status='active' ORDER BY created_at DESC LIMIT 1",
-                    (arm_id,)).fetchone()
+            row = c.execute(
+                "SELECT rig_fingerprint, kp_key, zeros_key, per_motor, samples, "
+                "rms_mrad, validated_mm, envelope FROM learning.sag_map "
+                "WHERE arm_id=%s AND status='active' "
+                "ORDER BY (rig_fingerprint = COALESCE(%s, '')) DESC, created_at DESC LIMIT 1",
+                (arm_id, rig_fingerprint)).fetchone()
         if row is None:
             return None
         return {"rig_fingerprint": row["rig_fingerprint"], "kp_key": row["kp_key"],

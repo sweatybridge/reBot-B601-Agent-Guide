@@ -662,9 +662,12 @@ def fit_sag_map(holds, kp_key, rig_fingerprint, zeros_key="none", min_holds=None
                 "rms_mrad": round(test_rms, 3)}
 
     q_all = np.asarray([h["q"] for h in holds], dtype=float)
+    tau_all = np.asarray([h["tau"] for h in holds], dtype=float)
     envelope = {
         "q_min": [float(v) for v in q_all.min(axis=0)],
         "q_max": [float(v) for v in q_all.max(axis=0)],
+        "tau_min": [float(v) for v in tau_all.min(axis=0)],
+        "tau_max": [float(v) for v in tau_all.max(axis=0)],
         "radius_m": [float(radius.min()), float(radius.max())],
         "height_m": [float(tips[:, 2].min()), float(tips[:, 2].max())],
     }
@@ -708,9 +711,11 @@ load_sag_map = sweep.load_sag_map
 
 
 def save_sag_map(calib_dir, map_doc):
+    text = json.dumps(map_doc, indent=2) + "\n"
     path = sag_map_path(calib_dir, map_doc["rig_fingerprint"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(map_doc, indent=2) + "\n", encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
+    (Path(calib_dir) / "sag-arm.json").write_text(text, encoding="utf-8")
     return path
 
 

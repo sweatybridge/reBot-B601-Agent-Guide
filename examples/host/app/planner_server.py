@@ -263,7 +263,7 @@ def save_telemetry(entry_id, telemetry):
         try:
             mirror.mirror_telemetry(
                 entry_id, entry_id, PG_ARM, raw.encode("utf-8"),
-                kp_key=str(telemetry.get("kp", "default")),
+                kp_key=sweep.format_kp_spec(telemetry.get("kp")),
                 summary={"abort": telemetry.get("abort"),
                          "gripper_stall": telemetry.get("gripper_stall"),
                          "tick": telemetry.get("tick")})
@@ -765,6 +765,14 @@ def move_one(body):
     return answer
 
 
+def stop_playback():
+    """Interrupt an in-progress edge playback (controlled ramp back to park)."""
+    status, payload = edge_request("POST", "/stop", timeout=10)
+    if status != 200:
+        raise GatewayError(payload.get("error", "the edge refused /stop"), 502)
+    return {"ok": True, **payload}
+
+
 def execute_one(body):
     if not EXECUTE:
         raise GatewayError("execution is disabled on this host (REBOT_EXECUTE=1 to allow it)", 403)
@@ -909,6 +917,8 @@ class Handler(BaseHTTPRequestHandler):
                     "/plan-sequence is deprecated; POST /plan with targets and gripper", 410)
             elif self.path == "/execute":
                 self._send(200, execute_one(self._body()))
+            elif self.path == "/stop":
+                self._send(200, stop_playback())
             elif self.path == "/move":
                 self._send(200, move_one(self._body()))
             elif self.path == "/fk":

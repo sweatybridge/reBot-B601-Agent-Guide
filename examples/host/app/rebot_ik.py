@@ -94,8 +94,9 @@ GRIPPER = {"motor7_open": 4.90, "motor7_closed": -0.015, "rad_per_mm": 0.0412}
 # seed bit-for-bit. The chain sample counts stay floats here (group convention) and
 # are coerced to ints at the use sites.
 MOTION = {
-    "default_min_z": 0.04, "sag_limit_rad": 0.15, "limit_tol": 0.002, "max_joint_step": 0.5,
-    "ramp_s": 0.15, "min_cruise_speed": 0.25, "min_seconds": 0.3, "max_seconds": 25.0,
+    "default_min_z": 0.04, "sag_limit_rad": 0.15, "tau_sag_scale": 0.45,
+    "limit_tol": 0.002, "max_joint_step": 0.5,
+    "ramp_s": 0.25, "min_cruise_speed": 0.25, "min_seconds": 0.3, "max_seconds": 25.0,
     "peak_speed": 0.5, "gripper_peak_speed": 3.0,
     "default_hz": 50.0, "corner_radius_rad": 0.05,
     "chain_line_samples": 40.0, "chain_fillet_samples": 16.0,
@@ -473,7 +474,7 @@ def apply_config(cfg):
         ("sweep", {"DEFAULT_MIN_Z": "default_min_z", "PEAK_SPEED": "peak_speed",
                    "MIN_CRUISE_SPEED": "min_cruise_speed", "MIN_SECONDS": "min_seconds",
                    "MAX_SECONDS": "max_seconds", "GRIPPER_PEAK_SPEED": "gripper_peak_speed",
-                   "SAG_LIMIT_RAD": "sag_limit_rad"}),
+                   "SAG_LIMIT_RAD": "sag_limit_rad", "TAU_SAG_SCALE": "tau_sag_scale"}),
     ):
         mod = sys.modules.get(name)
         if mod is not None:

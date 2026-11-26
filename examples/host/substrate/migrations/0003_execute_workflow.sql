@@ -644,13 +644,19 @@ BEGIN
     IF w0 < 0.0 AND w1 > 0.0 THEN w0 := 0.0; END IF;
     mid := 0.5 * (w0 + w1);
 
-    -- Pick the stillest telemetry sample inside the recorded span [w0, w1], tiebreak by midpoint.
+    -- Pick a settled telemetry sample (v <= 0.05 rad/s) near the settled target
+    -- time (65% through holds >= 0.8 s to absorb RTSP stream latency; midpoint
+    -- for shorter holds), falling back to minimum speed if never settled.
     SELECT (s->>'t')::float8 + ex.t_offset, (s->>'v')::float8
       INTO best_t, best_score
       FROM jsonb_array_elements(speeds) s
      WHERE (s->>'t')::float8 + ex.t_offset >= w0 - 1e-6
        AND (s->>'t')::float8 + ex.t_offset <= w1 + 1e-6
-     ORDER BY (s->>'v')::float8 ASC, abs(((s->>'t')::float8 + ex.t_offset) - mid) ASC, (s->>'t')::float8 ASC
+     ORDER BY (CASE WHEN (s->>'v')::float8 <= 0.05 THEN 0 ELSE 1 END) ASC,
+              abs(((s->>'t')::float8 + ex.t_offset)
+                  - (CASE WHEN (w1 - w0) >= 0.8 THEN w0 + 0.65 * (w1 - w0) ELSE mid END)) ASC,
+              (s->>'v')::float8 ASC,
+              (s->>'t')::float8 ASC
      LIMIT 1;
     IF best_t IS NULL THEN
       best_t := mid;
@@ -807,18 +813,29 @@ END $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION execution_detect_request(p_exec_id text) RETURNS jsonb AS $$
 DECLARE
   ex evidence.execution%ROWTYPE;
+  plan_json jsonb;
   tel jsonb;
   rig record;
   cal record;
   holds jsonb := '[]'::jsonb;
   samples_arr jsonb;
+  targets_arr jsonb := '[]'::jsonb;
 BEGIN
   SELECT * INTO ex FROM evidence.execution WHERE exec_id = p_exec_id;
   IF NOT FOUND THEN RAISE EXCEPTION 'unknown execution %', p_exec_id; END IF;
+  SELECT convert_from(b.bytes, 'UTF8')::jsonb INTO plan_json
+    FROM evidence.plan p JOIN evidence.blob b ON b.sha256 = p.blob_sha
+   WHERE p.plan_id = ex.plan_id;
   SELECT convert_from(b.bytes, 'UTF8')::jsonb INTO tel
     FROM evidence.telemetry t JOIN evidence.blob b ON b.sha256 = t.blob_sha
    WHERE t.exec_id = p_exec_id;
   samples_arr := CASE WHEN jsonb_typeof(tel->'samples') = 'array' THEN tel->'samples' ELSE '[]'::jsonb END;
+  IF plan_json IS NOT NULL THEN
+    targets_arr := CASE
+      WHEN jsonb_typeof(plan_json->'capture'->'targets') = 'array' THEN plan_json->'capture'->'targets'
+      WHEN jsonb_typeof(plan_json->'targets') = 'array' THEN plan_json->'targets'
+      ELSE '[]'::jsonb END;
+  END IF;
 
   SELECT r.* INTO rig
     FROM evidence.episode e
@@ -834,8 +851,12 @@ BEGIN
            'index', h.hold_index,
            'frame', h.still_sha,
            'image_size', jsonb_build_array(s.width, s.height),
-           'grid_scale', CASE WHEN (cal.image_size->>0)::float8 > 0 AND s.width IS NOT NULL
-                              THEN s.width::float8 / (cal.image_size->>0)::float8 ELSE 1.0 END,
+           'grid_scale', CASE
+             WHEN (cal.image_size->>0)::float8 > 0 AND s.width IS NOT NULL AND s.height IS NOT NULL THEN
+               CASE WHEN (s.width > s.height) <> ((cal.image_size->>0)::float8 > (cal.image_size->>1)::float8)
+                    THEN s.height::float8 / (cal.image_size->>0)::float8
+                    ELSE s.width::float8 / (cal.image_size->>0)::float8 END
+             ELSE 1.0 END,
            't', h.t,
            'q_meas', COALESCE((
              SELECT jsonb_build_array(
@@ -863,6 +884,8 @@ BEGIN
 
   RETURN jsonb_build_object(
     'holds', COALESCE(holds, '[]'::jsonb),
+    'targets', targets_arr,
+    'sequence', COALESCE((plan_json->'capture'->>'sequence')::boolean, (plan_json->>'sequence')::boolean, false),
     'K', cal.K, 'dist', cal.dist, 'T_base_cam', rig.T_base_cam,
     'tip_offset', rig.tip_offset, 'image_size', cal.image_size);
 END $$ LANGUAGE plpgsql STABLE;
@@ -971,15 +994,29 @@ BEGIN
     urdf_text, waypoints, samples, targets, det,
     jsonb_numbers(cal.K), jsonb_numbers(cal.dist),
     jsonb_numbers(rig.T_base_cam), jsonb_numbers(rig.tip_offset), kp,
-    jsonb_build_object(
+    jsonb_strip_nulls(jsonb_build_object(
       'plan_id', ex.plan_id, 'exec_id', p_exec_id,
       'telemetry', tel_meta,
+      'grasp_verification', CASE WHEN jsonb_typeof(p_detections->'grasp_verification') = 'object'
+                                 THEN p_detections->'grasp_verification' ELSE NULL END,
       'source', 'durable_offline_extract',
-      'created', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')),
+      'created', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))),
     ex.arm_id);
   doc := (res->'doc') || jsonb_build_object('verdict', res->'verdict');
+  IF jsonb_typeof(p_detections->'grasp_verification') = 'object'
+     AND (p_detections->'grasp_verification'->>'grasped') = 'false' THEN
+    doc := jsonb_set(
+      doc,
+      '{verdict,problems}',
+      COALESCE(doc->'verdict'->'problems', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+        'kind', 'empty-grasp',
+        'layer', 'grasp',
+        'detail', format('visual post-grasp check saw object still at pick spot (changed=%.0f%%, tm=%.2f)',
+                         COALESCE((p_detections->'grasp_verification'->>'changed_frac')::float8, 0.0) * 100.0,
+                         COALESCE((p_detections->'grasp_verification'->>'tm_max')::float8, 1.0)))));
+  END IF;
   PERFORM oracle_learn(p_exec_id, ex.arm_id, rig.rig_fingerprint, doc, NULL);
-  RETURN jsonb_build_object('doc', doc, 'verdict', res->'verdict');
+  RETURN jsonb_build_object('doc', doc, 'verdict', doc->'verdict');
 END $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION execution_adopt(
