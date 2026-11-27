@@ -7,7 +7,7 @@ description: >-
   publish a GitHub issue with the zip and individual video attachments via Chrome remote debugging.
   Use when the user asks for batch validation, multi-run physical pick-and-place evaluation,
   grading from recordings, or filing a bench evaluation GitHub issue with repro bundles and videos.
-version: 1.1.0
+version: 1.2.0
 ---
 
 # Batch Validation (B601-RS Physical Pick-and-Place)
@@ -15,7 +15,7 @@ version: 1.1.0
 End-to-end procedure for executing a batch of distinct physical pick-and-place runs on the
 B601-RS bench, grading each run visually from its recorded video + telemetry + oracle verdict,
 packaging trajectory metadata into one `.zip`, stitching individual `.mp4` recordings, and
-filing a GitHub issue with native attachments (modeled on Issues `#10`, `#12`, and `#13`).
+filing a GitHub issue with native attachments (modeled on Issues `#10`, `#12`, `#13`, and `#14`).
 
 > **Review-only mode (already-executed DB runs):** If the user asks to grade runs that are
 > already in Postgres, skip Steps 1–2, query `evidence.execution` for the target `exec_id`s
@@ -48,17 +48,23 @@ filing a GitHub issue with native attachments (modeled on Issues `#10`, `#12`, a
    curl.exe -sk https://127.0.0.1:8443/pose
    ```
    Confirm `execute: true`, `mode: "fixed"`, and arm joints `1..7` parked near `0`.
+   If `GET /pose` returns `no reply to the 0x7019 read from motor 1`, probe edge `/health` via
+   `rebot-capture-planner-1` (`$REBOT_EDGE_URL/health`): if `can_up: true`, the arm's 24 V power
+   supply is off or e-stop is engaged — ask the user to power on before continuing.
 2. Grab a live frame from `rtsp://mediamtx:8554/phone` inside `rebot-capture-capture-1` into
    `/app/work/live_now.jpg`, inspect it with `read_file`, and verify base ArUco tag projection
-   error (`< 5 px`; note `/health`'s cached `stream_turn.error_px` can be stale after a rig refit).
+   error (`< 5 px`). Note that RTSP frames can arrive at either `1356x762` or `1920x1080`
+   depending on WebRTC ramp state — **always use normalized fractional coordinates**
+   (`int(frac * fw)`, `int(frac * fh)`) for any HSV/pixel ROI rather than hardcoded 1080p pixels.
 3. Project candidate object centers at `z = 0.00`, `0.04`, `0.08 m` onto the image to verify
    vertical-column alignment and reach radii:
    - **Top-down (`tool_axis="x+"`, `entry="vertical"`)**: optimal around `r = 0.35–0.52 m`,
      `vertical_min_z = 0.0`. Because `REBOT_TIP_MM = 35` lifts `flange_point.z` by `+35 mm`,
      commanding `tip.z = 0.005–0.010 m` places fingertips `40–45 mm` above the worktop.
    - **Horizontal (`tool_axis="z-"`, `entry="front"`)**: reaches `r = 0.45–0.74 m`, `min_z = 0.04 m`.
-     Watch for lightweight/round objects near table edges on flat `0°` slide-ins; prefer
-     elevated `via` waypoints (`z = 0.14–0.18 m`) on Marker 2 to avoid table drag and collisions.
+     `capture_server.handle_sequence` now auto-inserts a 2-point `z = 0.16 m` transit clearance
+     arch unless explicit `via` or `transit_lift_m = 0` is supplied (`c5bbc12`). Watch for
+     lightweight/round objects near table edges or adjacent toys during flat slide-ins.
 
 ---
 
@@ -116,22 +122,21 @@ For **each** run:
    - `raw_frags/<key>/seg_*.mp4` (raw MediaMTX fragments ready for stitching)
 3. Visually inspect `storyboard_<key>.jpg`, `oracle_holds_all.jpg`, and `after_<key>.jpg` with
    `read_file` to grade every run honestly:
-   - Do **not** trust `grasp_verification` blindly: verify in the recording whether the object was
-     actually grasped & placed (vs knocked off the table = false positive, or occluded by the arm
-     at Hold 3 = false negative).
-   - Check `grid_scale` on every hold: mid-stream WebRTC ramps (`1356x762` -> `1920x1080`) can
-     trigger false ~250 mm pixel errors if `oracle_compute` does not rescale `detected_tip_px`.
+   - Verify `grasp_verification` (`source: "post_park"`, checking both `pick_departed` and
+     `place_arrived`) against the actual recording frames, and note whether the live mid-transit
+     guard (`_start_grasp_guard`) aborted or missed a nudged-object failure.
+   - Check `grid_scale` on every hold (confirm mid-stream WebRTC ramps `1356x762 -> 1920x1080`
+     do not inflate `pixel_error_mm`, and watch for top-down `x+` `green-collar` bias).
    - Separate servo tracking error (`tip_error_mm` = meas vs cmd) from net placement error
-     (`placement_mm` = meas vs requested `flange_point`) to diagnose sag over-/under-compensation
-     and catch inverted oracle verdicts (e.g., `placement_mm < 5 mm` falsely blamed as `sag`, or
-     `placement_mm > 15 mm` missed because `tip_error_mm < 8 mm`).
+     (`placement_mm` / `dz_cmd` / `dz_meas` / `herr[J2]`) to diagnose posture-dependent sag
+     over-/under-compensation and J2 stiction hysteresis across pick vs place holds.
    - **Check 50 Hz smoothness & tracking spikes (`motion_metrics`)**: inspect `jerk_cmd_max_rads3`,
-     `acc_meas_max_rads2`, `jerk_meas_max_rads3`, and `track_err_per_joint_max_rad` printed by
-     `extract_and_bundle.py`. Flag commanded jerk spikes (`> 150 rad/s³`, e.g., unblended V-corners
-     or joint-limit clamps) and measured acceleration/tracking spikes (`acc_meas_max > 25 rad/s²`
-     or `track_err_max > 0.10 rad`, e.g., mechanical binds or release slams) — a visually clean
-     pick can still hide a severe mid-carry jerk spike (`f95aff` in `#13`).
-   - Check motor-7 (`q[6]`) hold compliance (`meas - cmd` at grasp end) and edge tick jitter.
+     `acc_meas_max_rads2`, `jerk_meas_max_rads3` (including per-joint breakdown), and
+     `track_err_per_joint_max_rad` printed by `extract_and_bundle.py`. Flag commanded jerk spikes
+     (`> 150 rad/s³`) and measured acceleration/tracking spikes (`acc_meas_max > 25 rad/s²` or
+     `track_err_max > 0.10 rad`).
+   - Check per-hold motor-7 (`q[6]`) grip compliance (`meas - cmd` at grasp end) and edge tick
+     jitter (`mean_ms`, `p95_ms`, `max_ms`).
 4. Update `grade` / `summary_label` in `batch_manifest.json` after visual inspection and re-run
    `extract_and_bundle.py --zip-only` if grades changed.
 
@@ -140,10 +145,11 @@ For **each** run:
 ## Step 4: Stitch Individual Recordings (<10 MB MP4s)
 
 Run [`scripts/stitch_recordings.ps1`](./scripts/stitch_recordings.ps1) on the Windows host
-(use `powershell -File` on Windows PowerShell 5.1, or `pwsh -File` if PowerShell 7 is installed):
+(pass `-ExecutionPolicy Bypass` on Windows PowerShell 5.1 where script execution is disabled by
+default):
 
 ```powershell
-powershell -File skills\batch-validation\scripts\stitch_recordings.ps1 `
+powershell -ExecutionPolicy Bypass -File skills\batch-validation\scripts\stitch_recordings.ps1 `
   -ExportDir "d:\work\reBot-B601-Agent-Guide\examples\host\work\export_batch" `
   -Manifest "d:\work\reBot-B601-Agent-Guide\examples\host\work\batch_manifest.json"
 ```

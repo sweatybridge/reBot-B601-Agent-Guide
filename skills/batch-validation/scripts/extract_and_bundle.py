@@ -308,18 +308,37 @@ def main() -> int:
             print(f"  frags: {', '.join(res_summary)}")
             print(f"  verdict={verdict_doc.get('verdict')} grasp={verdict_doc.get('grasp_verification')}")
             if motion.get("jerk_cmd_max_rads3") is not None:
+                tick = (tel_doc or {}).get("tick") or {}
                 print(
                     f"  motion: track_rms={motion['track_err_rms_rad']} max={motion['track_err_max_rad']}rad "
                     f"vel_cmd/meas={motion['vel_cmd_max_rads']}/{motion['vel_meas_max_rads']}rad/s "
                     f"acc_max={motion['acc_meas_max_rads2']}rad/s2@{motion['acc_meas_max_t']}s "
                     f"jerk_cmd_max={motion['jerk_cmd_max_rads3']}@{motion['jerk_cmd_max_t']}s "
-                    f"jerk_meas_max={motion['jerk_meas_max_rads3']}@{motion['jerk_meas_max_t']}s"
+                    f"jerk_meas_max={motion['jerk_meas_max_rads3']}@{motion['jerk_meas_max_t']}s "
+                    f"per_joint={motion.get('jerk_meas_max_per_joint')} "
+                    f"tick_mean/p95/max={tick.get('mean_ms')}/{tick.get('p95_ms')}/{tick.get('max_ms')}ms"
                 )
             for h in verdict_doc.get("holds") or []:
+                fl = h.get("flange_point")
+                fc = h.get("tip_fk_cmd")
+                fm = h.get("tip_fk_meas")
+                dz_c = round(1000.0 * (fc[2] - fl[2]), 1) if fl and fc else None
+                dz_m = round(1000.0 * (fm[2] - fl[2]), 1) if fl and fm else None
+                herr = h.get("hold_error_rad") or []
+                j2_err = round(float(herr[1]), 4) if len(herr) > 1 else None
                 print(
                     f"    H{h['index']}: scale={h.get('grid_scale')} tip_err={h.get('tip_error_mm')}mm "
-                    f"place_err={h.get('placement_mm')}mm px_err={h.get('pixel_error_px')}px/{h.get('pixel_error_mm')}mm"
+                    f"place_err={h.get('placement_mm')}mm dz_cmd/meas={dz_c}/{dz_m}mm j2_herr={j2_err} "
+                    f"px_err={h.get('pixel_error_px')}px/{h.get('pixel_error_mm')}mm"
                 )
+            samples = (tel_doc or {}).get("samples") or []
+            for ti, tg in enumerate(targets, 1):
+                hs, he = tg.get("hold_t_start", 0), tg.get("hold_t_end", 0)
+                ins = [s for s in samples if hs <= s.get("t", -1) <= he and len(s.get("cmd") or []) >= 7]
+                if ins:
+                    c0, c1 = ins[0]["cmd"][6], ins[-1]["cmd"][6]
+                    m0, m1 = ins[0]["meas"][6], ins[-1]["meas"][6]
+                    print(f"    m7 hold {ti}: cmd {c0:.2f}->{c1:.2f} meas {m0:.2f}->{m1:.2f} (end err={m1 - c1:+.3f} rad)")
 
         # Build oracle hold panel row
         h_panels = []
