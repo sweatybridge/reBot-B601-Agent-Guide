@@ -207,21 +207,26 @@ _CLI_HINT_OLD = (
 
 def _clean_plan_error(error: Exception, options=None) -> str:
     """Strip raw PL/pgSQL CONTEXT tracebacks and replace CLI-only reach hints
-    with mode-aware guidance (Issue #12 #6a)."""
+    with mode-aware guidance (Issue #12 #6a), preserving verified IK advice."""
     text = _PG_INTERNAL_RE.sub("", str(error)).strip()
     if _CLI_HINT_OLD in text:
-        axis = str(getattr(options, "tool_axis", "") or "")
-        if axis == "x+":
-            replacement = (
-                "Top-down (x+) reach is limited (~0.55 m): move the target closer "
-                "or switch to horizontal (z-) entry."
-            )
+        has_verified = ("Verified alternative:" in text
+                        or "Closest verified reachable tip:" in text)
+        if has_verified:
+            text = text.replace(_CLI_HINT_OLD, "").replace("  ", " ").strip()
         else:
-            replacement = (
-                "The target may be out of reach or blocked by joint limits: adjust "
-                "the target position, entry mode, or approach standoff."
-            )
-        text = text.replace(_CLI_HINT_OLD, replacement)
+            axis = str(getattr(options, "tool_axis", "") or "")
+            if axis == "x+":
+                replacement = (
+                    "Top-down (x+) reach is limited (~0.55 m): move the target closer "
+                    "or switch to horizontal (z-) entry."
+                )
+            else:
+                replacement = (
+                    "The target may be out of reach or blocked by joint limits: adjust "
+                    "the target position, entry mode, or approach standoff."
+                )
+            text = text.replace(_CLI_HINT_OLD, replacement)
     return text
 
 PLAN_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
@@ -230,12 +235,65 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(me
                     datefmt="%H:%M:%S")
 
 
+_ADVICE_MARKER_RE = re.compile(r"\b(?:marker|above|stage)\s+(\d+)\b", re.I)
+_ADVICE_TIP_RE = re.compile(
+    r'Closest verified reachable tip:\s*\[\s*([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*\]\s*m\s*'
+    r'\(\s*([0-9]+(?:\.[0-9]+)?)\s*mm away,\s*tool_axis="([^"]+)"\s*\)',
+)
+_ADVICE_AXIS_RE = re.compile(
+    r'Verified alternative:\s*try tool_axis="([^"]+)"',
+)
+_ADVICE_YAW_RE = re.compile(
+    r'Verified alternative:\s*try yaw=([-+]?\d+(?:\.\d+)?)\s*deg with tool_axis="([^"]+)"',
+)
+
+
+def parse_ik_advice(text: str):
+    """Extract a structured advice object from a verified IK refusal message."""
+    if not text:
+        return None
+    m_idx = _ADVICE_MARKER_RE.search(text)
+    marker = int(m_idx.group(1)) if m_idx else 1
+    m_tip = _ADVICE_TIP_RE.search(text)
+    if m_tip:
+        return {
+            "kind": "tip",
+            "marker": marker,
+            "tip": [float(m_tip.group(1)), float(m_tip.group(2)), float(m_tip.group(3))],
+            "distance_mm": round(float(m_tip.group(4)), 1),
+            "tool_axis": m_tip.group(5),
+        }
+    m_axis = _ADVICE_AXIS_RE.search(text)
+    if m_axis:
+        return {
+            "kind": "tool_axis",
+            "marker": marker,
+            "tool_axis": m_axis.group(1),
+        }
+    m_yaw = _ADVICE_YAW_RE.search(text)
+    if m_yaw:
+        return {
+            "kind": "yaw",
+            "marker": marker,
+            "yaw_deg": float(m_yaw.group(1)),
+            "tool_axis": m_yaw.group(2),
+        }
+    return None
+
+
 class GatewayError(Exception):
     """Reported to the caller with a status code."""
 
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, extra=None):
         super().__init__(message)
         self.status = status
+        self.extra = dict(extra) if isinstance(extra, dict) else None
+
+    def payload(self):
+        body = {"ok": False, "error": str(self)}
+        if self.extra:
+            body.update(self.extra)
+        return body
 
 
 def edge_request(method, path, body=None, timeout=30):
@@ -293,6 +351,7 @@ def save_telemetry(entry_id, telemetry):
                 kp_key=sweep.format_kp_spec(telemetry.get("kp")),
                 summary={"abort": telemetry.get("abort"),
                          "gripper_stall": telemetry.get("gripper_stall"),
+                         "gripper_contacts": telemetry.get("gripper_contacts"),
                          "tick": telemetry.get("tick")})
             return entry_id
         except Exception as exc:  # noqa: BLE001 - never fail a move (§8.4)
@@ -499,7 +558,9 @@ def plan_targets(body):
         except Exception as error:
             status_code = 503 if _is_db_outage(error) else 422
             msg = str(error) if status_code == 503 else _clean_plan_error(error, options)
-            raise GatewayError(msg, status_code) from error
+            advice = None if status_code == 503 else parse_ik_advice(msg)
+            extra = {"advice": advice} if advice else None
+            raise GatewayError(msg, status_code, extra=extra) from error
         plan_id = res["plan_id"]
         summary = res["summary"]
         summary["compute_s"] = round(time.time() - started, 2)
@@ -520,7 +581,10 @@ def plan_targets(body):
             payload, summary = fp.plan_sequence(pose, targets, options)
             label = "sequence"
     except fp.PlanError as error:
-        raise GatewayError(_clean_plan_error(error, options), 422) from error
+        msg = _clean_plan_error(error, options)
+        advice = parse_ik_advice(msg)
+        extra = {"advice": advice} if advice else None
+        raise GatewayError(msg, 422, extra=extra) from error
 
     plan_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
     raw = json.dumps(payload, separators=(",", ":"))
@@ -935,7 +999,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(404, {"ok": False, "error": "no such route"})
         except GatewayError as error:
-            self._send(error.status, {"ok": False, "error": str(error)})
+            self._send(error.status, error.payload())
 
     def do_POST(self):  # noqa: N802 - stdlib signature
         try:
@@ -958,7 +1022,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, {"ok": False, "error": "no such route"})
         except GatewayError as error:
             logging.warning("%s -> %s: %s", self.path, error.status, error)
-            self._send(error.status, {"ok": False, "error": str(error)})
+            self._send(error.status, error.payload())
         except Exception as error:  # noqa: BLE001 - never kill the server on one request
             logging.exception("unhandled error on %s", self.path)
             self._send(500, {"ok": False, "error": "%s: %s" % (type(error).__name__, error)})

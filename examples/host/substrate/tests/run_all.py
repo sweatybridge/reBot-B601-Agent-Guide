@@ -63,6 +63,7 @@ PLANNER_PY_TESTS = [
     "move_parity.py",
     "calib_parity.py",
     "test_plan_one.py",
+    "test_mesh_ik_advice.py",
 ]
 
 

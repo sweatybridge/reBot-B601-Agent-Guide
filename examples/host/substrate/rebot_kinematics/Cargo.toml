@@ -20,6 +20,7 @@ pgrx = "=0.16.1"
 # exactly so the nalgebra/urdf-rs types are the same crates k compiles against.
 k = "0.32"
 nalgebra = "0.30"
+parry3d-f64 = "0.8"
 urdf-rs = "0.9"
 serde_json = "1"
 

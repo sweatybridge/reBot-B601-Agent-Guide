@@ -61,6 +61,11 @@ const GRIPPER_STALL_ERROR: f64 = 0.15; // rad of commanded-vs-measured gap
 const GRIPPER_STALL_VELOCITY: f64 = 0.08; // rad/s below which the jaw is "not moving"
 const GRIPPER_STALL_MIN_S: f64 = 0.10;
 const GRIPPER_STALL_MAX_S: f64 = 5.0;
+// In `latch` mode, closing onto a rigid object clamps the jaw setpoint just
+// inside the measured contact angle (~2 mm preload) so the jaws keep a steady
+// grasp through lift & transfer instead of aborting or over-pressing.
+const GRIPPER_CONTACT_PRELOAD: f64 = 0.08; // rad (~1.9 mm) firm-grasp preload
+const GRIPPER_RELEASE_MARGIN: f64 = 0.15;  // rad above latched angle to unlatch on open
 // The return ramp. The duration follows the same rule as the way out -- the
 // cosine-calibrated peak-speed cap (peak = pi/2 x average) -- so a long way home
 // is not rushed, and a short nudge still takes long enough to have a beginning
@@ -1808,6 +1813,32 @@ fn install_signal_handlers() -> Result<()> {
 // CLI
 // --------------------------------------------------------------------------- //
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GripperStallMode {
+    /// Closing stall latches the jaw at measured contact angle and continues playback;
+    /// opening stall still aborts.
+    Latch,
+    /// Any gripper stall aborts playback and ramps home.
+    Abort,
+}
+
+impl GripperStallMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Latch => "latch",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+fn parse_gripper_stall_mode(text: &str) -> Result<GripperStallMode> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "latch" => Ok(GripperStallMode::Latch),
+        "abort" => Ok(GripperStallMode::Abort),
+        other => bail!("--gripper-stall-mode must be 'latch' or 'abort' (got '{other}')"),
+    }
+}
+
 #[derive(Debug)]
 struct Args {
     trajectory: PathBuf,
@@ -1820,6 +1851,7 @@ struct Args {
     speed: f64,
     max_follow_error: f64,
     gripper_stall: f64,
+    gripper_stall_mode: GripperStallMode,
     allow_kp_mismatch: bool,
     log: Option<PathBuf>,
     delay: f64,
@@ -1843,6 +1875,7 @@ impl Default for Args {
             speed: 1.0,
             max_follow_error: 0.0,
             gripper_stall: 0.0,
+            gripper_stall_mode: GripperStallMode::Latch,
             allow_kp_mismatch: false,
             log: None,
             delay: 0.0,
@@ -1883,6 +1916,7 @@ struct ServeArgs {
     kd_spec: String,
     ramp: f64,
     gripper_stall: f64,
+    gripper_stall_mode: GripperStallMode,
     stay_enabled: bool,
     track: bool,
 }
@@ -1903,6 +1937,7 @@ impl Default for ServeArgs {
             kd_spec: "3,2:10,3:10,4:5,5:4,6:4,7:4".into(),
             ramp: 2.0,
             gripper_stall: 0.0,
+            gripper_stall_mode: GripperStallMode::Latch,
             stay_enabled: false,
             track: false,
         }
@@ -1949,10 +1984,13 @@ OPTIONS:
     --delay <SECONDS>        Hold the start pose before the motion starts
     --max-follow-error <RAD> Abort when measured position lags by more than this
                              (checked once a second of trajectory time; 0 disables)
-    --gripper-stall <SECONDS> Abort if motor 7 is >0.15 rad from its command and
+    --gripper-stall <SECONDS> Detect if motor 7 is >0.15 rad from its command and
                              moving <0.08 rad/s for this long; 0 disables,
                              otherwise 0.1..5.0 s
                              (default: 0; the systemd unit uses 0.3)
+    --gripper-stall-mode <M> What to do on a gripper stall: 'latch' (default:
+                             clamp closing contact at measured angle and continue
+                             playback; abort on opening jam) or 'abort'
     --log <FILE>             Write commanded and measured angles as JSON
     --allow-kp-mismatch      Play a sag-compensated file at a different kp
     --stay-enabled           Leave torque on when the script exits
@@ -2043,6 +2081,11 @@ fn parse_args(argv: Vec<String>) -> Result<Command> {
                 args.gripper_stall = parse_number(
                     &take_value(&mut iter, inline, "--gripper-stall")?,
                     "--gripper-stall",
+                )?
+            }
+            "--gripper-stall-mode" => {
+                args.gripper_stall_mode = parse_gripper_stall_mode(
+                    &take_value(&mut iter, inline, "--gripper-stall-mode")?,
                 )?
             }
             "--log" => {
@@ -2141,6 +2184,11 @@ fn parse_serve_args(argv: Vec<String>) -> Result<Command> {
                 serve.gripper_stall = parse_number(
                     &take_value(&mut iter, inline, "--gripper-stall")?,
                     "--gripper-stall",
+                )?
+            }
+            "--gripper-stall-mode" => {
+                serve.gripper_stall_mode = parse_gripper_stall_mode(
+                    &take_value(&mut iter, inline, "--gripper-stall-mode")?,
                 )?
             }
             "--stay-enabled" => serve.stay_enabled = true,
@@ -2411,6 +2459,8 @@ struct LogNotes {
     abort: Option<LogAbort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gripper_stall: Option<LogGripperStall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    gripper_contacts: Vec<LogGripperContact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tick: Option<LogTick>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2431,6 +2481,14 @@ struct LogGripperStall {
 }
 
 #[derive(Serialize)]
+struct LogGripperContact {
+    t: f64,
+    commanded: f64,
+    measured: f64,
+    latched: f64,
+}
+
+#[derive(Serialize)]
 struct LogTick {
     mean_ms: f64,
     p95_ms: f64,
@@ -2447,7 +2505,10 @@ struct LogFollowError {
 /// sample is logged. The abort note is still the evidence the caller needs:
 /// write the log whenever there is something to record, not only samples.
 fn log_has_evidence(samples: &[LogSample], notes: &LogNotes) -> bool {
-    !samples.is_empty() || notes.abort.is_some() || notes.gripper_stall.is_some()
+    !samples.is_empty()
+        || notes.abort.is_some()
+        || notes.gripper_stall.is_some()
+        || !notes.gripper_contacts.is_empty()
 }
 
 fn write_log(
@@ -2671,6 +2732,7 @@ fn play<T: Transport>(
         let mut held_velocity = vec![0.0_f64; arm.ids.len()];
         let gripper = arm.ids.iter().position(|id| *id == GRIPPER_ID);
         let mut gripper_stall_since: Option<Instant> = None;
+        let mut latched_gripper: Option<f64> = None;
         let logging = args.log.is_some();
 
         for (index, waypoint) in trajectory.raw.waypoints.iter().enumerate() {
@@ -2678,7 +2740,7 @@ fn play<T: Transport>(
                 break;
             }
 
-            let targets = waypoint.q.clone();
+            let mut targets = waypoint.q.clone();
             let elapsed = waypoint.t / speed;
             last_elapsed = elapsed;
             stamps.push(Instant::now());
@@ -2705,34 +2767,82 @@ fn play<T: Transport>(
                 }
             }
 
+            let mut velocities_buf: Option<Vec<f64>> = None;
             if let Some(gripper) = gripper {
-                if args.gripper_stall > 0.0
+                if let Some(latched_q) = latched_gripper {
+                    if targets[gripper] > latched_q + GRIPPER_RELEASE_MARGIN {
+                        // Trajectory is commanding the jaws to open past the latched
+                        // grasp angle: release the latch and follow normally.
+                        latched_gripper = None;
+                        gripper_stall_since = None;
+                    } else {
+                        targets[gripper] = latched_q;
+                        if let Some(v) = waypoint.v.as_deref() {
+                            let mut v_mod = v.to_vec();
+                            if gripper < v_mod.len() {
+                                v_mod[gripper] = 0.0;
+                            }
+                            velocities_buf = Some(v_mod);
+                        }
+                    }
+                }
+                if latched_gripper.is_none()
+                    && args.gripper_stall > 0.0
                     && gripper_stall_condition(targets[gripper], held[gripper], held_velocity[gripper])
                 {
                     let since = *gripper_stall_since.get_or_insert_with(Instant::now);
                     if since.elapsed().as_secs_f64() >= args.gripper_stall {
-                        // Do not send another closing frame. Hold the measured
-                        // opening for the return ramp so the jaws stop pressing;
-                        // shut_down() then ramps the arm home and drops torque.
-                        arm.start[gripper] = held[gripper];
-                        arm.last[gripper] = held[gripper];
-                        notes.gripper_stall = Some(LogGripperStall {
-                            t: elapsed,
-                            commanded: targets[gripper],
-                            measured: held[gripper],
-                        });
-                        abort_reason = Some(format!(
-                            "gripper motor {} stalled: commanded {:+.3}, measured {:+.3} \
-                             ({:.3} rad error, {:.3} rad/s); the jaws are blocked",
-                            arm.ids[gripper],
-                            targets[gripper],
-                            held[gripper],
-                            targets[gripper] - held[gripper],
-                            held_velocity[gripper]
-                        ));
-                        break;
+                        let closing = targets[gripper] < held[gripper] - GRIPPER_STALL_ERROR;
+                        if closing && args.gripper_stall_mode == GripperStallMode::Latch {
+                            // Rigid-object contact while closing: latch just inside
+                            // the measured opening (~2 mm preload) and continue lift/place.
+                            let latched_q =
+                                (held[gripper] - GRIPPER_CONTACT_PRELOAD).max(targets[gripper]);
+                            notes.gripper_contacts.push(LogGripperContact {
+                                t: round4(elapsed),
+                                commanded: round4(targets[gripper]),
+                                measured: round4(held[gripper]),
+                                latched: round4(latched_q),
+                            });
+                            println!(
+                                "  gripper contact latched at t={elapsed:.2}s: commanded {:+.3}, \
+                                 measured {:+.3} -> holding {:+.3}",
+                                targets[gripper], held[gripper], latched_q
+                            );
+                            latched_gripper = Some(latched_q);
+                            gripper_stall_since = None;
+                            targets[gripper] = latched_q;
+                            if let Some(v) = waypoint.v.as_deref() {
+                                let mut v_mod = v.to_vec();
+                                if gripper < v_mod.len() {
+                                    v_mod[gripper] = 0.0;
+                                }
+                                velocities_buf = Some(v_mod);
+                            }
+                        } else {
+                            // Do not send another pressing frame. Hold the measured
+                            // opening for the return ramp so the jaws stop pressing;
+                            // shut_down() then ramps the arm home and drops torque.
+                            arm.start[gripper] = held[gripper];
+                            arm.last[gripper] = held[gripper];
+                            notes.gripper_stall = Some(LogGripperStall {
+                                t: elapsed,
+                                commanded: targets[gripper],
+                                measured: held[gripper],
+                            });
+                            abort_reason = Some(format!(
+                                "gripper motor {} stalled: commanded {:+.3}, measured {:+.3} \
+                                 ({:.3} rad error, {:.3} rad/s); the jaws are blocked",
+                                arm.ids[gripper],
+                                targets[gripper],
+                                held[gripper],
+                                targets[gripper] - held[gripper],
+                                held_velocity[gripper]
+                            ));
+                            break;
+                        }
                     }
-                } else {
+                } else if latched_gripper.is_none() {
                     gripper_stall_since = None;
                 }
             }
@@ -2740,7 +2850,8 @@ fn play<T: Transport>(
             let sample = args.track && sample_at.contains(&index);
             let check_due = args.max_follow_error > 0.0 && elapsed >= next_follow_check;
             let torques = waypoint.tau.as_deref();
-            arm.command(&targets, torques, waypoint.v.as_deref(), false)?;
+            let velocities = velocities_buf.as_deref().or(waypoint.v.as_deref());
+            arm.command(&targets, torques, velocities, false)?;
 
             if logging {
                 logged.push(LogSample {
@@ -2791,6 +2902,12 @@ fn play<T: Transport>(
             }
 
             sleep_until(t0 + Duration::from_secs_f64(elapsed));
+        }
+
+        if let (Some(gripper), Some(latched_q)) = (gripper, latched_gripper) {
+            // Still holding a grasped object when playback ended or interrupted:
+            // keep the latched opening through the return ramp instead of crushing it.
+            arm.start[gripper] = latched_q;
         }
 
         if interrupted() {
@@ -3415,6 +3532,12 @@ fn run_child(
     command.arg(format!("--ramp={}", state.args.ramp));
     if state.args.gripper_stall > 0.0 {
         command.arg(format!("--gripper-stall={}", state.args.gripper_stall));
+        let mode = request
+            .query
+            .get("gripper_stall_mode")
+            .map(String::as_str)
+            .unwrap_or(state.args.gripper_stall_mode.as_str());
+        command.arg(format!("--gripper-stall-mode={mode}"));
     }
     if state.args.stay_enabled {
         command.arg("--stay-enabled");
@@ -4189,6 +4312,7 @@ mod tests {
         let notes = LogNotes {
             abort: Some(LogAbort { t: 0.1, reason: "motor 1 is not following".into() }),
             gripper_stall: Some(LogGripperStall { t: 0.1, commanded: 0.5, measured: 0.1 }),
+            gripper_contacts: Vec::new(),
             tick: Some(LogTick { mean_ms: 33.3, p95_ms: 35.0, max_ms: 40.0 }),
             follow_error_max: Some(LogFollowError { motor: 1, rad: 0.42 }),
         };
@@ -4396,6 +4520,7 @@ mod tests {
         enabled: RefCell<BTreeSet<u8>>,
         frames: RefCell<Vec<MockFrame>>,
         blocked: RefCell<Option<(u8, f64)>>,
+        blocked_above: RefCell<Option<(u8, f64)>>,
         /// Latch a fault once this many operation frames have been sent,
         /// mimicking the reader thread's fault latch.
         fault_after: RefCell<Option<(u8, usize)>>,
@@ -4418,6 +4543,7 @@ mod tests {
                 enabled: RefCell::new(BTreeSet::new()),
                 frames: RefCell::new(Vec::new()),
                 blocked: RefCell::new(None),
+                blocked_above: RefCell::new(None),
                 fault_after: RefCell::new(None),
                 latched_fault: RefCell::new(None),
                 reader_mode: false,
@@ -4429,6 +4555,11 @@ mod tests {
 
         fn blocked(self, id: u8, at: f64) -> Self {
             *self.blocked.borrow_mut() = Some((id, at));
+            self
+        }
+
+        fn blocked_above(self, id: u8, at: f64) -> Self {
+            *self.blocked_above.borrow_mut() = Some((id, at));
             self
         }
 
@@ -4495,6 +4626,11 @@ mod tests {
                     let torque = (f64::from(torque_u16) / 0x7FFF as f64 - 1.0) * 17.0;
                     if let Some((blocked_id, blocked_at)) = *self.blocked.borrow() {
                         if device == blocked_id && position < blocked_at {
+                            position = blocked_at;
+                        }
+                    }
+                    if let Some((blocked_id, blocked_at)) = *self.blocked_above.borrow() {
+                        if device == blocked_id && position > blocked_at {
                             position = blocked_at;
                         }
                     }
@@ -4882,12 +5018,13 @@ mod tests {
         let mut args = Args::default();
         args.execute = true;
         args.gripper_stall = 0.3;
+        args.gripper_stall_mode = GripperStallMode::Abort;
         let mut logged = Vec::new();
         let mut notes = LogNotes::default();
 
         let code = play(&mut arm, &trajectory, &args, &mut logged, &mut notes).unwrap();
 
-        assert_eq!(code, 1, "the blocked gripper should abort playback");
+        assert_eq!(code, 1, "the blocked gripper should abort playback in abort mode");
         assert!((arm.start[1] - 4.00).abs() < 1e-3, "home should hold the blocked opening");
         assert!((arm.last[1] - 4.00).abs() < 1e-3, "the last gripper command should be the measured opening");
         assert!((arm.start[0] - 0.0).abs() < 1e-9);
@@ -4896,6 +5033,112 @@ mod tests {
         assert!(stall.commanded < 4.00);
         let abort = notes.abort.expect("the abort is recorded for the log");
         assert!(abort.reason.contains("stalled"));
+    }
+
+    #[test]
+    fn blocked_closing_gripper_latches_and_releases_on_open() {
+        // In latch mode (default), closing onto a rigid object at 4.00 rad latches
+        // the jaw setpoint at 4.00 - GRIPPER_CONTACT_PRELOAD, completes the lift/carry
+        // cleanly (exit 0, no abort/stall), and unlatches when commanded back open to 4.90.
+        let mut waypoints = Vec::new();
+        // 0..30: close 4.90 -> 2.40 (1.0 s)
+        for step in 0..=30 {
+            let t = f64::from(step) / 30.0;
+            let q = 4.90 - (4.90 - 2.40) * (f64::from(step) / 30.0);
+            waypoints.push(format!("{{\"t\":{t:.4},\"q\":[0.0,{q:.5}]}}"));
+        }
+        // 31..40: hold closed while arm moves 0.0 -> 0.3 rad
+        for step in 1..=10 {
+            let t = (30.0 + f64::from(step)) / 30.0;
+            let j1 = 0.3 * (f64::from(step) / 10.0);
+            waypoints.push(format!("{{\"t\":{t:.4},\"q\":[{j1:.5},2.40000]}}"));
+        }
+        // 41..50: open back to 4.90 rad (release object)
+        for step in 1..=10 {
+            let t = (40.0 + f64::from(step)) / 30.0;
+            let q = 2.40 + (4.90 - 2.40) * (f64::from(step) / 10.0);
+            waypoints.push(format!("{{\"t\":{t:.4},\"q\":[0.30000,{q:.5}]}}"));
+        }
+        let text = format!(
+            "{{\"format\":\"{TRAJECTORY_FORMAT}\",\"ids\":[1,7],\"control_hz\":30,\
+             \"waypoints\":[{}]}}",
+            waypoints.join(",")
+        );
+        let trajectory = parse_trajectory(Path::new("latch.json"), &text).unwrap();
+        let mock = MockBus::new(&[(1, 0.0), (7, 4.90)]).blocked(7, 4.00);
+        let mut arm = Arm::new(
+            mock,
+            trajectory.ids.clone(),
+            vec![model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0],
+            vec![3.0, 4.0],
+            trajectory.hz,
+        );
+        let mut args = Args::default();
+        args.execute = true;
+        args.gripper_stall = 0.2;
+        args.gripper_stall_mode = GripperStallMode::Latch;
+        let mut logged = Vec::new();
+        let mut notes = LogNotes::default();
+
+        let code = play(&mut arm, &trajectory, &args, &mut logged, &mut notes).unwrap();
+
+        assert_eq!(code, 0, "closing contact in latch mode should complete playback");
+        assert!(notes.abort.is_none(), "latch mode must not abort on closing contact");
+        assert!(notes.gripper_stall.is_none(), "latch mode records contact, not stall");
+        assert_eq!(notes.gripper_contacts.len(), 1);
+        let contact = &notes.gripper_contacts[0];
+        assert!((contact.measured - 4.00).abs() < 1e-3);
+        assert!((contact.latched - (4.00 - GRIPPER_CONTACT_PRELOAD)).abs() < 1e-3);
+        // Carry phase reached arm j1=0.30 and final open phase released past latch to 4.90.
+        assert!((arm.last[0] - 0.30).abs() < 1e-3);
+        assert!((arm.last[1] - 4.90).abs() < 1e-3);
+    }
+
+    #[test]
+    fn blocked_opening_gripper_still_aborts_in_latch_mode() {
+        // Even in latch mode, stalling while OPENING (target > measured) is a jam
+        // and must abort safely.
+        let mut waypoints = Vec::new();
+        for step in 0..31 {
+            let t = f64::from(step) / 30.0;
+            let q = 2.00 + (4.90 - 2.00) * (f64::from(step) / 30.0);
+            waypoints.push(format!("{{\"t\":{t:.4},\"q\":[0.0,{q:.5}]}}"));
+        }
+        let text = format!(
+            "{{\"format\":\"{TRAJECTORY_FORMAT}\",\"ids\":[1,7],\"control_hz\":30,\
+             \"waypoints\":[{}]}}",
+            waypoints.join(",")
+        );
+        let trajectory = parse_trajectory(Path::new("open_jam.json"), &text).unwrap();
+        let mock = MockBus::new(&[(1, 0.0), (7, 2.00)]).blocked_above(7, 2.50);
+        let mut arm = Arm::new(
+            mock,
+            trajectory.ids.clone(),
+            vec![model("rs-00"), model("rs-00")],
+            vec![50.0, 50.0],
+            vec![3.0, 4.0],
+            trajectory.hz,
+        );
+        let mut args = Args::default();
+        args.execute = true;
+        args.gripper_stall = 0.2;
+        args.gripper_stall_mode = GripperStallMode::Latch;
+        let mut logged = Vec::new();
+        let mut notes = LogNotes::default();
+
+        let code = play(&mut arm, &trajectory, &args, &mut logged, &mut notes).unwrap();
+
+        assert_eq!(code, 1, "opening jam must still abort in latch mode");
+        assert!(notes.gripper_stall.is_some());
+        assert!(notes.gripper_contacts.is_empty());
+    }
+
+    #[test]
+    fn gripper_stall_mode_flag_is_validated() {
+        assert_eq!(parse_gripper_stall_mode("latch").unwrap(), GripperStallMode::Latch);
+        assert_eq!(parse_gripper_stall_mode("ABORT").unwrap(), GripperStallMode::Abort);
+        assert!(parse_gripper_stall_mode("ignore").is_err());
     }
 
     #[test]

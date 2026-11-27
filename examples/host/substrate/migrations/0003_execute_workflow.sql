@@ -1014,9 +1014,10 @@ BEGIN
   kp := _kp_key_from_tel(tel);
   det := CASE WHEN jsonb_typeof(p_detections->'detections') = 'object' THEN p_detections->'detections' ELSE '{}'::jsonb END;
 
-  -- Forward execution fault metadata so oracle_attribute reports abort/gripper-stall.
+  -- Forward execution fault metadata + non-fatal gripper contact evidence.
   tel_meta := jsonb_strip_nulls(jsonb_build_object(
     'version', tel->'version', 'abort', tel->'abort', 'gripper_stall', tel->'gripper_stall',
+    'gripper_contacts', tel->'gripper_contacts',
     'tick', tel->'tick', 'follow_error_max', tel->'follow_error_max',
     'kp', tel->'kp', 'kd', tel->'kd'));
 

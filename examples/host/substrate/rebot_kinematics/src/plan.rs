@@ -1244,6 +1244,162 @@ impl<'a> Planner<'a> {
             .unwrap_or_else(|e| panic!("{e}"))
     }
 
+    /// Read-only IK + safety probe for refusal advice: does not perturb `worst_residual`.
+    fn probe_pose_safe(
+        &mut self,
+        place: &V3,
+        stage_place: Option<&V3>,
+        vertical_stage: bool,
+        rotation: &M3,
+        seed: &[f64],
+        fallback_seed: &[f64],
+    ) -> bool {
+        let prev_worst = self.worst_residual;
+        let prev_where = self.worst_where.clone();
+        let ok = (|| -> bool {
+            let Ok(tq) = self.try_ik_with_fallback(place, rotation, seed, fallback_seed, "advice") else {
+                return false;
+            };
+            if !self.ctx.arm.pose_safe(&tq, &self.ctx.cfg) {
+                return false;
+            }
+            if let Some(sp) = stage_place {
+                let sseed: &[f64] = if vertical_stage { &tq } else { seed };
+                let Ok(sq) = self.try_ik_with_fallback(sp, rotation, sseed, fallback_seed, "advice_stage") else {
+                    return false;
+                };
+                if !self.ctx.arm.pose_safe(&sq, &self.ctx.cfg) {
+                    return false;
+                }
+            }
+            true
+        })();
+        self.worst_residual = prev_worst;
+        self.worst_where = prev_where;
+        ok
+    }
+
+    /// Compute a self-verified recovery suggestion when IK/pose safety fails at `tip_point`.
+    ///
+    /// Every suggested alternative (alternate tool axis, rounded yaw, or rounded
+    /// tip coordinate) is re-solved through IK and `pose_safe` before being returned.
+    #[allow(clippy::too_many_arguments)]
+    fn ik_refusal_advice(
+        &mut self,
+        tip_point: &V3,
+        tip_offset_m: f64,
+        r0: &M3,
+        requested_axis: &str,
+        requested_yaw: f64,
+        approach: f64,
+        min_z: f64,
+        max_z: f64,
+        max_reach: f64,
+        seed: &[f64],
+        fallback_seed: &[f64],
+    ) -> Option<String> {
+        let flange = *tip_point + V3::new(0.0, 0.0, tip_offset_m);
+        let req_vertical = requested_axis == "x+";
+        let stage_for = |tp: &V3, vertical: bool| -> Option<V3> {
+            if approach <= 1e-6 {
+                return None;
+            }
+            if vertical {
+                if tp.z + approach > max_z {
+                    return None;
+                }
+                Some(*tp + V3::new(0.0, 0.0, approach + tip_offset_m))
+            } else {
+                let r = (tp.x * tp.x + tp.y * tp.y).sqrt();
+                if r <= approach {
+                    return None;
+                }
+                let s = (r - approach) / r;
+                Some(V3::new(tp.x * s, tp.y * s, tp.z + tip_offset_m))
+            }
+        };
+
+        // 1. Alternate tool axis (horizontal z- <-> top-down x+).
+        let alt_axis = if requested_axis == "x+" { "z-" } else { "x+" };
+        let alt_vertical = alt_axis == "x+";
+        let alt_yaw = tip_point.y.atan2(tip_point.x).to_degrees();
+        let r_alt_nom = work_orientation(r0, alt_axis, alt_yaw);
+        let alt_stage = stage_for(tip_point, alt_vertical);
+        for &delta in pitch_deltas(alt_axis) {
+            let r_try = if delta.abs() < 1e-9 {
+                r_alt_nom
+            } else {
+                r_alt_nom * roty(delta)
+            };
+            if self.probe_pose_safe(&flange, alt_stage.as_ref(), alt_vertical, &r_try, seed, fallback_seed) {
+                let desc = if alt_vertical { "vertical top-down" } else { "horizontal" };
+                return Some(format!(
+                    "Verified alternative: try tool_axis=\"{alt_axis}\" ({desc})."
+                ));
+            }
+        }
+
+        // 2. Nearest reachable yaw (keeping requested axis & exact tip point).
+        let req_stage = stage_for(tip_point, req_vertical);
+        let yaw_offsets = [
+            15.0_f64, -15.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0,
+            90.0, -90.0, 120.0, -120.0, 150.0, -150.0, 180.0,
+        ];
+        for offset in yaw_offsets {
+            let mut cand_yaw = requested_yaw + offset;
+            while cand_yaw > 180.0 {
+                cand_yaw -= 360.0;
+            }
+            while cand_yaw <= -180.0 {
+                cand_yaw += 360.0;
+            }
+            let rounded_yaw = (cand_yaw * 10.0).round() / 10.0;
+            let r_yaw = work_orientation(r0, requested_axis, rounded_yaw);
+            if self.probe_pose_safe(&flange, req_stage.as_ref(), req_vertical, &r_yaw, seed, fallback_seed) {
+                return Some(format!(
+                    "Verified alternative: try yaw={rounded_yaw:.1} deg with tool_axis=\"{requested_axis}\"."
+                ));
+            }
+        }
+
+        // 3. Closest verified reachable tip (radial pull-in and/or vertical lift).
+        let mut candidates: Vec<(f64, V3)> = Vec::new();
+        for &r_scale in &[1.0_f64, 0.90, 0.80, 0.70, 0.60] {
+            for &dz in &[0.0_f64, 0.03, 0.06, 0.10] {
+                if (r_scale - 1.0).abs() < 1e-9 && dz.abs() < 1e-9 {
+                    continue;
+                }
+                let rx = ((tip_point.x * r_scale) * 1000.0).round() / 1000.0;
+                let ry = ((tip_point.y * r_scale) * 1000.0).round() / 1000.0;
+                let rz = ((tip_point.z + dz) * 1000.0).round() / 1000.0;
+                let rad = (rx * rx + ry * ry).sqrt();
+                if rz < min_z || rz > max_z || rad > max_reach || rad < 0.08 {
+                    continue;
+                }
+                let cand = V3::new(rx, ry, rz);
+                let dist = (cand - *tip_point).norm();
+                candidates.push((dist, cand));
+            }
+        }
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (dist, cand) in candidates {
+            let cand_flange = cand + V3::new(0.0, 0.0, tip_offset_m);
+            let cand_yaw = cand.y.atan2(cand.x).to_degrees();
+            for axis in [requested_axis, alt_axis] {
+                let vert = axis == "x+";
+                let stg = stage_for(&cand, vert);
+                let r_cand = work_orientation(r0, axis, cand_yaw);
+                if self.probe_pose_safe(&cand_flange, stg.as_ref(), vert, &r_cand, seed, fallback_seed) {
+                    return Some(format!(
+                        "Closest verified reachable tip: [{:.3}, {:.3}, {:.3}] m ({:.0} mm away, tool_axis=\"{axis}\").",
+                        cand.x, cand.y, cand.z, dist * 1000.0
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     fn joint_leg(&mut self, base: &[f64], delta: &[f64], seconds: f64, gripper: f64) -> [f64; 6] {
         let seconds = validate_duration(seconds, "leg seconds");
         let count = (seconds * self.hz).round_ties_even().max(1.0) as usize;
@@ -1594,8 +1750,25 @@ fn rebot_plan(
                 }
             }
         }
-        let (target_q, stage_q, chosen_pitch) =
-            solved.unwrap_or_else(|| panic!("{}", first_err.unwrap_or_else(|| "IK failed".to_string())));
+        let (target_q, stage_q, chosen_pitch) = solved.unwrap_or_else(|| {
+            let base = first_err.unwrap_or_else(|| "IK failed".to_string());
+            if let Some(advice) = pl.ik_refusal_advice(
+                &tip_point,
+                tip_offset_m,
+                &r0,
+                &hover_axis,
+                hover_yaw,
+                approach,
+                min_z,
+                max_z,
+                max_reach,
+                &seed,
+                &q_start,
+            ) {
+                panic!("{base} {advice}");
+            }
+            panic!("{base}");
+        });
         let current_q = pl.last_q6();
         if let Some(sq) = stage_q {
             if !ctx.path_safe(&current_q, &sq) {
@@ -2050,8 +2223,25 @@ fn rebot_plan_sequence(
                 }
             }
         }
-        let (target_q, arrival_q, via_qs, chosen_pitch) =
-            solved.unwrap_or_else(|| panic!("{}", first_err.unwrap_or_else(|| "IK failed".to_string())));
+        let (target_q, arrival_q, via_qs, chosen_pitch) = solved.unwrap_or_else(|| {
+            let base = first_err.unwrap_or_else(|| "IK failed".to_string());
+            if let Some(advice) = pl.ik_refusal_advice(
+                point,
+                tip_offsets[i],
+                &r0,
+                &sequence_axis,
+                yaw_deg,
+                approach,
+                min_z,
+                max_z,
+                max_reach,
+                &seed,
+                &start_seed,
+            ) {
+                panic!("{base} {advice}");
+            }
+            panic!("{base}");
+        });
         pitch_degrees.push(chosen_pitch);
         marker_q_ik.push(target_q);
         via_q_ik[i] = via_qs.clone();

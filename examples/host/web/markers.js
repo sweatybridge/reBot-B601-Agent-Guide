@@ -100,12 +100,13 @@
         // Amber for odd (close), green for even (open); a red outline only
         // marks a target outside the planner's reach gate.
         pin.className = "seq-pin " + ((index + 1) % 2 === 1 ? "half" : "open")
-          + (marker.radius > 0.75 ? " far" : "");
+          + (marker.radius > 0.75 ? " far" : "")
+          + (marker.adjusted ? " adjusted" : "");
         pin.style.left = point.x + "px";
         pin.style.top = point.y + "px";
         pin.textContent = String(index + 1);
         pin.title = (index + 1) + " · " + ((index + 1) % 2 === 1
-          ? "close" : "open");
+          ? "close" : "open") + (marker.adjusted ? " · adjusted to reachable point" : "");
         container.appendChild(pin);
         // Via pins: dashed blue, lettered after their marker (1a, 1b, ...).
         // The arm passes through them without stopping, on the way to that
@@ -245,13 +246,81 @@
       new ResizeObserver(render).observe(stage);
     }
 
+    function updateTip(markerNumber, newTip) {
+      // Snap a 1-based marker to a planner-verified reachable [x, y, z] tip.
+      // Preserves `original` so Clear/Undo restores the user's tap first.
+      const idx = Number(markerNumber) - 1;
+      if (!Number.isInteger(idx) || idx < 0 || idx >= markers.length) {
+        return { ok: false, error: "marker " + markerNumber + " does not exist" };
+      }
+      if (!Array.isArray(newTip) || newTip.length !== 3
+          || !newTip.every((v) => Number.isFinite(Number(v)))) {
+        return { ok: false, error: "adjusted tip must be finite [x, y, z]" };
+      }
+      const marker = markers[idx];
+      const tip = [Number(newTip[0]), Number(newTip[1]), Number(newTip[2])];
+      const previousTip = marker.target.tip.slice();
+      if (!marker.original) {
+        marker.original = {
+          tip: previousTip,
+          pixel: Array.isArray(marker.pixel) ? marker.pixel.slice() : null,
+          u: marker.u,
+          v: marker.v,
+          radius: marker.radius,
+        };
+      }
+      marker.target.tip = tip;
+      marker.radius = Math.hypot(tip[0], tip[1]);
+      const projected = projectPoint ? (function () {
+        try {
+          const px = projectPoint(tip);
+          return (px && Number.isFinite(px[0]) && Number.isFinite(px[1])) ? px : null;
+        } catch (_err) {
+          return null;
+        }
+      })() : null;
+      if (projected) {
+        marker.pixel = projected;
+        marker.target.pixel = projected;
+        marker.u = projected[0];
+        marker.v = projected[1];
+      }
+      marker.adjusted = true;
+      render();
+      onChange();
+      return {
+        ok: true,
+        index: idx + 1,
+        previousTip: previousTip,
+        tip: tip,
+        pixel: projected || marker.pixel,
+      };
+    }
+
     function clearLast() {
-      // Undo in placement order: a via was added after its marker, so the last
-      // marker's last via goes first; the marker itself only goes once it has
-      // no vias left. Returns a description of what went, or false.
+      // Undo in reverse order: if a marker was auto-adjusted to match IK advice,
+      // restore its original tap first; otherwise remove the last via or marker.
       if (busy) return false;
       if (!markers.length) return false;
       generation += 1;
+      for (let i = markers.length - 1; i >= 0; i -= 1) {
+        if (markers[i].adjusted && markers[i].original) {
+          const orig = markers[i].original;
+          markers[i].target.tip = orig.tip.slice();
+          markers[i].radius = orig.radius;
+          if (orig.pixel) {
+            markers[i].pixel = orig.pixel.slice();
+            markers[i].target.pixel = orig.pixel.slice();
+          }
+          markers[i].u = orig.u;
+          markers[i].v = orig.v;
+          markers[i].adjusted = false;
+          delete markers[i].original;
+          render();
+          onChange();
+          return "adjustment on marker " + (i + 1);
+        }
+      }
       const owner = markers[markers.length - 1];
       let removed;
       if (owner.vias && owner.vias.length) {
@@ -273,6 +342,7 @@
     return {
       addAt: addAt,
       addViaAt: addViaAt,
+      updateTip: updateTip,
       clearLast: clearLast,
       clear: function () {
         generation += 1;

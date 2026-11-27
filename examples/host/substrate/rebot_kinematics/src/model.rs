@@ -108,21 +108,35 @@ impl ArmModel {
     /// Validate finiteness and set the 6 arm joints (padding any extra gripper
     /// DOF with 0.0) without URDF limit-tag panics, then update transforms.
     pub fn set_arm_joints(&self, q6: &[f64]) {
+        self.set_arm_and_jaw(q6, 0.0);
+    }
+
+    /// Set the 6 arm joints and optional symmetric prismatic jaw opening (m,
+    /// `0.0..=0.05` per finger) without URDF limit-tag panics.
+    pub fn set_arm_and_jaw(&self, q6: &[f64], jaw_slide_m: f64) {
         if q6.len() != 6 {
             panic!("expected 6 arm joint angles, got {}", q6.len());
         }
-        if !q6.iter().all(|v| v.is_finite()) {
-            panic!("joint angles must be finite");
+        if !q6.iter().all(|v| v.is_finite()) || !jaw_slide_m.is_finite() {
+            panic!("joint angles and jaw opening must be finite");
         }
         let dof = self.chain.dof();
+        let jaw = jaw_slide_m.clamp(0.0, 0.05);
         let mut q = Vec::with_capacity(dof.max(6));
         q.extend_from_slice(q6);
         while q.len() < dof {
-            q.push(0.0);
+            q.push(jaw);
         }
         q.truncate(dof);
         self.chain.set_joint_positions_unchecked(&q);
         self.chain.update_transforms();
+    }
+
+    /// World transform of an arbitrary URDF link from the current updated chain.
+    pub fn link_world_transform(&self, link_name: &str) -> Option<Isometry3<f64>> {
+        let node = self.chain.find_link(link_name)?;
+        let t = node.world_transform()?;
+        Some(Isometry3::from_parts(t.translation, t.rotation))
     }
 
     /// World pose of `gripper_end` at `q6`.
@@ -253,39 +267,67 @@ impl ArmModel {
         jac
     }
 
-    /// Worktop capsule clearance + reach cylinder + folded-wrist bind gate for a single pose `q6`.
-    pub fn pose_safe(&self, q6: &[f64], cfg: &Config) -> bool {
+    /// Evaluate kinematic/collision margins for a single pose `q6`:
+    /// returns `Some((capsule_min_z, mesh_min_z))` if reach cylinder, folded-wrist
+    /// bind, and exact mesh self-collision all pass; `None` if hard-violated.
+    fn pose_floor_margins(&self, q6: &[f64], cfg: &Config) -> Option<(f64, Option<f64>)> {
         if q6.len() < 6 || !q6[..6].iter().all(|v| v.is_finite()) {
-            return false;
+            return None;
         }
         // Folded-elbow wrist-bind guard: below ~8 deg (UNPARK_J3_DEG) the j4
         // hinge seats onto the j2 casing; driving j4 negative jams the wrist
         // into link 2 (b602e4: j3=0.057, j4=-0.55 -> 0.22 rad stall & slam).
         if q6[2] < 8.0_f64.to_radians() - 1e-6 && q6[3] < -0.10 {
-            return false;
+            return None;
         }
         let points = self.joint_points(q6);
+        let mut cap_min_z = f64::INFINITY;
         for index in 1..points.len() {
             let start = points[index - 1];
             let end = points[index];
             if !start.iter().chain(end.iter()).all(|v| v.is_finite()) {
-                return false;
+                return None;
             }
             let radius = cfg.link_radii[index.min(cfg.link_radii.len() - 1)];
             for fraction in [0.0, 0.5] {
                 let cz = start[2] + (end[2] - start[2]) * fraction;
-                if cz - radius < cfg.clearance {
-                    return false;
-                }
+                cap_min_z = cap_min_z.min(cz - radius);
             }
             if (end[0] * end[0] + end[1] * end[1]).sqrt() > cfg.link_radius_max {
+                return None;
+            }
+        }
+        // Exact parry3d convex-hull self-collision check (reuse already-updated chain).
+        if let Some(gap) = crate::mesh_collision::mesh_self_clearance_current(self) {
+            if gap < -crate::mesh_collision::MESH_SELF_PENETRATION_TOL_M {
+                return None;
+            }
+        }
+        let mesh_z = crate::mesh_collision::mesh_lowest_z_current(self);
+        Some((cap_min_z, mesh_z))
+    }
+
+    /// Worktop clearance + reach cylinder + folded-wrist bind + mesh self-collision gate
+    /// for a single pose `q6`.
+    pub fn pose_safe(&self, q6: &[f64], cfg: &Config) -> bool {
+        let Some((cap_z, mesh_z)) = self.pose_floor_margins(q6, cfg) else {
+            return false;
+        };
+        if cap_z < cfg.clearance {
+            return false;
+        }
+        if let Some(mz) = mesh_z {
+            if mz < 0.0 {
                 return false;
             }
         }
         true
     }
 
-    /// Straight joint-space interpolation `a -> b` worktop gate (`sweep.path_safe`).
+    /// Straight joint-space interpolation `a -> b` safety gate (`sweep.path_safe`),
+    /// using the recovery-safe surface guard: if the arm starts slightly below the
+    /// worktop clearance plane, upward recovery is allowed while any further descent
+    /// below the plane is refused.
     pub fn path_safe(&self, a: &[f64], b: &[f64], samples: usize, cfg: &Config) -> bool {
         if a.len() != 6 || b.len() != 6 {
             panic!("path_safe expects 6-joint poses, got {} and {}", a.len(), b.len());
@@ -296,23 +338,59 @@ impl ArmModel {
         if !(2..=10_000).contains(&samples) {
             panic!("samples must be in 2..=10000, got {samples}");
         }
-        let mut q = [0.0; 6];
+        let mut pts = Vec::with_capacity(samples);
         for s in 0..samples {
             let t = s as f64 / (samples as f64 - 1.0);
+            let mut q = [0.0; 6];
             for j in 0..6 {
                 q[j] = a[j] + (b[j] - a[j]) * t;
             }
-            if !self.pose_safe(&q, cfg) {
-                return false;
-            }
+            pts.push(q);
         }
-        true
+        self.samples_safe(&pts, cfg)
     }
 
-    /// Capsule worktop gate on a dense sample series (`sweep.samples_safe`).
+    /// Recovery-safe table clearance + mesh self-collision gate on a dense sample series.
+    ///
+    /// Mirrors RUA's `surface_guard`: descending below the worktop floor is always
+    /// refused, while climbing upward out of a pose that started below the floor is
+    /// permitted (provided the path actually rises and does not drag horizontally
+    /// below clearance).
     pub fn samples_safe(&self, samples: &[[f64; 6]], cfg: &Config) -> bool {
-        for q6 in samples {
-            if !self.pose_safe(q6, cfg) {
+        if samples.is_empty() {
+            return true;
+        }
+        if samples.len() == 1 {
+            return self.pose_safe(&samples[0], cfg);
+        }
+        let noise = crate::mesh_collision::DESCENT_NOISE_M;
+        let Some((mut prev_cap, mut prev_mesh)) = self.pose_floor_margins(&samples[0], cfg) else {
+            return false;
+        };
+        let start_cap = prev_cap;
+        let start_mesh = prev_mesh;
+        for q6 in &samples[1..] {
+            let Some((cur_cap, cur_mesh)) = self.pose_floor_margins(q6, cfg) else {
+                return false;
+            };
+            if cur_cap < cfg.clearance && cur_cap < prev_cap - noise {
+                return false;
+            }
+            if let (Some(pm), Some(cm)) = (prev_mesh, cur_mesh) {
+                if cm < 0.0 && cm < pm - noise {
+                    return false;
+                }
+            }
+            prev_cap = cur_cap;
+            prev_mesh = cur_mesh;
+        }
+        // If we started below clearance and never climbed at all (e.g. stationary or
+        // purely horizontal drag below the floor), refuse.
+        if prev_cap < cfg.clearance && prev_cap <= start_cap + noise {
+            return false;
+        }
+        if let (Some(sm), Some(em)) = (start_mesh, prev_mesh) {
+            if em < 0.0 && em <= sm + noise {
                 return false;
             }
         }

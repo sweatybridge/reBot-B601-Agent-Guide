@@ -103,6 +103,7 @@
   .seq-pin.half { border-color: var(--warn); color: var(--warn); }
   .seq-pin.open { border-color: var(--good); color: var(--good); }
   .seq-pin.far { outline: 2px solid var(--bad); outline-offset: 2px; }
+  .seq-pin.adjusted { outline: 2px solid #56d4ff; outline-offset: 2px; }
   .seq-pin.via {
     border-color: var(--accent); color: var(--accent); border-style: dashed;
     width: 26px; height: 26px; margin: -13px 0 0 -13px; font-size: 11px;
@@ -953,6 +954,68 @@ function updateStartButton() {
   undoButton.disabled = cantRun;
 }
 
+function setTopDownMode(nextTopDown, silent) {
+  const target = Boolean(nextTopDown);
+  if (state.topDown === target) return false;
+  const prevKey = state.topDown ? "vertical" : "horizontal";
+  state.savedHeight[prevKey] = heightControl.height;
+  state.topDown = target;
+  const nextKey = state.topDown ? "vertical" : "horizontal";
+  const h = state.health || {};
+  const planeZ = Number(h.plane_z ?? 0);
+  const modeDefault = state.topDown
+    ? Number(h.vertical_hover_m ?? 0.0)
+    : Number(h.hover_m ?? 0.04);
+  const modeMinZ = state.topDown
+    ? Number(h.vertical_min_z ?? (planeZ + modeDefault))
+    : Number(h.min_z ?? (planeZ + modeDefault));
+  heightControl.setRange(Math.max(0, modeMinZ - planeZ), window.HeightControl.MAX);
+  heightControl.setHeight(state.savedHeight[nextKey] != null ? state.savedHeight[nextKey] : modeDefault);
+  gripperModeButton.textContent = "Gripper: " + (state.topDown ? "top-down" : "horizontal");
+  gripperModeButton.classList.toggle("on", state.topDown);
+  reachOverlay.setHeight(heightControl.height);
+  reachOverlay.setToolAxis(state.topDown ? "x+" : "current");
+  if (!silent) {
+    log(state.topDown
+      ? "gripper: top-down orientation with vertical descend (height " + window.HeightControl.format(heightControl.height) + ")"
+      : "gripper: horizontal orientation with front slide-in (height " + window.HeightControl.format(heightControl.height) + ")", "warn");
+  }
+  return true;
+}
+
+function applySequenceAdvice(advice) {
+  // Option 1 (preview-only auto-snap): move the refused marker pin (or switch
+  // gripper orientation) to match the planner's verified reachable advice, and
+  // NEVER auto-execute so the user inspects the adjusted pin first.
+  if (!advice || typeof advice !== "object") return null;
+  if (advice.kind === "tip" && Array.isArray(advice.tip) && advice.tip.length === 3) {
+    const markerIdx = Number(advice.marker || 1);
+    const updated = markersOverlay.updateTip(markerIdx, advice.tip);
+    if (!updated || !updated.ok) return null;
+    let axisNote = "";
+    if (advice.tool_axis === "x+" || advice.tool_axis === "z-") {
+      const switched = setTopDownMode(advice.tool_axis === "x+", true);
+      if (switched) {
+        axisNote = " and switched to " + (advice.tool_axis === "x+" ? "top-down" : "horizontal");
+      }
+    }
+    const pt = updated.tip.map((v) => Number(v).toFixed(3)).join(", ");
+    const dist = Number.isFinite(Number(advice.distance_mm))
+      ? Math.round(Number(advice.distance_mm)) + " mm " : "";
+    return "Adjusted marker " + updated.index + " by " + dist
+      + "to nearest reachable point [" + pt + "] m" + axisNote
+      + " — check the pin and tap Move arm to run (or Clear to revert)";
+  }
+  if (advice.kind === "tool_axis" && (advice.tool_axis === "x+" || advice.tool_axis === "z-")) {
+    const wantTopDown = advice.tool_axis === "x+";
+    if (!setTopDownMode(wantTopDown, true)) return null;
+    return "Switched gripper to " + (wantTopDown ? "top-down" : "horizontal")
+      + " (verified reachable for marker " + Number(advice.marker || 1)
+      + ") — tap Move arm to run";
+  }
+  return null;
+}
+
 async function startSequence(options) {
   if (state.busy || !state.track || markersOverlay.count === 0) return;
   const reverse = Boolean(options && options.reverse);
@@ -978,6 +1041,13 @@ async function startSequence(options) {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.ok) {
+      if (!reverse && data.advice) {
+        const note = applySequenceAdvice(data.advice);
+        if (note) {
+          log(escapeHtml(note), "warn");
+          return;
+        }
+      }
       throw new Error(data.error || ("sequence failed: " + response.status));
     }
     const plan = data.plan || {};
@@ -1093,27 +1163,7 @@ gripperModeButton.addEventListener("click", () => {
     log("wait for the sequence to finish", "warn");
     return;
   }
-  const prevKey = state.topDown ? "vertical" : "horizontal";
-  state.savedHeight[prevKey] = heightControl.height;
-  state.topDown = !state.topDown;
-  const nextKey = state.topDown ? "vertical" : "horizontal";
-  const h = state.health || {};
-  const planeZ = Number(h.plane_z ?? 0);
-  const modeDefault = state.topDown
-    ? Number(h.vertical_hover_m ?? 0.0)
-    : Number(h.hover_m ?? 0.04);
-  const modeMinZ = state.topDown
-    ? Number(h.vertical_min_z ?? (planeZ + modeDefault))
-    : Number(h.min_z ?? (planeZ + modeDefault));
-  heightControl.setRange(Math.max(0, modeMinZ - planeZ), window.HeightControl.MAX);
-  heightControl.setHeight(state.savedHeight[nextKey] != null ? state.savedHeight[nextKey] : modeDefault);
-  gripperModeButton.textContent = "Gripper: " + (state.topDown ? "top-down" : "horizontal");
-  gripperModeButton.classList.toggle("on", state.topDown);
-  reachOverlay.setHeight(heightControl.height);
-  reachOverlay.setToolAxis(state.topDown ? "x+" : "current");
-  log(state.topDown
-    ? "gripper: top-down orientation with vertical descend (height " + window.HeightControl.format(heightControl.height) + ")"
-    : "gripper: horizontal orientation with front slide-in (height " + window.HeightControl.format(heightControl.height) + ")", "warn");
+  setTopDownMode(!state.topDown, false);
 });
 liveButton.addEventListener("click", togglePublish);
 lockButton.addEventListener("click", toggleLock);

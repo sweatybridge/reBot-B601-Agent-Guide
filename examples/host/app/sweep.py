@@ -139,36 +139,62 @@ FOLDED_J3_RAD = math.radians(UNPARK_J3_DEG) - 1e-6
 FOLDED_J4_MIN_RAD = -0.10
 
 
-def pose_safe(q):
-    """Single-pose safety gate: table clearance, reach cylinder, and folded-wrist bind."""
+DESCENT_NOISE_M = 1e-6
+
+
+def _pose_min_clearance_z(q):
+    """Return lowest link-surface Z (m) if reach cylinder and wrist-bind pass, else None."""
     q6 = np.asarray(q, dtype=float).reshape(6)
     if not np.all(np.isfinite(q6)):
-        return False
+        return None
     if float(q6[2]) < FOLDED_J3_RAD and float(q6[3]) < FOLDED_J4_MIN_RAD:
-        return False
+        return None
     points = joint_points(q6)
+    min_z = float("inf")
     for index in range(1, len(points)):
         start, end = points[index - 1], points[index]
         radius = RADII[min(index, len(RADII) - 1)]
         for fraction in (0.0, 0.5):
             centre = start + (end - start) * fraction
-            if centre[2] - radius < CLEARANCE:
-                return False
+            z = float(centre[2] - radius)
+            if z < min_z:
+                min_z = z
         if math.hypot(end[0], end[1]) > LINK_RADIUS_MAX:
-            return False
-    return True
+            return None
+    return min_z
+
+
+def pose_safe(q):
+    """Single-pose safety gate: table clearance, reach cylinder, and folded-wrist bind."""
+    min_z = _pose_min_clearance_z(q)
+    return min_z is not None and min_z >= CLEARANCE
 
 
 def samples_safe(samples):
-    """The capsule test on a dense joint-space sample series: no link centre
-    passes within its own radius of the worktop, none leaves the cell's
-    radial bound, and no pose folds j4 negative against the j2 casing.
-    `path_safe` is this test on a straight-line linspace; a curved leg
-    (a via chain) must be gated on its own curve, not its chords.
+    """Recovery-safe capsule gate on a dense joint-space sample series.
+
+    Matches `rebot_kinematics::ArmModel::samples_safe`: descending below the
+    worktop clearance plane is always refused, while climbing upward out of a
+    start pose that sits slightly below clearance is allowed.
     """
-    for q in samples:
-        if not pose_safe(q):
+    pts = list(samples)
+    if not pts:
+        return True
+    if len(pts) == 1:
+        return pose_safe(pts[0])
+    start_z = _pose_min_clearance_z(pts[0])
+    if start_z is None:
+        return False
+    prev_z = start_z
+    for q in pts[1:]:
+        cur_z = _pose_min_clearance_z(q)
+        if cur_z is None:
             return False
+        if cur_z < CLEARANCE and cur_z < prev_z - DESCENT_NOISE_M:
+            return False
+        prev_z = cur_z
+    if prev_z < CLEARANCE and prev_z <= start_z + DESCENT_NOISE_M:
+        return False
     return True
 
 

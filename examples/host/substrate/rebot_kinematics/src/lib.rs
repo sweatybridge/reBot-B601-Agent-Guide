@@ -14,6 +14,8 @@ pg_module_magic!();
 mod calib;
 mod camera;
 mod config;
+mod mesh_collision;
+mod meshes;
 mod model;
 mod plan;
 
@@ -433,6 +435,31 @@ fn rebot_min_self_clearance(urdf: &str, q: Vec<f64>, config: pgrx::JsonB) -> f64
     let cfg = Config::from_json(&config.0);
     let arm = ArmModel::new(urdf);
     arm.min_self_clearance(&q, &cfg)
+}
+
+/// Exact parry3d convex-hull signed self-clearance (m) across non-adjacent B601
+/// link meshes (`base_link..gripper_right`). Negative = penetration depth.
+#[pg_extern(immutable, parallel_safe)]
+fn rebot_mesh_self_clearance(
+    urdf: &str,
+    q: Vec<f64>,
+    jaw_slide_m: default!(f64, 0.0),
+) -> f64 {
+    let arm = ArmModel::new(urdf);
+    mesh_collision::mesh_self_clearance(&arm, &q, jaw_slide_m)
+        .unwrap_or_else(|| panic!("URDF does not contain the B601 link set for mesh collision"))
+}
+
+/// Exact lowest world-Z vertex (m) across moving B601 link meshes (`link2..gripper_right`).
+#[pg_extern(immutable, parallel_safe)]
+fn rebot_mesh_lowest_z(
+    urdf: &str,
+    q: Vec<f64>,
+    jaw_slide_m: default!(f64, 0.0),
+) -> f64 {
+    let arm = ArmModel::new(urdf);
+    mesh_collision::mesh_lowest_z(&arm, &q, jaw_slide_m)
+        .unwrap_or_else(|| panic!("URDF does not contain the B601 link set for mesh surface check"))
 }
 
 // --------------------------------------------------------------------------- //

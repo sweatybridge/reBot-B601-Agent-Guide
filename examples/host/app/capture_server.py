@@ -1214,9 +1214,11 @@ async def handle_sequence(request: web.Request) -> web.Response:
                       status=status, ok=status == 200,
                       error=payload.get("error") if status != 200 else None)
     if status != 200:
-        return web.json_response({"ok": False, "stage": "plan",
-                                  "error": payload.get("error", "sequence plan failed")},
-                                 status=status)
+        err_body = {"ok": False, "stage": "plan",
+                    "error": payload.get("error", "sequence plan failed")}
+        if isinstance(payload.get("advice"), dict):
+            err_body["advice"] = payload["advice"]
+        return web.json_response(err_body, status=status)
 
     logging.info("sequence plan %s: %s markers at [%s] mm tap height",
                  payload.get("id"), (payload.get("summary") or {}).get("markers"),
@@ -2329,8 +2331,8 @@ async def oracle_finish(app, prep, sid):
             telemetry = payload.get("telemetry") if status == 200 else None
         if telemetry:
             doc["telemetry"] = {key: telemetry.get(key) for key in
-                                ("version", "abort", "gripper_stall", "tick",
-                                 "follow_error_max", "kp", "kd")}
+                                ("version", "abort", "gripper_stall", "gripper_contacts",
+                                 "tick", "follow_error_max", "kp", "kd")}
         samples = (telemetry or {}).get("samples") or []
 
         calibration = calib_mod.load(resolve_calibration(app))

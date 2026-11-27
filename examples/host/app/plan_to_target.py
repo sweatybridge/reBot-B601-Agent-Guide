@@ -344,6 +344,108 @@ def inspect_frame(R0, p0):
     print("\npick the axis that points at the table as --tool-axis, then replan")
 
 
+def _ik_refusal_advice(ik_to_fn, n_arm, tip_point, tip_offset_m, R0, requested_axis,
+                       requested_yaw, approach, min_z, max_z, max_reach,
+                       seed, fallback_seed, worst):
+    """Self-verified IK refusal advice (mirrors rebot_kinematics::Planner::ik_refusal_advice)."""
+    tip = np.asarray(tip_point, dtype=float)
+    flange = tip + np.array([0.0, 0.0, float(tip_offset_m)])
+
+    def _stage_for(tp, vertical):
+        if float(approach) <= 1e-6:
+            return None
+        if vertical:
+            if float(tp[2]) + float(approach) > float(max_z):
+                return None
+            return tp + np.array([0.0, 0.0, float(approach) + float(tip_offset_m)])
+        rad = math.hypot(float(tp[0]), float(tp[1]))
+        if rad <= float(approach):
+            return None
+        scale = (rad - float(approach)) / rad
+        return np.array([float(tp[0]) * scale, float(tp[1]) * scale,
+                         float(tp[2]) + float(tip_offset_m)])
+
+    def _probe(place_p, stage_p, vertical, rot_m):
+        saved_worst = dict(worst)
+        try:
+            try:
+                tq = ik_to_fn(place_p, rot_m, seed, "advice")
+            except PlanError:
+                tq = ik_to_fn(place_p, rot_m, fallback_seed, "advice")
+            if not sweep.pose_safe(tq[:n_arm]):
+                return False
+            if stage_p is not None:
+                sseed = tq if vertical else seed
+                try:
+                    sq = ik_to_fn(stage_p, rot_m, sseed, "advice_stage")
+                except PlanError:
+                    sq = ik_to_fn(stage_p, rot_m, fallback_seed, "advice_stage")
+                if not sweep.pose_safe(sq[:n_arm]):
+                    return False
+            return True
+        except PlanError:
+            return False
+        finally:
+            worst.clear()
+            worst.update(saved_worst)
+
+    # 1. Alternate tool axis (z- <-> x+)
+    alt_axis = "z-" if requested_axis == "x+" else "x+"
+    alt_vert = (alt_axis == "x+")
+    alt_yaw = math.degrees(math.atan2(float(tip[1]), float(tip[0])))
+    R_alt_nom = work_orientation(R0, alt_axis, alt_yaw)
+    alt_stage = _stage_for(tip, alt_vert)
+    for delta in pitch_deltas(alt_axis):
+        R_try = R_alt_nom if abs(delta) < 1e-9 else (R_alt_nom @ roty(delta))
+        if _probe(flange, alt_stage, alt_vert, R_try):
+            desc = "vertical top-down" if alt_vert else "horizontal"
+            return 'Verified alternative: try tool_axis="%s" (%s).' % (alt_axis, desc)
+
+    # 2. Nearest reachable yaw
+    req_vert = (requested_axis == "x+")
+    req_stage = _stage_for(tip, req_vert)
+    for offset in (15.0, -15.0, 30.0, -30.0, 45.0, -45.0, 60.0, -60.0,
+                   90.0, -90.0, 120.0, -120.0, 150.0, -150.0, 180.0):
+        cand_yaw = float(requested_yaw) + offset
+        while cand_yaw > 180.0:
+            cand_yaw -= 360.0
+        while cand_yaw <= -180.0:
+            cand_yaw += 360.0
+        rounded_yaw = round(cand_yaw, 1)
+        R_yaw = work_orientation(R0, requested_axis, rounded_yaw)
+        if _probe(flange, req_stage, req_vert, R_yaw):
+            return ('Verified alternative: try yaw=%.1f deg with tool_axis="%s".'
+                    % (rounded_yaw, requested_axis))
+
+    # 3. Closest verified reachable tip (radial pull-in / vertical lift)
+    candidates = []
+    for r_scale in (1.0, 0.90, 0.80, 0.70, 0.60):
+        for dz in (0.0, 0.03, 0.06, 0.10):
+            if abs(r_scale - 1.0) < 1e-9 and abs(dz) < 1e-9:
+                continue
+            rx = round(float(tip[0]) * r_scale, 3)
+            ry = round(float(tip[1]) * r_scale, 3)
+            rz = round(float(tip[2]) + dz, 3)
+            rad = math.hypot(rx, ry)
+            if rz < float(min_z) or rz > float(max_z) or rad > float(max_reach) or rad < 0.08:
+                continue
+            cand = np.array([rx, ry, rz])
+            candidates.append((float(np.linalg.norm(cand - tip)), cand))
+    candidates.sort(key=lambda item: item[0])
+    for dist, cand in candidates:
+        cand_flange = cand + np.array([0.0, 0.0, float(tip_offset_m)])
+        cand_yaw = math.degrees(math.atan2(float(cand[1]), float(cand[0])))
+        for axis in (requested_axis, alt_axis):
+            vert = (axis == "x+")
+            stg = _stage_for(cand, vert)
+            R_cand = work_orientation(R0, axis, cand_yaw)
+            if _probe(cand_flange, stg, vert, R_cand):
+                return ('Closest verified reachable tip: [%.3f, %.3f, %.3f] m '
+                        '(%.0f mm away, tool_axis="%s").'
+                        % (cand[0], cand[1], cand[2], dist * 1000.0, axis))
+    return None
+
+
 def plan(dump, target, options: Options, log: Callable[[str], None] = print):
     """Build the trajectory payload for one target. Returns (payload, summary)."""
     model = load_robot_model(options.urdf or None)
@@ -564,6 +666,12 @@ def plan(dump, target, options: Options, log: Callable[[str], None] = print):
                 if first_err is None:
                     first_err = error
         if target_q is None:
+            advice = _ik_refusal_advice(
+                ik_to, n_arm, tip_point, tip_offset_m, R0, hover_axis, hover_yaw,
+                options.approach, options.min_z, options.max_z, options.max_reach,
+                seed, start_seed, worst)
+            if advice:
+                raise PlanError("%s %s" % (first_err, advice))
             raise first_err
         report_axis, report_yaw, report_entry, report_pitch = (
             hover_axis, hover_yaw, effective_entry, chosen_pitch)
@@ -1090,6 +1198,12 @@ def plan_sequence(dump, targets, options: Options, log: Callable[[str], None] = 
                 if first_err is None:
                     first_err = error
         if target is None:
+            advice = _ik_refusal_advice(
+                ik_to, n_arm, point, tip_offsets[index - 1], R0, sequence_axis, yaw_deg,
+                options.approach, options.min_z, options.max_z, options.max_reach,
+                seed, start_seed, worst)
+            if advice:
+                raise PlanError("%s %s" % (first_err, advice))
             raise first_err
         pitch_degrees.append(chosen_pitch)
         marker_q_ik.append([float(v) for v in target[:n_arm]])
