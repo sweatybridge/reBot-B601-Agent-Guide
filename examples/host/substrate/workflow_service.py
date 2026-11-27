@@ -56,6 +56,7 @@ GRASP_VERIFY = os.environ.get("REBOT_GRASP_VERIFY", "1") == "1"
 KP = os.environ.get("REBOT_KP", "50,2:150,3:150")
 KD = os.environ.get("REBOT_KD", "3,2:10,3:10,4:5,5:4,6:4,7:4")
 PLAY_TIMEOUT = int(float(os.environ.get("REBOT_PLAY_TIMEOUT", "900")))
+PLAN_MAX_AGE_S = float(os.environ.get("REBOT_PLAN_MAX_AGE", "600"))
 MAX_BODY_BYTES = 32 * 1024 * 1024
 _EDGE_TOL = 1e-6
 
@@ -297,6 +298,19 @@ def execute(exec_id: str) -> dict:
         guard_result: dict = {}
         guard_thread = None
         try:
+            # Validate plan existence & freshness BEFORE toggling MediaMTX recording
+            # so expired plans never waste 2.5 s waiting for an IDR keyframe (#12 #6c).
+            if STORE is not None:
+                plan_row = STORE.plan_fetch(plan_id, PLAN_MAX_AGE_S)
+                if plan_row is None:
+                    return {"ok": False, "claimed": True, "executed": False,
+                            "error": "no plan %s in the substrate" % plan_id,
+                            "no_recording": True}
+                if plan_row.get("expired"):
+                    return {"ok": False, "claimed": True, "executed": False,
+                            "error": "plan %s is %.0f s old (limit %.0f s): plan again"
+                                     % (plan_id, float(plan_row.get("age_s") or 0.0), PLAN_MAX_AGE_S),
+                            "no_recording": True}
             grasp_spec = _plan_grasp_check_spec(plan_id, WORKSPACE)
             pre_frame = _grab_camera_frame(CAMERA) if grasp_spec is not None else None
             path_name = mediamtx.path_from_camera(CAMERA) or "phone"
@@ -455,14 +469,46 @@ def extract(exec_id: str) -> dict:
             "width": int(w), "height": int(h),
         })
         jpeg_blobs.append(buf.tobytes())
+    post_park_sha = None
+    pp = plan.get("post_park")
+    if isinstance(pp, dict):
+        pp_frags = [by_seq[int(s)] for s in (pp.get("fragments") or []) if int(s) in by_seq]
+        if pp_frags:
+            pp_target = float(pp.get("target_t") if pp.get("target_t") is not None else pp["w1"])
+            picked_pp = decode_best_frame_for_window(pp_frags, float(pp["w0"]), float(pp["w1"]), pp_target)
+            if picked_pp is not None:
+                pp_t, pp_frame = picked_pp
+                ok_pp, buf_pp = cv2.imencode(".jpg", pp_frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                if ok_pp:
+                    ep_id = plan["episode_id"]
+                    pp_h, pp_w = pp_frame.shape[:2]
+                    post_park_sha = STORE.put_blob(buf_pp.tobytes(), kind="still")
+                    with STORE.conn() as c:
+                        exists = c.execute(
+                            "SELECT 1 FROM evidence.still WHERE episode_id=%s AND purpose='post_exec' AND sha256=%s",
+                            (ep_id, post_park_sha),
+                        ).fetchone()
+                        if not exists:
+                            c.execute(
+                                "INSERT INTO evidence.still(episode_id, sha256, arm_id, purpose, t, width, height) "
+                                "VALUES (%s, %s, %s, 'post_exec', %s, %s, %s)",
+                                (ep_id, post_park_sha, plan.get("arm_id"), round(float(pp_t), 6), int(pp_w), int(pp_h)),
+                            )
+
     if hold_metas:
         persisted = STORE.store_execution_stills(exec_id, hold_metas, jpeg_blobs)
-        return {
+        out = {
             "stored": int(persisted.get("stored") or 0),
             "holds": persisted.get("holds") or [],
             "missed": missed,
         }
-    return {"stored": 0, "holds": [], "missed": missed}
+        if post_park_sha:
+            out["post_park_frame"] = post_park_sha
+        return out
+    out = {"stored": 0, "holds": [], "missed": missed}
+    if post_park_sha:
+        out["post_park_frame"] = post_park_sha
+    return out
 
 
 def detect(exec_id: str) -> dict:
@@ -518,26 +564,29 @@ def detect(exec_id: str) -> dict:
                                           (int(frame.shape[1]), int(frame.shape[0])))
             found = oracle_vision.detect_tip(
                 frame, q6, K_use, dist, T, tip, scale=scale)
-        if found:
-            detections[str(hold["index"])] = {
-                "uv": [float(found["uv"][0]), float(found["uv"][1])],
-                "score": float(found["score"]),
-                "detector": found["detector"],
-                "image_size": [int(frame.shape[1]), int(frame.shape[0])],
-                "grid_scale": round(float(scale), 4),
-                "frame": sha,
-            }
+        # Always record extracted frame metadata so doc['holds'] preserves the
+        # still SHA even when visual tip detection returns None (Issue #12 #5a).
+        entry = {
+            "uv": ([float(found["uv"][0]), float(found["uv"][1])] if found else None),
+            "score": (float(found["score"]) if found else None),
+            "detector": (found["detector"] if found else None),
+            "image_size": [int(frame.shape[1]), int(frame.shape[0])],
+            "grid_scale": round(float(scale), 4),
+            "frame": sha,
+        }
+        detections[str(hold["index"])] = entry
 
-    # Offline post-grasp verification on pick-and-place sequences: compare the
-    # unobstructed pre-pick still (Hold 1) against the post-transit still (Hold 3)
-    # around the first pick target pixel.
+    # Offline post-grasp / transfer verification on pick-and-place sequences:
+    # prefer the unobstructed post-park still (checking BOTH pick-zone departure
+    # and place-zone arrival so knocked-off-table failures are caught and arm
+    # occlusion is eliminated); fall back to Hold 3 if no post-park still exists.
     grasp_verification = None
     targets = req.get("targets") or []
-    if not DRY and req.get("sequence") and len(targets) >= 2 and 1 in upright_by_index and 3 in upright_by_index:
+    if not DRY and req.get("sequence") and len(targets) >= 2 and 1 in upright_by_index:
         pick_pt = targets[0].get("point")
+        place_pt = targets[1].get("point")
         if pick_pt and len(pick_pt) >= 3:
             pre_img, pre_scale = upright_by_index[1]
-            post_img, _post_scale = upright_by_index[3]
             K_use = K
             if calib_size and len(calib_size) >= 2 and (
                 int(pre_img.shape[1]) != int(calib_size[0]) or int(pre_img.shape[0]) != int(calib_size[1])
@@ -546,10 +595,30 @@ def detect(exec_id: str) -> dict:
                 K_use = calib_mod.scale_K(K, (int(calib_size[0]), int(calib_size[1])),
                                           (int(pre_img.shape[1]), int(pre_img.shape[0])))
             pick_uv = oracle_vision._project_point(pick_pt, K_use, dist, T)
-            if pick_uv is not None:
+            place_uv = (oracle_vision._project_point(place_pt, K_use, dist, T)
+                        if place_pt and len(place_pt) >= 3 else None)
+            pp_sha = req.get("post_park_frame")
+            pp_raw = by_sha.get(pp_sha) if pp_sha else None
+            pp_img = None
+            if pp_raw:
+                dec = cv2.imdecode(np.frombuffer(pp_raw, np.uint8), cv2.IMREAD_COLOR)
+                if dec is not None:
+                    q_park = q6_by_index.get(1) if 1 in q6_by_index else np.zeros(6, dtype=float)
+                    pp_img, _tpp, _spp = oracle_vision.orient_frame(
+                        dec, q_park, K, dist, T, calib_size, hint_turn=cached_turn)
+            if pick_uv is not None and pp_img is not None:
+                grasp_verification = oracle_vision.verify_grasp(
+                    pre_img, pp_img, pick_uv, scale=pre_scale,
+                    post_q6=q6_by_index.get(1), K=K_use, dist=dist, T_base_cam=T,
+                    place_uv=place_uv)
+                grasp_verification["source"] = "post_park"
+                grasp_verification["post_park_frame"] = pp_sha
+            elif pick_uv is not None and 3 in upright_by_index:
+                post_img, _post_scale = upright_by_index[3]
                 grasp_verification = oracle_vision.verify_grasp(
                     pre_img, post_img, pick_uv, scale=pre_scale,
                     post_q6=q6_by_index.get(3), K=K_use, dist=dist, T_base_cam=T)
+                grasp_verification["source"] = "hold_3"
 
     out = {"detections": detections}
     if grasp_verification is not None:

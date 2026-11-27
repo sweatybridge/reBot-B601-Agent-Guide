@@ -615,28 +615,34 @@ BEGIN
       END IF;
 
       det := det_obj->((w->>'index')::text);
-      IF det IS NOT NULL AND jsonb_typeof(det) = 'object' AND jsonb_typeof(det->'uv') = 'array' THEN
-        tip_point := rebot_tip_point(p_urdf, q_meas, p_tip_offset);
-        predicted := rebot_project_dist(p_k, p_t_base_cam, tip_point, p_dist);
-        gscale := COALESCE((det->>'grid_scale')::float8, 1.0);
-        IF gscale <= 0 THEN gscale := 1.0; END IF;
-        IF predicted IS NOT NULL AND abs(gscale - 1.0) > 1e-6 THEN
-          predicted := ARRAY[predicted[1] * gscale, predicted[2] * gscale];
-        END IF;
-        detected := det->'uv';
-        hold := hold || jsonb_build_object(
+      IF det IS NOT NULL AND jsonb_typeof(det) = 'object' THEN
+        -- Always preserve extracted still metadata (frame SHA, image_size, grid_scale)
+        -- even when visual tip detection returned null (Issue #12 #5a).
+        hold := hold || jsonb_strip_nulls(jsonb_build_object(
           'image_size', det->'image_size', 'grid_scale', det->'grid_scale',
-          'predicted_tip_px', predicted, 'detected_tip_px', detected,
-          'detector', det->'detector', 'detector_score', det->'score', 'frame', det->'frame');
-        IF predicted IS NOT NULL THEN
-          px_err := sqrt(((detected->>0)::float8 - predicted[1])^2
-                       + ((detected->>1)::float8 - predicted[2])^2);
-          dist_cam := sqrt((cam_origin[1]-tip_point[1])^2 + (cam_origin[2]-tip_point[2])^2
-                         + (cam_origin[3]-tip_point[3])^2);
-          mm_per_px := CASE WHEN focal * gscale > 0 THEN 1000.0 * dist_cam / (focal * gscale) ELSE NULL END;
+          'frame', det->'frame'));
+        IF jsonb_typeof(det->'uv') = 'array' THEN
+          tip_point := rebot_tip_point(p_urdf, q_meas, p_tip_offset);
+          predicted := rebot_project_dist(p_k, p_t_base_cam, tip_point, p_dist);
+          gscale := COALESCE((det->>'grid_scale')::float8, 1.0);
+          IF gscale <= 0 THEN gscale := 1.0; END IF;
+          IF predicted IS NOT NULL AND abs(gscale - 1.0) > 1e-6 THEN
+            predicted := ARRAY[predicted[1] * gscale, predicted[2] * gscale];
+          END IF;
+          detected := det->'uv';
           hold := hold || jsonb_build_object(
-            'pixel_error_px', round(px_err::numeric, 2),
-            'pixel_error_mm', CASE WHEN mm_per_px IS NOT NULL THEN round((px_err * mm_per_px)::numeric, 2) ELSE NULL END);
+            'predicted_tip_px', predicted, 'detected_tip_px', detected,
+            'detector', det->'detector', 'detector_score', det->'score');
+          IF predicted IS NOT NULL THEN
+            px_err := sqrt(((detected->>0)::float8 - predicted[1])^2
+                         + ((detected->>1)::float8 - predicted[2])^2);
+            dist_cam := sqrt((cam_origin[1]-tip_point[1])^2 + (cam_origin[2]-tip_point[2])^2
+                           + (cam_origin[3]-tip_point[3])^2);
+            mm_per_px := CASE WHEN focal * gscale > 0 THEN 1000.0 * dist_cam / (focal * gscale) ELSE NULL END;
+            hold := hold || jsonb_build_object(
+              'pixel_error_px', round(px_err::numeric, 2),
+              'pixel_error_mm', CASE WHEN mm_per_px IS NOT NULL THEN round((px_err * mm_per_px)::numeric, 2) ELSE NULL END);
+          END IF;
         END IF;
       END IF;
       max_radius := greatest(max_radius, sqrt(tip_cmd[1]^2 + tip_cmd[2]^2));

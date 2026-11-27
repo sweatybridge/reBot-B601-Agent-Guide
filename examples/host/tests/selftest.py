@@ -587,6 +587,28 @@ async def test_server(workdir: Path, geometry):
                                  request.get("tip_offset_m"), options))
         check("sequence forwards compact tip targets", forwarded_ok, forwarded_note)
 
+        # Issue #12 #3: tabletop horizontal pick-and-place automatically adds a
+        # 2-point elevated transit arch (`via` at z=0.16 m) unless opted out.
+        forwarded.clear()
+        capture_server.planner_call = fake_planner_call
+        try:
+            low_pair = [{"tip": [0.45, 0.0, 0.11]}, {"tip": [0.43, 0.20, 0.11]}]
+            await client.post("/sequence", json={"targets": low_pair},
+                              headers={"X-Rebot-Token": "selftest-token"})
+            lift_sent = (forwarded[-1][1].get("targets") or []) if forwarded else []
+            await client.post("/sequence", json={"targets": low_pair, "transit_lift_m": 0},
+                              headers={"X-Rebot-Token": "selftest-token"})
+            optout_sent = (forwarded[-1][1].get("targets") or []) if forwarded else []
+        finally:
+            capture_server.planner_call = real_planner_call
+        check("sequence auto-inserts elevated transit vias on tabletop horizontal moves",
+              len(lift_sent) == 2 and len(lift_sent[1].get("via") or []) == 2
+              and lift_sent[1]["via"][0][2] >= 0.16,
+              str(lift_sent))
+        check("sequence respects transit_lift_m=0 opt-out",
+              len(optout_sent) == 2 and "via" not in optout_sent[1],
+              str(optout_sent))
+
         deprecated_hover = await client.post(
             "/sequence", json={"targets": compact, "hover_m": 0.1},
             headers={"X-Rebot-Token": "selftest-token"})
@@ -6021,6 +6043,21 @@ def test_oracle_detect(workdir: Path):
     check("verify_grasp abstains when post_q6 arm skeleton occludes pick_uv",
           v_occ["grasped"] is None and v_occ.get("reason") == "arm_occludes_pick_zone",
           str(v_occ))
+    # Issue #12 #2: place-zone arrival verification distinguishes real transfer
+    # from knocking an object off the table (empty pick AND empty place).
+    placed_frame = table.copy()
+    cv2.circle(placed_frame, (480, 240), 38, (30, 30, 220), -1)
+    cv2.circle(placed_frame, (470, 232), 9, (250, 250, 250), -1)
+    v_transfer_ok = ov.verify_grasp(pre_g, placed_frame, (320, 240), place_uv=(480, 240))
+    check("verify_grasp confirms pick departure + place arrival",
+          v_transfer_ok["grasped"] is True and v_transfer_ok.get("place_arrived") is True,
+          str(v_transfer_ok))
+    v_knocked_off = ov.verify_grasp(pre_g, table, (320, 240), place_uv=(480, 240))
+    check("verify_grasp catches knocked-off-table transfer (object missing at place)",
+          v_knocked_off["grasped"] is False
+          and v_knocked_off.get("place_arrived") is False
+          and v_knocked_off.get("reason") == "object_missing_at_place",
+          str(v_knocked_off))
 
 
 def test_uniform_rescale(workdir: Path, geometry):
@@ -6340,6 +6377,18 @@ def test_via_chain(workdir: Path):
     check("soft_clamp_sag exits a joint-limit hold without a peel-off jerk spike",
           jerk_c < 60.0 and np.all(arr_c[:, 3] <= hi[3] + 1e-12),
           "max_j4_jerk=%.1f rad/s3" % jerk_c)
+
+    # Issue #12 #6a: planner_server strips PL/pgSQL CONTEXT and replaces CLI hints.
+    raw_pg = RuntimeError(
+        "IK failed at [0.638 0.000 0.040] m (marker 1): no solution; reached 0.05 m / 1.0 deg off. "
+        "The target is probably out of reach from this pose: try a smaller --yaw, a larger --approach, "
+        "or start from a pose closer to the workspace.\n"
+        "CONTEXT:  PL/pgSQL function plan_one(text,jsonb,jsonb,jsonb,text) line 11 at assignment"
+    )
+    cleaned_td = planner._clean_plan_error(raw_pg, SimpleNamespace(tool_axis="x+"))
+    check("planner error cleaner strips PL/pgSQL CONTEXT and gives top-down hint",
+          "CONTEXT:" not in cleaned_td and "--yaw" not in cleaned_td and "top-down" in cleaned_td.lower(),
+          cleaned_td)
 
 
 def main(argv=None):

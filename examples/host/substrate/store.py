@@ -454,6 +454,8 @@ class SubstrateStore:
         with self.conn() as c:
             req = c.execute("SELECT execution_detect_request(%s) AS r", (exec_id,)).fetchone()["r"] or {}
             shas = list({h["frame"] for h in (req.get("holds") or []) if h.get("frame")})
+            if req.get("post_park_frame") and req["post_park_frame"] not in shas:
+                shas.append(req["post_park_frame"])
             by_sha: dict[str, bytes] = {}
             if shas:
                 rows = c.execute(

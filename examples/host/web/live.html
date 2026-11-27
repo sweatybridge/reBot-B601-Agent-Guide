@@ -153,6 +153,8 @@
           title="Drag up or down in the preview to set the arm height">4 cm</span>
     <button class="chip" id="reach" type="button">Reach: off</button>
     <button class="chip" id="gripperMode" type="button">Gripper: horizontal</button>
+    <button class="chip on" id="gripWidth" type="button"
+            title="Toggle jaw close width: snug (20 mm) for plush/small objects vs wide (49 mm)">Grip: 20 mm</button>
     <button class="chip" id="tapMode" type="button">Tap: plan</button>
     <button class="chip" id="viaMode" type="button" hidden>Via: off</button>
     <button class="chip" id="clear" type="button" disabled>Clear marker</button>
@@ -217,6 +219,7 @@ const moveButton = $("#move");
 const undoButton = $("#undo");
 const reachButton = $("#reach");
 const gripperModeButton = $("#gripperMode");
+const gripWidthButton = $("#gripWidth");
 const tapModeButton = $("#tapMode");
 const viaModeButton = $("#viaMode");
 const clearButton = $("#clear");
@@ -239,6 +242,7 @@ const state = {
   health: null,
   tapMode: "plan",          // "plan": one tap plans one point; "markers": taps queue up
   topDown: false,           // false: horizontal + front entry; true: top-down (x+) + vertical descend
+  snugGrip: true,           // true: close_width_mm=20 (plush/small); false: wide default (grasp_q=2.0)
   savedHeight: { horizontal: null, vertical: null },
   busy: false,
   busyText: "",
@@ -248,9 +252,11 @@ function currentToolAxis() {
   return state.topDown ? "x+" : "current";
 }
 function gripperPlanOptions() {
-  return state.topDown
+  const base = state.topDown
     ? { tool_axis: "x+", entry: "vertical" }
     : { tool_axis: "current", entry: "front" };
+  if (state.snugGrip) base.close_width_mm = 20;
+  return base;
 }
 let pc = null;
 let sessionUrl = null;
@@ -2365,6 +2371,15 @@ gripperModeButton.addEventListener("click", () => {
   status(state.topDown
     ? "gripper: top-down orientation with vertical descend (height " + window.HeightControl.format(heightControl.height) + ")"
     : "gripper: horizontal orientation with front slide-in (height " + window.HeightControl.format(heightControl.height) + ")", "warn");
+});
+gripWidthButton.addEventListener("click", () => {
+  if (state.busy) return;
+  state.snugGrip = !state.snugGrip;
+  gripWidthButton.textContent = "Grip: " + (state.snugGrip ? "20 mm" : "49 mm");
+  gripWidthButton.classList.toggle("on", state.snugGrip);
+  status(state.snugGrip
+    ? "grip width: snug 20 mm (plush / small objects)"
+    : "grip width: wide 49 mm (default grasp_q=2.0)", "warn");
 });
 tapModeButton.addEventListener("click", () => {
   if (state.busy) {

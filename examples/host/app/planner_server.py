@@ -197,6 +197,33 @@ def _is_db_outage(exc: Exception) -> bool:
     name = type(exc).__name__
     return name in ("OperationalError", "InterfaceError", "DatabaseError") and "RaiseException" not in name
 
+
+_PG_INTERNAL_RE = re.compile(r"\n\s*(?:CONTEXT|DETAIL|HINT|QUERY|LINE \d+):.*$", re.S)
+_CLI_HINT_OLD = (
+    "The target is probably out of reach from this pose: try a smaller --yaw, "
+    "a larger --approach, or start from a pose closer to the workspace."
+)
+
+
+def _clean_plan_error(error: Exception, options=None) -> str:
+    """Strip raw PL/pgSQL CONTEXT tracebacks and replace CLI-only reach hints
+    with mode-aware guidance (Issue #12 #6a)."""
+    text = _PG_INTERNAL_RE.sub("", str(error)).strip()
+    if _CLI_HINT_OLD in text:
+        axis = str(getattr(options, "tool_axis", "") or "")
+        if axis == "x+":
+            replacement = (
+                "Top-down (x+) reach is limited (~0.55 m): move the target closer "
+                "or switch to horizontal (z-) entry."
+            )
+        else:
+            replacement = (
+                "The target may be out of reach or blocked by joint limits: adjust "
+                "the target position, entry mode, or approach standoff."
+            )
+        text = text.replace(_CLI_HINT_OLD, replacement)
+    return text
+
 PLAN_ID = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s",
@@ -470,7 +497,9 @@ def plan_targets(body):
             res = pg_mirror().store.plan_one(
                 PG_WORKSPACE, pose, target_arg, _options_json(options), PG_ARM)
         except Exception as error:
-            raise GatewayError(str(error), 503 if _is_db_outage(error) else 422) from error
+            status_code = 503 if _is_db_outage(error) else 422
+            msg = str(error) if status_code == 503 else _clean_plan_error(error, options)
+            raise GatewayError(msg, status_code) from error
         plan_id = res["plan_id"]
         summary = res["summary"]
         summary["compute_s"] = round(time.time() - started, 2)
@@ -491,7 +520,7 @@ def plan_targets(body):
             payload, summary = fp.plan_sequence(pose, targets, options)
             label = "sequence"
     except fp.PlanError as error:
-        raise GatewayError(str(error), 422) from error
+        raise GatewayError(_clean_plan_error(error, options), 422) from error
 
     plan_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
     raw = json.dumps(payload, separators=(",", ":"))
@@ -602,7 +631,9 @@ def move_one(body):
             res = pg_mirror().store.move_one(
                 PG_WORKSPACE, pose_arg, tgt_arg, opts, PG_ARM, plan_id=requested_id or None)
         except Exception as error:
-            raise GatewayError(str(error), 503 if _is_db_outage(error) else 422) from error
+            status_code = 503 if _is_db_outage(error) else 422
+            msg = str(error) if status_code == 503 else _clean_plan_error(error)
+            raise GatewayError(msg, status_code) from error
         move_id = res["plan_id"]
         summary = res["summary"]
         trajectory = res["payload"]

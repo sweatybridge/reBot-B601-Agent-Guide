@@ -1171,6 +1171,34 @@ async def handle_sequence(request: web.Request) -> web.Response:
     planner_targets = [compact_target(tip, target)
                        for tip, target in zip(tips, targets)]
 
+    # Automatic transit clearance arch for horizontal tabletop pick-and-place
+    # (Issue #12 #3): when moving low over the table (max z < 0.14 m) in
+    # horizontal front entry and an even (place) target did not supply explicit
+    # `via` points (including `via: []` or `transit_lift_m: 0` to opt out),
+    # insert two elevated via points so the arm lifts cleanly over neighboring
+    # objects instead of dragging across the mat.
+    raw_lift = body.get("transit_lift_m")
+    if raw_lift is None:
+        raw_lift = (body.get("options") or {}).get("transit_lift_m")
+    lift_z = 0.16 if raw_lift is None else float(raw_lift)
+    plan_options.pop("transit_lift_m", None)
+    if (not _is_vertical_request(app, body) and lift_z > 0.0 and len(planner_targets) >= 2):
+        for idx in range(1, len(planner_targets), 2):
+            raw_tgt = targets[idx] if isinstance(targets[idx], dict) else {}
+            if "via" in raw_tgt:
+                continue
+            prev_tip = planner_targets[idx - 1]["tip"]
+            curr_tip = planner_targets[idx]["tip"]
+            top_z = max(float(prev_tip[2]), float(curr_tip[2]))
+            horiz = math.hypot(float(curr_tip[0]) - float(prev_tip[0]),
+                               float(curr_tip[1]) - float(prev_tip[1]))
+            if top_z < 0.14 and horiz > 0.03:
+                arch_z = round(min(0.22, max(lift_z, top_z + 0.10)), 4)
+                planner_targets[idx]["via"] = [
+                    [float(prev_tip[0]), float(prev_tip[1]), arch_z],
+                    [float(curr_tip[0]), float(curr_tip[1]), arch_z],
+                ]
+
     sid = request.headers.get("X-Rebot-Session", "")
     status, payload = await planner_call(app, "/plan", {
         "targets": planner_targets,
@@ -2838,6 +2866,7 @@ async def handle_calibrate(request: web.Request) -> web.Response:
                             payload["written"], error)
         else:
             app["rig"] = rig
+            app["measured_turn"] = None
             app["extrinsics_path"] = payload["written"]
             await asyncio.to_thread(_pg_mirror_rig, app, rig)
             try:
@@ -3211,6 +3240,7 @@ async def handle_identify_run(request: web.Request) -> web.Response:
                             payload["written"], error)
         else:
             app["rig"] = rig
+            app["measured_turn"] = None
             app["extrinsics_path"] = payload["written"]
             await asyncio.to_thread(_pg_mirror_rig, app, rig)
             try:
@@ -3708,6 +3738,7 @@ async def handle_capture_pose(request: web.Request) -> web.Response:
             logging.warning("the tag wrote %s but it could not be loaded: %s", written, error)
         else:
             app["rig"] = rig
+            app["measured_turn"] = None
             app["extrinsics_path"] = written
             await asyncio.to_thread(_pg_mirror_rig, app, rig)
             try:
@@ -4004,6 +4035,7 @@ def build_app(args) -> web.Application:
                         Path(image).parent.mkdir(parents=True, exist_ok=True)
                         Path(image).write_bytes(wbytes)
                 app["rig"] = pg_rig
+                app["measured_turn"] = None
                 app["extrinsics_path"] = str(calib_dir / "extrinsics-fixed.json")
                 try:
                     app["witness"] = witness.load_for(pg_rig, calib_dir)

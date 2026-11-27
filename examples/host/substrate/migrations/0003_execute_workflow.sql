@@ -620,12 +620,26 @@ DECLARE
   seqs jsonb;
   needed_seqs int[] := ARRAY[]::int[];
   frags jsonb;
+  plan_json jsonb;
+  is_seq boolean := false;
+  last_w1 float8 := 0.0;
+  tail_seq int;
+  tail_t0 float8;
+  tail_t1 float8;
+  post_park jsonb := NULL;
 BEGIN
   SELECT * INTO ex FROM evidence.execution WHERE exec_id = p_exec_id;
   IF NOT FOUND THEN RAISE EXCEPTION 'unknown execution %', p_exec_id; END IF;
   IF ex.episode_id IS NULL THEN
     RETURN jsonb_build_object('episode_id', NULL, 't_offset', ex.t_offset,
                               'windows', '[]'::jsonb, 'needed_seqs', '[]'::jsonb);
+  END IF;
+  SELECT convert_from(b.bytes, 'UTF8')::jsonb INTO plan_json
+    FROM evidence.plan p JOIN evidence.blob b ON b.sha256 = p.blob_sha
+   WHERE p.plan_id = ex.plan_id;
+  IF plan_json IS NOT NULL THEN
+    is_seq := COALESCE((plan_json->'capture'->>'sequence')::boolean,
+                       (plan_json->>'sequence')::boolean, false);
   END IF;
   SELECT (convert_from(b.bytes, 'UTF8')::jsonb) -> 'samples'
     INTO samples
@@ -672,6 +686,7 @@ BEGIN
        WHERE f.episode_id = ex.episode_id
          AND f.t_end >= w0 - 1e-6 AND f.t_start <= w1 + 1e-6
     );
+    last_w1 := greatest(last_w1, w1);
     wins := wins || jsonb_build_array(jsonb_build_object(
       'index', (w->>'index')::int,
       't_start', t_start, 't_end', t_end,
@@ -679,6 +694,25 @@ BEGIN
       'target_t', best_t, 'score', best_score, 'midpoint', mid,
       'fragments', seqs));
   END LOOP;
+
+  -- For multi-marker pick-and-place sequences, request one unobstructed
+  -- post-park frame from the tail of the recording (after the arm returns to
+  -- park) so visual transfer verification can check both pick departure and
+  -- place arrival with the arm completely out of the scene (Issue #12 #2).
+  IF is_seq THEN
+    SELECT f.seq, f.t_start, f.t_end INTO tail_seq, tail_t0, tail_t1
+      FROM evidence.media_fragment f
+     WHERE f.episode_id = ex.episode_id
+     ORDER BY f.seq DESC LIMIT 1;
+    IF tail_seq IS NOT NULL AND tail_t1 >= last_w1 + 1.0 THEN
+      needed_seqs := needed_seqs || ARRAY[tail_seq];
+      post_park := jsonb_build_object(
+        'w0', greatest(last_w1 + 0.5, tail_t1 - 1.5),
+        'w1', tail_t1,
+        'target_t', greatest(last_w1 + 0.5, tail_t1 - 0.3),
+        'fragments', jsonb_build_array(tail_seq));
+    END IF;
+  END IF;
 
   SELECT COALESCE(jsonb_agg(jsonb_build_object(
            'seq', f.seq, 't_start', f.t_start, 't_end', f.t_end, 'codec', f.codec)
@@ -690,8 +724,10 @@ BEGIN
 
   RETURN jsonb_build_object(
     'episode_id', ex.episode_id,
+    'arm_id', ex.arm_id,
     't_offset', ex.t_offset,
     'windows', wins,
+    'post_park', post_park,
     'fragments', frags,
     'needed_seqs', to_jsonb(ARRAY(SELECT DISTINCT x FROM unnest(needed_seqs) x ORDER BY x)));
 END $$ LANGUAGE plpgsql STABLE;
@@ -884,6 +920,10 @@ BEGIN
 
   RETURN jsonb_build_object(
     'holds', COALESCE(holds, '[]'::jsonb),
+    'post_park_frame', (
+      SELECT st.sha256 FROM evidence.still st
+       WHERE st.episode_id = ex.episode_id AND st.purpose = 'post_exec'
+       ORDER BY st.id DESC LIMIT 1),
     'targets', targets_arr,
     'sequence', COALESCE((plan_json->'capture'->>'sequence')::boolean, (plan_json->>'sequence')::boolean, false),
     'K', cal.K, 'dist', cal.dist, 'T_base_cam', rig.T_base_cam,
@@ -1005,15 +1045,28 @@ BEGIN
   doc := (res->'doc') || jsonb_build_object('verdict', res->'verdict');
   IF jsonb_typeof(p_detections->'grasp_verification') = 'object'
      AND (p_detections->'grasp_verification'->>'grasped') = 'false' THEN
-    doc := jsonb_set(
-      doc,
-      '{verdict,problems}',
-      COALESCE(doc->'verdict'->'problems', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
-        'kind', 'empty-grasp',
-        'layer', 'grasp',
-        'detail', format('visual post-grasp check saw object still at pick spot (changed=%s%%, tm=%s)',
-                         round((COALESCE((p_detections->'grasp_verification'->>'changed_frac')::float8, 0.0) * 100.0)::numeric, 0),
-                         round(COALESCE((p_detections->'grasp_verification'->>'tm_max')::float8, 1.0)::numeric, 2)))));
+    IF (p_detections->'grasp_verification'->>'reason') = 'object_missing_at_place' THEN
+      doc := jsonb_set(
+        doc,
+        '{verdict,problems}',
+        COALESCE(doc->'verdict'->'problems', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+          'kind', 'dropped-transfer',
+          'layer', 'grasp',
+          'detail', format('visual transfer check saw object leave pick spot (changed=%s%%) but never arrive at place spot (place_changed=%s%%, place_tm=%s)',
+                           round((COALESCE((p_detections->'grasp_verification'->>'changed_frac')::float8, 0.0) * 100.0)::numeric, 0),
+                           round((COALESCE((p_detections->'grasp_verification'->>'place_changed_frac')::float8, 0.0) * 100.0)::numeric, 0),
+                           round(COALESCE((p_detections->'grasp_verification'->>'place_tm_max')::float8, 1.0)::numeric, 2)))));
+    ELSE
+      doc := jsonb_set(
+        doc,
+        '{verdict,problems}',
+        COALESCE(doc->'verdict'->'problems', '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+          'kind', 'empty-grasp',
+          'layer', 'grasp',
+          'detail', format('visual post-grasp check saw object still at pick spot (changed=%s%%, tm=%s)',
+                           round((COALESCE((p_detections->'grasp_verification'->>'changed_frac')::float8, 0.0) * 100.0)::numeric, 0),
+                           round(COALESCE((p_detections->'grasp_verification'->>'tm_max')::float8, 1.0)::numeric, 2)))));
+    END IF;
   END IF;
   PERFORM oracle_learn(p_exec_id, ex.arm_id, rig.rig_fingerprint, doc, NULL);
   RETURN jsonb_build_object('doc', doc, 'verdict', doc->'verdict');

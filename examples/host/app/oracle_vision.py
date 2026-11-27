@@ -255,8 +255,9 @@ def detect_tip(frame, q6, K, dist, T_base_cam, t_tip, scale=1.0):
 
 
 def verify_grasp(pre_frame, post_frame, pick_uv, radius_px=65.0, scale=1.0,
-                 post_q6=None, K=None, dist=None, T_base_cam=None):
-    """Verify whether the target object left the pick zone after grasp + retract.
+                 post_q6=None, K=None, dist=None, T_base_cam=None, place_uv=None):
+    """Verify whether the target object left the pick zone (and, when `place_uv`
+    is supplied on an unobstructed post-park frame, arrived at the place zone).
 
     Uses projected arm-skeleton occlusion gating (when `post_q6`, `K`, `dist`,
     `T_base_cam` are supplied) plus translation-invariant template matching
@@ -264,7 +265,9 @@ def verify_grasp(pre_frame, post_frame, pick_uv, radius_px=65.0, scale=1.0,
     difference, and HSV histogram correlation around `pick_uv`. Tolerates a
     missed grasp nudging the object a few centimetres or casting an overhead
     arm shadow on the table while cleanly detecting object removal across
-    arbitrary object colors.
+    arbitrary object colors. When `place_uv` is provided, also checks that an
+    object appeared at `place_uv` so knocking an object off the table is not
+    misclassified as a successful grasp/transfer.
     """
     import cv2
 
@@ -283,69 +286,94 @@ def verify_grasp(pre_frame, post_frame, pick_uv, radius_px=65.0, scale=1.0,
         return {"grasped": None, "confidence": "low", "reason": "pick_uv_out_of_frame",
                 "pick_uv": [round(cx, 1), round(cy, 1)]}
 
-    # Geometric arm-skeleton occlusion guard: black motor/wrist housings are
-    # invisible to `green_mask`, so project links j2..ee in the post frame and
-    # abstain whenever the arm itself sits directly over `pick_uv`.
-    if post_q6 is not None and K is not None and dist is not None and T_base_cam is not None:
+    def _arm_dist_to(uv_pt):
+        if post_q6 is None or K is None or dist is None or T_base_cam is None:
+            return None
         try:
             joints_uv, _collar_uv, ee_uv = _arm_joint_pixels(post_q6, K, dist, T_base_cam)
             chain = [p for p in joints_uv[1:] + [ee_uv] if p is not None]
-            if len(chain) >= 2:
-                p_arr = np.asarray([[cx, cy]], dtype=float)
-                min_arm_d = min(
-                    float(_point_to_seg_dist(p_arr, a, b)[0])
-                    for a, b in zip(chain[:-1], chain[1:])
-                )
-                occlude_gate = max(75.0, float(radius_px) + 15.0) * float(scale)
-                if min_arm_d < occlude_gate:
-                    return {
-                        "grasped": None, "confidence": "low",
-                        "reason": "arm_occludes_pick_zone",
-                        "arm_dist_px": round(min_arm_d, 1),
-                        "pick_uv": [round(cx, 1), round(cy, 1)],
-                    }
+            if len(chain) < 2:
+                return None
+            p_arr = np.asarray([[float(uv_pt[0]), float(uv_pt[1])]], dtype=float)
+            return min(
+                float(_point_to_seg_dist(p_arr, a, b)[0])
+                for a, b in zip(chain[:-1], chain[1:])
+            )
         except Exception:  # noqa: BLE001 - fall back to pixel checks if FK/proj fails
-            pass
+            return None
 
-    tpl = pre_frame[y0:y1, x0:x1]
-    sx0, sx1 = max(0, x0 - shift_r), min(w, x1 + shift_r)
-    sy0, sy1 = max(0, y0 - shift_r), min(h, y1 + shift_r)
-    search = post_frame[sy0:sy1, sx0:sx1]
-
-    # Guard against arm occlusion over the pick zone in either frame.
-    pre_arm = auto_calibrate.green_mask(tpl) > 0
-    post_center = post_frame[y0:y1, x0:x1]
-    post_arm = auto_calibrate.green_mask(post_center) > 0
-    valid_frac = float(np.mean((~pre_arm) & (~post_arm)))
-    if valid_frac < 0.35:
+    # Geometric arm-skeleton occlusion guard: black motor/wrist housings are
+    # invisible to `green_mask`, so project links j2..ee in the post frame and
+    # abstain whenever the arm itself sits directly over `pick_uv`.
+    occlude_gate = max(75.0, float(radius_px) + 15.0) * float(scale)
+    min_arm_d = _arm_dist_to((cx, cy))
+    if min_arm_d is not None and min_arm_d < occlude_gate:
         return {
-            "grasped": None, "confidence": "low", "reason": "pick_zone_occluded",
-            "valid_frac": round(valid_frac, 3), "pick_uv": [round(cx, 1), round(cy, 1)],
+            "grasped": None, "confidence": "low",
+            "reason": "arm_occludes_pick_zone",
+            "arm_dist_px": round(min_arm_d, 1),
+            "pick_uv": [round(cx, 1), round(cy, 1)],
         }
 
-    # Translation-invariant match: if a missed grasp bumped the object slightly,
-    # the object patch still matches with high TM_CCOEFF_NORMED nearby.
-    res_tm = cv2.matchTemplate(search, tpl, cv2.TM_CCOEFF_NORMED)
-    _, tm_max, _, max_loc = cv2.minMaxLoc(res_tm)
-    tm_max = float(tm_max)
-    th, tw = tpl.shape[:2]
-    best_patch = search[max_loc[1]:max_loc[1] + th, max_loc[0]:max_loc[0] + tw]
+    def _patch_metrics(ux, uy, allow_shift=True):
+        px0, px1 = max(0, int(round(ux)) - r), min(w, int(round(ux)) + r)
+        py0, py1 = max(0, int(round(uy)) - r), min(h, int(round(uy)) + r)
+        if (px1 - px0) < 20 or (py1 - py0) < 20:
+            return None
+        tpl = pre_frame[py0:py1, px0:px1]
+        pre_arm = auto_calibrate.green_mask(tpl) > 0
+        post_center = post_frame[py0:py1, px0:px1]
+        post_arm = auto_calibrate.green_mask(post_center) > 0
+        vfrac = float(np.mean((~pre_arm) & (~post_arm)))
+        if vfrac < 0.35:
+            return {"occluded": True, "valid_frac": vfrac}
+        th, tw = tpl.shape[:2]
+        if allow_shift:
+            sx0, sx1 = max(0, px0 - shift_r), min(w, px1 + shift_r)
+            sy0, sy1 = max(0, py0 - shift_r), min(h, py1 + shift_r)
+            search = post_frame[sy0:sy1, sx0:sx1]
+            res_tm = cv2.matchTemplate(search, tpl, cv2.TM_CCOEFF_NORMED)
+            _, tm_m, _, max_loc = cv2.minMaxLoc(res_tm)
+            tm_m = float(tm_m)
+            best_patch = search[max_loc[1]:max_loc[1] + th, max_loc[0]:max_loc[0] + tw]
+        else:
+            best_patch = post_center
+            res_tm = cv2.matchTemplate(post_center, tpl, cv2.TM_CCOEFF_NORMED)
+            tm_m = float(res_tm[0, 0])
+        tpl_lab = cv2.cvtColor(tpl, cv2.COLOR_BGR2LAB).astype(np.float32)
+        bp_lab = cv2.cvtColor(best_patch, cv2.COLOR_BGR2LAB).astype(np.float32)
+        valid = (~pre_arm) & (auto_calibrate.green_mask(best_patch) == 0)
+        if int(valid.sum()) < 64:
+            valid = np.ones((th, tw), dtype=bool)
+        diff = tpl_lab[valid] - bp_lab[valid]
+        de = np.sqrt(np.sum(diff * diff, axis=1))
+        m_de = float(np.mean(de))
+        chg = float(np.mean(de > 22.0))
+        h1 = cv2.calcHist([cv2.cvtColor(tpl, cv2.COLOR_BGR2HSV)], [0, 1], None, [18, 16], [0, 180, 0, 256])
+        h2 = cv2.calcHist([cv2.cvtColor(best_patch, cv2.COLOR_BGR2HSV)], [0, 1], None, [18, 16], [0, 180, 0, 256])
+        cv2.normalize(h1, h1)
+        cv2.normalize(h2, h2)
+        hc = float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
+        return {
+            "occluded": False, "valid_frac": vfrac,
+            "tm_max": tm_m, "mean_de": m_de, "changed_frac": chg, "hist_corr": hc,
+        }
 
-    tpl_lab = cv2.cvtColor(tpl, cv2.COLOR_BGR2LAB).astype(np.float32)
-    bp_lab = cv2.cvtColor(best_patch, cv2.COLOR_BGR2LAB).astype(np.float32)
-    valid = (~pre_arm) & (auto_calibrate.green_mask(best_patch) == 0)
-    if int(valid.sum()) < 64:
-        valid = np.ones((th, tw), dtype=bool)
-    diff = tpl_lab[valid] - bp_lab[valid]
-    de = np.sqrt(np.sum(diff * diff, axis=1))
-    mean_de = float(np.mean(de))
-    changed_frac = float(np.mean(de > 22.0))
+    pick_m = _patch_metrics(cx, cy)
+    if pick_m is None:
+        return {"grasped": None, "confidence": "low", "reason": "pick_uv_out_of_frame",
+                "pick_uv": [round(cx, 1), round(cy, 1)]}
+    if pick_m["occluded"]:
+        return {
+            "grasped": None, "confidence": "low", "reason": "pick_zone_occluded",
+            "valid_frac": round(pick_m["valid_frac"], 3), "pick_uv": [round(cx, 1), round(cy, 1)],
+        }
 
-    h1 = cv2.calcHist([cv2.cvtColor(tpl, cv2.COLOR_BGR2HSV)], [0, 1], None, [18, 16], [0, 180, 0, 256])
-    h2 = cv2.calcHist([cv2.cvtColor(best_patch, cv2.COLOR_BGR2HSV)], [0, 1], None, [18, 16], [0, 180, 0, 256])
-    cv2.normalize(h1, h1)
-    cv2.normalize(h2, h2)
-    hist_corr = float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
+    tm_max = pick_m["tm_max"]
+    mean_de = pick_m["mean_de"]
+    changed_frac = pick_m["changed_frac"]
+    hist_corr = pick_m["hist_corr"]
+    valid_frac = pick_m["valid_frac"]
 
     grasped = bool(tm_max < 0.72 and changed_frac >= 0.20 and mean_de >= 18.0)
     # Shadow-tolerant high-confidence miss bar: overhead arm shadows during
@@ -361,7 +389,8 @@ def verify_grasp(pre_frame, post_frame, pick_uv, radius_px=65.0, scale=1.0,
         confidence = "high"
     else:
         confidence = "medium"
-    return {
+
+    out = {
         "grasped": grasped,
         "confidence": confidence,
         "tm_max": round(tm_max, 4),
@@ -371,6 +400,44 @@ def verify_grasp(pre_frame, post_frame, pick_uv, radius_px=65.0, scale=1.0,
         "valid_frac": round(valid_frac, 3),
         "pick_uv": [round(cx, 1), round(cy, 1)],
     }
+
+    # Place-zone arrival check (Issue #12): when `place_uv` is provided on a
+    # clear post-park frame and the object left `pick_uv`, confirm something
+    # actually appeared at `place_uv` so knocked-off-table / dropped transfers
+    # are caught instead of returning a false-positive `grasped=True`.
+    if place_uv is not None and grasped:
+        px, py = float(place_uv[0]), float(place_uv[1])
+        place_arm_d = _arm_dist_to((px, py))
+        if place_arm_d is not None and place_arm_d < occlude_gate:
+            out["place_arrived"] = None
+            out["place_uv"] = [round(px, 1), round(py, 1)]
+        else:
+            place_m = _patch_metrics(px, py, allow_shift=False)
+            if place_m is None or place_m["occluded"]:
+                out["place_arrived"] = None
+                out["place_uv"] = [round(px, 1), round(py, 1)]
+            else:
+                # Object arrived when the destination patch shows substantial
+                # Lab color change relative to the unobstructed pre-pick frame.
+                # Avoid relying on `tm_max` alone because low-texture table
+                # surfaces have noisy TM_CCOEFF_NORMED (~0.55-0.65) even when empty.
+                place_arrived = bool(
+                    place_m["changed_frac"] >= 0.25 and place_m["mean_de"] >= 22.0
+                )
+                out["place_arrived"] = place_arrived
+                out["place_tm_max"] = round(place_m["tm_max"], 4)
+                out["place_mean_de"] = round(place_m["mean_de"], 2)
+                out["place_changed_frac"] = round(place_m["changed_frac"], 3)
+                out["place_uv"] = [round(px, 1), round(py, 1)]
+                if not place_arrived:
+                    out["pick_departed"] = True
+                    out["grasped"] = False
+                    out["reason"] = "object_missing_at_place"
+                    out["confidence"] = (
+                        "high" if (place_m["changed_frac"] < 0.20 and place_m["mean_de"] < 20.0)
+                        else "medium"
+                    )
+    return out
 
 
 def green_centroid(frame):
